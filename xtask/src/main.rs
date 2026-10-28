@@ -11,12 +11,20 @@ const USAGE: &str = "usage: cargo xtask check";
 struct Step {
     name: &'static str,
     command: fn(&Path) -> Command,
+    /// Runs before `command`; an `Err` fails the step with that message.
+    precondition: Option<Precondition>,
 }
+
+type Precondition = fn(&Path) -> Result<(), String>;
+
+const CORE_BIN: &str = "target/debug/applejack";
+const SWIFT_PACKAGE: &str = "apps/Applejack";
 
 const CHECK_STEPS: &[Step] = &[
     Step {
         name: "fmt",
         command: |root| cargo(root, ["fmt", "--all", "--check"]),
+        precondition: None,
     },
     Step {
         name: "clippy",
@@ -33,10 +41,12 @@ const CHECK_STEPS: &[Step] = &[
                 ],
             )
         },
+        precondition: None,
     },
     Step {
         name: "test",
         command: |root| cargo(root, ["test", "--workspace"]),
+        precondition: None,
     },
     Step {
         name: "doc",
@@ -45,6 +55,38 @@ const CHECK_STEPS: &[Step] = &[
             command.env("RUSTDOCFLAGS", "-D warnings");
             command
         },
+        precondition: None,
+    },
+    Step {
+        name: "core-build",
+        command: |root| cargo(root, ["build", "--package", "applejack"]),
+        precondition: None,
+    },
+    Step {
+        name: "swift-build",
+        command: |root| swift(root, ["build", "--package-path", SWIFT_PACKAGE]),
+        precondition: None,
+    },
+    Step {
+        name: "swift-test",
+        command: |root| {
+            let mut command = swift(root, ["test", "--package-path", SWIFT_PACKAGE]);
+            command.env("APPLEJACK_CORE_BIN", root.join(CORE_BIN));
+            command
+        },
+        // The Swift suite skips the real-binary test when the binary is absent;
+        // checking here keeps that skip from hiding a missing build during `check`.
+        precondition: Some(|root| {
+            let binary = root.join(CORE_BIN);
+            if binary.is_file() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "core binary missing at {}; expected `cargo build --package applejack` to produce it",
+                    binary.display()
+                ))
+            }
+        }),
     },
 ];
 
@@ -61,6 +103,12 @@ fn main() -> ExitCode {
 
 fn check(root: &Path) -> ExitCode {
     for step in CHECK_STEPS {
+        if let Some(precondition) = step.precondition
+            && let Err(message) = precondition(root)
+        {
+            eprintln!("[xtask] {} failed: {message}", step.name);
+            return ExitCode::FAILURE;
+        }
         let mut command = (step.command)(root);
         let rendered = render(&command);
         println!("[xtask] {}: {rendered}", step.name);
@@ -93,6 +141,12 @@ fn workspace_root() -> PathBuf {
 fn cargo<const N: usize>(root: &Path, args: [&str; N]) -> Command {
     let program = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(program);
+    command.args(args).current_dir(root);
+    command
+}
+
+fn swift<const N: usize>(root: &Path, args: [&str; N]) -> Command {
+    let mut command = Command::new("swift");
     command.args(args).current_dir(root);
     command
 }
