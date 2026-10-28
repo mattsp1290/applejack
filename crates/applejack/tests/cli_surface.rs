@@ -28,7 +28,8 @@ fn help_lists_every_subcommand() {
     let help = String::from_utf8(output.stdout).expect("utf-8");
     for name in SUBCOMMANDS {
         assert!(
-            help.lines().any(|line| line.trim_start().starts_with(name)),
+            help.lines()
+                .any(|line| line.split_whitespace().next() == Some(name)),
             "--help does not list `{name}`:\n{help}"
         );
     }
@@ -48,11 +49,35 @@ fn version_prints_crate_version() {
 #[test]
 fn stubs_exit_with_ex_unavailable() {
     for name in STUBS {
-        let output = applejack().arg(name).output().expect("runs");
-        assert_eq!(output.status.code(), Some(69), "`{name}` exit code");
-        let stderr = String::from_utf8(output.stderr).expect("utf-8");
-        assert_eq!(stderr.trim(), format!("applejack {name}: not implemented"));
+        assert_not_implemented(name, &[]);
     }
+}
+
+#[test]
+fn stubs_ignore_trailing_arguments() {
+    assert_not_implemented("serve", &["--stdio"]);
+    assert_not_implemented("steam", &["login"]);
+}
+
+fn assert_not_implemented(name: &str, args: &[&str]) {
+    let output = applejack().arg(name).args(args).output().expect("runs");
+    assert_eq!(
+        output.status.code(),
+        Some(69),
+        "`{name} {}` exit code",
+        args.join(" ")
+    );
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert_eq!(stderr.trim(), format!("applejack {name}: not implemented"));
+}
+
+#[test]
+fn doctor_rejects_unknown_flags_with_usage_error() {
+    let output = applejack()
+        .args(["doctor", "--bogus"])
+        .output()
+        .expect("runs");
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]

@@ -136,11 +136,14 @@ fn cargo<const N: usize>(root: &Path, args: [&str; N]) -> Command {
 
 fn render(command: &Command) -> String {
     let envs = command.get_envs().filter_map(|(key, value)| {
-        Some(format!(
-            "{}={} ",
-            key.to_string_lossy(),
-            value?.to_string_lossy()
-        ))
+        let value = value?.to_string_lossy();
+        // Quote so the printed command can be pasted back into a shell.
+        let value = if value.contains(char::is_whitespace) {
+            format!("'{value}'")
+        } else {
+            value.into_owned()
+        };
+        Some(format!("{}={value} ", key.to_string_lossy()))
     });
     let args = command
         .get_args()
