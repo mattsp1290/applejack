@@ -2,6 +2,7 @@ name: check
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -23,6 +24,18 @@ jobs:
           fi
           sudo xcode-select -s "$xcode"
           xcodebuild -version
+      - name: Require Xcode 26.2 or newer
+        run: |
+          version=$(xcodebuild -version | awk '/^Xcode / { print $2 }')
+          echo "found Xcode ${version:-unknown}"
+          if [ -z "$version" ]; then
+            echo "could not read the Xcode version from xcodebuild -version" >&2
+            exit 1
+          fi
+          if [ "$(printf '%s\n' 26.2 "$version" | sort -V | head -1)" != 26.2 ]; then
+            echo "Xcode $version is older than the required 26.2" >&2
+            exit 1
+          fi
       - name: Install the pinned Rust toolchain
         run: |
           rustup toolchain install
