@@ -2,10 +2,13 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask check";
+use applejack_manifest::Manifest;
+
+const USAGE: &str = "usage: cargo xtask <check|manifest-verify>";
 
 /// One quality-gate step. Sibling work packages append rows to `CHECK_STEPS`.
 struct Step {
@@ -88,12 +91,17 @@ const CHECK_STEPS: &[Step] = &[
             }
         }),
     },
+    Step {
+        name: "manifest-verify",
+        command: |root| cargo(root, ["xtask", "manifest-verify"]),
+    },
 ];
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.as_slice() {
         [command] if command == "check" => check(&workspace_root()),
+        [command] if command == "manifest-verify" => manifest_verify(&workspace_root()),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -131,6 +139,35 @@ fn check(root: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn manifest_verify(root: &Path) -> ExitCode {
+    let path = root.join("engines").join("manifest.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("[xtask] manifest-verify: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let manifest =
+        Manifest::parse(&text).and_then(|manifest| manifest.validate().map(|()| manifest));
+    match manifest {
+        Ok(manifest) => {
+            println!(
+                "[xtask] manifest-verify: {} ok (engines: {}, tools: {}, probes: {})",
+                path.display(),
+                manifest.engine.len(),
+                manifest.tool.len(),
+                manifest.probe.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("[xtask] manifest-verify: {}: {error}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -153,11 +190,14 @@ fn swift<const N: usize>(root: &Path, args: [&str; N]) -> Command {
 
 fn render(command: &Command) -> String {
     let envs = command.get_envs().filter_map(|(key, value)| {
-        Some(format!(
-            "{}={} ",
-            key.to_string_lossy(),
-            value?.to_string_lossy()
-        ))
+        let value = value?.to_string_lossy();
+        // Quote so the printed command can be pasted back into a shell.
+        let value = if value.contains(char::is_whitespace) {
+            format!("'{value}'")
+        } else {
+            value.into_owned()
+        };
+        Some(format!("{}={value} ", key.to_string_lossy()))
     });
     let args = command
         .get_args()
