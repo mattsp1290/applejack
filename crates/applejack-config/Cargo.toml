@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 applejack-manifest = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
