@@ -11,7 +11,7 @@ const DATA_DIR_RELATIVE: &str = "Library/Application Support/applejack";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFacts {
     pub macos_version: String,
-    pub arch: String,
+    pub arch: Option<String>,
     pub rosetta_present: Option<bool>,
     pub free_disk_bytes: Option<u64>,
     pub screen_recording: ScreenRecordingState,
@@ -40,7 +40,11 @@ impl HostFacts {
                 .filter(|captured| captured.success)
                 .and_then(|captured| parse_product_version(&captured.stdout))
                 .unwrap_or_else(|| "unknown".to_owned()),
-            arch: std::env::consts::ARCH.to_owned(),
+            // hw.machine is the chip the kernel runs on; `std::env::consts::ARCH`
+            // is the binary's compile target and reads `aarch64` under Rosetta too.
+            arch: capture("/usr/sbin/sysctl", ["-n", "hw.machine"])
+                .filter(|captured| captured.success)
+                .and_then(|captured| parse_hw_machine(&captured.stdout)),
             rosetta_present: capture("/usr/bin/arch", ["-x86_64", "/usr/bin/true"])
                 .map(|captured| captured.success),
             free_disk_bytes: free_disk_bytes(&data_dir()),
@@ -66,6 +70,12 @@ pub fn data_dir() -> PathBuf {
 pub fn parse_product_version(text: &str) -> Option<String> {
     let version = text.trim();
     (!version.is_empty()).then(|| version.to_owned())
+}
+
+#[must_use]
+pub fn parse_hw_machine(text: &str) -> Option<String> {
+    let machine = text.trim();
+    (!machine.is_empty() && !machine.contains(char::is_whitespace)).then(|| machine.to_owned())
 }
 
 /// Reads the `Available` column of `df -Pk` output and returns it in bytes.
@@ -120,6 +130,8 @@ mod tests {
 
     const SW_VERS_SAMPLE: &str = "26.6.2\n";
 
+    const HW_MACHINE_SAMPLE: &str = "arm64\n";
+
     const DF_SAMPLE: &str = concat!(
         "Filesystem   1024-blocks       Used  Available Capacity  Mounted on\n",
         "/dev/disk3s5  7811085600 6633997744 1141219520    86%    /System/Volumes/Data\n",
@@ -156,6 +168,17 @@ mod tests {
             Some("26.6.2")
         );
         assert_eq!(parse_product_version("  \n"), None);
+    }
+
+    #[test]
+    fn hw_machine_is_a_single_trimmed_token() {
+        assert_eq!(
+            parse_hw_machine(HW_MACHINE_SAMPLE).as_deref(),
+            Some("arm64")
+        );
+        assert_eq!(parse_hw_machine(""), None);
+        assert_eq!(parse_hw_machine("  \n"), None);
+        assert_eq!(parse_hw_machine("arm64 x86_64\n"), None);
     }
 
     #[test]
@@ -204,7 +227,7 @@ mod tests {
     fn screen_recording_serializes_as_unknown() {
         let facts = HostFacts {
             macos_version: "26.6.2".to_owned(),
-            arch: "aarch64".to_owned(),
+            arch: None,
             rosetta_present: None,
             free_disk_bytes: None,
             screen_recording: ScreenRecordingState::Unknown,
@@ -212,6 +235,7 @@ mod tests {
         };
         let json = serde_json::to_value(&facts).expect("serializes");
         assert_eq!(json["screen_recording"], "unknown");
+        assert!(json["arch"].is_null());
         assert!(json["free_disk_bytes"].is_null());
         assert!(json["rosetta_present"].is_null());
         assert!(json["developer_id_identities"].is_null());
