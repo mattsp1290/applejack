@@ -129,7 +129,10 @@ fn render_facts(facts: &HostFacts) -> String {
         .map_or_else(|| "unknown".to_owned(), |count| count.to_string());
     let rows: [(&str, String); 6] = [
         ("macOS version", facts.macos_version.clone()),
-        ("architecture", facts.arch.clone()),
+        (
+            "architecture",
+            facts.arch.clone().unwrap_or_else(|| "unknown".to_owned()),
+        ),
         ("Rosetta", rosetta.to_owned()),
         ("free disk (data dir)", free_disk),
         ("screen recording", facts.screen_recording.to_string()),
