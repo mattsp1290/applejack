@@ -1,0 +1,7 @@
+# Pinned launcher-supplied components: engine bundles ([[engine]]), helper
+# tools ([[tool]]), and diagnostic probes ([[probe]]), each by URL and SHA-256.
+# The schema lives in crates/applejack-manifest; `cargo xtask manifest-verify`
+# checks this file, and applejack-engine embeds it at build time.
+#
+# Empty until work packages 3 (Rosetta engine), 5 (tools), and 7 (probes)
+# populate it.

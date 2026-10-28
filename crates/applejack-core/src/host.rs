@@ -12,10 +12,10 @@ const DATA_DIR_RELATIVE: &str = "Library/Application Support/applejack";
 pub struct HostFacts {
     pub macos_version: String,
     pub arch: String,
-    pub rosetta_present: bool,
+    pub rosetta_present: Option<bool>,
     pub free_disk_bytes: Option<u64>,
     pub screen_recording: ScreenRecordingState,
-    pub developer_id_identities: usize,
+    pub developer_id_identities: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,22 +36,21 @@ impl HostFacts {
     #[must_use]
     pub fn gather() -> Self {
         Self {
-            macos_version: capture("sw_vers", ["-productVersion"])
+            macos_version: capture("/usr/bin/sw_vers", ["-productVersion"])
                 .filter(|captured| captured.success)
                 .and_then(|captured| parse_product_version(&captured.stdout))
                 .unwrap_or_else(|| "unknown".to_owned()),
             arch: std::env::consts::ARCH.to_owned(),
-            rosetta_present: capture("arch", ["-x86_64", "/usr/bin/true"])
-                .is_some_and(|captured| captured.success),
+            rosetta_present: capture("/usr/bin/arch", ["-x86_64", "/usr/bin/true"])
+                .map(|captured| captured.success),
             free_disk_bytes: free_disk_bytes(&data_dir()),
             screen_recording: ScreenRecordingState::Unknown,
             developer_id_identities: capture(
-                "security",
+                "/usr/bin/security",
                 ["find-identity", "-v", "-p", "codesigning"],
             )
-            .map_or(0, |captured| {
-                count_developer_id_identities(&captured.stdout)
-            }),
+            .filter(|captured| captured.success)
+            .map(|captured| count_developer_id_identities(&captured.stdout)),
         }
     }
 }
@@ -70,17 +69,22 @@ pub fn parse_product_version(text: &str) -> Option<String> {
 }
 
 /// Reads the `Available` column of `df -Pk` output and returns it in bytes.
+///
+/// The column is located relative to the `Capacity` field (the only one that
+/// ends in `%`) because a filesystem name may contain spaces.
 #[must_use]
 pub fn parse_df_available_bytes(text: &str) -> Option<u64> {
     let row = text.lines().rev().find(|line| !line.trim().is_empty())?;
-    let kibibytes: u64 = row.split_whitespace().nth(3)?.parse().ok()?;
+    let fields: Vec<&str> = row.split_whitespace().collect();
+    let capacity = fields.iter().rposition(|field| field.ends_with('%'))?;
+    let kibibytes: u64 = fields.get(capacity.checked_sub(1)?)?.parse().ok()?;
     kibibytes.checked_mul(1024)
 }
 
 #[must_use]
 pub fn count_developer_id_identities(text: &str) -> usize {
     text.lines()
-        .filter(|line| line.contains("Developer ID Application"))
+        .filter(|line| line.contains("\"Developer ID Application:"))
         .count()
 }
 
@@ -105,7 +109,7 @@ fn free_disk_bytes(data_dir: &Path) -> Option<u64> {
     // The data directory does not exist until first install; df on its
     // nearest existing ancestor reports the same volume.
     let probe = data_dir.ancestors().find(|path| path.exists())?;
-    capture("df", [OsStr::new("-Pk"), probe.as_os_str()])
+    capture("/bin/df", [OsStr::new("-Pk"), probe.as_os_str()])
         .filter(|captured| captured.success)
         .and_then(|captured| parse_df_available_bytes(&captured.stdout))
 }
@@ -116,19 +120,32 @@ mod tests {
 
     const SW_VERS_SAMPLE: &str = "26.6.2\n";
 
-    const DF_SAMPLE: &str = "Filesystem   1024-blocks       Used  Available Capacity  Mounted on\n\
-/dev/disk3s5  7811085600 6633997744 1141219520    86%    /System/Volumes/Data\n";
+    const DF_SAMPLE: &str = concat!(
+        "Filesystem   1024-blocks       Used  Available Capacity  Mounted on\n",
+        "/dev/disk3s5  7811085600 6633997744 1141219520    86%    /System/Volumes/Data\n",
+    );
 
-    // Captured on the planning host, which holds one Apple Development
-    // identity and no Developer ID; hash and team id redacted.
-    const SECURITY_NO_DEVELOPER_ID_SAMPLE: &str = "  1) 0000000000000000000000000000000000000000 \"Apple Development: Matthew Spurlin (TEAMID0000)\"\n\
-     1 valid identities found\n";
+    // autofs reports a filesystem name with a space; the sizes are synthetic
+    // so a column slip cannot pass by coincidence.
+    const DF_SPACED_FILESYSTEM_SAMPLE: &str = concat!(
+        "Filesystem    1024-blocks Used Available Capacity Mounted on\n",
+        "map auto_home          40   10        30    25%   /System/Volumes/Data/home\n",
+    );
+
+    // Same shape as a host with one Apple Development identity and no
+    // Developer ID; the name, hash, and team id are synthetic.
+    const SECURITY_NO_DEVELOPER_ID_SAMPLE: &str = concat!(
+        "  1) 0000000000000000000000000000000000000000 \"Apple Development: Example Developer (TEAMID0000)\"\n",
+        "     1 valid identities found\n",
+    );
 
     // Same format with the identity kinds a signing host carries.
-    const SECURITY_WITH_DEVELOPER_ID_SAMPLE: &str = "  1) 0000000000000000000000000000000000000000 \"Apple Development: Matthew Spurlin (TEAMID0000)\"\n\
-  2) 1111111111111111111111111111111111111111 \"Developer ID Application: Matthew Spurlin (TEAMID0000)\"\n\
-  3) 2222222222222222222222222222222222222222 \"Developer ID Installer: Matthew Spurlin (TEAMID0000)\"\n\
-     3 valid identities found\n";
+    const SECURITY_WITH_DEVELOPER_ID_SAMPLE: &str = concat!(
+        "  1) 0000000000000000000000000000000000000000 \"Apple Development: Example Developer (TEAMID0000)\"\n",
+        "  2) 1111111111111111111111111111111111111111 \"Developer ID Application: Example Developer (TEAMID0000)\"\n",
+        "  3) 2222222222222222222222222222222222222222 \"Developer ID Installer: Example Developer (TEAMID0000)\"\n",
+        "     3 valid identities found\n",
+    );
 
     const SECURITY_EMPTY_SAMPLE: &str = "     0 valid identities found\n";
 
@@ -146,6 +163,14 @@ mod tests {
         assert_eq!(
             parse_df_available_bytes(DF_SAMPLE),
             Some(1_141_219_520 * 1024)
+        );
+    }
+
+    #[test]
+    fn df_available_column_survives_spaces_in_filesystem_name() {
+        assert_eq!(
+            parse_df_available_bytes(DF_SPACED_FILESYSTEM_SAMPLE),
+            Some(30 * 1024)
         );
     }
 
@@ -180,14 +205,16 @@ mod tests {
         let facts = HostFacts {
             macos_version: "26.6.2".to_owned(),
             arch: "aarch64".to_owned(),
-            rosetta_present: true,
+            rosetta_present: None,
             free_disk_bytes: None,
             screen_recording: ScreenRecordingState::Unknown,
-            developer_id_identities: 0,
+            developer_id_identities: None,
         };
         let json = serde_json::to_value(&facts).expect("serializes");
         assert_eq!(json["screen_recording"], "unknown");
         assert!(json["free_disk_bytes"].is_null());
+        assert!(json["rosetta_present"].is_null());
+        assert!(json["developer_id_identities"].is_null());
     }
 
     #[test]
