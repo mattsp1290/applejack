@@ -10,6 +10,12 @@ pub enum Error {
     /// The stored `schema_version` is not a non-negative integer.
     #[error("invalid schema_version in meta: {0:?}")]
     InvalidSchemaVersion(String),
+    /// SQLite kept a journal mode other than WAL for a file database.
+    #[error("expected journal_mode wal, sqlite reports {found:?}")]
+    JournalMode {
+        /// Mode SQLite reported after the switch.
+        found: String,
+    },
     /// The database was written by a newer build with more migrations.
     #[error("database schema version {found} is newer than supported version {supported}")]
     SchemaTooNew {
