@@ -61,6 +61,11 @@ const CHECK_STEPS: &[Step] = &[
         precondition: None,
     },
     Step {
+        name: "manifest-verify",
+        command: |root| cargo(root, ["xtask", "manifest-verify"]),
+        precondition: None,
+    },
+    Step {
         name: "core-build",
         command: |root| cargo(root, ["build", "--package", "applejack"]),
         precondition: None,
@@ -90,10 +95,6 @@ const CHECK_STEPS: &[Step] = &[
                 ))
             }
         }),
-    },
-    Step {
-        name: "manifest-verify",
-        command: |root| cargo(root, ["xtask", "manifest-verify"]),
     },
 ];
 
