@@ -2,6 +2,10 @@
 //! `[[tool]]`, and `[[probe]]` tables that pin every launcher-supplied
 //! download by URL and SHA-256. Shared by `applejack-engine`, which embeds the
 //! manifest, and by `xtask manifest-verify`, which validates it.
+//!
+//! Tool and probe ids are open strings, not a closed list, because later work
+//! packages add ids such as the `hello32` probe and the `osslsigncode` tool.
+//! [`Manifest::validate`] enforces uniqueness of ids per table.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -17,7 +21,10 @@ pub enum Error {
     /// `path` locates the offending value as `<table>[<index>].<field>`; it is
     /// `None` when the document failed to tokenize before any table was read.
     Parse {
+        /// Location of the offending value, when known.
         path: Option<String>,
+        /// The underlying TOML error.
+        #[source]
         inner: toml::de::Error,
     },
     /// Two entries of the same table share an `id`.
@@ -245,6 +252,10 @@ impl Manifest {
     }
 
     /// Checks cross-entry rules: every `id` is unique within its table.
+    ///
+    /// Engine entries are unique by `id` alone; a version bump replaces the
+    /// entry, and rollback uses the previously installed version on disk, not
+    /// a second manifest entry.
     ///
     /// # Errors
     ///
