@@ -13,6 +13,12 @@ Scaffold only. The Cargo workspace, the CLI surface, and the quality gate
 exist; nothing runs games yet. Every subcommand except `doctor` exits with
 code 69 (`EX_UNAVAILABLE`) until its work package lands.
 
+## Requirements
+
+An Apple Silicon Mac. rustup, which installs the pinned toolchain from
+`rust-toolchain.toml` on first use. Xcode 26.2 or newer with its command
+line tools. Network access for the first build so Cargo can fetch crates.
+
 ## Build and run
 
 ```sh
@@ -37,4 +43,4 @@ and the workspace lints, `cargo test --workspace`, rustdoc with
 `APPLEJACK_CORE_BIN` pointing at the freshly built core binary. It stops at
 the first failure. CI runs the same
 command on a GitHub-hosted Apple Silicon runner (`macos-latest`) on every push
-and pull request; see `.github/workflows/check.yml`.
+to `main` and on every pull request; see `.github/workflows/check.yml`.

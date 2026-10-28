@@ -7,10 +7,14 @@ mod error;
 mod migrations;
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 
 pub use error::Error;
+
+const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+const WAL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Handle to the configuration database. Wraps the workspace's only
 /// `rusqlite::Connection`; every other crate goes through this type.
@@ -27,13 +31,14 @@ impl ConfigDb {
     /// # Errors
     ///
     /// Returns [`Error::Io`] when the parent directory cannot be created,
+    /// [`Error::JournalMode`] when SQLite will not switch the file to WAL,
     /// [`Error::SchemaTooNew`] when the file was written by a newer build, and
     /// [`Error::Sqlite`] for any SQLite failure.
     pub fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        Self::prepare(Connection::open(path)?)
+        Self::prepare(Connection::open(path)?, "wal")
     }
 
     /// Opens a fresh in-memory database with the current schema.
@@ -42,12 +47,16 @@ impl ConfigDb {
     ///
     /// Returns [`Error::Sqlite`] when SQLite fails to open or migrate it.
     pub fn open_in_memory() -> Result<Self, Error> {
-        Self::prepare(Connection::open_in_memory()?)
+        Self::prepare(Connection::open_in_memory()?, "memory")
     }
 
-    fn prepare(mut conn: Connection) -> Result<Self, Error> {
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+    fn prepare(mut conn: Connection, expected_mode: &str) -> Result<Self, Error> {
+        let deadline = Instant::now() + BUSY_TIMEOUT;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let mode = enable_wal(&conn, deadline)?;
+        if !mode.eq_ignore_ascii_case(expected_mode) {
+            return Err(Error::JournalMode { found: mode });
+        }
         conn.pragma_update(None, "foreign_keys", true)?;
         migrations::apply_pending(&mut conn)?;
         Ok(Self { conn })
@@ -80,9 +89,26 @@ impl ConfigDb {
     }
 }
 
+/// Switches to WAL and returns the journal mode SQLite reports afterwards.
+fn enable_wal(conn: &Connection, deadline: Instant) -> Result<String, rusqlite::Error> {
+    loop {
+        match conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0)) {
+            // The WAL switch can return SQLITE_BUSY without consulting the busy
+            // handler while another connection creates the file, so retry it here.
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(WAL_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -213,5 +239,51 @@ mod tests {
         }
         let error = ConfigDb::open(&temp.path).unwrap_err();
         assert!(matches!(error, Error::SchemaTooNew { .. }), "{error}");
+    }
+
+    #[test]
+    fn concurrent_open_of_fresh_path_succeeds() {
+        const THREADS: usize = 4;
+        for round in 0..20 {
+            let temp = TempDb::new("concurrent");
+            let barrier = Barrier::new(THREADS);
+            let results: Vec<Result<u32, Error>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            ConfigDb::open(&temp.path)?.schema_version()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+            for result in results {
+                match result {
+                    Ok(version) => assert_eq!(version, migrations::LATEST_VERSION),
+                    Err(error) => panic!("round {round}: open failed: {error}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn null_text_keys_fail_not_null_constraint() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        for sql in [
+            "INSERT INTO engine_versions (engine_id, version) VALUES (NULL, '1')",
+            "INSERT INTO engine_versions (engine_id, version) VALUES ('engine', NULL)",
+            "INSERT INTO d3dmetal (engine_version) VALUES (NULL)",
+            "INSERT INTO meta (key, value) VALUES (NULL, 'value')",
+        ] {
+            let error = db.conn.execute(sql, []).unwrap_err();
+            assert!(
+                error.to_string().contains("NOT NULL constraint failed"),
+                "{sql}: unexpected error: {error}"
+            );
+        }
     }
 }

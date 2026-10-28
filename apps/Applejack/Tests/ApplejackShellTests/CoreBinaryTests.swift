@@ -19,10 +19,15 @@ final class CoreBinaryTests: XCTestCase {
         let stdout = Pipe()
         process.standardOutput = stdout
         try process.run()
+        // Drain the pipe before waiting so a full pipe buffer cannot deadlock the child.
+        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         process.waitUntilExit()
 
-        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         XCTAssertEqual(process.terminationStatus, 0, "\(binary) --version exited \(process.terminationStatus)")
-        XCTAssertTrue(output.contains("applejack"), "unexpected --version output: \(output)")
+        XCTAssertEqual(
+            output.trimmingCharacters(in: .whitespacesAndNewlines),
+            "applejack 0.1.0",
+            "unexpected --version output: \(output)"
+        )
     }
 }

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::Error;
 
@@ -19,18 +19,16 @@ pub(crate) const LATEST_VERSION: u32 = match MIGRATIONS.last() {
     None => 0,
 };
 
-/// Applies every migration above the stored version, one transaction each,
-/// so a crash leaves the database at a whole version.
+/// Applies every migration above the stored version, one IMMEDIATE
+/// transaction each, so a crash leaves the database at a whole version and
+/// concurrent openers apply each migration exactly once.
 pub(crate) fn apply_pending(conn: &mut Connection) -> Result<(), Error> {
-    let current = stored_version(conn)?;
-    if current > LATEST_VERSION {
-        return Err(Error::SchemaTooNew {
-            found: current,
-            supported: LATEST_VERSION,
-        });
-    }
+    let current = check_supported(stored_version(conn)?)?;
     for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if check_supported(stored_version(&tx)?)? >= migration.version {
+            continue;
+        }
         tx.execute_batch(migration.sql)?;
         tx.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) \
@@ -40,6 +38,16 @@ pub(crate) fn apply_pending(conn: &mut Connection) -> Result<(), Error> {
         tx.commit()?;
     }
     Ok(())
+}
+
+fn check_supported(version: u32) -> Result<u32, Error> {
+    if version > LATEST_VERSION {
+        return Err(Error::SchemaTooNew {
+            found: version,
+            supported: LATEST_VERSION,
+        });
+    }
+    Ok(version)
 }
 
 /// The version recorded in `meta`, or 0 when the database is empty. The

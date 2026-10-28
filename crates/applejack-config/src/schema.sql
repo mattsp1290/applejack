@@ -1,5 +1,5 @@
--- Schema version 1. Column lists come from plan section 6a; later work
--- packages change them through new migrations, never by editing this file.
+-- Schema version 1. Column lists come from the per-game configuration design;
+-- later changes are new migrations, never edits to this file.
 
 CREATE TABLE apps (
     appid INTEGER PRIMARY KEY,
@@ -61,21 +61,21 @@ CREATE TABLE sessions (
 );
 
 CREATE TABLE engine_versions (
-    engine_id TEXT,
-    version TEXT,
+    engine_id TEXT NOT NULL,
+    version TEXT NOT NULL,
     installed_at TEXT,
     active INTEGER,
     PRIMARY KEY (engine_id, version)
 );
 
 CREATE TABLE d3dmetal (
-    engine_version TEXT PRIMARY KEY,
+    engine_version TEXT NOT NULL PRIMARY KEY,
     imported_from TEXT,
     gptk_version TEXT,
     accepted_at TEXT
 );
 
 CREATE TABLE meta (
-    key TEXT PRIMARY KEY,
+    key TEXT NOT NULL PRIMARY KEY,
     value TEXT
 );
