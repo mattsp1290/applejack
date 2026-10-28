@@ -20,7 +20,6 @@ struct Step {
 
 type Precondition = fn(&Path) -> Result<(), String>;
 
-const CORE_BIN: &str = "target/debug/applejack";
 const SWIFT_PACKAGE: &str = "apps/Applejack";
 
 const CHECK_STEPS: &[Step] = &[
@@ -79,13 +78,13 @@ const CHECK_STEPS: &[Step] = &[
         name: "swift-test",
         command: |root| {
             let mut command = swift(root, ["test", "--package-path", SWIFT_PACKAGE]);
-            command.env("APPLEJACK_CORE_BIN", root.join(CORE_BIN));
+            command.env("APPLEJACK_CORE_BIN", core_bin(root));
             command
         },
         // The Swift suite skips the real-binary test when the binary is absent;
         // checking here keeps that skip from hiding a missing build during `check`.
         precondition: Some(|root| {
-            let binary = root.join(CORE_BIN);
+            let binary = core_bin(root);
             if binary.is_file() {
                 Ok(())
             } else {
@@ -112,14 +111,14 @@ fn main() -> ExitCode {
 
 fn check(root: &Path) -> ExitCode {
     for step in CHECK_STEPS {
+        let mut command = (step.command)(root);
+        let rendered = render(&command);
         if let Some(precondition) = step.precondition
             && let Err(message) = precondition(root)
         {
-            eprintln!("[xtask] {} failed: {message}", step.name);
+            eprintln!("[xtask] {} failed: {message}\n  {rendered}", step.name);
             return ExitCode::FAILURE;
         }
-        let mut command = (step.command)(root);
-        let rendered = render(&command);
         println!("[xtask] {}: {rendered}", step.name);
         let status = match command.status() {
             Ok(status) => status,
@@ -174,6 +173,15 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask lives one level below the workspace root")
         .to_path_buf()
+}
+
+/// The debug binary `core-build` produces, wherever Cargo's target directory is.
+fn core_bin(root: &Path) -> PathBuf {
+    // `root.join` keeps an absolute `CARGO_TARGET_DIR` unchanged and anchors a
+    // relative one at the workspace root, which is where the cargo steps run.
+    let target =
+        env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), |dir| root.join(dir));
+    target.join("debug").join("applejack")
 }
 
 fn cargo<const N: usize>(root: &Path, args: [&str; N]) -> Command {
