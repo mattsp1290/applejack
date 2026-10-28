@@ -1,7 +1,9 @@
 //! Command-line entry point for applejack.
 
 use applejack_core::host::HostFacts;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use std::ffi::OsString;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 /// `EX_UNAVAILABLE` from sysexits(3): the subcommand exists but is not implemented yet.
@@ -18,24 +20,32 @@ struct Cli {
     command: Command,
 }
 
+/// Arguments a stub accepts and ignores, so callers see exit 69 rather than a
+/// usage error until the subcommand's work package lands.
+#[derive(Args)]
+struct Pending {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    _args: Vec<OsString>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Install, inspect, and roll back engines
-    Engine,
+    Engine(Pending),
     /// Sign in to Steam and list the owned library
-    Steam,
+    Steam(Pending),
     /// Download a title's Windows depot
-    Install,
+    Install(Pending),
     /// Launch an installed title
-    Run,
+    Run(Pending),
     /// Read and write per-game configuration
-    Config,
+    Config(Pending),
     /// Create, snapshot, and reset Wine prefixes
-    Prefix,
+    Prefix(Pending),
     /// Manage the shared Steam client prefix
-    Runtime,
+    Runtime(Pending),
     /// Serve JSON-RPC over stdio for the app shell
-    Serve,
+    Serve(Pending),
     /// Report host readiness facts
     Doctor {
         /// Print the facts as JSON
@@ -47,14 +57,14 @@ enum Command {
 impl Command {
     fn name(&self) -> &'static str {
         match self {
-            Self::Engine => "engine",
-            Self::Steam => "steam",
-            Self::Install => "install",
-            Self::Run => "run",
-            Self::Config => "config",
-            Self::Prefix => "prefix",
-            Self::Runtime => "runtime",
-            Self::Serve => "serve",
+            Self::Engine(_) => "engine",
+            Self::Steam(_) => "steam",
+            Self::Install(_) => "install",
+            Self::Run(_) => "run",
+            Self::Config(_) => "config",
+            Self::Prefix(_) => "prefix",
+            Self::Runtime(_) => "runtime",
+            Self::Serve(_) => "serve",
             Self::Doctor { .. } => "doctor",
         }
     }
@@ -75,45 +85,59 @@ fn not_implemented(name: &str) -> ExitCode {
 
 fn doctor(json: bool) -> ExitCode {
     let facts = HostFacts::gather();
-    if json {
+    let text = if json {
         match serde_json::to_string_pretty(&facts) {
-            Ok(text) => println!("{text}"),
+            Ok(text) => text,
             Err(error) => {
                 eprintln!("applejack doctor: cannot encode facts: {error}");
                 return ExitCode::FAILURE;
             }
         }
     } else {
-        print_facts(&facts);
-    }
-    ExitCode::SUCCESS
+        render_facts(&facts)
+    };
+    emit(&text)
 }
 
-fn print_facts(facts: &HostFacts) {
+/// Writes `text` to stdout. A reader that closes the pipe early is not an
+/// error for a report command, so `BrokenPipe` exits 0.
+fn emit(text: &str) -> ExitCode {
+    let mut out = io::stdout().lock();
+    match writeln!(out, "{text}").and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("applejack doctor: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn render_facts(facts: &HostFacts) -> String {
     let free_disk = facts
         .free_disk_bytes
         .map_or_else(|| "unknown".to_owned(), |bytes| format!("{bytes} bytes"));
+    let rosetta =
+        facts.rosetta_present.map_or(
+            "unknown",
+            |present| {
+                if present { "present" } else { "absent" }
+            },
+        );
+    let identities = facts
+        .developer_id_identities
+        .map_or_else(|| "unknown".to_owned(), |count| count.to_string());
     let rows: [(&str, String); 6] = [
         ("macOS version", facts.macos_version.clone()),
         ("architecture", facts.arch.clone()),
-        (
-            "Rosetta",
-            if facts.rosetta_present {
-                "present"
-            } else {
-                "absent"
-            }
-            .to_owned(),
-        ),
+        ("Rosetta", rosetta.to_owned()),
         ("free disk (data dir)", free_disk),
         ("screen recording", facts.screen_recording.to_string()),
-        (
-            "Developer ID identities",
-            facts.developer_id_identities.to_string(),
-        ),
+        ("Developer ID identities", identities),
     ];
     let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
-    for (label, value) in &rows {
-        println!("{label:<width$}  {value}");
-    }
+    rows.iter()
+        .map(|(label, value)| format!("{label:<width$}  {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
