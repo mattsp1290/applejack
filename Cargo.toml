@@ -1,0 +1,34 @@
+[workspace]
+members = ["crates/*", "xtask"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+applejack-core = { path = "crates/applejack-core" }
+applejack-config = { path = "crates/applejack-config" }
+applejack-steam = { path = "crates/applejack-steam" }
+applejack-engine = { path = "crates/applejack-engine" }
+applejack-manifest = { path = "crates/applejack-manifest" }
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+sha2 = "0.11.1"
+zstd = "0.14.3"
+tar = "0.4.46"
+security-framework = "3.7.0"
+tracing = "0.1.44"
+thiserror = "2.0.21"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

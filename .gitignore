@@ -1,0 +1,12 @@
+target/
+.agents/plans/
+.agents/reviews/
+.agents/orchestrate/
+reviews/
+*.dmg
+fixtures/engines/
+fixtures/payloads/
+apps/Applejack/.build/
+build/
+*.xcuserstate
+.worktrees/
