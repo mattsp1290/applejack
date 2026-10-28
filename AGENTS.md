@@ -1,8 +1,9 @@
 # Working in applejack
 
 Run `cargo xtask check` before handoff. It checks formatting, Clippy with the
-workspace lints, workspace tests, and rustdoc with warnings denied, and it must
-exit 0 from the repository root.
+workspace lints, workspace tests, rustdoc with warnings denied, the engine
+manifest, and the Swift package build and tests, and it must exit 0 from the
+repository root.
 
 Keep `.agents/plans/`, `.agents/reviews/`, and `reviews/` local. They are
 ignored and must not be committed.

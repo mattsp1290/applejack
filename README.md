@@ -31,7 +31,10 @@ identities.
 ## Verification
 
 `cargo xtask check` runs `cargo fmt --all --check`, Clippy with `-D warnings`
-and the workspace lints, `cargo test --workspace`, and rustdoc with
-`RUSTDOCFLAGS=-D warnings`, stopping at the first failure. CI runs the same
+and the workspace lints, `cargo test --workspace`, rustdoc with
+`RUSTDOCFLAGS=-D warnings`, `cargo xtask manifest-verify` on
+`engines/manifest.toml`, then the Swift package build and tests with
+`APPLEJACK_CORE_BIN` pointing at the freshly built core binary. It stops at
+the first failure. CI runs the same
 command on a GitHub-hosted Apple Silicon runner (`macos-latest`) on every push
 and pull request; see `.github/workflows/check.yml`.

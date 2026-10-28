@@ -2,7 +2,7 @@
 # Copies the research report and notes into docs/research and prints their hashes.
 set -eu
 
-src="${APPLEJACK_RESEARCH_SOURCE_DIR:-/Users/punk1290/git/crabber/.agents/plans}"
+src="${APPLEJACK_RESEARCH_SOURCE_DIR:?set APPLEJACK_RESEARCH_SOURCE_DIR to the directory that holds reports/ and research_notes/}"
 dest="$(cd "$(dirname "$0")" && pwd)"
 topic="Windows games on Android and macOS"
 
