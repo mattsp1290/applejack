@@ -507,13 +507,11 @@ fn install_extracts_validates_and_renames() {
     let reopened = InstalledEngine::open(&layout, rosetta(), &v).unwrap();
     assert_eq!(reopened, installed);
 
-    let request = InstallRequest {
-        id: rosetta(),
-        version: v.clone(),
-        source: ArchiveSource::LocalFile(archive),
-        sha256: digest,
-        manifest: None,
-    };
+    let request = InstallRequest::local(rosetta(), v.clone(), &archive, digest);
+    assert_eq!(request.id(), rosetta());
+    assert_eq!(request.version(), &v);
+    assert_eq!(request.source(), &ArchiveSource::LocalFile(archive.clone()));
+    assert!(request.manifest().is_none());
     let again = bundle::install(&layout, &request, &mut |_| {}).unwrap_err();
     assert!(matches!(again, Error::AlreadyInstalled { .. }), "{again}");
 }
@@ -538,13 +536,7 @@ fn install_reports_progress_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let layout = layout(dir.path());
     let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
-    let request = InstallRequest {
-        id: rosetta(),
-        version: version("10.0.0"),
-        source: ArchiveSource::LocalFile(archive),
-        sha256: digest,
-        manifest: None,
-    };
+    let request = InstallRequest::local(rosetta(), version("10.0.0"), archive, digest);
     let mut seen = Vec::new();
     bundle::install(&layout, &request, &mut |progress| seen.push(progress)).unwrap();
     assert_eq!(
@@ -594,13 +586,15 @@ fn install_from_manifest_cross_checks_descriptor() {
 
     let entry = manifest_entry("10.0.0", &digest);
     let request = InstallRequest::from_manifest(&entry, source).unwrap();
-    assert_eq!(request.id, rosetta());
-    assert_eq!(request.version, v);
+    assert_eq!(request.id(), rosetta());
+    assert_eq!(request.version(), &v);
+    assert_eq!(request.sha256(), &digest);
+    assert_eq!(request.manifest(), Some(&entry));
     let installed = bundle::install(&layout, &request, &mut |_| {}).unwrap();
     assert_eq!(installed.version, v);
 
     let bad = manifest_entry("10.0.0-RC1", &digest);
-    let error = InstallRequest::from_manifest(&bad, request.source.clone()).unwrap_err();
+    let error = InstallRequest::from_manifest(&bad, request.source().clone()).unwrap_err();
     assert!(matches!(error, Error::InvalidVersion { .. }), "{error}");
 }
 

@@ -40,10 +40,20 @@ keep, to `versions::prune` and `versions::remove` as `protected`.
 
 Symlinks inside a bundle may point only inside the bundle. Extraction refuses
 a symlink or hard link entry whose target is absolute or climbs above the
-archive root, and validation canonicalizes every file it checks and requires
-it to stay inside the canonical bundle root. Every path handed to Wine is
-inside the data directory or the game library directory. D3DMetal is never
-committed, downloaded, or published.
+archive root (a lexical check, fast and first). Because an earlier symlink
+used as a directory (`p -> .`) can make an entry's archive path deeper than
+its real one, the extracted tree is then walked and every symlink is followed
+component by component on disk; each intermediate path must stay inside the
+canonical `.partial` root. That refuses `a/b -> ..` followed by
+`a/b/c -> ..`, a target that climbs out and back in through
+`<version>.partial` (inside while checked, a sibling once renamed), dangling
+links, and loops, while `wine/bin/wine64 -> ../lib/wine64-real` and other
+`..` links that stay inside install as they are. Validation then
+canonicalizes every file it names, including the `[probes]` executables, and
+requires it to stay inside the canonical bundle root. Setuid, setgid, and
+sticky bits are stripped on extraction; the executable bit is kept. Every
+path handed to Wine is inside the data directory or the game library
+directory. D3DMetal is never committed, downloaded, or published.
 
 ## `BUNDLE.toml`
 
@@ -102,13 +112,22 @@ roots derive from one value.
 
 ## Installation
 
-Every install is an `InstallRequest { id, version, source, sha256, manifest }`.
-`InstallRequest::from_manifest(entry, source)` builds one from an
-`engines/manifest.toml` entry; a local, unsigned bundle builds one by hand
-with `manifest: None` (`bundle::install_from_archive` is the shorthand).
-`bundle::install(layout, &request, progress)` and
-`Engine::install(&self, layout, &request, progress)` have the same shape; the
-engine adds its own checks (Rosetta present) before calling the bundle step.
+Every install is an `InstallRequest`: which engine and version, where the
+archive comes from, the digest it must hash to, and the manifest entry it
+came from, if any. Its fields are private and it has two constructors:
+`InstallRequest::from_manifest(entry, source)` for a bundle pinned by
+`engines/manifest.toml`, and `InstallRequest::local(id, version, archive,
+sha256)` for a local, unsigned bundle (the `APPLEJACK_ALLOW_UNSIGNED_ENGINE`
+path). A request that carries a manifest entry therefore always agrees with
+it. `bundle::install(layout, &request, progress)` and
+`Engine::install(&self, host, layout, &request, progress)` have the same
+shape; the engine adds its own checks before calling the bundle step.
+`rosetta-wine` refuses with `Error::RosettaMissing` when
+`host.rosetta_present == Some(false)` (naming
+`softwareupdate --install-rosetta`) and proceeds when it is `None`: `doctor`
+reports uncertainty about the host, and an install is not blocked by a probe
+the core could not run. The `Host` handed to `install` is the one `doctor`
+saw, so the engine never probes the host itself.
 `progress` receives `Verifying`, `Extracting`, and `Validating` in that order
 (`Downloading` once a download source exists). The steps:
 
@@ -123,10 +142,13 @@ engine adds its own checks (Rosetta present) before calling the bundle step.
 3. Replaces a stale `engines/<id>/<version>.partial` from an earlier attempt,
    whatever it is (directory, file, or dangling link), and extracts into it.
    An entry whose path or link target would leave the root is refused.
-4. Checks that `BUNDLE.toml` is a top-level entry, then loads and validates it
-   and checks that it names the same engine and version. When the request
-   came from a manifest entry, `arch`, `version`, and `min_macos` must match
-   the entry too. On any failure the partial directory is removed.
+4. Walks the extracted tree and refuses any symlink that does not resolve
+   inside it (below). Checks that `BUNDLE.toml` is a top-level entry, then
+   loads and validates it and checks that it names the same engine and
+   version. When the request came from a manifest entry, the entry's `id`
+   and `sha256` must match the request and its `arch`, `version`, and
+   `min_macos` must match the descriptor. On any failure the partial
+   directory is removed.
 5. Renames `.partial` to `<version>/`; if the rename fails, `.partial` is
    removed as well.
 
@@ -244,9 +266,13 @@ The `rosetta-wine` implementation of the `Engine` trait adds:
   copied from the `InstalledEngine` per architecture, sync mode variables,
   registry seeds including the `hidraw_key`, the `S:` library drive,
   snapshots before an engine version change. The `Prefix` records the engine
-  id and version that made it.
+  id and version that made it and the `backend`, `sync_mode`, and `hidraw`
+  last applied; `apply_overrides` returns the updated `Prefix`.
 - Launch: `Engine::launch(installed, prefix, spec)` spawns `installed`'s
-  loader with `APPLEJACK_SESSION` in `engine_set`, log capture to
+  loader with `WINEPREFIX` and `APPLEJACK_SESSION` in `engine_set` and
+  derives `WINEMSYNC`/`WINEESYNC`, `WINEDLLOVERRIDES`, and
+  `VK_ICD_FILENAMES` from `prefix.sync_mode` and `prefix.backend` (Wine
+  does not persist them, so the prefix is the one record). Log capture to
   `~/Library/Logs/applejack/<session>/wine.log`, cancellation through
   `wineserver -k`.
 - Process discovery: same-user processes carrying the session id, and the

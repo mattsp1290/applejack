@@ -425,20 +425,52 @@ pub enum ArchiveSource {
 }
 
 /// Everything [`install`] needs: which bundle, where its archive comes from,
-/// and the digest it must hash to. Built from a manifest entry with
-/// [`InstallRequest::from_manifest`] or by hand for a local, unsigned bundle.
+/// and the digest it must hash to. Built only through
+/// [`InstallRequest::from_manifest`] (a pinned bundle) or
+/// [`InstallRequest::local`] (an unsigned local bundle), so a request that
+/// carries a manifest entry always agrees with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRequest {
-    pub id: EngineId,
-    pub version: Version,
-    pub source: ArchiveSource,
-    pub sha256: Sha256,
-    /// The manifest entry the request came from, when any. Its `arch`,
-    /// `version`, and `min_macos` are cross-checked against `BUNDLE.toml`.
-    pub manifest: Option<applejack_manifest::Engine>,
+    id: EngineId,
+    version: Version,
+    source: ArchiveSource,
+    sha256: Sha256,
+    manifest: Option<applejack_manifest::Engine>,
 }
 
 impl InstallRequest {
+    /// The engine to install.
+    #[must_use]
+    pub const fn id(&self) -> EngineId {
+        self.id
+    }
+
+    /// The version to install; names the `engines/<id>/<version>/` directory.
+    #[must_use]
+    pub const fn version(&self) -> &Version {
+        &self.version
+    }
+
+    /// Where the archive comes from.
+    #[must_use]
+    pub const fn source(&self) -> &ArchiveSource {
+        &self.source
+    }
+
+    /// The digest the archive must hash to.
+    #[must_use]
+    pub const fn sha256(&self) -> &Sha256 {
+        &self.sha256
+    }
+
+    /// The manifest entry the request came from, when any. Its `id`,
+    /// `sha256`, `arch`, `version`, and `min_macos` are cross-checked
+    /// against the request and `BUNDLE.toml`.
+    #[must_use]
+    pub const fn manifest(&self) -> Option<&applejack_manifest::Engine> {
+        self.manifest.as_ref()
+    }
+
     /// Builds a request for the bundle a manifest entry pins, taking the
     /// archive from `source`.
     ///
@@ -478,29 +510,6 @@ impl InstallRequest {
     }
 }
 
-/// Installs a local `.tar.zst` archive as `engines/<id>/<version>/` with no
-/// manifest cross-check and no progress reporting. See [`install`].
-///
-/// # Errors
-///
-/// As [`install`].
-pub fn install_from_archive(
-    layout: &EngineLayout,
-    id: EngineId,
-    version: &Version,
-    archive: &Path,
-    expected: &Sha256,
-) -> Result<InstalledEngine> {
-    let request = InstallRequest {
-        id,
-        version: version.clone(),
-        source: ArchiveSource::LocalFile(archive.to_path_buf()),
-        sha256: expected.clone(),
-        manifest: None,
-    };
-    install(layout, &request, &mut |_| {})
-}
-
 /// Installs an engine bundle, reporting [`Progress`] as it goes:
 ///
 /// 1. refuses when `engines/<id>/<version>/` already holds a bundle (a
@@ -512,8 +521,9 @@ pub fn install_from_archive(
 ///    and extracts the same open archive into it, refusing any entry that
 ///    escapes the root or links outside it;
 /// 4. loads and validates `BUNDLE.toml`, checking it names `id` and
-///    `version` and, when the request came from a manifest entry, that
-///    `arch`, `version`, and `min_macos` match it; on failure removes
+///    `version` and, when the request came from a manifest entry, that the
+///    entry's `id` and `sha256` match the request and its `arch`,
+///    `version`, and `min_macos` match the descriptor; on failure removes
 ///    `.partial`;
 /// 5. renames `.partial` to `<version>/`, removing `.partial` if that fails.
 ///
@@ -664,7 +674,7 @@ fn extract_and_validate(
         });
     }
     if let Some(entry) = &request.manifest {
-        check_against_manifest(&bundle, entry)?;
+        check_against_manifest(request, &bundle, entry)?;
     }
     Ok(bundle)
 }
@@ -770,12 +780,29 @@ fn link_resolves_inside(root: &Path, link: &Path) -> bool {
     true
 }
 
-fn check_against_manifest(bundle: &BundleToml, entry: &applejack_manifest::Engine) -> Result<()> {
+/// The constructors keep a request consistent with its entry; the `id` and
+/// `sha256` checks make that invariant explicit at the one place it is
+/// relied on.
+fn check_against_manifest(
+    request: &InstallRequest,
+    bundle: &BundleToml,
+    entry: &applejack_manifest::Engine,
+) -> Result<()> {
     let mismatch = |field, manifest: &str, bundle: &str| Error::ManifestMismatch {
         field,
         manifest: manifest.to_owned(),
         bundle: bundle.to_owned(),
     };
+    if entry.id != request.id.as_str() {
+        return Err(mismatch("id", &entry.id, request.id.as_str()));
+    }
+    if entry.sha256 != request.sha256 {
+        return Err(mismatch(
+            "sha256",
+            entry.sha256.as_str(),
+            request.sha256.as_str(),
+        ));
+    }
     if bundle.arch != entry.arch {
         return Err(mismatch(
             "arch",

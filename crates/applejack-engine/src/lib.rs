@@ -316,8 +316,9 @@ impl EngineLayout {
 }
 
 /// Facts about the machine, gathered by the core and handed to
-/// [`Engine::doctor`]. Read-only input; the engine never probes the host
-/// itself inside `doctor`.
+/// [`Engine::doctor`] and [`Engine::install`]. Read-only input; the engine
+/// never probes the host itself, so there is one source of truth for what
+/// `doctor` reported and what `install` refused on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {
     /// `ProductVersion` from `sw_vers`, for example `15.1`.
@@ -363,14 +364,26 @@ pub struct PrefixSpec {
     pub library_dir: Option<PathBuf>,
 }
 
-/// A Wine prefix created by an engine.
+/// A Wine prefix created by an engine, with the configuration last applied
+/// to it. The sync mode and backend are per-process choices that Wine does
+/// not persist, so [`Engine::launch`] derives `WINEMSYNC`/`WINEESYNC`,
+/// `WINEDLLOVERRIDES`, and `VK_ICD_FILENAMES` from the prefix it is handed
+/// rather than from a second source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefix {
+    /// The prefix directory (`WINEPREFIX`).
     pub dir: PathBuf,
     /// Engine that created the prefix.
     pub engine: EngineId,
     /// Engine version that last touched the prefix.
     pub engine_version: Version,
+    /// Backend whose DLL overrides [`Engine::create_prefix`] or the last
+    /// [`Engine::apply_overrides`] applied.
+    pub backend: GraphicsBackend,
+    /// Sync mode applied with it.
+    pub sync_mode: SyncMode,
+    /// HID toggle applied with it.
+    pub hidraw: HidrawMode,
 }
 
 /// Reported by [`Engine::install`] as work proceeds.
@@ -390,23 +403,34 @@ pub trait Engine {
     /// The engine's identity.
     fn id(&self) -> EngineId;
 
-    /// What the bundle can do, derived from its `BUNDLE.toml`.
-    fn capabilities(&self, bundle: &BundleToml) -> Capabilities;
+    /// What the bundle can do, derived from its `BUNDLE.toml`. The default
+    /// is [`Capabilities::from_bundle`]; an engine overrides it only when
+    /// its capabilities depend on more than the descriptor.
+    fn capabilities(&self, bundle: &BundleToml) -> Capabilities {
+        Capabilities::from_bundle(bundle)
+    }
 
     /// Read-only, network-free check of the host and an installed bundle.
     fn doctor(&self, host: &Host, installed: Option<&InstalledEngine>) -> DoctorReport;
 
     /// Fetches, verifies, extracts, and validates the requested bundle into
-    /// `layout`, after the engine's own checks (for `rosetta-wine`, that
-    /// Rosetta is present). Same shape as [`bundle::install`], which does
-    /// the bundle part. Writes only under `engines/<id>/<version>.partial/`
-    /// until the final rename and never touches another version.
+    /// `layout`, after the engine's own checks against `host`. Same shape as
+    /// [`bundle::install`], which does the bundle part. Writes only
+    /// `engines/<id>/<version>.download` and under
+    /// `engines/<id>/<version>.partial/` until the final rename, and never
+    /// touches another version.
+    ///
+    /// `rosetta-wine` refuses with [`Error::RosettaMissing`] when
+    /// `host.rosetta_present == Some(false)` and proceeds when it is `None`:
+    /// `doctor` is where uncertainty about the host is reported, and an
+    /// install must not be blocked by a probe the core could not run.
     ///
     /// # Errors
     ///
     /// Returns the first failure; a failed install leaves no `<version>/`.
     fn install(
         &self,
+        host: &Host,
         layout: &EngineLayout,
         request: &InstallRequest,
         progress: &mut dyn FnMut(Progress),
@@ -425,7 +449,9 @@ pub trait Engine {
     ) -> Result<Prefix>;
 
     /// Re-applies DLL overrides from `installed`, the sync mode, and the HID
-    /// toggle to a prefix.
+    /// toggle to a prefix, and returns the prefix with those values
+    /// recorded so the caller holds the current state without re-reading
+    /// the prefix.
     ///
     /// # Errors
     ///
@@ -439,13 +465,17 @@ pub trait Engine {
         backend: GraphicsBackend,
         sync_mode: SyncMode,
         hidraw: HidrawMode,
-    ) -> Result<()>;
+    ) -> Result<Prefix>;
 
     /// Spawns the loader of `installed` with the allowlisted environment.
+    /// The engine-set tier carries `WINEPREFIX` and `APPLEJACK_SESSION` and
+    /// derives `WINEMSYNC`/`WINEESYNC`, `WINEDLLOVERRIDES`, and
+    /// `VK_ICD_FILENAMES` from `prefix.sync_mode` and `prefix.backend`.
     ///
     /// # Errors
     ///
-    /// Returns the spawn failure.
+    /// Returns the spawn failure, or [`Error::MissingEngineVariable`] from
+    /// [`launch::env::assemble`].
     fn launch(
         &self,
         installed: &InstalledEngine,
