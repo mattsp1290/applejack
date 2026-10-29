@@ -31,9 +31,11 @@ fn list_counts_only_directories_with_a_descriptor() {
     let dir = tempfile::tempdir().unwrap();
     let layout = layout(dir.path());
     fake_installed(&layout, "10.0.0");
-    // A stray directory named like a version, and one whose descriptor is a
-    // directory rather than a file, are not installed versions.
-    fs::create_dir_all(layout.engine_root(rosetta()).join("10.0.5")).unwrap();
+    // A stale directory named like a version, and one whose descriptor is a
+    // directory rather than a file, are not installed versions: `list`
+    // omits them and `prune` leaves them alone.
+    let stale = layout.engine_root(rosetta()).join("10.0.5");
+    fs::create_dir_all(&stale).unwrap();
     fs::create_dir_all(layout.engine_root(rosetta()).join("10.0.6/BUNDLE.toml")).unwrap();
 
     assert_eq!(
@@ -42,8 +44,15 @@ fn list_counts_only_directories_with_a_descriptor() {
     );
     let removed = versions::prune(&layout, rosetta(), 0, &[]).unwrap();
     assert_eq!(removed, [version("10.0.0")]);
-    assert!(layout.engine_root(rosetta()).join("10.0.5").is_dir());
+    assert!(stale.is_dir());
     assert!(layout.engine_root(rosetta()).join("10.0.6").is_dir());
+
+    // `remove` deletes a stale directory, so the three agree on what is
+    // there: an interrupted removal can always be finished.
+    versions::remove(&layout, rosetta(), &version("10.0.5"), &[]).unwrap();
+    assert!(!stale.exists());
+    versions::remove(&layout, rosetta(), &version("10.0.6"), &[]).unwrap();
+    assert!(!layout.engine_root(rosetta()).join("10.0.6").exists());
 }
 
 #[test]
@@ -107,6 +116,10 @@ fn remove_refuses_protected_and_missing() {
         versions::remove(&layout, rosetta(), &version("10.0.0"), &[version("10.0.0")]).unwrap_err();
     assert!(matches!(error, Error::ProtectedVersion { .. }), "{error}");
     let error = versions::remove(&layout, rosetta(), &version("10.0.9"), &[]).unwrap_err();
+    assert!(matches!(error, Error::NotInstalled { .. }), "{error}");
+    // A protected version that is not installed reports the accurate state.
+    let error =
+        versions::remove(&layout, rosetta(), &version("10.0.9"), &[version("10.0.9")]).unwrap_err();
     assert!(matches!(error, Error::NotInstalled { .. }), "{error}");
 
     versions::remove(&layout, rosetta(), &version("10.0.2"), &[version("10.0.0")]).unwrap();

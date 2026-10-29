@@ -417,15 +417,51 @@ fn install_removes_partial_when_rename_fails() {
     let layout = layout(dir.path());
     let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
     let v = version("10.0.0");
-    // A dangling symlink does not count as "exists" but makes the final
-    // rename fail, which is the failure the cleanup rule covers.
+    // Another install commits `<version>/` between the existence check and
+    // the rename; a non-empty target makes the rename fail, which is the
+    // failure the cleanup rule covers.
     let final_dir = layout.engine_dir(rosetta(), &v);
-    fs::create_dir_all(final_dir.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink("missing-target", &final_dir).unwrap();
-
-    let error = install_local(&layout, &v, &archive, &digest).unwrap_err();
+    let occupied = final_dir.join("occupied");
+    let request = InstallRequest::local(rosetta(), v.clone(), &archive, digest);
+    let error = bundle::install(&layout, &request, &mut |progress| {
+        if progress == Progress::Validating {
+            fs::create_dir_all(&final_dir).unwrap();
+            fs::write(&occupied, b"x").unwrap();
+        }
+    })
+    .unwrap_err();
     assert!(matches!(error, Error::Io { .. }), "{error}");
     assert!(!layout.partial_dir(rosetta(), &v).exists());
+    assert!(
+        occupied.is_file(),
+        "the other install's directory is untouched"
+    );
+}
+
+#[test]
+fn install_replaces_stale_version_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
+    let v = version("10.0.0");
+    let final_dir = layout.engine_dir(rosetta(), &v);
+
+    // A `<version>/` without a descriptor (an interrupted removal) is not
+    // installed: `open` says so and `install` replaces it.
+    fs::create_dir_all(final_dir.join("wine")).unwrap();
+    fs::write(final_dir.join("wine/leftover"), b"x").unwrap();
+    let error = InstalledEngine::open(&layout, rosetta(), &v).unwrap_err();
+    assert!(matches!(error, Error::NotInstalled { .. }), "{error}");
+    let installed = install_local(&layout, &v, &archive, &digest).unwrap();
+    assert!(!final_dir.join("wine/leftover").exists());
+    assert!(installed.root.join("BUNDLE.toml").is_file());
+
+    // A dangling link at `<version>` is not a bundle either.
+    fs::remove_dir_all(&final_dir).unwrap();
+    std::os::unix::fs::symlink("missing-target", &final_dir).unwrap();
+    install_local(&layout, &v, &archive, &digest).unwrap();
+    assert!(final_dir.is_dir());
+    assert!(!final_dir.symlink_metadata().unwrap().is_symlink());
 }
 
 #[test]

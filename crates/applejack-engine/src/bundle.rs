@@ -393,11 +393,11 @@ impl InstalledEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NotInstalled`] when the directory is absent, else the
-    /// load error.
+    /// Returns [`Error::NotInstalled`] when the directory is absent or holds
+    /// no `BUNDLE.toml`, else the load error.
     pub fn open(layout: &EngineLayout, id: EngineId, version: &Version) -> Result<Self> {
         let root = layout.engine_dir(id, version);
-        if !root.is_dir() {
+        if !root.is_dir() || !has_descriptor(&root) {
             return Err(Error::NotInstalled {
                 id,
                 version: version.clone(),
@@ -503,7 +503,9 @@ pub fn install_from_archive(
 
 /// Installs an engine bundle, reporting [`Progress`] as it goes:
 ///
-/// 1. refuses when `engines/<id>/<version>/` already exists;
+/// 1. refuses when `engines/<id>/<version>/` already holds a bundle (a
+///    regular `BUNDLE.toml`); a stale directory or link without one, left
+///    by an interrupted removal, is removed instead;
 /// 2. opens the archive once, hashes it, and refuses on mismatch, leaving
 ///    the archive as is;
 /// 3. replaces a stale `engines/<id>/<version>.partial` (file or directory)
@@ -531,11 +533,14 @@ pub fn install(
 ) -> Result<InstalledEngine> {
     let (id, version) = (request.id, &request.version);
     let final_dir = layout.engine_dir(id, version);
-    if final_dir.exists() {
-        return Err(Error::AlreadyInstalled {
-            id,
-            version: version.clone(),
-        });
+    if fs::symlink_metadata(&final_dir).is_ok() {
+        if final_dir.is_dir() && has_descriptor(&final_dir) {
+            return Err(Error::AlreadyInstalled {
+                id,
+                version: version.clone(),
+            });
+        }
+        remove_stale(&final_dir)?;
     }
     let ArchiveSource::LocalFile(archive) = &request.source;
     progress(Progress::Verifying);
@@ -579,7 +584,7 @@ pub fn install(
 
 /// Removes whatever sits at `path`, whether a directory, a file, or a
 /// dangling symlink.
-fn remove_stale(path: &Path) -> Result<()> {
+pub(crate) fn remove_stale(path: &Path) -> Result<()> {
     let result = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
         Ok(_) => fs::remove_file(path),

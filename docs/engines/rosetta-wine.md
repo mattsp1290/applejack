@@ -112,7 +112,9 @@ engine adds its own checks (Rosetta present) before calling the bundle step.
 `progress` receives `Verifying`, `Extracting`, and `Validating` in that order
 (`Downloading` once a download source exists). The steps:
 
-1. Refuses when `engines/<id>/<version>/` already exists.
+1. Refuses when `engines/<id>/<version>/` already holds a bundle, that is a
+   regular `BUNDLE.toml`. A directory, file, or dangling link at that path
+   without one is stale (an interrupted removal) and is removed first.
 2. Opens the archive once and hashes it with SHA-256 against the request's
    digest. On mismatch it stops before extracting anything and leaves the
    archive in place, reporting expected and actual digests. The same open
@@ -141,17 +143,25 @@ callback.
   volume, and `10.0.0-RC1` is rejected rather than silently aliased.
 - `versions::list` returns installed versions, oldest first. Only a directory
   whose name is a version and that holds a regular `BUNDLE.toml` counts;
-  anything else under `engines/<id>/` is ignored and never pruned.
+  anything else under `engines/<id>/` is ignored and never pruned. That is
+  the one definition of "installed": `InstalledEngine::open` reports
+  `NotInstalled` for a `<version>/` without a descriptor, `install` replaces
+  such a directory, and `remove` deletes it.
 - Version order compares dot- and dash-separated segments left to right, each
-  split into digit and letter runs: numbers by value, letters lexically. So
+  split into digit and letter runs: numbers by value (of any width, so a
+  digit run wider than a machine word still sorts numerically), letters
+  lexically. So
   `9.9.9 < 10.0.9 < 10.0.10`, `10.0.0-rc1 < 10.0.0`, and
   `10.0.0-rc9 < 10.0.0-rc10`. Caveats: a shorter version with a letter tag
   sorts below the plain release (`10.0.0-rc1 < 10.0.0`, and `10.0.0a` would
   too), while a numeric tag sorts above it (`10.0.0 < 10.0.0-1`, a
   post-release); tags compare lexically (`beta < rc`); `_` and `+` are not
   separators.
-- `versions::remove(layout, id, version, protected)` deletes one version and
-  refuses one in `protected`.
+- `versions::remove(layout, id, version, protected)` deletes whatever sits at
+  `engines/<id>/<version>`, a bundle or a stale directory. It reports
+  `NotInstalled` when nothing is there (checked first, so a protected
+  version that is not installed is reported as such) and refuses one in
+  `protected`.
 - `versions::prune(layout, id, keep, protected)` keeps every protected
   version and the newest `keep` others, removes the rest, and returns what it
   removed. `protected` is every version the caller must keep: the active one,

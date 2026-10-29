@@ -22,9 +22,10 @@ use crate::{EngineId, EngineLayout, Error, Result};
 /// case-insensitive volume and no version collides with a layout file.
 ///
 /// Ordering compares dot- and dash-separated segments left to right, each
-/// split into alternating digit and letter runs: numbers by value, letters
-/// lexically. So `10.0.0 < 10.0.1 < 10.1.0`, `10.0.0-rc1 < 10.0.0`, and
-/// `10.0.0-rc9 < 10.0.0-rc10`. The newest version is the greatest.
+/// split into alternating digit and letter runs: numbers by value (of any
+/// width), letters lexically. So `10.0.0 < 10.0.1 < 10.1.0`,
+/// `10.0.0-rc1 < 10.0.0`, and `10.0.0-rc9 < 10.0.0-rc10`. The newest
+/// version is the greatest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Version(String);
@@ -66,6 +67,7 @@ impl Version {
         }
     }
 
+    /// The version text, which is also its directory name.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -78,8 +80,8 @@ impl Version {
                 out.push(Segment::Text(""));
                 continue;
             }
-            // `rc10` -> Text("rc"), Number(10): a digit run and a letter run
-            // never compare lexically against each other.
+            // `rc10` -> Text("rc"), Number("10"): a digit run and a letter
+            // run never compare lexically against each other.
             let bytes = part.as_bytes();
             let mut start = 0;
             for i in 1..=bytes.len() {
@@ -95,20 +97,31 @@ impl Version {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Segment<'a> {
-    Number(u64),
+    /// A digit run, kept as text so no width overflows.
+    Number(&'a str),
     Text(&'a str),
 }
 
 impl<'a> Segment<'a> {
     fn parse(text: &'a str) -> Self {
-        text.parse().map_or(Self::Text(text), Self::Number)
+        if text.bytes().all(|b| b.is_ascii_digit()) {
+            Self::Number(text)
+        } else {
+            Self::Text(text)
+        }
     }
 }
 
 impl Ord for Segment<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (Self::Number(a), Self::Number(b)) => a.cmp(b),
+            // Numeric order without parsing: after dropping leading zeros, a
+            // longer digit run is the larger number, and equal lengths
+            // compare lexically.
+            (Self::Number(a), Self::Number(b)) => {
+                let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+                a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+            }
             (Self::Text(a), Self::Text(b)) => a.cmp(b),
             // Numbers sort after text so `10.0.0-rc1 < 10.0.0` when the
             // shorter side runs out (see `Ord for Version`).
@@ -184,7 +197,8 @@ impl From<Version> for String {
 
 /// Installed versions of `id`, oldest first. Only a directory whose name is a
 /// version and that holds a regular `BUNDLE.toml` counts; extraction,
-/// overlay, download, and stray directories are not versions.
+/// overlay, download, and stale directories (a `<version>/` without a
+/// descriptor, left by an interrupted removal) are not versions.
 ///
 /// # Errors
 ///
@@ -203,7 +217,7 @@ pub fn list(layout: &EngineLayout, id: EngineId) -> Result<Vec<Version>> {
             .file_type()
             .map_err(|error| Error::io(entry.path(), error))?
             .is_dir();
-        if !is_dir || !has_descriptor(&entry.path()) {
+        if !is_dir || !crate::bundle::has_descriptor(&entry.path()) {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -217,38 +231,42 @@ pub fn list(layout: &EngineLayout, id: EngineId) -> Result<Vec<Version>> {
     Ok(versions)
 }
 
-fn has_descriptor(dir: &std::path::Path) -> bool {
-    fs::symlink_metadata(dir.join(crate::bundle::BUNDLE_FILE)).is_ok_and(|meta| meta.is_file())
-}
-
-/// Removes one installed version. `protected` lists every version the caller
-/// must keep: the active one, those pinned by a game configuration, and those
-/// in use by a running session. Comparison is exact.
+/// Removes one version directory, whatever it holds: an installed bundle or
+/// the stale remains of an interrupted removal. `protected` lists every
+/// version the caller must keep: the active one, those pinned by a game
+/// configuration, and those in use by a running session. Comparison is
+/// exact.
 ///
 /// # Errors
 ///
-/// Returns [`Error::ProtectedVersion`] when `version` is in `protected`,
-/// [`Error::NotInstalled`] when it is not installed, or [`Error::Io`].
+/// Returns [`Error::NotInstalled`] when nothing sits at
+/// `engines/<id>/<version>` (checked first, so a protected version that is
+/// not installed reports the accurate state), [`Error::ProtectedVersion`]
+/// when `version` is in `protected`, or [`Error::Io`].
 pub fn remove(
     layout: &EngineLayout,
     id: EngineId,
     version: &Version,
     protected: &[Version],
 ) -> Result<()> {
+    let dir = layout.engine_dir(id, version);
+    match fs::symlink_metadata(&dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(Error::NotInstalled {
+                id,
+                version: version.clone(),
+            });
+        }
+        Err(error) => return Err(Error::io(dir, error)),
+    }
     if protected.contains(version) {
         return Err(Error::ProtectedVersion {
             id,
             version: version.clone(),
         });
     }
-    if !list(layout, id)?.contains(version) {
-        return Err(Error::NotInstalled {
-            id,
-            version: version.clone(),
-        });
-    }
-    let dir = layout.engine_dir(id, version);
-    fs::remove_dir_all(&dir).map_err(|error| Error::io(dir, error))
+    crate::bundle::remove_stale(&dir)
 }
 
 /// Removes installed versions beyond the newest `keep`, never one in
@@ -302,6 +320,19 @@ mod tests {
             "a numeric tag is a post-release"
         );
         assert_eq!(v("10.0.0").cmp(&v("10.0.0")), Ordering::Equal);
+    }
+
+    #[test]
+    fn version_orders_numbers_wider_than_u64() {
+        let wide = "1.99999999999999999999";
+        assert!(v("1.2") < v(wide));
+        assert!(v(wide) < v("1.100000000000000000000"));
+        assert!(v("1.007") < v("1.8"));
+        assert!(v("1.0000") < v("1.1"));
+        assert!(
+            v("1.0") < v("1.00"),
+            "equal numbers fall back to text order"
+        );
     }
 
     #[test]
