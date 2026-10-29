@@ -7,8 +7,9 @@
 #
 # Sub-packages of gstreamer-1.0-<version>-universal.pkg and why each is in or out:
 #   in   base-system-1.0, base-crypto  glib, cairo, pango, orc, openssl: the runtime every plugin links (LGPL, MIT, Apache)
-#   in   osx-framework                 the framework's Versions/Current, Commands, Libraries, Resources links
-#                                      (Headers points into the unstaged devel package and is pruned below)
+#   in   osx-framework                 the framework's Versions/Current, Libraries, Resources links
+#                                      (Headers points into the unstaged devel package and is pruned below;
+#                                      Commands points at the tools removed below)
 #   in   gstreamer-1.0-core            libgstreamer and the base plugins (coreelements, typefind, audioconvert, videoconvertscale)
 #   in   gstreamer-1.0-system          osxaudio, osxvideo, applemedia (VideoToolbox H.264/AAC), opengl, vulkan
 #   in   gstreamer-1.0-playback        playbin, decodebin, uridecodebin
@@ -78,6 +79,13 @@ done
 # pkg-config, never the umbrella.
 rm -f "$stage/GStreamer" "$stage/Versions/1.0/GStreamer" "$stage/Versions/1.0/lib/GStreamer"
 
+# The command-line tools and helpers: nothing in winegstreamer runs them, and
+# the payload check resolves references along the executables BUNDLE.toml
+# declares only, so an executable here would be dead weight dyld never
+# starts. libgstreamer scans plugins in-process when gst-plugin-scanner is
+# absent; gst-ptp-helper serves only the PTP network clock.
+rm -rf "$stage/Versions/1.0/bin" "$stage/Versions/1.0/libexec" "$stage/Versions/1.0/Commands" "$stage/Commands"
+
 # The payload runs x86_64 only; keep that slice so --check sees what the
 # hardened runtime loads and the arm64 copy of every library is not shipped.
 find "$stage" -type f | while IFS= read -r f; do
@@ -98,6 +106,15 @@ done
 dangling=$(find "$stage" -type l ! -exec test -e {} \; -print)
 [ -z "$dangling" ] || { echo "gstreamer: dangling links remain:" >&2; printf '%s\n' "$dangling" >&2; exit 1; }
 
+# A package layout change that puts an executable outside bin/ and libexec/
+# must not ship unnoticed: every Mach-O left must be a library or a plugin.
+executables=$(find "$stage" -type f | while IFS= read -r f; do
+  if file "$f" | grep -q 'Mach-O' && otool -l "$f" | grep -qE '^ +cmd LC_(MAIN|UNIXTHREAD)$'; then
+    printf '%s\n' "${f#"$stage"/}"
+  fi
+done)
+[ -z "$executables" ] || { echo "gstreamer: executables remain in the stage:" >&2; printf '%s\n' "$executables" >&2; exit 1; }
+
 listing=$(cd "$WORK/gstreamer/stage" && find . \( -type f -o -type l \) | sed 's|^\./||')
 printf '%s\n' "$listing" | check_listing
 echo "gstreamer $version staged into $stage ($(du -sh "$stage" | cut -f1))"
@@ -105,9 +122,10 @@ echo "plugins: $(find "$stage/Versions/1.0/lib/gstreamer-1.0" -name 'libgst*.dyl
 echo "libgstreamer: $(file "$stage/Versions/1.0/lib/libgstreamer-1.0.0.dylib" | sed "s|$stage/||")"
 
 # The devel counterparts of the staged sub-packages (osx-framework has none):
-# headers, pkg-config files, and import libraries. build/wine/build.sh puts
-# lib/pkgconfig on PKG_CONFIG_PATH and links against the stage, so nothing
-# from here reaches the payload and the sub-package allowlist still bounds it.
+# headers, pkg-config files, and import libraries. build/wine/build.sh queries
+# lib/pkgconfig on its own (PKG_CONFIG_LIBDIR, never PKG_CONFIG_PATH) and
+# links against the stage, so nothing from here reaches the payload and the
+# sub-package allowlist still bounds it.
 rm -rf "$devel_expanded" "$devel"
 pkgutil --expand-full "$devel_archive" "$devel_expanded"
 for name in $ALLOW; do

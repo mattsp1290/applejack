@@ -21,8 +21,8 @@ every archive once at `--fetch`; the scripts extract without a second scan.
 | Apple Silicon host, Rosetta 2, Xcode command line tools (`clang`, `otool`, `install_name_tool`, `codesign`, `lipo`, `strip`, `file`, `flex`, `git`, `xar`, `lsbom`, `pkgutil`) | the build runs under `arch -x86_64`; `xar` and `lsbom` list `.pkg` archives before extraction | present |
 | `cargo`, `rustup`, `rustup target add x86_64-apple-darwin` | every script reads pins through `cargo xtask`; the `cpuid` probe is an x86-64 Mach-O | `cargo`/`rustup` present; target **missing** |
 | llvm-mingw (pin `llvm-mingw`) extracted under `build/work/toolchain/` | PE side of Wine (`--with-mingw=llvm-mingw`), `dx11-sample`, `xinput-check`; only the pinned version satisfies the check | **missing** (`sh build/bootstrap.sh` extracts it) |
-| x86-64 Homebrew at `/usr/local` with `freetype gnutls sdl2 molten-vk bison flex pkgconf` | Wine's Unix-side dependencies; build inputs only. Install Homebrew per <https://brew.sh> under `arch -x86_64`; `bootstrap.sh` never runs that installer (it is an unpinned script). `pkgconf` also runs the pkg-config report in `build/wine/build.sh` | present; `molten-vk` and `pkgconf` **missing** |
-| GStreamer devel package (pin `gstreamer-devel`) expanded under `build/work/gstreamer/devel/` | headers and `.pc` files Wine's `configure` resolves GStreamer through; a build input (`kind = "toolchain"`), never staged | expanded by `sh build/gstreamer/fetch.sh` |
+| x86-64 Homebrew at `/usr/local` with `freetype gnutls sdl2 molten-vk bison flex pkgconf` | Wine's Unix-side dependencies; build inputs only. Install Homebrew per <https://brew.sh> under `arch -x86_64`; `bootstrap.sh` never runs that installer (it is an unpinned script). `pkgconf` is what `configure` runs for the Homebrew packages and what the report in `build/wine/build.sh` probes them with | present; `molten-vk` and `pkgconf` **missing** |
+| GStreamer devel package (pin `gstreamer-devel`) expanded under `build/work/gstreamer/devel/` | headers and `.pc` files `build/wine/build.sh` computes `GSTREAMER_CFLAGS` and `GSTREAMER_LIBS` from, off `PKG_CONFIG_PATH`; a build input (`kind = "toolchain"`), never staged | expanded by `sh build/gstreamer/fetch.sh` |
 | bison 3.0 or newer (`<x86 prefix>/opt/bison/bin/bison`, keg-only) | wine-11.0's `configure` feeds bison `%define parse.error verbose` and aborts on Apple's bison 2.3; `--check` runs that conftest, and `build/wine/build.sh` puts the keg on `PATH` and passes `BISON=`/`FLEX=` to `configure` | present (3.8.2) |
 | Homebrew mingw-w64 (`i686-` and `x86_64-w64-mingw32-gcc`) | fallback compiler for the probes only | present (14.0.0, GCC 15.2) |
 | `zstd` | the vkd3d-proton release is `.tar.zst` | present |
@@ -73,21 +73,35 @@ Environment knobs:
    which it needs) — tool checks, the bison conftest, the pkg-config report,
    gate G4b (below), project patches from `build/wine/patches/`, then
    `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests`
-   with `CC=clang`, `BISON=`, `FLEX=`, `GSTREAMER_LIBS=`, `make`,
-   `make install-lib` into `build/work/wine/stage/`. Hours. GStreamer
-   reaches `configure` through `PKG_CONFIG_PATH`, which ends with the devel
-   package's `lib/pkgconfig` (its `.pc` files are relocatable, so
-   `GSTREAMER_CFLAGS` comes from them; it goes last because it also carries
-   `freetype2.pc`, `fontconfig.pc`, and the rest of GStreamer's base system,
-   which must not shadow the Homebrew packages Wine links), while
-   `GSTREAMER_LIBS` points at the
-   staged, thinned `lib/` so the link references name what ships and the
-   closure in step 7 rewrites them; `--with-gstreamer` makes a miss a
-   configure error instead of the silent "GStreamer won't be supported"
-   notice. The pkg-config report runs `arch -x86_64 pkg-config --exists` for
-   `gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0 freetype2 gnutls sdl2`
-   and prints each version and `.pc` location; a miss is a gap, since
-   `configure` would otherwise disable that feature without failing. Vulkan
+   with `CC=clang`, `BISON=`, `FLEX=`, `GSTREAMER_CFLAGS=`,
+   `GSTREAMER_LIBS=`, `make`, `make install-lib` into
+   `build/work/wine/stage/`. Hours. GStreamer reaches `configure` only
+   through those two precious variables, computed from the devel tree alone
+   (`PKG_CONFIG_LIBDIR=<devel>/lib/pkgconfig` with `PKG_CONFIG_PATH` cleared,
+   so neither a Homebrew `gstreamer` nor Homebrew's `glib` can answer;
+   `configure` never asks pkg-config for these packages when the variables
+   are set): `GSTREAMER_CFLAGS` is `pkg-config --cflags` of the four packages
+   (the `.pc` files are relocatable, so every `-I` points into the devel
+   tree), and `GSTREAMER_LIBS` is `-L<stage>/lib` plus
+   `pkg-config --libs-only-l`, pointed at the staged, thinned `lib/` so the
+   link references name what ships and the closure in step 7 rewrites them;
+   the script fails if any `-l` has no dylib in the stage. The devel tree
+   stays off `PKG_CONFIG_PATH`: it also carries `freetype2.pc`,
+   `fontconfig.pc`, and the rest of GStreamer's base system, which must not
+   shadow the Homebrew packages Wine links. `--with-gstreamer` makes a miss
+   a configure error instead of the silent "GStreamer won't be supported"
+   notice. The pkg-config report resolves
+   `gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0 glib-2.0 gobject-2.0`
+   the same devel-only way, prints each version and `pcfiledir`, and fails
+   if any `pcfiledir` is outside the devel tree (a missing package is a
+   gap, since `configure` builds no winegstreamer without it); the devel
+   queries read `.pc` text only, so the host's pkg-config serves them until
+   the x86-64 one is installed. It then runs the x86-64
+   `arch -x86_64 pkg-config --exists` for `freetype2 gnutls sdl2` on the
+   real `PKG_CONFIG_PATH`, printing version and `pcfiledir` (a miss is a
+   bootstrap gap, since `configure` would otherwise disable that feature
+   without failing), and lists any GStreamer or glib package that path also
+   offers as unused. Vulkan
    is not a pkg-config package on macOS (`configure` links `-lMoltenVK`),
    so the report looks for `libMoltenVK.dylib` under the x86-64 prefix
    instead. Writes `build/work/wine/build.log` and
@@ -125,6 +139,12 @@ Environment knobs:
    `GStreamer` binary and its links (it re-exports libraries of the dropped
    sub-packages, `libgstvalidate` among them, so it could never load;
    winegstreamer links `libgstreamer-1.0` and friends, never the umbrella),
+   removes the command-line tools and helpers (`Versions/1.0/bin`,
+   `Versions/1.0/libexec`, and the `Commands` links: nothing in
+   winegstreamer runs them, `libgstreamer` scans plugins in-process when
+   `gst-plugin-scanner` is absent, and an executable the bundle does not
+   declare is dead weight step 9 never follows) and fails if any `LC_MAIN`
+   executable remains under the framework,
    thins every universal Mach-O to x86-64 with `lipo` (a failure names the
    file), prunes the symlinks that point into unstaged sub-packages
    (`Headers`, into the devel package) and fails if any link still dangles,
