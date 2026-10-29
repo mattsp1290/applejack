@@ -9,13 +9,17 @@
 #   in   gstreamer-1.0-core            libgstreamer and the base plugins (coreelements, typefind, audioconvert, videoconvertscale)
 #   in   gstreamer-1.0-system          osxaudio, osxvideo, applemedia (VideoToolbox H.264/AAC), opengl, vulkan
 #   in   gstreamer-1.0-playback        playbin, decodebin, uridecodebin
-#   in   gstreamer-1.0-codecs          upstream's unrestricted codec set: vorbis, theora, opus, flac, vpx, dav1d, isomp4, matroska, avi, ogg, wav, jpeg, png
+#   in   gstreamer-1.0-codecs          upstream's unrestricted codec set: vorbis, theora, opus, flac, vpx, dav1d, isomp4, matroska, avi, ogg, wav, jpeg, png.
+#                                      Also libgstopenh264 (BSD-2-Clause, built from source): Cisco's H.264 patent
+#                                      coverage applies to Cisco's own binaries only, so this plugin carries the
+#                                      H.264 patent exposure itself; VideoToolbox in -system already decodes H.264.
 #   in   gstreamer-1.0-effects         audio and video filters from gst-plugins-good and -bad (LGPL)
 #   in   gstreamer-1.0-net             souphttpsrc, rtp, rtsp, tcp, udp (LGPL)
 #   in   gstreamer-1.0-encoding        encodebin (LGPL)
 #   out  gstreamer-1.0-codecs-gpl             a52dec, dtsdec: GPL
 #   out  gstreamer-1.0-codecs-gpl-restricted  x264, x265: GPL and patent-encumbered
 #   out  gstreamer-1.0-codecs-restricted      asf, mpeg-ps/ts, realmedia, voaacenc, vvdec: upstream's patent-restricted set
+#                                             (so no WMV/WMA/VC-1, MPEG-1/2, or MPEG-PS/TS; see docs/engines/payload-build.md)
 #   out  gstreamer-1.0-net-restricted         librtmp: GPL
 #   out  gstreamer-1.0-dvd-gpl                dvdread, resindvd: GPL
 #   out  gstreamer-1.0-libav                  ffmpeg: duplicates the codec set with the same patent exposure
@@ -45,7 +49,10 @@ done
 for name in $ALLOW; do
   component="$expanded/$name-$version-universal.pkg"
   [ -d "$component/Payload" ] || { echo "gstreamer: sub-package $name is missing from the pinned package" >&2; exit 1; }
-  # Each sub-package declares where under /Library/Frameworks/GStreamer.framework it installs.
+  # Each sub-package declares where under /Library/Frameworks/GStreamer.framework
+  # it installs; an empty match would stage the payload at the wrong depth.
+  grep -q 'install-location="/Library/Frameworks/GStreamer.framework' "$component/PackageInfo" \
+    || { echo "gstreamer: $name has no GStreamer.framework install-location in PackageInfo" >&2; exit 1; }
   location=$(sed -n 's/.*install-location="\/Library\/Frameworks\/GStreamer.framework\/\{0,1\}\([^"]*\)".*/\1/p' "$component/PackageInfo" | head -1)
   mkdir -p "$stage/$location"
   cp -R "$component/Payload/." "$stage/$location/"

@@ -4,7 +4,6 @@ set -eu
 . "$(dirname "$0")/../lib.sh"
 
 archive=$(fetch_pin dxmt)
-scan_archive "$archive"
 extract "$archive" "$WORK/dxmt/src"
 version=$(pin_field dxmt version)
 echo "dxmt $version DLLs:"

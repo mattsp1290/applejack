@@ -24,22 +24,18 @@ pin_field() {
   xtask engine-payload --print-pin "$1" "$2"
 }
 
-# fetch_pin <id>: download, verify, and denylist-scan one pin; prints the archive path.
+# fetch_pin <id>: download, verify, and denylist-scan one pin; prints the
+# archive path. The Rust loader lists and scans every archive, present ones
+# too, so the scripts extract without a second scan.
 fetch_pin() {
   xtask engine-payload --fetch "$1" >&2
   printf '%s/%s\n' "$WORK" "$(pin_field "$1" dest)"
 }
 
-# check_listing: denylist scan of a listing on stdin; an empty listing fails.
+# check_listing: denylist scan of a listing on stdin (the staged GStreamer
+# tree, where payload-scoped rules apply); an empty listing fails.
 check_listing() {
   xtask engine-payload --check-listing - >&2
-}
-
-# scan_archive <archive>: denylist scan of the archive listing. The listing is
-# captured first because sh has no pipefail: a failed lister must not pass.
-scan_archive() {
-  listing=$(list_archive "$1")
-  printf '%s\n' "$listing" | check_listing
 }
 
 # payload_dir: where the payload tree is assembled.
@@ -55,8 +51,13 @@ payload_dir() {
 # Only the pinned version counts; a stale toolchain must not satisfy the check.
 llvm_mingw_bin() {
   version=$(pin_field llvm-mingw version) || return 1
-  dir=$(ls -d "$TOOLCHAIN"/llvm-mingw-"$version"-*/bin 2>/dev/null | head -1 || true)
-  [ -n "$dir" ] && printf '%s\n' "$dir"
+  for dir in "$TOOLCHAIN"/llvm-mingw-"$version"-*/bin; do
+    if [ -d "$dir" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # need <tool> [hint]: fail with a message when a tool is not on PATH.
@@ -79,12 +80,3 @@ extract() {
   esac
 }
 
-# list_archive <archive>: the archive listing, one path per line.
-list_archive() {
-  case "$1" in
-    *.tar.zst) tar --zstd -tf "$1" ;;
-    *.tar.xz | *.tar.gz | *.tar) tar -tf "$1" ;;
-    *.zip) unzip -Z1 "$1" ;;
-    *) echo "list_archive: unknown archive type: $1" >&2; exit 1 ;;
-  esac
-}

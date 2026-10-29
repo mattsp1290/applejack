@@ -134,7 +134,6 @@ echo "== install"
 rustup target list --installed | grep -qx x86_64-apple-darwin || rustup target add x86_64-apple-darwin
 if [ -z "$(llvm_mingw_bin || true)" ]; then
   archive=$(fetch_pin llvm-mingw)
-  scan_archive "$archive"
   mkdir -p "$TOOLCHAIN"
   tar -xf "$archive" -C "$TOOLCHAIN"
   echo "extracted llvm-mingw into $TOOLCHAIN"

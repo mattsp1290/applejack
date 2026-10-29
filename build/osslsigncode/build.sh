@@ -6,7 +6,6 @@ set -eu
 
 need cmake "brew install cmake"
 archive=$(fetch_pin osslsigncode)
-scan_archive "$archive"
 version=$(pin_field osslsigncode version)
 extract "$archive" "$WORK/osslsigncode/src"
 src="$WORK/osslsigncode/src/osslsigncode-$version"
