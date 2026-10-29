@@ -22,8 +22,11 @@ pub const BUNDLE_FILE: &str = "BUNDLE.toml";
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Wine {
+    /// Upstream Wine version the build is based on.
     pub version: String,
+    /// Repository the Wine build came from.
     pub source_url: HttpsUrl,
+    /// Revision of that repository.
     pub source_rev: String,
     /// Loader executable, relative to the bundle root (`wine/bin/wine64`).
     pub loader: PathBuf,
@@ -32,6 +35,7 @@ pub struct Wine {
     /// Preloader, relative to the bundle root, when the build has one.
     #[serde(default)]
     pub preloader: Option<PathBuf>,
+    /// How 32-bit Windows code runs.
     pub wow64: Wow64,
 }
 
@@ -39,6 +43,7 @@ pub struct Wine {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Component {
+    /// The component's own version string.
     pub version: String,
     /// SPDX license id.
     pub license: String,
@@ -75,10 +80,13 @@ impl DllOverrides {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Overrides {
+    /// DXMT, for DirectX 10 and 11.
     #[serde(default)]
     pub dxmt: DllOverrides,
+    /// vkd3d-proton, for DirectX 12.
     #[serde(default)]
     pub vkd3d: DllOverrides,
+    /// Bundle-side DLLs for the user-supplied `D3DMetal` payload.
     #[serde(default)]
     pub d3dmetal: DllOverrides,
 }
@@ -97,8 +105,11 @@ pub struct D3DMetal {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Probes {
+    /// x86-64 Mach-O that reports the CPU features Rosetta advertises.
     pub cpuid: PathBuf,
+    /// PE that draws one Direct3D 11 frame.
     pub dx11_sample: PathBuf,
+    /// PE that enumerates `XInput` controllers.
     pub xinput_check: PathBuf,
 }
 
@@ -114,21 +125,31 @@ pub struct Registry {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleToml {
+    /// The engine this bundle implements.
     pub id: EngineId,
+    /// The bundle version; names the `engines/<id>/<version>/` directory.
     pub version: Version,
+    /// Architecture of the Wine build; must be the one `id` runs.
     pub arch: Arch,
+    /// Oldest macOS the bundle runs on, for example `14.0`.
     pub min_macos: String,
+    /// The `[wine]` table.
     pub wine: Wine,
     /// Ordered; the first entry is the default. Non-empty, no duplicates.
     pub sync_modes: Vec<SyncMode>,
+    /// Third-party parts by name (`dxmt`, `vkd3d_proton`, `moltenvk`, ...).
     #[serde(default)]
     pub components: BTreeMap<String, Component>,
+    /// The `[overrides]` tables.
     #[serde(default)]
     pub overrides: Overrides,
+    /// The `[d3dmetal]` table; required when `overrides.d3dmetal` lists a DLL.
     #[serde(default)]
     pub d3dmetal: Option<D3DMetal>,
+    /// The `[probes]` table.
     #[serde(default)]
     pub probes: Option<Probes>,
+    /// The `[registry]` table.
     #[serde(default)]
     pub registry: Option<Registry>,
     /// Executable (relative path) to the code-signing entitlements it needs.
@@ -342,17 +363,22 @@ fn resolves_to_file_inside(root: &Path, path: &Path) -> bool {
 /// What a bundle can do, derived from its `BUNDLE.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
+    /// Architecture of the Wine build.
     pub arch: Arch,
+    /// Oldest macOS the bundle runs on.
     pub min_macos: String,
     /// Backends the bundle carries overrides for, plus `WineD3D`, which needs
     /// none. `D3DMetal` is listed only when the bundle declares an overlay
     /// location; whether the overlay is populated is a runtime question.
     pub backends: Vec<GraphicsBackend>,
+    /// True when 32-bit Windows executables can run.
     pub supports_32bit: bool,
+    /// Sync modes the bundle supports, default first.
     pub sync_modes: Vec<SyncMode>,
 }
 
 impl Capabilities {
+    /// Derives the capabilities from a validated descriptor.
     #[must_use]
     pub fn from_bundle(bundle: &BundleToml) -> Self {
         let mut backends = vec![GraphicsBackend::WineD3D];
@@ -378,13 +404,16 @@ impl Capabilities {
 /// An engine bundle installed under `engines/<id>/<version>/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledEngine {
+    /// The engine.
     pub id: EngineId,
+    /// The installed version.
     pub version: Version,
     /// `engines/<id>/<version>/`, the signed bundle.
     pub root: PathBuf,
     /// `engines/<id>/<version>.user/`, the per-user overlay. May not exist
     /// yet; the `D3DMetal` payload lives under it.
     pub overlay_root: PathBuf,
+    /// The validated descriptor read from `root`.
     pub bundle: BundleToml,
 }
 

@@ -8,6 +8,8 @@
 //! `D3DMetal` overlay, CPUID probe) lands in a later unit. See
 //! `docs/engines/rosetta-wine.md`.
 
+#![warn(missing_docs)]
+
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -187,7 +189,9 @@ impl From<SyncMode> for String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HidrawMode {
+    /// Games see raw HID devices through `winebus.sys`.
     Enabled,
+    /// Raw HID access is disabled in the prefix registry.
     Disabled,
 }
 
@@ -266,6 +270,7 @@ impl EngineLayout {
     /// File name suffix of an archive being downloaded.
     pub const DOWNLOAD_SUFFIX: &'static str = ".download";
 
+    /// A layout rooted at the launcher's data directory.
     #[must_use]
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -273,6 +278,7 @@ impl EngineLayout {
         }
     }
 
+    /// The launcher's data directory.
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
@@ -333,15 +339,20 @@ pub struct Host {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    /// Informational; does not affect whether the engine runs.
     Info,
+    /// The engine runs, with a caveat worth showing.
     Warning,
+    /// The engine cannot run until this is fixed.
     Error,
 }
 
 /// One line of a [`DoctorReport`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
+    /// How serious the finding is.
     pub severity: Severity,
+    /// What was found, printable as is.
     pub message: String,
 }
 
@@ -349,15 +360,20 @@ pub struct Finding {
 /// why not when it cannot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorReport {
+    /// False when any finding has [`Severity::Error`].
     pub runnable: bool,
+    /// Every finding, in the order checked.
     pub findings: Vec<Finding>,
 }
 
 /// What [`Engine::create_prefix`] applies to a fresh prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixSpec {
+    /// Backend whose DLL overrides go into the prefix.
     pub backend: GraphicsBackend,
+    /// Sync mode recorded for launches from the prefix.
     pub sync_mode: SyncMode,
+    /// Whether raw HID access is enabled in the prefix registry.
     pub hidraw: HidrawMode,
     /// Shared game library mounted as drive `S:`; `None` leaves the drive
     /// unmapped.
@@ -390,9 +406,18 @@ pub struct Prefix {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Progress {
-    Downloading { received: u64, total: Option<u64> },
+    /// Bytes of the archive received so far; `total` when the server said.
+    Downloading {
+        /// Bytes received.
+        received: u64,
+        /// Content length, when known.
+        total: Option<u64>,
+    },
+    /// Hashing the archive against the pinned digest.
     Verifying,
+    /// Unpacking into `<version>.partial/`.
     Extracting,
+    /// Checking links and `BUNDLE.toml` before the rename.
     Validating,
 }
 

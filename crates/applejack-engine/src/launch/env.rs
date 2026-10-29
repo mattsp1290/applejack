@@ -52,8 +52,11 @@ impl Owner {
 /// Which of the [`AllowedRoots`] a path-valued row accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootSet {
+    /// `engines/<id>/<version>/`.
     pub engine: bool,
+    /// `engines/<id>/<version>.user/`.
     pub overlay: bool,
+    /// The prefix directory.
     pub prefix: bool,
 }
 
@@ -281,7 +284,10 @@ pub enum DropReason {
     NotOwner,
     /// A path-valued variable is not absolute, contains `..`, or resolves
     /// outside every root its row accepts.
-    OutsideRoots { value: OsString },
+    OutsideRoots {
+        /// The rejected value.
+        value: OsString,
+    },
     /// An earlier value of the same name was overridden by a later one.
     Superseded,
 }

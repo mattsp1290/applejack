@@ -15,9 +15,11 @@ pub struct LaunchSpec {
     /// Windows executable path (Wine path syntax or a path under a mapped
     /// drive) or the Steam client when `args` select it.
     pub exe: PathBuf,
+    /// Arguments passed to `exe`.
     pub args: Vec<OsString>,
     /// Per-game variables; filtered through [`env::assemble`].
     pub env_extras: Vec<EnvPair>,
+    /// Working directory of the loader process.
     pub cwd: PathBuf,
     /// Directory that receives `wine.log` for the session.
     pub log_dir: PathBuf,
@@ -31,5 +33,6 @@ pub struct Session {
     pub id: String,
     /// Pid of the loader process.
     pub pid: u32,
+    /// `<log_dir>/wine.log` for this session.
     pub log_path: PathBuf,
 }
