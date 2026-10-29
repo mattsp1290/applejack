@@ -21,7 +21,8 @@ every archive once at `--fetch`; the scripts extract without a second scan.
 | Apple Silicon host, Rosetta 2, Xcode command line tools (`clang`, `otool`, `install_name_tool`, `codesign`, `lipo`, `strip`, `file`, `flex`, `git`, `xar`, `lsbom`, `pkgutil`) | the build runs under `arch -x86_64`; `xar` and `lsbom` list `.pkg` archives before extraction | present |
 | `cargo`, `rustup`, `rustup target add x86_64-apple-darwin` | every script reads pins through `cargo xtask`; the `cpuid` probe is an x86-64 Mach-O | `cargo`/`rustup` present; target **missing** |
 | llvm-mingw (pin `llvm-mingw`) extracted under `build/work/toolchain/` | PE side of Wine (`--with-mingw=llvm-mingw`), `dx11-sample`, `xinput-check`; only the pinned version satisfies the check | **missing** (`sh build/bootstrap.sh` extracts it) |
-| x86-64 Homebrew at `/usr/local` with `freetype gnutls sdl2 molten-vk bison flex pkgconf` | Wine's Unix-side dependencies; build inputs only. Install Homebrew per <https://brew.sh> under `arch -x86_64`; `bootstrap.sh` never runs that installer (it is an unpinned script) | present; `molten-vk` and `pkgconf` **missing** |
+| x86-64 Homebrew at `/usr/local` with `freetype gnutls sdl2 molten-vk bison flex pkgconf` | Wine's Unix-side dependencies; build inputs only. Install Homebrew per <https://brew.sh> under `arch -x86_64`; `bootstrap.sh` never runs that installer (it is an unpinned script). `pkgconf` also runs the pkg-config report in `build/wine/build.sh` | present; `molten-vk` and `pkgconf` **missing** |
+| GStreamer devel package (pin `gstreamer-devel`) expanded under `build/work/gstreamer/devel/` | headers and `.pc` files Wine's `configure` resolves GStreamer through; a build input (`kind = "toolchain"`), never staged | expanded by `sh build/gstreamer/fetch.sh` |
 | bison 3.0 or newer (`<x86 prefix>/opt/bison/bin/bison`, keg-only) | wine-11.0's `configure` feeds bison `%define parse.error verbose` and aborts on Apple's bison 2.3; `--check` runs that conftest, and `build/wine/build.sh` puts the keg on `PATH` and passes `BISON=`/`FLEX=` to `configure` | present (3.8.2) |
 | Homebrew mingw-w64 (`i686-` and `x86_64-w64-mingw32-gcc`) | fallback compiler for the probes only | present (14.0.0, GCC 15.2) |
 | `zstd` | the vkd3d-proton release is `.tar.zst` | present |
@@ -49,7 +50,7 @@ All commands run from the repository root. Output goes under `build/work/`
    `xar` and `lsbom`) and rejects it if any path matches an archive-scoped
    denylist rule. A present archive is re-verified and re-scanned on every
    run. `--fetch <id>` fetches one pin. Verified on the planning host for all
-   eight pins.
+   nine pins.
 3. `sh build/wine/fetch.sh` — extracts Wine and the msync patch set (the
    loader in step 2 scanned both archives; the scripts do not scan again),
    removes the patch stamps, and reports whether `configure.ac` has
@@ -57,11 +58,25 @@ All commands run from the repository root. Output goes under `build/work/`
    not: Metal support is detected automatically (`configure.ac` checks
    `MTLDevice.registryID` and defines `HAVE_MTLDEVICE_REGISTRYID`); there is
    no option to pass.
-4. `sh build/wine/build.sh` — tool checks and the bison conftest, gate G4b
-   (below), project patches from `build/wine/patches/`, then
-   `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --disable-tests`
-   with `CC=clang`, `BISON=`, `FLEX=`, `make`, `make install-lib` into
-   `build/work/wine/stage/`. Hours. Writes `build/work/wine/build.log` and
+4. `sh build/wine/build.sh` (after step 5's `sh build/gstreamer/fetch.sh`,
+   which it needs) — tool checks, the bison conftest, the pkg-config report,
+   gate G4b (below), project patches from `build/wine/patches/`, then
+   `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests`
+   with `CC=clang`, `BISON=`, `FLEX=`, `GSTREAMER_LIBS=`, `make`,
+   `make install-lib` into `build/work/wine/stage/`. Hours. GStreamer
+   reaches `configure` through `PKG_CONFIG_PATH`, which starts with the
+   devel package's `lib/pkgconfig` (its `.pc` files are relocatable, so
+   `GSTREAMER_CFLAGS` comes from them), while `GSTREAMER_LIBS` points at the
+   staged, thinned `lib/` so the link references name what ships and the
+   closure in step 7 rewrites them; `--with-gstreamer` makes a miss a
+   configure error instead of the silent "GStreamer won't be supported"
+   notice. The pkg-config report runs `arch -x86_64 pkg-config --exists` for
+   `gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0 freetype2 gnutls sdl2`
+   and prints each version and `.pc` location; a miss is a gap, since
+   `configure` would otherwise disable that feature without failing. Vulkan
+   is not a pkg-config package on macOS (`configure` links `-lMoltenVK`),
+   so the report looks for `libMoltenVK.dylib` under the x86-64 prefix
+   instead. Writes `build/work/wine/build.log` and
    `build/work/wine/g4b.txt`. The project patches are applied in file-name
    order to a clone of the tree first (`cp -c`, an APFS clonefile) and to the
    real tree only when every patch applied there, so the tree is never half
@@ -73,16 +88,21 @@ All commands run from the repository root. Output goes under `build/work/`
    `sh build/wine/build.sh --preflight` runs everything up to `configure`
    without changing the tree: it reports the msync dry runs, the project-patch
    trial (on the tree without msync applied, since preflight applies nothing),
-   and the bison outcome. It exits 0 when the build can start, 3 when the
-   only gaps are ones `sh build/bootstrap.sh` installs (llvm-mingw, the
-   Homebrew bison and flex), and 1 for anything else (Rosetta, the x86-64
-   Homebrew, the msync patch set), so CI can run it before bootstrap and
+   the bison outcome, and the pkg-config report. It exits 0 when the build
+   can start, 3 when the only gaps are ones `sh build/bootstrap.sh` installs
+   (llvm-mingw, the Homebrew bison, flex, pkgconf, molten-vk, and the
+   packages the report misses), and 1 for anything else (Rosetta, the x86-64
+   Homebrew, the msync patch set, the GStreamer stage or devel tree, a
+   project patch that does not apply), so CI can run it before bootstrap and
    still catch a recipe defect.
 5. `sh build/dxmt/fetch.sh`, `sh build/vkd3d/fetch.sh`, `sh build/vulkan/fetch.sh`,
    `sh build/gstreamer/fetch.sh` — extract each component under `build/work/`
    after a denylist scan of its listing. `vulkan/fetch.sh` thins the universal
    `libMoltenVK.dylib` to x86-64. `gstreamer/fetch.sh` expands the upstream
-   `.pkg` without installing it, stages only the allowlisted sub-packages
+   `.pkg` without installing it (and the devel `.pkg` of the same release
+   into `build/work/gstreamer/devel/`, a build input for step 4 that is
+   never staged; the devel counterparts of the same allowlist), stages only
+   the allowlisted sub-packages
    (`base-system`, `base-crypto`, `osx-framework`, `core`, `system`,
    `playback`, `codecs`, `effects`, `net`, `encoding`; the script comments
    justify each), drops the GPL and patent-restricted ones (`codecs-gpl`,
@@ -97,7 +117,8 @@ All commands run from the repository root. Output goes under `build/work/`
    and scans the staged listing against the denylist, whose
    `scope = "payload"` rules name the excluded plugin dylibs. The
    `LGPL-2.1-or-later` recorded for the component describes that allowlist,
-   not the whole upstream package. With this set winegstreamer decodes
+   not the whole upstream package. Once `configure` has found GStreamer
+   (step 4 asserts it), winegstreamer decodes
    H.264/HEVC and AAC through VideoToolbox/AudioToolbox, VP8/VP9/AV1, Theora,
    Vorbis, Opus, FLAC, MP3, and PCM in MP4, Matroska, WebM, Ogg, AVI, and
    WAV. It does not decode WMV/VC-1, WMA, MPEG-1/2 video, MPEG-PS/TS, or

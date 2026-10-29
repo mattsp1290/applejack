@@ -2,10 +2,11 @@
 # SHA-256. `cargo xtask engine-payload --fetch` downloads each `dest` under
 # build/work/, verifies it, and scans its listing against build/denylist.toml
 # before any script extracts it; `cargo xtask pins-verify` parses this file
-# offline. Hashes were computed from the downloaded files on 2026-10-28; each
-# pin's `# verified:` line says what cross-checked that hash: an upstream
-# digest, or TOFU (trust on first use, no published digest to compare with).
-# `kind` is "source", "release-asset", or "toolchain". Each `dest` is unique.
+# offline. Hashes were computed from the downloaded files on the date in each
+# pin's `# verified:` line, which says what cross-checked that hash: an
+# upstream digest, or TOFU (trust on first use, no published digest to compare
+# with). `kind` is "source", "release-asset", or "toolchain" (a build input
+# that is never staged or shipped). Each `dest` is unique.
 #
 # GitHub `/archive/` tarballs (wine-msync, osslsigncode) are generated on
 # demand and their bytes are not guaranteed stable (the 2023 gzip change
@@ -89,6 +90,22 @@ sha256 = "d371ab04a7632713626836c2fc234e863cc98484c74c473eba99b0fbd9b3a3fe"
 version = "1.28.8"
 license = "LGPL-2.1-or-later"
 dest = "gstreamer/gstreamer-1.0-1.28.8-universal.pkg"
+
+# The matching devel package: headers and pkg-config files of the same
+# release. A build input only (kind "toolchain", like llvm-mingw): never
+# staged, never shipped. build/gstreamer/fetch.sh expands the devel
+# counterparts of the staged sub-packages under build/work/gstreamer/devel/,
+# where build/wine/build.sh points Wine's configure; without it configure
+# finds no GStreamer and builds a Wine without winegstreamer.
+# verified: TOFU 2026-10-29 (upstream publishes no digest for the macOS package)
+[[pin]]
+id = "gstreamer-devel"
+kind = "toolchain"
+url = "https://gstreamer.freedesktop.org/data/pkg/osx/1.28.8/gstreamer-1.0-devel-1.28.8-universal.pkg"
+sha256 = "e6d380bc17be7eccf13e0154567d4718fc9321da822408c7ca0cd808b3d4a3f7"
+version = "1.28.8"
+license = "LGPL-2.1-or-later"
+dest = "gstreamer/gstreamer-1.0-devel-1.28.8-universal.pkg"
 
 # osslsigncode 2.14 source (GitHub tag archive; the release has no separate
 # source tarball). Built as a host-arch tool for Authenticode verification.

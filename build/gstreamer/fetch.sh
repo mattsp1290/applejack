@@ -1,7 +1,9 @@
 #!/bin/sh
 # Fetches the upstream GStreamer macOS runtime package and stages the
-# sub-packages winegstreamer needs under build/work/gstreamer/ without
-# installing it, thinned to x86_64. Never the Gcenx asset.
+# sub-packages winegstreamer needs under build/work/gstreamer/stage/ without
+# installing it, thinned to x86_64, then expands the matching devel package
+# (headers and pkg-config files, a build input for Wine's configure) under
+# build/work/gstreamer/devel/, which is never staged. Never the Gcenx asset.
 #
 # Sub-packages of gstreamer-1.0-<version>-universal.pkg and why each is in or out:
 #   in   base-system-1.0, base-crypto  glib, cairo, pango, orc, openssl: the runtime every plugin links (LGPL, MIT, Apache)
@@ -35,8 +37,22 @@ ALLOW="base-system-1.0 base-crypto osx-framework gstreamer-1.0-core gstreamer-1.
 
 archive=$(fetch_pin gstreamer)
 version=$(pin_field gstreamer version)
+devel_archive=$(fetch_pin gstreamer-devel)
+devel_version=$(pin_field gstreamer-devel version)
+[ "$devel_version" = "$version" ] || { echo "gstreamer: devel pin is $devel_version but the runtime pin is $version" >&2; exit 1; }
 expanded="$WORK/gstreamer/expanded"
 stage="$WORK/gstreamer/stage/GStreamer.framework"
+devel_expanded="$WORK/gstreamer/devel-expanded"
+devel="$WORK/gstreamer/devel/GStreamer.framework"
+
+# install_location <component.pkg>: where under GStreamer.framework the
+# sub-package installs; an empty match would stage the payload at the wrong depth.
+install_location() {
+  grep -q 'install-location="/Library/Frameworks/GStreamer.framework' "$1/PackageInfo" \
+    || { echo "gstreamer: $(basename "$1") has no GStreamer.framework install-location in PackageInfo" >&2; exit 1; }
+  sed -n 's/.*install-location="\/Library\/Frameworks\/GStreamer.framework\/\{0,1\}\([^"]*\)".*/\1/p' "$1/PackageInfo" | head -1
+}
+
 rm -rf "$expanded" "$stage"
 pkgutil --expand-full "$archive" "$expanded"
 mkdir -p "$stage"
@@ -50,11 +66,7 @@ done
 for name in $ALLOW; do
   component="$expanded/$name-$version-universal.pkg"
   [ -d "$component/Payload" ] || { echo "gstreamer: sub-package $name is missing from the pinned package" >&2; exit 1; }
-  # Each sub-package declares where under /Library/Frameworks/GStreamer.framework
-  # it installs; an empty match would stage the payload at the wrong depth.
-  grep -q 'install-location="/Library/Frameworks/GStreamer.framework' "$component/PackageInfo" \
-    || { echo "gstreamer: $name has no GStreamer.framework install-location in PackageInfo" >&2; exit 1; }
-  location=$(sed -n 's/.*install-location="\/Library\/Frameworks\/GStreamer.framework\/\{0,1\}\([^"]*\)".*/\1/p' "$component/PackageInfo" | head -1)
+  location=$(install_location "$component")
   mkdir -p "$stage/$location"
   cp -R "$component/Payload/." "$stage/$location/"
   echo "gstreamer: staged $name"
@@ -91,3 +103,22 @@ printf '%s\n' "$listing" | check_listing
 echo "gstreamer $version staged into $stage ($(du -sh "$stage" | cut -f1))"
 echo "plugins: $(find "$stage/Versions/1.0/lib/gstreamer-1.0" -name 'libgst*.dylib' | wc -l | tr -d ' ')"
 echo "libgstreamer: $(file "$stage/Versions/1.0/lib/libgstreamer-1.0.0.dylib" | sed "s|$stage/||")"
+
+# The devel counterparts of the staged sub-packages (osx-framework has none):
+# headers, pkg-config files, and import libraries. build/wine/build.sh puts
+# lib/pkgconfig on PKG_CONFIG_PATH and links against the stage, so nothing
+# from here reaches the payload and the sub-package allowlist still bounds it.
+rm -rf "$devel_expanded" "$devel"
+pkgutil --expand-full "$devel_archive" "$devel_expanded"
+for name in $ALLOW; do
+  [ "$name" != osx-framework ] || continue
+  component="$devel_expanded/$name-devel-$version-universal.pkg"
+  [ -d "$component/Payload" ] || { echo "gstreamer: sub-package $name-devel is missing from the pinned devel package" >&2; exit 1; }
+  location=$(install_location "$component")
+  mkdir -p "$devel/$location"
+  cp -R "$component/Payload/." "$devel/$location/"
+done
+rm -rf "$devel_expanded"
+[ -f "$devel/Versions/1.0/lib/pkgconfig/gstreamer-1.0.pc" ] \
+  || { echo "gstreamer: the devel package expanded without lib/pkgconfig/gstreamer-1.0.pc" >&2; exit 1; }
+echo "gstreamer $version devel package expanded into $devel ($(du -sh "$devel" | cut -f1)); a build input, not staged"

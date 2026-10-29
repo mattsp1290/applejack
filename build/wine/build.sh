@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds x86-64 Wine under Rosetta (ADR-0010 Option A) into the payload tree.
-# Needs: build/wine/fetch.sh done, x86-64 Homebrew at /usr/local, llvm-mingw
-# under build/work/toolchain/ (sh build/bootstrap.sh). Takes hours.
+# Needs: build/wine/fetch.sh and build/gstreamer/fetch.sh done, x86-64
+# Homebrew at /usr/local, llvm-mingw under build/work/toolchain/
+# (sh build/bootstrap.sh). Takes hours.
 #   --preflight            run the tool checks and the patch trials, change
 #                          nothing, and stop before configure. Exit 0: the
 #                          build can start; 3: the only gaps are ones
@@ -31,6 +32,12 @@ X86_BREW=/usr/local/bin/brew
 LOG="$WORK/wine/build.log"
 MSYNC_STAMP="$WORK/wine/.msync-applied"
 PATCHES_STAMP="$WORK/wine/.patches-applied"
+# The devel package supplies headers and .pc files to configure; the staged,
+# thinned libraries are what the link references point at, so the closure
+# step rewrites them to what ships.
+GST_DEVEL="$WORK/gstreamer/devel/GStreamer.framework/Versions/1.0"
+GST_STAGE="$WORK/gstreamer/stage/GStreamer.framework/Versions/1.0"
+GST_PKGS="gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0"
 GAPS=0
 BOOTSTRAP_GAPS=0
 
@@ -55,6 +62,8 @@ if [ -x "$X86_BREW" ]; then
 else
   fail "x86-64 Homebrew at /usr/local (docs/engines/payload-build.md)"
 fi
+[ -f "$GST_DEVEL/lib/pkgconfig/gstreamer-1.0.pc" ] || fail "GStreamer devel package under $GST_DEVEL (sh build/gstreamer/fetch.sh)"
+[ -f "$GST_STAGE/lib/libgstreamer-1.0.dylib" ] || fail "staged GStreamer under $GST_STAGE (sh build/gstreamer/fetch.sh)"
 
 # Every pin value is read above this line: the restricted PATH below has no
 # cargo, so pin_field and payload_dir cannot be called after it.
@@ -67,7 +76,9 @@ FLEX=$(command -v flex || true)
 [ -n "$FLEX" ] || fail "flex (sh build/bootstrap.sh --install-brew-deps)" bootstrap
 export CPPFLAGS="-I$BREW_PREFIX/include"
 export LDFLAGS="-L$BREW_PREFIX/lib"
-export PKG_CONFIG_PATH="$BREW_PREFIX/lib/pkgconfig:$BREW_PREFIX/opt/openssl/lib/pkgconfig"
+# The upstream .pc files are relocatable (prefix=${pcfiledir}/../..), so the
+# expanded devel tree resolves through PKG_CONFIG_PATH alone.
+export PKG_CONFIG_PATH="$GST_DEVEL/lib/pkgconfig:$BREW_PREFIX/lib/pkgconfig:$BREW_PREFIX/opt/openssl/lib/pkgconfig"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 JOBS=${WINE_JOBS:-$(sysctl -n hw.ncpu)}
 
@@ -84,6 +95,32 @@ if [ -n "$BISON" ]; then
   rm -f "$conftest"
 fi
 [ -z "$FLEX" ] || echo "flex: $("$FLEX" --version | head -1) at $FLEX"
+
+# What configure resolves through pkg-config. A miss is not a configure
+# error: it silently disables the matching Wine feature (GStreamer: a notice
+# and no winegstreamer), so it is a gap here.
+PKG_CONFIG=$(command -v pkg-config || command -v pkgconf || true)
+if [ -n "$PKG_CONFIG" ]; then
+  for pkg in $GST_PKGS freetype2 gnutls sdl2; do
+    if arch -x86_64 "$PKG_CONFIG" --exists "$pkg" 2>/dev/null; then
+      echo "pkg-config: $pkg $(arch -x86_64 "$PKG_CONFIG" --modversion "$pkg") in $(arch -x86_64 "$PKG_CONFIG" --variable=pcfiledir "$pkg")"
+    else
+      case " $GST_PKGS " in
+        *" $pkg "*) fail "pkg-config package $pkg under $GST_DEVEL/lib/pkgconfig (sh build/gstreamer/fetch.sh; configure builds no winegstreamer without it)" ;;
+        *) fail "pkg-config package $pkg (sh build/bootstrap.sh --install-brew-deps; configure disables the matching Wine feature without it)" bootstrap ;;
+      esac
+    fi
+  done
+else
+  fail "pkg-config (sh build/bootstrap.sh --install-brew-deps); not probed: $GST_PKGS freetype2 gnutls sdl2" bootstrap
+fi
+# Vulkan is not a pkg-config package on macOS: configure links -lMoltenVK
+# (WINE_CHECK_SONAME) from LDFLAGS, so the dylib is what to look for.
+if [ -f "$BREW_PREFIX/lib/libMoltenVK.dylib" ]; then
+  echo "vulkan: $BREW_PREFIX/lib/libMoltenVK.dylib (molten-vk)"
+else
+  fail "libMoltenVK.dylib under $BREW_PREFIX/lib (sh build/bootstrap.sh --install-brew-deps; configure disables Vulkan without it)" bootstrap
+fi
 
 # patch_dry_run <patch>: GNU patch's report on stdout; exit 1 when any hunk fails.
 patch_dry_run() {
@@ -173,13 +210,19 @@ else
   fi
 fi
 
-CONFIGURE_FLAGS="--prefix=$STAGE --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --disable-tests"
+# Positional parameters carry the configure arguments, so a checkout path
+# with a space survives. --with-gstreamer turns the "GStreamer won't be
+# supported" notice into a configure error.
+set -- "--prefix=$STAGE" --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests
 if grep -q 'AC_ARG_WITH(metal' "$WINE_SRC/configure.ac"; then
-  CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-metal"
+  set -- "$@" --with-metal
 fi
+# Link against the staged, thinned libraries rather than the devel tree's;
+# the .pc files still supply GSTREAMER_CFLAGS.
+GSTREAMER_LIBS="-L$GST_STAGE/lib -lgstreamer-1.0 -lgstvideo-1.0 -lgstaudio-1.0 -lgsttag-1.0 -lgobject-2.0 -lglib-2.0"
 
 if [ "$PREFLIGHT" = 1 ]; then
-  echo "preflight: configure would run as: arch -x86_64 $WINE_SRC/configure $CONFIGURE_FLAGS CC=clang CXX=clang++ BISON=${BISON:-bison} FLEX=${FLEX:-flex}"
+  echo "preflight: configure would run as: arch -x86_64 $WINE_SRC/configure $* CC=clang CXX=clang++ BISON=${BISON:-bison} FLEX=${FLEX:-flex} GSTREAMER_LIBS='$GSTREAMER_LIBS'"
   if [ "$GAPS" -gt 0 ]; then
     if [ "$GAPS" -eq "$BOOTSTRAP_GAPS" ]; then
       echo "preflight: $GAPS prerequisite(s) missing, all installed by sh build/bootstrap.sh; stopping before configure (exit 3)"
@@ -202,9 +245,8 @@ logged() {
 
 mkdir -p "$BUILD"
 : >"$LOG"
-echo "configure: $CONFIGURE_FLAGS (log: $LOG)"
-# shellcheck disable=SC2086
-logged "$WINE_SRC/configure" $CONFIGURE_FLAGS CC=clang CXX=clang++ BISON="$BISON" FLEX="$FLEX"
+echo "configure: $* (log: $LOG)"
+logged "$WINE_SRC/configure" "$@" CC=clang CXX=clang++ BISON="$BISON" FLEX="$FLEX" GSTREAMER_LIBS="$GSTREAMER_LIBS"
 logged make -j"$JOBS"
 # The stage is replaced only after make succeeded, so a failed rerun keeps the last good one.
 rm -rf "$STAGE"
