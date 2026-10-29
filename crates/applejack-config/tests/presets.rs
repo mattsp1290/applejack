@@ -419,6 +419,7 @@ fn home_placeholder_expands_only_when_the_host_supplies_home() {
                 .to_owned(),
         )]),
         launch_exe_override: Some("$HOME/Games/game.exe".to_owned()),
+        dx12_expectation: Some("vkd3d; saves in $HOME/Saves".to_owned()),
         notes: Some("see $HOME/notes.txt".to_owned()),
         ..GameConfig::default()
     });
@@ -441,6 +442,10 @@ fn home_placeholder_expands_only_when_the_host_supplies_home() {
     assert_eq!(
         plan.confirmations[0].value,
         format!("{}/Games/game.exe", home().display())
+    );
+    assert_eq!(
+        plan.config.dx12_expectation.as_deref(),
+        Some("vkd3d; saves in /Users/example/Saves")
     );
     assert_eq!(
         plan.config.notes.as_deref(),

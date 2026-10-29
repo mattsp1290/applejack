@@ -6,6 +6,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{ConfigDb, Error, Field, GameConfig, GraphicsBackend};
 
@@ -186,6 +187,7 @@ pub fn export(
     for text in [
         &mut config.launch_exe_override,
         &mut config.launch_args_override,
+        &mut config.dx12_expectation,
         &mut config.notes,
     ]
     .into_iter()
@@ -220,10 +222,25 @@ fn account_name(home: &Path) -> Option<String> {
 
 /// Whether `text` holds `account` as a whole path component under either
 /// separator: `/Users/x`, `drive_c/users/x`, `Z:\Users\x`, `file:///Users/x`.
-/// Case does not matter, because the macOS file system ignores it.
+/// A component ends at the next separator, at a delimiter (whitespace, `:`,
+/// `;`, `=`, `,`, quotes), or at a closing bracket, and a trailing sentence
+/// period is dropped, so a path inside prose, quotes, or a `:`-list is still
+/// seen. Case and normalization form do not matter, because the macOS file
+/// system ignores both.
 fn contains_account(text: &str, account: &str) -> bool {
-    text.split(['/', '\\'])
-        .any(|part| part.eq_ignore_ascii_case(account))
+    let account = fold(account);
+    text.split(['/', '\\']).any(|part| {
+        let end = part
+            .find(|c: char| is_delimiter(c) || matches!(c, ')' | ']' | '}' | '>'))
+            .unwrap_or(part.len());
+        fold(part[..end].trim_end_matches('.')) == account
+    })
+}
+
+/// Text in the form the account comparison uses: NFC, then lower case, so
+/// `JOSÉ` and the decomposed `jose\u{301}` both read as `josé`.
+fn fold(text: &str) -> String {
+    text.nfc().collect::<String>().to_lowercase()
 }
 
 /// Every text field an export carries, with its report name.
@@ -235,6 +252,7 @@ fn exported_texts(config: &GameConfig) -> impl Iterator<Item = (String, &str)> {
     let fields = [
         (Field::LaunchExeOverride, &config.launch_exe_override),
         (Field::LaunchArgsOverride, &config.launch_args_override),
+        (Field::Dx12Expectation, &config.dx12_expectation),
         (Field::Notes, &config.notes),
     ]
     .into_iter()
@@ -395,7 +413,9 @@ pub fn import(
             Field::LaunchArgsOverride => {
                 confirm(&mut plan, field, &placeholders.expand(&value));
             }
-            Field::Notes => accept(&mut plan, field, &placeholders.expand(&value)),
+            Field::Notes | Field::Dx12Expectation => {
+                accept(&mut plan, field, &placeholders.expand(&value));
+            }
             Field::GraphicsBackend
                 if preset.config.graphics_backend == Some(GraphicsBackend::D3dmetal) =>
             {
@@ -1015,6 +1035,180 @@ mod tests {
         };
         db.set_game_config(34, &config).unwrap();
         export(&db, 34, &data, None).unwrap();
+    }
+
+    /// A path component ends at a delimiter, a closing bracket, or a
+    /// sentence period, not only at a separator or the end of the text.
+    #[test]
+    fn account_guard_ends_a_component_at_a_delimiter() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        let data = data_dir();
+        let home = home();
+        let env = |name: &str, value: String| GameConfig {
+            extra_env: BTreeMap::from([(name.to_owned(), value)]),
+            ..GameConfig::default()
+        };
+        let cases = [
+            (
+                "notes",
+                GameConfig {
+                    notes: Some("prefix user dir drive_c/users/example holds the saves".to_owned()),
+                    ..GameConfig::default()
+                },
+            ),
+            (
+                "launch_args_override",
+                GameConfig {
+                    launch_args_override: Some("-savedir \"Z:\\Users\\example\"".to_owned()),
+                    ..GameConfig::default()
+                },
+            ),
+            (
+                "extra_env.GST_PLUGIN_PATH",
+                env(
+                    "GST_PLUGIN_PATH",
+                    format!(
+                        "{}/prefixes/g/drive_c/users/example:{}/engines/x",
+                        data.display(),
+                        data.display()
+                    ),
+                ),
+            ),
+            (
+                "notes",
+                GameConfig {
+                    notes: Some("saves under drive_c/users/example.".to_owned()),
+                    ..GameConfig::default()
+                },
+            ),
+            (
+                "extra_env.DXMT_CONFIG",
+                env(
+                    "DXMT_CONFIG",
+                    "d3d11.path=Z:\\Users\\example;x=1".to_owned(),
+                ),
+            ),
+            (
+                "dx12_expectation",
+                GameConfig {
+                    dx12_expectation: Some("vkd3d works (saves in Z:\\Users\\example)".to_owned()),
+                    ..GameConfig::default()
+                },
+            ),
+        ];
+        for (expected, config) in cases {
+            db.set_game_config(38, &config).unwrap();
+            let error = export(&db, 38, &data, Some(&home)).unwrap_err();
+            assert!(
+                matches!(&error, Error::AccountNameInExport { field } if field == expected),
+                "{expected}: {error}"
+            );
+            assert!(!error.to_string().contains("example"), "{error}");
+        }
+
+        // Prose mentioning a common-word account name still exports: the
+        // account counts only as a path component.
+        let config = GameConfig {
+            notes: Some("uses wine and wine-staging; see wine/README".to_owned()),
+            ..GameConfig::default()
+        };
+        db.set_game_config(35, &config).unwrap();
+        export(&db, 35, &data, Some(Path::new("/Users/wine"))).unwrap();
+    }
+
+    #[test]
+    fn account_guard_ignores_case_and_normalization_form() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        let data = data_dir();
+        let nfc = PathBuf::from("/Users/jos\u{e9}");
+        let nfd = PathBuf::from("/Users/jose\u{301}");
+        let texts = [
+            "drive_c/users/jose\u{301}",
+            "drive_c/users/jos\u{e9}",
+            "Z:\\Users\\JOS\u{c9}",
+            "see /users/JOSE\u{301}/x",
+        ];
+        for home in [&nfc, &nfd] {
+            for text in texts {
+                let config = GameConfig {
+                    notes: Some(text.to_owned()),
+                    ..GameConfig::default()
+                };
+                db.set_game_config(36, &config).unwrap();
+                let error = export(&db, 36, &data, Some(home.as_path())).unwrap_err();
+                assert!(
+                    matches!(&error, Error::AccountNameInExport { field } if field == "notes"),
+                    "{text:?} under {}: {error}",
+                    home.display()
+                );
+            }
+        }
+        let config = GameConfig {
+            notes: Some("drive_c/users/jose".to_owned()),
+            ..GameConfig::default()
+        };
+        db.set_game_config(37, &config).unwrap();
+        export(&db, 37, &data, Some(&nfc)).unwrap();
+    }
+
+    /// Every column that accepts free text must be rewritten and guarded on
+    /// export, without a hand-kept list: a column whose parser accepts a
+    /// home path is a text column.
+    #[test]
+    fn every_free_text_field_is_rewritten_and_guarded_on_export() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        let data = data_dir();
+        let home = home();
+        let rewritable = format!("{}/Saves", home.display());
+        let unrewritable = "saves in drive_c/users/example";
+        let mut covered = Vec::new();
+        for field in Field::ALL {
+            let mut config = GameConfig::default();
+            if config.set(field, &rewritable).is_err() {
+                continue;
+            }
+            covered.push(field.name());
+            db.set_game_config(50, &config).unwrap();
+            let preset = export(&db, 50, &data, Some(&home)).unwrap();
+            let json = preset.to_json_pretty().unwrap();
+            assert!(
+                !json.contains("example"),
+                "{field} leaked the account: {json}"
+            );
+            // A column export clears is gone; any other must be rewritten.
+            assert!(
+                matches!(
+                    preset.config.get(field).as_deref(),
+                    None | Some("$HOME/Saves")
+                ),
+                "{field} not rewritten: {json}"
+            );
+
+            let mut config = GameConfig::default();
+            config.set(field, unrewritable).unwrap();
+            db.set_game_config(50, &config).unwrap();
+            match export(&db, 50, &data, Some(&home)) {
+                Err(Error::AccountNameInExport { field: named }) => {
+                    assert_eq!(named, field.name());
+                }
+                Ok(preset) => assert_eq!(
+                    preset.config.get(field),
+                    None,
+                    "{field} exported the account unguarded"
+                ),
+                Err(other) => panic!("{field}: {other}"),
+            }
+        }
+        assert_eq!(
+            covered,
+            [
+                "launch_exe_override",
+                "launch_args_override",
+                "direct_verified_at",
+                "dx12_expectation",
+                "notes",
+            ]
+        );
     }
 
     #[test]
