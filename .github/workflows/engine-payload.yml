@@ -1,0 +1,44 @@
+# Builds the Rosetta engine payload. Expected to fail at `bootstrap.sh --check`
+# or `engine-payload --build` until the Wine build lands (the toolchain install
+# and the multi-hour build are not yet exercised); `--fetch` and the data-file
+# checks are the parts that pass today.
+name: engine-payload
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["engine-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  payload:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require Apple Silicon
+        run: test "$(uname -m)" = arm64
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Verify the pin and denylist files
+        run: cargo xtask pins-verify
+      - name: Check build prerequisites
+        run: sh build/bootstrap.sh --check
+      - name: Fetch every pin
+        run: cargo xtask engine-payload --fetch
+      - name: Build the payload
+        run: cargo xtask engine-payload --build
+      - name: Check the payload
+        run: cargo xtask engine-payload --check "fixtures/payloads/rosetta-wine-$(cargo xtask engine-payload --print-pin wine version)"
