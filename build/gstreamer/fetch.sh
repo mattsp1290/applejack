@@ -5,7 +5,8 @@
 #
 # Sub-packages of gstreamer-1.0-<version>-universal.pkg and why each is in or out:
 #   in   base-system-1.0, base-crypto  glib, cairo, pango, orc, openssl: the runtime every plugin links (LGPL, MIT, Apache)
-#   in   osx-framework                 the framework's Versions/Current, Headers, Commands links
+#   in   osx-framework                 the framework's Versions/Current, Commands, Libraries, Resources links
+#                                      (Headers points into the unstaged devel package and is pruned below)
 #   in   gstreamer-1.0-core            libgstreamer and the base plugins (coreelements, typefind, audioconvert, videoconvertscale)
 #   in   gstreamer-1.0-system          osxaudio, osxvideo, applemedia (VideoToolbox H.264/AAC), opengl, vulkan
 #   in   gstreamer-1.0-playback        playbin, decodebin, uridecodebin
@@ -59,14 +60,31 @@ for name in $ALLOW; do
   echo "gstreamer: staged $name"
 done
 
+# The umbrella GStreamer binary re-exports the libraries of every sub-package,
+# dropped ones included (libgstvalidate from devtools), so it cannot load from
+# this stage; winegstreamer links libgstreamer-1.0 and friends through
+# pkg-config, never the umbrella.
+rm -f "$stage/GStreamer" "$stage/Versions/1.0/GStreamer" "$stage/Versions/1.0/lib/GStreamer"
+
 # The payload runs x86_64 only; keep that slice so --check sees what the
 # hardened runtime loads and the arm64 copy of every library is not shipped.
 find "$stage" -type f | while IFS= read -r f; do
   if file "$f" | grep -q 'Mach-O universal binary'; then
-    lipo "$f" -thin x86_64 -output "$f.x86_64"
+    lipo "$f" -thin x86_64 -output "$f.x86_64" || { echo "gstreamer: lipo failed on $f" >&2; exit 1; }
     mv "$f.x86_64" "$f"
   fi
 done
+
+# Links into dropped sub-packages (Headers -> the devel package) must not
+# ship; one that still dangles afterwards is a package layout change to look at.
+find "$stage" -type l | while IFS= read -r link; do
+  if [ ! -e "$link" ]; then
+    echo "gstreamer: dropping dangling link ${link#"$stage"/} -> $(readlink "$link")"
+    rm -f "$link"
+  fi
+done
+dangling=$(find "$stage" -type l ! -exec test -e {} \; -print)
+[ -z "$dangling" ] || { echo "gstreamer: dangling links remain:" >&2; printf '%s\n' "$dangling" >&2; exit 1; }
 
 listing=$(cd "$WORK/gstreamer/stage" && find . \( -type f -o -type l \) | sed 's|^\./||')
 printf '%s\n' "$listing" | check_listing

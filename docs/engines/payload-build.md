@@ -87,9 +87,15 @@ All commands run from the repository root. Output goes under `build/work/`
    `playback`, `codecs`, `effects`, `net`, `encoding`; the script comments
    justify each), drops the GPL and patent-restricted ones (`codecs-gpl`,
    `codecs-gpl-restricted`, `codecs-restricted`, `net-restricted`,
-   `dvd-gpl`, `libav`) and the tooling ones, thins every universal Mach-O to
-   x86-64 with `lipo`, and scans the staged listing against the denylist,
-   whose `scope = "payload"` rules name the excluded plugin dylibs. The
+   `dvd-gpl`, `libav`) and the tooling ones, removes the umbrella
+   `GStreamer` binary and its links (it re-exports libraries of the dropped
+   sub-packages, `libgstvalidate` among them, so it could never load;
+   winegstreamer links `libgstreamer-1.0` and friends, never the umbrella),
+   thins every universal Mach-O to x86-64 with `lipo` (a failure names the
+   file), prunes the symlinks that point into unstaged sub-packages
+   (`Headers`, into the devel package) and fails if any link still dangles,
+   and scans the staged listing against the denylist, whose
+   `scope = "payload"` rules name the excluded plugin dylibs. The
    `LGPL-2.1-or-later` recorded for the component describes that allowlist,
    not the whole upstream package. With this set winegstreamer decodes
    H.264/HEVC and AAC through VideoToolbox/AudioToolbox, VP8/VP9/AV1, Theora,
