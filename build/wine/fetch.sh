@@ -7,12 +7,15 @@ set -eu
 WINE_VERSION=$(pin_field wine version)
 SRC="$WORK/wine/src"
 archive=$(fetch_pin wine)
-list_archive "$archive" | check_listing
+scan_archive "$archive"
 extract "$archive" "$SRC"
+# A fresh tree has no patches; build.sh's stamps must not claim otherwise.
+rm -f "$WORK/wine/.msync-applied" "$WORK/wine/.patches-applied"
 WINE_SRC="$SRC/wine-$WINE_VERSION"
 [ -f "$WINE_SRC/configure.ac" ] || { echo "wine source not at $WINE_SRC" >&2; exit 1; }
 
 msync=$(fetch_pin wine-msync)
+scan_archive "$msync"
 extract "$msync" "$WORK/wine/msync"
 echo "msync patches:"
 ls "$WORK"/wine/msync/*/*.patch

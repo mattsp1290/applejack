@@ -15,23 +15,31 @@ TOOLCHAIN="$WORK/toolchain"
 PAYLOAD_DIR=${APPLEJACK_PAYLOAD_DIR:-}
 
 xtask() {
-  (cd "$ROOT" && cargo xtask "$@")
+  (cd "$ROOT" && cargo -q xtask "$@")
 }
 
-# pin_field <id> <field>: one field of a pin, on stdout.
+# pin_field <id> <field>: one field of a pin, on stdout. Cargo's own output
+# stays on stderr so a failing xtask build is visible.
 pin_field() {
-  xtask engine-payload --print-pin "$1" "$2" 2>/dev/null
+  xtask engine-payload --print-pin "$1" "$2"
 }
 
-# fetch_pin <id>: download and verify one pin; prints the archive path.
+# fetch_pin <id>: download, verify, and denylist-scan one pin; prints the archive path.
 fetch_pin() {
   xtask engine-payload --fetch "$1" >&2
   printf '%s/%s\n' "$WORK" "$(pin_field "$1" dest)"
 }
 
-# check_listing: denylist scan of the archive listing on stdin.
+# check_listing: denylist scan of a listing on stdin; an empty listing fails.
 check_listing() {
   xtask engine-payload --check-listing - >&2
+}
+
+# scan_archive <archive>: denylist scan of the archive listing. The listing is
+# captured first because sh has no pipefail: a failed lister must not pass.
+scan_archive() {
+  listing=$(list_archive "$1")
+  printf '%s\n' "$listing" | check_listing
 }
 
 # payload_dir: where the payload tree is assembled.
@@ -44,8 +52,10 @@ payload_dir() {
 }
 
 # llvm_mingw_bin: the bin directory of the extracted llvm-mingw pin, if present.
+# Only the pinned version counts; a stale toolchain must not satisfy the check.
 llvm_mingw_bin() {
-  dir=$(ls -d "$TOOLCHAIN"/llvm-mingw-*/bin 2>/dev/null | head -1 || true)
+  version=$(pin_field llvm-mingw version) || return 1
+  dir=$(ls -d "$TOOLCHAIN"/llvm-mingw-"$version"-*/bin 2>/dev/null | head -1 || true)
   [ -n "$dir" ] && printf '%s\n' "$dir"
 }
 
