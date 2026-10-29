@@ -151,7 +151,6 @@ dependencies = [
 name = "applejack-steam"
 version = "0.1.0"
 dependencies = [
- "applejack-manifest",
  "prost",
  "rpassword",
  "rustix",

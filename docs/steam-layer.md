@@ -2,8 +2,9 @@
 
 `crates/applejack-steam` owns authentication, refresh-token storage, the
 owned-license list, `.acf` and `.vdf` handling, and the advisory locks that
-serialize applejack processes. It depends on `applejack-manifest` and external
-crates only, never on `applejack-config`; it accepts and returns plain structs.
+serialize applejack processes. It depends on external crates only, never on
+`applejack-config` or another applejack crate; it accepts and returns plain
+structs.
 
 Gate G2 status: **not yet run**. The spike builds (`examples/auth_spike.rs`);
 the operator runs it with their own account and records the outcome below.
@@ -69,9 +70,11 @@ them. The CM does not report a retry-after, so the value is a fixed 60 s floor.
   run (`-D warnings`) enforces by resolved type, so an import alias cannot
   hide one; `tests/no_token_argv.rs` greps `src/` and `examples/` as a
   textual backstop.
-- `RefreshToken` is not comparable (no `PartialEq`), `License::Debug` omits
-  the PICS `access_token`, and the `CMsgClientLogon` built in `live::logon`
-  carries the refresh token and is never logged or `Debug`-formatted.
+- `RefreshToken`, `AccessToken`, `Password`, and `Credentials` are not
+  comparable (no `PartialEq`: a derived comparison is not constant time and
+  nothing needs one), `License::Debug` omits the PICS `access_token`, and the
+  `CMsgClientLogon` built in `live::logon` carries the refresh token and is
+  never logged or `Debug`-formatted.
 - Fixtures and docs contain no credential values. The fixture token in tests is
   the literal `fixture-refresh-token-not-a-real-value`.
 - The `applejack` CLI and the copy embedded in the app are the same signed
@@ -187,6 +190,42 @@ client-written files for `install --update`, retains them.
 `tests/fixtures/appmanifest_000000.acf` is hand-written and redacted (appid
 0); work package 5 replaces it with a captured client file and extends the
 writer with whatever keys the client needs.
+
+## Follow-ups
+
+Design notes for the depot unit, recorded here rather than changed in this
+work package:
+
+- **Auth/session split.** `SteamConnection` covers both the auth flow and
+  the logged-in session, and every method takes `&mut self`, so a keepalive
+  task cannot run `send_heartbeat` while a long `license_list` or PICS call
+  holds the same object, even though steamroom's `SteamClient<LoggedIn>`
+  methods are all `&self`. The next unit should have `logon` return a
+  session object (`type Session: SteamSession`) whose methods take `&self`,
+  keep `SteamConnection` for the auth flow only, and let the fake script PICS
+  answers per session; that mirrors steamroom's `Ready`/`LoggedIn` split.
+  Until then the trait carries `heartbeat_interval` and `send_heartbeat` so a
+  CLI written against the trait (the only way to test it with the fake) can
+  keep the session alive between calls.
+- **One receive loop.** `license_list` and steamroom's `pics_get_*` and
+  `call_service_method` read from the same `recv_raw`; whichever is waiting
+  consumes the other's reply. The unit that shares the session must own one
+  receive-and-dispatch loop.
+- **Multi-app locking.** `LockDir::apps` over a sorted, deduplicated appid
+  list, if the depot unit ever holds more than one title per process.
+
+Upstream gaps in `steamroom` and `steamroom-client` 0.3.0, for the operator
+to file; the local copies in `live.rs` stay until they land:
+
+1. `TokenLogin::login` (`steamroom-client-0.3.0/src/login/terminal.rs:55-70`)
+   never sends `config.login_id`, so applejack composes `CMsgClientLogon`
+   itself to carry the fixed `LOGIN_ID`.
+2. The same builder omits `supports_rate_limit_response`, so a throttled
+   logon comes back as a generic failure rather than the typed EResult.
+3. `SteamClient<Ready>::login` (`steamroom-0.3.0/src/client/mod.rs:286-350`)
+   discards the sibling messages of the `MULTI` that carries the logon
+   response, which is the MULTI-drain risk described under "Reading the
+   result".
 
 ## Legal note
 

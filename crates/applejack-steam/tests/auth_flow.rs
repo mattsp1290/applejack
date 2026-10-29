@@ -102,6 +102,15 @@ impl SteamConnection for Fake {
             access_token: 0,
         }]))
     }
+
+    fn heartbeat_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    fn send_heartbeat(&mut self) -> impl Future<Output = Result<(), AuthError>> + Send {
+        self.calls.push("send_heartbeat".into());
+        ready(Ok(()))
+    }
 }
 
 fn credentials() -> Credentials {
@@ -367,6 +376,12 @@ async fn refresh_uses_the_stored_token_and_logout_deletes_it() {
         Some(("redacted".to_owned(), FIXTURE_TOKEN.to_owned()))
     );
     assert_eq!(fake.license_list().await.unwrap().len(), 1);
+    assert_eq!(fake.heartbeat_interval(), None);
+    fake.send_heartbeat().await.unwrap();
+    assert_eq!(
+        fake.calls.last().map(String::as_str),
+        Some("send_heartbeat")
+    );
 }
 
 #[test]

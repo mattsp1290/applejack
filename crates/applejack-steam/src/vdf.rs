@@ -64,28 +64,47 @@ impl Value {
     #[must_use]
     pub fn get(&self, path: &str) -> Option<&Value> {
         path.split('/').try_fold(self, |value, key| match value {
-            Value::Map(children) => children
-                .iter()
-                .find(|node| node.key.eq_ignore_ascii_case(key))
-                .map(|node| &node.value),
+            Value::Map(children) => find(children, key),
             Value::Str(_) => None,
         })
     }
 
+    /// Mutable counterpart of [`Value::get`]; `None` when any segment is
+    /// missing.
     #[must_use]
-    pub fn get_str(&self, path: &str) -> Option<&str> {
-        match self.get(path)? {
+    pub fn get_mut(&mut self, path: &str) -> Option<&mut Value> {
+        path.split('/').try_fold(self, |value, key| match value {
+            Value::Map(children) => find_mut(children, key),
+            Value::Str(_) => None,
+        })
+    }
+
+    /// The leaf text; `None` for a map.
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
             Value::Str(text) => Some(text),
             Value::Map(_) => None,
         }
     }
 
+    /// The child nodes; `None` for a leaf.
     #[must_use]
-    pub fn get_map(&self, path: &str) -> Option<&[Node]> {
-        match self.get(path)? {
+    pub fn as_map(&self) -> Option<&[Node]> {
+        match self {
             Value::Map(children) => Some(children),
             Value::Str(_) => None,
         }
+    }
+
+    #[must_use]
+    pub fn get_str(&self, path: &str) -> Option<&str> {
+        self.get(path)?.as_str()
+    }
+
+    #[must_use]
+    pub fn get_map(&self, path: &str) -> Option<&[Node]> {
+        self.get(path)?.as_map()
     }
 
     #[must_use]
@@ -96,6 +115,27 @@ impl Value {
     #[must_use]
     pub fn get_u64(&self, path: &str) -> Option<u64> {
         self.get_str(path)?.parse().ok()
+    }
+}
+
+fn find<'a>(children: &'a [Node], key: &str) -> Option<&'a Value> {
+    children
+        .iter()
+        .find(|node| node.key.eq_ignore_ascii_case(key))
+        .map(|node| &node.value)
+}
+
+fn find_mut<'a>(children: &'a mut [Node], key: &str) -> Option<&'a mut Value> {
+    children
+        .iter_mut()
+        .find(|node| node.key.eq_ignore_ascii_case(key))
+        .map(|node| &mut node.value)
+}
+
+fn split_first(path: &str) -> (&str, Option<&str>) {
+    match path.split_once('/') {
+        Some((first, rest)) => (first, Some(rest)),
+        None => (path, None),
     }
 }
 
@@ -135,35 +175,34 @@ impl Document {
     /// Looks a path up across the top-level nodes; see [`Value::get`].
     #[must_use]
     pub fn get(&self, path: &str) -> Option<&Value> {
-        let (first, rest) = match path.split_once('/') {
-            Some((first, rest)) => (first, Some(rest)),
-            None => (path, None),
-        };
-        let root = self
-            .nodes
-            .iter()
-            .find(|node| node.key.eq_ignore_ascii_case(first))
-            .map(|node| &node.value)?;
+        let (first, rest) = split_first(path);
+        let root = find(&self.nodes, first)?;
         match rest {
             Some(rest) => root.get(rest),
             None => Some(root),
         }
     }
 
+    /// Mutable counterpart of [`Document::get`]; `None` when any segment is
+    /// missing.
     #[must_use]
-    pub fn get_str(&self, path: &str) -> Option<&str> {
-        match self.get(path)? {
-            Value::Str(text) => Some(text),
-            Value::Map(_) => None,
+    pub fn get_mut(&mut self, path: &str) -> Option<&mut Value> {
+        let (first, rest) = split_first(path);
+        let root = find_mut(&mut self.nodes, first)?;
+        match rest {
+            Some(rest) => root.get_mut(rest),
+            None => Some(root),
         }
     }
 
     #[must_use]
+    pub fn get_str(&self, path: &str) -> Option<&str> {
+        self.get(path)?.as_str()
+    }
+
+    #[must_use]
     pub fn get_map(&self, path: &str) -> Option<&[Node]> {
-        match self.get(path)? {
-            Value::Map(children) => Some(children),
-            Value::Str(_) => None,
-        }
+        self.get(path)?.as_map()
     }
 
     #[must_use]

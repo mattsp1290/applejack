@@ -17,8 +17,11 @@ pub mod lock;
 pub mod vdf;
 
 pub use acf::{AcfWriter, AppManifest, InstalledDepot};
-pub use auth::{AuthError, AuthMode, Authenticator, LoginStep, SteamConnection};
+pub use auth::{
+    AccessToken, AuthError, AuthMode, Authenticator, Credentials, GuardFactor, License, LoginStep,
+    Password, SteamConnection, Tokens,
+};
 pub use error::Error;
 pub use keychain::{InMemoryStore, RefreshToken, RefreshTokenStore, SecurityFrameworkStore};
-pub use lock::{AppLock, LibraryLock, Lock, LockDir, Mode};
+pub use lock::{AppLock, Holder, LibraryLock, Lock, LockDir, Mode};
 pub use vdf::{Document, Node, Value};

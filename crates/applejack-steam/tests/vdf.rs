@@ -46,6 +46,36 @@ fn typed_accessors_follow_paths_case_insensitively() {
 }
 
 #[test]
+fn get_mut_edits_in_place_and_keeps_the_layout() {
+    let lf = fixture("libraryfolders.vdf");
+    let mut document = Document::parse(&lf).unwrap();
+    *document.get_mut("LibraryFolders/1/label").unwrap() = Value::Str("renamed".to_owned());
+    assert_eq!(document.get_str("libraryfolders/1/label"), Some("renamed"));
+    assert_eq!(
+        document.to_text(),
+        lf.replace("\"label\"\t\t\"applejack\"", "\"label\"\t\t\"renamed\"")
+    );
+
+    let Some(Value::Map(apps)) = document.get_mut("libraryfolders/1/apps") else {
+        panic!("apps is a map");
+    };
+    apps.push(Node::str("42", "1"));
+    assert_eq!(document.get_u64("libraryfolders/1/apps/42"), Some(1));
+    assert_eq!(Document::parse(&document.to_text()).unwrap(), document);
+
+    assert!(document.get_mut("libraryfolders/9/label").is_none());
+    assert!(document.get_mut("libraryfolders/1/label/x").is_none());
+    assert!(document.get_mut("missing").is_none());
+    assert_eq!(
+        document
+            .get("libraryfolders/1/label")
+            .and_then(Value::as_map),
+        None
+    );
+    assert_eq!(document.get("libraryfolders").and_then(Value::as_str), None);
+}
+
+#[test]
 fn reader_accepts_comments_bare_tokens_conditionals_and_escapes() {
     let text = "// leading comment\n\"root\" // trailing\n{\n\tbare value\n\t\"quoted\" \"a \\\"b\\\" \\\\ c\\n\" [$WIN32]\n\t\"nested\" { \"k\" \"v\" }\n}\n";
     let document = Document::parse(text).unwrap();

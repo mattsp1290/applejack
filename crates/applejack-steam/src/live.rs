@@ -93,17 +93,6 @@ impl SteamroomConnection {
     fn take_stage(&mut self) -> Stage {
         std::mem::replace(&mut self.stage, Stage::Idle)
     }
-
-    /// The heartbeat interval the CM asked for in the logon response, once
-    /// `logon` has succeeded. The unit that keeps a session open drives
-    /// `SteamClient<LoggedIn>::send_heartbeat` at this interval.
-    #[must_use]
-    pub fn heartbeat_interval(&self) -> Option<Duration> {
-        match &self.stage {
-            Stage::LoggedIn(session) => session.heartbeat,
-            _ => None,
-        }
-    }
 }
 
 impl std::fmt::Debug for SteamroomConnection {
@@ -314,6 +303,22 @@ impl SteamConnection for SteamroomConnection {
                 }
             }
         }
+    }
+
+    fn heartbeat_interval(&self) -> Option<Duration> {
+        match &self.stage {
+            Stage::LoggedIn(session) => session.heartbeat,
+            _ => None,
+        }
+    }
+
+    async fn send_heartbeat(&mut self) -> Result<(), AuthError> {
+        let Stage::LoggedIn(Session { client, .. }) = &self.stage else {
+            return Err(AuthError::OutOfOrder(
+                "send_heartbeat needs a logged-in session",
+            ));
+        };
+        client.send_heartbeat().await.map_err(map_steamroom_error)
     }
 }
 

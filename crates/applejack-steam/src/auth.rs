@@ -71,8 +71,9 @@ pub enum AuthError {
     Connection(String),
 }
 
-/// A password typed by the user. `Debug` never reveals the value.
-#[derive(Clone, PartialEq, Eq)]
+/// A password typed by the user. `Debug` never reveals the value, and the
+/// type is not comparable: a derived comparison is not constant time.
+#[derive(Clone)]
 pub struct Password(String);
 
 impl Password {
@@ -92,8 +93,9 @@ impl fmt::Debug for Password {
     }
 }
 
-/// A short-lived Steam access token, kept in memory only.
-#[derive(Clone, PartialEq, Eq)]
+/// A short-lived Steam access token, kept in memory only. Not comparable,
+/// for the same reason as [`Password`].
+#[derive(Clone)]
 pub struct AccessToken(String);
 
 impl AccessToken {
@@ -114,7 +116,7 @@ impl fmt::Debug for AccessToken {
 }
 
 /// Account name and password for [`AuthMode::Credentials`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Credentials {
     pub account_name: String,
     pub password: Password,
@@ -154,7 +156,8 @@ impl fmt::Debug for License {
 /// The calls that reach Steam. Each method advances one connection's state;
 /// the order is `begin_qr` or `begin_credentials`, optionally
 /// `submit_guard_code`, then `wait_for_tokens`; `logon` opens a session from a
-/// refresh token and `license_list` reads from that session.
+/// refresh token, `license_list` reads from that session, and
+/// `send_heartbeat` keeps it open at `heartbeat_interval`.
 pub trait SteamConnection {
     /// Starts a QR session and returns the challenge payload to render.
     fn begin_qr(&mut self) -> impl Future<Output = Result<String, AuthError>> + Send;
@@ -189,6 +192,14 @@ pub trait SteamConnection {
     /// whenever the account's licenses change), so a later call can eat
     /// another reply or wait out its timeout.
     fn license_list(&mut self) -> impl Future<Output = Result<Vec<License>, AuthError>> + Send;
+
+    /// The interval the CM asked for in the logon response; `None` before
+    /// `logon` succeeds or when the CM did not say.
+    fn heartbeat_interval(&self) -> Option<Duration>;
+
+    /// Sends `CLIENT_HEART_BEAT` on the logged-in session. The unit that keeps
+    /// a session open calls this at [`heartbeat_interval`](Self::heartbeat_interval).
+    fn send_heartbeat(&mut self) -> impl Future<Output = Result<(), AuthError>> + Send;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
