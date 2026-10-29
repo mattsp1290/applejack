@@ -6,6 +6,8 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+mod cmd;
+
 /// `EX_UNAVAILABLE` from sysexits(3): the subcommand exists but is not implemented yet.
 const EXIT_NOT_IMPLEMENTED: u8 = 69;
 
@@ -45,7 +47,7 @@ enum Command {
     /// Manage the shared Steam client prefix
     Runtime(Pending),
     /// Serve JSON-RPC over stdio for the app shell
-    Serve(Pending),
+    Serve(cmd::serve::ServeArgs),
     /// Report host readiness facts
     Doctor {
         /// Print the facts as JSON
@@ -74,6 +76,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Doctor { json } => doctor(json),
+        Command::Serve(args) => cmd::serve::run(args),
         stub => not_implemented(stub.name()),
     }
 }
