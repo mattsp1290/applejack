@@ -259,7 +259,7 @@ fn write_quoted(out: &mut String, text: &str) {
     out.push('"');
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Token {
     Open,
     Close,

@@ -206,7 +206,7 @@ pub trait SteamConnection {
     fn send_heartbeat(&mut self) -> impl Future<Output = Result<(), AuthError>> + Send;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum Pending {
     Idle,
     AwaitingTokens,

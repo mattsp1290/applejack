@@ -93,13 +93,18 @@ them. The CM does not report a retry-after, so the value is a fixed 60 s floor.
 
 ## Locks
 
-`lock::Lock` takes an exclusive `flock` on `<data>/locks/<name>.lock`
+`lock::Lock` takes an advisory `flock` on `<data>/locks/<name>.lock`
 (created with mode `0600`) and writes one JSON line `{"pid", "command",
-"acquired_at"}` into it. `command` is the fixed subcommand label given to
-`LockDir::new` (`install`, `run`, ...), never argv or user input. After
-`flock` succeeds the lock re-checks that the path still names the locked
-inode and relocks otherwise, so unlinking a held lock file does not admit a
-second holder. On release the holder line is truncated before the unlock.
+"acquired_at"}` into it. The per-appid lock and `LockDir::library_exclusive`
+take `LOCK_EX`; `AppLock::library` takes `LOCK_SH`. `command` is the fixed
+subcommand label given to `LockDir::new` (`install`, `run`, ...), never argv
+or user input. After `flock` succeeds the lock re-checks that the path still
+names the locked inode and relocks otherwise, so unlinking a held lock file
+does not admit a second holder. On release the holder line is truncated
+before the unlock, unless it names another live process: shared holders
+write into one file, so the line an exclusive contender sees is the last
+shared holder's, and it is `None` once that holder released while others
+remain.
 
 Modes: `NonBlocking` fails at once with `Error::LockHeld { name, holder }`;
 `Wait(duration)` polls and fails the same way on timeout; `Blocking` waits
@@ -112,27 +117,46 @@ filter.
 
 `Wait(duration)` adds the duration to the current instant with a checked
 add; a duration too large to represent (`Duration::MAX`) polls without a
-deadline instead of panicking. `locks/` is recreated on every poll, so a
-directory removed while a caller waits does not end the wait. The holder in
-`LockHeld` is the last line written into the file: after a crash, a reused
-pid names an unrelated process, so the message says "last recorded holder"
-and nothing in applejack kills it.
+deadline instead of panicking. A waiter polls the descriptor it already
+holds open, so a `locks/` directory removed while it waits leaves it polling
+the orphaned inode until the old holder lets go; `locks/` is recreated only
+when `acquire` reopens the lock file after finding that the inode it locked
+no longer sits at the path, so the waiter then relocks a fresh file. A
+removal that races the `create_dir_all` or the open itself fails with
+`LockIo` and is not retried. The holder in `LockHeld` is the last line
+written into the file: after a crash, a reused pid names an unrelated
+process, so the message says "last recorded holder" and nothing in applejack
+kills it.
 
-Lock order is per-appid first, then the library. What the types guarantee,
-within one process:
+Lock order is per-appid first, then the library. Decision (U8e): the library
+lock taken under an app lock is **shared**. "Shared library lock" in the plan
+means `LOCK_SH`, so two `applejack install` processes for different appids
+download at the same time and serialize only against library-wide
+operations (rewriting `libraryfolders.vdf`, moving the library), which take
+the library lock exclusively through `LockDir::library_exclusive` and are
+never run while the same process holds an app lock. What the types
+guarantee, within one process:
 
 - `LockDir::app(&mut self, appid, mode)` yields an `AppLock` that borrows the
   `LockDir` mutably, so one `LockDir` holds at most one app lock, and the
   sequence app-1, library, app-2 on one `LockDir` does not compile (the
   `compile_fail` doc test on `LockDir::app` pins it).
-- Only `AppLock::library(&mut self, mode)` yields a `LibraryLock`, which
+- `AppLock::library(&mut self, mode)` yields a shared `LibraryLock`, which
   borrows the `AppLock` mutably and so cannot outlive it; one `AppLock` holds
   at most one `LibraryLock`, so a second `library()` call while the first is
   alive does not compile (the `compile_fail` doc test on `AppLock::library`
-  pins it). `flock` conflicts between two open descriptions of one file even
-  inside one process, so without that rule the second call would wait on
-  itself. `Lock::acquire` and the library lock's name are crate-private; there
-  is no other constructor.
+  pins it). One descriptor per holder keeps the holder record meaningful and
+  keeps the shared lock from being mistaken for a reentrant one.
+- `LockDir::library_exclusive(&mut self, mode)` yields an exclusive
+  `LibraryLock` that borrows the `LockDir` mutably, so an app lock and the
+  exclusive library lock cannot coexist on one `LockDir` (the `compile_fail`
+  doc test on `LockDir::library_exclusive` pins it). It waits for every
+  shared holder and keeps new ones out; `flock` conflicts between two open
+  descriptions of one file even inside one process, so a process that held
+  an app lock's shared library lock on another `LockDir` would wait on
+  itself, which is why the rule is "never together with an app lock in one
+  process". `Lock::acquire` and the library lock's name are crate-private;
+  there is no other constructor.
 - `LockDir` is not `Clone`.
 
 What they do not guarantee: a process can construct two `LockDir`s and take
@@ -345,7 +369,7 @@ real ones are listed in the unit report's DEVIATIONS.
 | CM connect | `CmServer::fetch`/`defaults`, `TcpTransport::connect`, `SteamClient::connect`, `encrypt`, `prepare` | `steamroom-0.3.0/src/connection/mod.rs:42,35`, `src/transport/tcp.rs:21`, `src/client/mod.rs:97,143,276` |
 | fixed logon id | `CMsgClientLogon.obfuscated_private_ip: Option<CMsgIpAddress>`, `c_msg_ip_address::Ip::V4(u32)` | generated from `steammessages_base.proto:64` |
 | EResult mapping | `steamroom::enums::EResultError::{RateLimitExceeded, LoginDeniedThrottle, TwoFactorRequired, TwoFactorCodeMismatch, InvalidPassword, AccessDenied, Expired, Revoked, Banned}` | `steamroom-0.3.0/src/enums/mod.rs:33-72` |
-| `fd-lock` / `rustix` flock | `rustix::fs::flock(fd, FlockOperation::{LockExclusive, NonBlockingLockExclusive, Unlock})` | `rustix-1.1.6/src/fs/fd.rs:322`, `src/backend/libc/fs/types.rs:943` (what `fd-lock-4.0.4/src/sys/unix/rw_lock.rs:20-32` calls) |
+| `fd-lock` / `rustix` flock | `rustix::fs::flock(fd, FlockOperation::{LockShared, LockExclusive, NonBlockingLockShared, NonBlockingLockExclusive, Unlock})` | `rustix-1.1.6/src/fs/fd.rs:322`, `src/backend/libc/fs/types.rs:946-973` (what `fd-lock-4.0.4/src/sys/unix/rw_lock.rs:20-32` calls) |
 | `set_generic_password` | `security_framework::passwords::set_generic_password(service, account, &[u8])` | `security-framework-3.7.0/src/passwords.rs:26` |
 | `find_generic_password` | `security_framework::passwords::generic_password(PasswordOptions::new_generic_password(..))` (SecItem API) | `security-framework-3.7.0/src/passwords.rs:53`, `src/passwords_options.rs:63` |
 | delete | `security_framework::passwords::delete_generic_password(service, account)` | `security-framework-3.7.0/src/passwords.rs:63` |

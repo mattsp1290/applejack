@@ -7,6 +7,19 @@
 //! [`auth::SteamConnection`]; [`live::SteamroomConnection`] is the only
 //! implementation that opens a network connection, and nothing in this crate
 //! calls it at test time.
+//!
+//! # Token rules
+//!
+//! The refresh token lives only in a Keychain generic-password item (service
+//! `applejack`, account `steam-refresh-token`) written through the Security
+//! framework; the `security` command line tool is never invoked. No token is
+//! ever passed on a process command line: this crate spawns no process at
+//! all, so it constructs no `Command` from `std::process` or `tokio::process`
+//! (`clippy.toml` lists both under `disallowed-types`, and
+//! `tests/no_token_argv.rs` greps for them). [`keychain::RefreshToken`],
+//! [`auth::AccessToken`], and [`auth::Password`] redact themselves in `Debug`
+//! and are readable only through `expose()`. `docs/steam-layer.md` under
+//! "Token handling rules" is the full list.
 
 pub mod acf;
 pub mod auth;

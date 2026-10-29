@@ -9,10 +9,6 @@
 use crate::Error;
 use crate::vdf::{Document, Node, Value};
 
-/// `StateFlags` value the Steam client writes for a fully installed title:
-/// exactly [`app_state::FULLY_INSTALLED`] with no other bit set.
-pub const STATE_FLAGS_FULLY_INSTALLED: u32 = app_state::FULLY_INSTALLED;
-
 /// The `EAppState` bitfield behind `StateFlags`, as documented by `SteamKit`.
 /// [`AppManifest::is_fully_installed`] deliberately compares the whole value
 /// with [`FULLY_INSTALLED`](app_state::FULLY_INSTALLED) rather than testing
@@ -60,8 +56,8 @@ pub struct InstalledDepot {
 }
 
 /// The fields applejack reads and writes in an `appmanifest`. `Universe` is
-/// not modelled: the writer always emits `1`, and `parse` accepts only `1`
-/// or its absence.
+/// not modelled: the writer always emits `1`, and `parse` accepts only a
+/// single `Universe "1"` or its absence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppManifest {
     pub appid: u32,
@@ -82,19 +78,41 @@ impl AppManifest {
     ///
     /// Returns [`Error::VdfParse`] for malformed text and [`Error::AcfField`]
     /// when a required field is missing or not a number, or when `Universe`
-    /// names anything but the public universe.
+    /// names anything but the public universe, is a map, or appears twice.
     pub fn parse(text: &str) -> Result<Self, Error> {
         let document = Document::parse(text)?;
         let root = document.get(ROOT_KEY).ok_or_else(|| missing(ROOT_KEY))?;
-        if let Some(universe) = root.get_str("Universe")
-            && universe != UNIVERSE_PUBLIC
-        {
-            return Err(Error::AcfField {
-                path: "Universe".to_owned(),
-                reason: format!(
-                    "unsupported universe `{universe}`; only `{UNIVERSE_PUBLIC}` (public) is handled"
-                ),
-            });
+        // Look at the nodes rather than `get_str`, which answers `None` for
+        // a map and sees only the first of duplicate keys.
+        let mut universes = root
+            .as_map()
+            .unwrap_or_default()
+            .iter()
+            .filter(|node| node.key.eq_ignore_ascii_case("Universe"));
+        if let Some(node) = universes.next() {
+            if universes.next().is_some() {
+                return Err(Error::AcfField {
+                    path: "Universe".to_owned(),
+                    reason: "duplicated".to_owned(),
+                });
+            }
+            match &node.value {
+                Value::Str(universe) if universe == UNIVERSE_PUBLIC => {}
+                Value::Str(universe) => {
+                    return Err(Error::AcfField {
+                        path: "Universe".to_owned(),
+                        reason: format!(
+                            "unsupported universe `{universe}`; only `{UNIVERSE_PUBLIC}` (public) is handled"
+                        ),
+                    });
+                }
+                Value::Map(_) => {
+                    return Err(Error::AcfField {
+                        path: "Universe".to_owned(),
+                        reason: "expected a string".to_owned(),
+                    });
+                }
+            }
         }
         let installed_depots = match root.get("InstalledDepots") {
             Some(Value::Map(children)) => children
@@ -137,7 +155,7 @@ impl AppManifest {
     /// client owns the title's update.
     #[must_use]
     pub fn is_fully_installed(&self) -> bool {
-        self.state_flags == STATE_FLAGS_FULLY_INSTALLED
+        self.state_flags == app_state::FULLY_INSTALLED
     }
 
     /// `appmanifest_<appid>.acf`

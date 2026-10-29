@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use applejack_steam::acf::{
-    AcfWriter, AppManifest, InstalledDepot, STATE_FLAGS_FULLY_INSTALLED, app_state,
-};
+use applejack_steam::acf::{AcfWriter, AppManifest, InstalledDepot, app_state};
 
 fn fixture() -> String {
     let path =
@@ -27,7 +25,7 @@ fn parse_reads_every_field() {
             appid: 0,
             name: "Redacted Title".to_owned(),
             installdir: "Redacted Title".to_owned(),
-            state_flags: STATE_FLAGS_FULLY_INSTALLED,
+            state_flags: app_state::FULLY_INSTALLED,
             buildid: 1,
             last_updated: 1_700_000_000,
             size_on_disk: 123_456_789,
@@ -51,7 +49,7 @@ fn parse_reads_every_field() {
 
 #[test]
 fn state_flags_other_than_four_are_not_fully_installed() {
-    assert_eq!(STATE_FLAGS_FULLY_INSTALLED, app_state::FULLY_INSTALLED);
+    assert_eq!(app_state::FULLY_INSTALLED, 4);
     for flags in [
         app_state::UPDATE_REQUIRED | app_state::UPDATE_STARTED,
         app_state::FULLY_INSTALLED | app_state::UPDATE_REQUIRED,
@@ -91,6 +89,23 @@ fn universe_other_than_public_is_rejected() {
     assert_eq!(
         error.to_string(),
         "acf: field `Universe`: unsupported universe `2`; only `1` (public) is handled"
+    );
+}
+
+#[test]
+fn universe_as_a_map_or_duplicated_is_rejected() {
+    let map = fixture().replace("\"Universe\"\t\t\"1\"", "\"Universe\"\n\t{\n\t}");
+    assert_eq!(
+        AppManifest::parse(&map).unwrap_err().to_string(),
+        "acf: field `Universe`: expected a string"
+    );
+    let twice = fixture().replace(
+        "\"Universe\"\t\t\"1\"",
+        "\"Universe\"\t\t\"1\"\n\t\"universe\"\t\t\"2\"",
+    );
+    assert_eq!(
+        AppManifest::parse(&twice).unwrap_err().to_string(),
+        "acf: field `Universe`: duplicated"
     );
 }
 

@@ -28,10 +28,8 @@ fn non_blocking_acquire_fails_with_the_holders_pid_and_command() {
     thread::spawn(move || {
         let mut other = LockDir::new(&data_dir, "run 0");
         let app = other.app(0, Mode::NonBlocking).map(|_| ());
-        let mut other = LockDir::new(&data_dir, "run 9");
-        let library = other
-            .app(9, Mode::NonBlocking)
-            .and_then(|mut app| app.library(Mode::NonBlocking).map(|_| ()));
+        let mut other = LockDir::new(&data_dir, "move");
+        let library = other.library_exclusive(Mode::NonBlocking).map(|_| ());
         tx.send((app, library)).unwrap();
     });
     let (app_result, library_result) = rx.recv().unwrap();
@@ -219,6 +217,62 @@ fn wait_mode_with_duration_max_polls_without_a_deadline() {
     );
     drop(held);
     assert_eq!(waiter.join().unwrap().unwrap(), "app-4");
+}
+
+#[test]
+fn shared_library_lock_admits_two_app_holders_and_exclusive_waits_for_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut first = LockDir::new(dir.path(), "install 1");
+    let mut app_1 = first.app(1, Mode::NonBlocking).unwrap();
+    let shared_1 = app_1.library(Mode::NonBlocking).unwrap();
+    let mut second = LockDir::new(dir.path(), "install 2");
+    let mut app_2 = second.app(2, Mode::NonBlocking).unwrap();
+    let shared_2 = app_2
+        .library(Mode::NonBlocking)
+        .expect("a second app holder shares the library lock");
+    assert_eq!(shared_1.lock().path(), shared_2.lock().path());
+
+    let mut admin = LockDir::new(dir.path(), "move");
+    match admin.library_exclusive(Mode::NonBlocking) {
+        Err(Error::LockHeld { name, holder }) => {
+            assert_eq!(name, "library");
+            assert_eq!(
+                holder.map(|holder| holder.command).as_deref(),
+                Some("install 2"),
+                "the last shared holder to write is reported"
+            );
+        }
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+
+    let data_dir = dir.path().to_path_buf();
+    let waiter = thread::spawn(move || {
+        let mut admin = LockDir::new(&data_dir, "move");
+        admin
+            .library_exclusive(Mode::Wait(Duration::from_secs(5)))
+            .map(|lock| lock.lock().name().to_owned())
+    });
+    thread::sleep(Duration::from_millis(50));
+    drop(shared_1);
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !waiter.is_finished(),
+        "the exclusive acquire returned while a shared holder remained"
+    );
+    drop(shared_2);
+    assert_eq!(waiter.join().unwrap().unwrap(), "library");
+
+    // Exclusive keeps new shared holders out, and names itself to them.
+    let exclusive = admin.library_exclusive(Mode::NonBlocking).unwrap();
+    match app_1.library(Mode::NonBlocking) {
+        Err(Error::LockHeld { name, holder }) => {
+            assert_eq!(name, "library");
+            assert_eq!(holder.map(|holder| holder.command).as_deref(), Some("move"));
+        }
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+    drop(exclusive);
+    assert!(app_1.library(Mode::NonBlocking).is_ok());
 }
 
 #[test]

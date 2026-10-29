@@ -109,7 +109,13 @@ impl SteamConnection for Fake {
 
     fn send_heartbeat(&mut self) -> impl Future<Output = Result<(), AuthError>> + Send {
         self.calls.push("send_heartbeat".into());
-        ready(Ok(()))
+        ready(if self.logged_on_with.is_some() {
+            Ok(())
+        } else {
+            Err(AuthError::OutOfOrder(
+                "send_heartbeat needs a logged-in session",
+            ))
+        })
     }
 }
 
@@ -377,6 +383,10 @@ async fn refresh_uses_the_stored_token_and_logout_deletes_it() {
     );
     assert_eq!(fake.license_list().await.unwrap().len(), 1);
     assert_eq!(fake.heartbeat_interval(), None);
+    assert!(matches!(
+        Fake::default().send_heartbeat().await,
+        Err(AuthError::OutOfOrder(_))
+    ));
     fake.send_heartbeat().await.unwrap();
     assert_eq!(
         fake.calls.last().map(String::as_str),
