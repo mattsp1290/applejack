@@ -67,6 +67,8 @@ version = "0.1.0"
 dependencies = [
  "applejack-manifest",
  "rusqlite",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
