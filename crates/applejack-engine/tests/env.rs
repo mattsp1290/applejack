@@ -510,6 +510,70 @@ fn drops_path_through_dangling_symlink_inside_prefix() {
 }
 
 #[test]
+fn drops_trailing_slash_spellings_of_a_dangling_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let (roots, prefix) = disk_roots(dir.path());
+    let outside_dir = dir.path().join("outside-not-yet");
+    std::os::unix::fs::symlink(&outside_dir, prefix.join("drive_c/later")).unwrap();
+    let prefix_text = prefix.to_str().unwrap();
+
+    // `lstat("later/")` follows the link and reports "missing", which would
+    // let the value through as "not created yet" until the volume appears.
+    for (name, value) in [
+        ("GST_PLUGIN_PATH", prefix.join("drive_c/later/")),
+        ("GST_PLUGIN_PATH", prefix.join("drive_c/later/.")),
+        ("DXMT_CONFIG_FILE", prefix.join("drive_c/later/evil.conf/")),
+        ("VK_ICD_FILENAMES", prefix.join("drive_c/later/./icd.json")),
+    ] {
+        let value = value.to_str().unwrap();
+        let (env, dropped) = assemble_with(&roots, prefix_text, &[], &[pair(name, value)], &[]);
+        assert_eq!(env, [], "{name}={value}");
+        assert_eq!(dropped, [drop_of(name, outside(value), Owner::Game)]);
+    }
+
+    // The same spellings of a real directory still resolve inside.
+    let plugins = prefix.join("drive_c/plugins/");
+    let plugins = plugins.to_str().unwrap();
+    let (env, dropped) = assemble_with(
+        &roots,
+        prefix_text,
+        &[],
+        &[pair("GST_PLUGIN_PATH", plugins)],
+        &[],
+    );
+    assert_eq!(env, [pair("GST_PLUGIN_PATH", plugins)]);
+    assert_eq!(dropped, []);
+}
+
+#[test]
+fn allowed_roots_rejects_symlink_root_with_trailing_slash() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("homelink");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let ok = Path::new(PREFIX_DIR);
+
+    for spelling in [
+        format!("{}/", link.display()),
+        format!("{}/.", link.display()),
+    ] {
+        let error = AllowedRoots::new(Path::new(&spelling), ok, ok).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidRoot { .. }),
+            "{spelling}: {error}"
+        );
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "{spelling}: {error}"
+        );
+    }
+    // A real directory spelled with a trailing slash is the directory.
+    let roots = AllowedRoots::new(Path::new(&format!("{}/", real.display())), ok, ok).unwrap();
+    assert_eq!(roots.engine_dir(), fs::canonicalize(&real).unwrap());
+}
+
+#[test]
 fn allowed_roots_rejects_empty_relative_root_and_symlinks() {
     let ok = Path::new(PREFIX_DIR);
     for (bad, reason) in [

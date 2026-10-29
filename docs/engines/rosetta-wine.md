@@ -252,8 +252,12 @@ its row accepts. A Wine prefix always contains `dosdevices/z: -> /`, so
 A component that exists but cannot be resolved, a dangling or looping
 symlink such as `dosdevices/<x>:` to an unmounted volume, makes the value
 unresolvable and it is dropped too: its target could appear later, outside
-every root. Only components that do not exist at all are re-appended
-lexically. Any `DYLD_*` variable is always dropped; the hardened runtime
+every root. A trailing `/` or `/.` is dropped before the check (`lstat`
+follows a link spelled `later/`, which would make a dangling link look like
+a missing component), and the same normalization applies to the roots
+themselves, so a root spelled `<link>/` is still refused as a symlink. Only
+components that do not exist at all are re-appended lexically. Any `DYLD_*`
+variable is always dropped; the hardened runtime
 strips them anyway, so the bundle must be self-contained. Names outside the
 table are dropped.
 

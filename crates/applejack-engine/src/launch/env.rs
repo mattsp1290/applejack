@@ -236,7 +236,10 @@ fn check_root(root: &Path) -> Result<PathBuf> {
     {
         return Err(invalid("must not contain `..`"));
     }
-    if fs::symlink_metadata(root).is_ok_and(|meta| meta.is_symlink()) {
+    // `lstat("link/")` follows the link, so probe the components, not the
+    // spelling.
+    let normalized: PathBuf = root.components().collect();
+    if fs::symlink_metadata(&normalized).is_ok_and(|meta| meta.is_symlink()) {
         return Err(invalid("must not be a symlink"));
     }
     let resolved = resolve(root).ok_or_else(|| invalid("cannot be resolved"))?;
@@ -251,9 +254,12 @@ fn check_root(root: &Path) -> Result<PathBuf> {
 /// its real location while a not-yet-created file still resolves. A
 /// component that exists but cannot be canonicalized is a dangling or
 /// looping symlink; its target could appear later, outside every root, so
-/// the path is unresolvable rather than "not created yet".
+/// the path is unresolvable rather than "not created yet". A trailing `/`
+/// or `/.` is dropped first: `lstat` follows a link spelled `link/`, which
+/// would make a dangling link look like a missing component.
 fn resolve(path: &Path) -> Option<PathBuf> {
-    let mut existing = path;
+    let normalized: PathBuf = path.components().collect();
+    let mut existing = normalized.as_path();
     let mut missing: Vec<&OsStr> = Vec::new();
     loop {
         if let Ok(canonical) = fs::canonicalize(existing) {
