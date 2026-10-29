@@ -25,10 +25,30 @@ pub const META_MACOS_VERSION: &str = "macos_version";
 /// the host and are never imported.
 const SECRET_NAME_FRAGMENTS: [&str; 3] = ["TOKEN", "SECRET", "PASSWORD"];
 
-/// Allowlisted names whose values the launcher supplies from the host. A
-/// preset that sets them could redirect binary lookup (`PATH`) or the
-/// session's files, and the policy does not path-check them.
-const HOST_OWNED_NAMES: [&str; 4] = ["PATH", "HOME", "TMPDIR", "APPLEJACK_SESSION"];
+/// Names a preset may never set, whatever the policy allows: the host
+/// environment the launcher supplies, and variables that choose which
+/// binaries, loaders, or shell startup files run. This is the hard stop behind
+/// a policy that the engine crate will replace.
+const HOST_OWNED_NAMES: [&str; 15] = [
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "APPLEJACK_SESSION",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PWD",
+    "WINELOADER",
+    "WINESERVER",
+    "WINEDLLPATH",
+    "BASH_ENV",
+    "ENV",
+    "IFS",
+    "SHELLOPTS",
+];
+
+/// Dynamic-loader variable prefixes; any name starting with one is rejected.
+const LOADER_PREFIXES: [&str; 2] = ["DYLD_", "LD_"];
 
 /// The engine's environment allowlist, reached through a trait so this crate
 /// never depends on `applejack-engine`.
@@ -263,16 +283,24 @@ pub fn import(
     Ok(plan)
 }
 
+/// Applies `value` through the same field parser `config set` uses. Serde
+/// accepts any string for text columns, so the parser is where checks such as
+/// the engine id charset reject a preset item.
 fn accept(plan: &mut ImportPlan, field: Field, value: &str) {
-    // `value` came from `GameConfig::get` on a parsed preset, or is a path
-    // rewrite of one, so it parses; a failure would be a table bug.
-    plan.config
-        .set(field, value)
-        .expect("value read from a parsed preset parses again");
-    plan.accepted.push(Accepted {
-        field: field.name().to_owned(),
-        value: value.to_owned(),
-    });
+    match plan.config.set(field, value) {
+        Ok(()) => plan.accepted.push(Accepted {
+            field: field.name().to_owned(),
+            value: value.to_owned(),
+        }),
+        Err(error) => plan.rejected.push(Rejected {
+            field: field.name().to_owned(),
+            value: value.to_owned(),
+            reason: match error {
+                Error::InvalidValue { reason, .. } => reason,
+                other => other.to_string(),
+            },
+        }),
+    }
 }
 
 fn import_env_entry(
@@ -293,13 +321,13 @@ fn import_env_entry(
     if let Err(reason) = crate::game_config::check_env_name(name) {
         return reject(value, reason);
     }
-    if name
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("DYLD_"))
-    {
+    if let Some(prefix) = LOADER_PREFIXES.iter().find(|prefix| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    }) {
         return reject(
             value,
-            "DYLD_* variables are never passed to the engine".to_owned(),
+            format!("{prefix}* loader variables are never passed to the engine"),
         );
     }
     if HOST_OWNED_NAMES

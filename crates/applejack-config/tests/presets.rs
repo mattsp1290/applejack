@@ -246,6 +246,90 @@ fn data_dir_placeholder_expands_before_the_root_check() {
     assert_eq!(stored.direct_verified_at, None);
 }
 
+/// Allows every name and path, so only the policy-independent hard stops
+/// in `import` can reject.
+struct PermissivePolicy;
+
+impl EnvPolicy for PermissivePolicy {
+    fn allows(&self, _: &str) -> bool {
+        true
+    }
+
+    fn path_valued(&self, _: &str) -> bool {
+        false
+    }
+
+    fn allowed_roots(&self) -> &[PathBuf] {
+        &[]
+    }
+
+    fn d3dmetal_overlay_present(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn hard_stops_hold_under_a_permissive_policy() {
+    let names = [
+        "dyld_insert_libraries",
+        "DYLD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "ld_library_path",
+        "PATH",
+        "path",
+        "HOME",
+        "WINELOADER",
+        "BASH_ENV",
+        "MY_TOKEN",
+    ];
+    let config = GameConfig {
+        engine_id: Some("../../tmp/x".to_owned()),
+        engine_version: Some(".hidden".to_owned()),
+        extra_env: names
+            .iter()
+            .map(|name| ((*name).to_owned(), "/x".to_owned()))
+            .chain([("WINEDEBUG".to_owned(), "-all".to_owned())])
+            .collect(),
+        ..GameConfig::default()
+    };
+    let preset = Preset {
+        schema: 1,
+        appid: 4,
+        engine_id: None,
+        engine_version: None,
+        host_chip: None,
+        macos_version: None,
+        config,
+    };
+    let plan = presets::import(
+        &preset,
+        &PermissivePolicy,
+        &data_dir(),
+        ImportOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        rejected(&plan.rejected, "engine_id")
+            .reason
+            .contains("letters")
+    );
+    assert!(
+        rejected(&plan.rejected, "engine_version")
+            .reason
+            .contains("letters")
+    );
+    for name in names {
+        rejected(&plan.rejected, &format!("extra_env.{name}"));
+    }
+    assert_eq!(plan.rejected.len(), names.len() + 2, "{:?}", plan.rejected);
+    assert_eq!(plan.config.engine_id, None);
+    assert_eq!(plan.config.engine_version, None);
+    assert_eq!(
+        plan.config.extra_env.keys().collect::<Vec<_>>(),
+        ["WINEDEBUG"]
+    );
+}
+
 #[test]
 fn export_then_import_round_trips_a_clean_config() {
     let data = data_dir();
