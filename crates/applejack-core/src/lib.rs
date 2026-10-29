@@ -4,3 +4,4 @@
 //! only crate that depends on `applejack-config`.
 
 pub mod host;
+pub mod rpc;

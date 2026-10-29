@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "core_version": "0.1.0",
+    "protocol_version": 1
+  }
+}

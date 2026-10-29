@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "engine.install",
+  "params": {
+    "engine_id": "rosetta-wine"
+  }
+}

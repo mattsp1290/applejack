@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": 28,
+  "method": "session.list",
+  "params": {
+    "appid": 220
+  }
+}
