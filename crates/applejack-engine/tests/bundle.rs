@@ -8,8 +8,8 @@ use std::time::SystemTime;
 use applejack_engine::bundle::{self, ArchiveSource, BundleToml, Capabilities, InstallRequest};
 use applejack_engine::{Arch, Error, GraphicsBackend, InstalledEngine, Progress, SyncMode};
 use common::{
-    BUNDLE_TOML, fake_installed, fixture_archive, layout, rosetta, version, write_bundle_tree,
-    wrong_digest,
+    BUNDLE_TOML, fake_installed, fixture_archive, install_local, layout, rosetta, version,
+    write_bundle_tree, wrong_digest,
 };
 
 fn validate_variant(replace: &str, with: &str) -> Result<BundleToml, Error> {
@@ -230,12 +230,12 @@ fn hash_is_checked_before_extraction() {
     let archive = dir.path().join("garbage.tar.zst");
     fs::write(&archive, b"not zstd").unwrap();
 
-    let error =
-        bundle::install_from_archive(&layout, id, &v, &archive, &wrong_digest()).unwrap_err();
+    let error = install_local(&layout, &v, &archive, &wrong_digest()).unwrap_err();
     assert!(matches!(error, Error::Sha256Mismatch { .. }), "{error}");
+    assert!(error.to_string().contains("SHA-256 mismatch"), "{error}");
     assert!(
-        error.to_string().starts_with("archive SHA-256 mismatch"),
-        "{error}"
+        error.to_string().contains("garbage.tar.zst"),
+        "names the archive: {error}"
     );
 
     assert!(
@@ -263,15 +263,85 @@ fn install_rejects_symlink_escaping_bundle_root() {
         let archive = dir.path().join(format!("{name}.tar.zst"));
         let digest = common::pack(&tree, &archive);
 
-        let error =
-            bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap_err();
-        assert!(matches!(error, Error::InvalidBundle(_)), "{name}: {error}");
+        let error = install_local(&layout, &v, &archive, &digest).unwrap_err();
+        assert!(matches!(error, Error::InvalidArchive(_)), "{name}: {error}");
         assert!(
             error.to_string().contains("outside the bundle"),
             "{name}: {error}"
         );
         assert!(!layout.partial_dir(rosetta(), &v).exists(), "{name}");
         assert!(!layout.engine_dir(rosetta(), &v).exists(), "{name}");
+    }
+}
+
+/// Archives whose symlinks pass the lexical extraction check but resolve
+/// outside the bundle on disk, because an earlier symlink is used as a
+/// directory component. Each is a hand-built entry list; a tree on disk
+/// cannot express them.
+#[test]
+fn install_rejects_chained_symlinks_resolving_outside() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let v = version("10.0.0");
+    let deep = format!("{}esc", "p/".repeat(24));
+    let up = "../".repeat(24);
+    let through_partial = "a/../10.0.0.partial/BUNDLE.toml";
+    let cases: [(&str, Vec<(&str, &str)>); 4] = [
+        // `p -> .` makes the archive path 24 deep while the real one is 0.
+        ("dir-link-then-deep-escape", vec![("p", "."), (&deep, &up)]),
+        // `a/b` is the root on disk, so `c -> ..` lands at `<root>/c -> ..`.
+        ("double-parent", vec![("a/b", ".."), ("a/b/c", "..")]),
+        // Resolves inside `.partial` while checked, to a sibling once renamed.
+        (
+            "climb-out-and-back-in",
+            vec![("a", "."), ("x", through_partial)],
+        ),
+        ("dangling", vec![("wine/nowhere", "missing-target")]),
+    ];
+    for (name, links) in cases {
+        let tree = dir.path().join(format!("tree-{name}"));
+        write_bundle_tree(&tree, BUNDLE_TOML);
+        let archive = dir.path().join(format!("{name}.tar.zst"));
+        let digest = common::pack_with_links(&tree, &archive, &links);
+
+        let error = install_local(&layout, &v, &archive, &digest).unwrap_err();
+        assert!(matches!(error, Error::InvalidArchive(_)), "{name}: {error}");
+        assert!(
+            error.to_string().contains("does not resolve inside"),
+            "{name}: {error}"
+        );
+        assert!(!layout.partial_dir(rosetta(), &v).exists(), "{name}");
+        assert!(!layout.engine_dir(rosetta(), &v).exists(), "{name}");
+    }
+}
+
+#[test]
+fn install_keeps_chained_symlinks_that_stay_inside() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let v = version("10.0.0");
+    let tree = dir.path().join("tree");
+    write_bundle_tree(&tree, BUNDLE_TOML);
+    fs::write(tree.join("wine/lib/wine64-real"), b"loader").unwrap();
+    let archive = dir.path().join("inside.tar.zst");
+    // `..` that reaches exactly the root, a link through a link, and a link
+    // whose archive path runs through an earlier directory link.
+    let digest = common::pack_with_links(
+        &tree,
+        &archive,
+        &[
+            ("wine/lib64", "../wine/lib"),
+            ("wine/bin/wine64-alias", "../lib64/wine64-real"),
+            ("self", "."),
+            ("self/self/wine/loader-alias", "bin/wine64-alias"),
+        ],
+    );
+
+    let installed = install_local(&layout, &v, &archive, &digest).unwrap();
+    for alias in ["wine/bin/wine64-alias", "wine/loader-alias"] {
+        let path = installed.root.join(alias);
+        assert!(path.symlink_metadata().unwrap().is_symlink(), "{alias}");
+        assert_eq!(fs::read(&path).unwrap(), b"loader", "{alias}");
     }
 }
 
@@ -290,8 +360,7 @@ fn install_keeps_symlinks_that_stay_inside() {
     let archive = dir.path().join("linked.tar.zst");
     let digest = common::pack(&tree, &archive);
 
-    let installed =
-        bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap();
+    let installed = install_local(&layout, &v, &archive, &digest).unwrap();
     let loader = installed.root.join("wine/bin/wine64");
     assert!(loader.symlink_metadata().unwrap().is_symlink());
     assert_eq!(fs::read(&loader).unwrap(), b"loader");
@@ -320,7 +389,7 @@ fn install_replaces_stale_partial_file() {
     fs::create_dir_all(partial.parent().unwrap()).unwrap();
     fs::write(&partial, b"left over").unwrap();
 
-    bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap();
+    install_local(&layout, &v, &archive, &digest).unwrap();
     assert!(!partial.exists());
     assert!(layout.engine_dir(rosetta(), &v).is_dir());
 }
@@ -335,9 +404,8 @@ fn missing_root_descriptor_names_the_archive_root_rule() {
     let archive = dir.path().join("nested.tar.zst");
     let digest = common::pack(&tree, &archive);
 
-    let error =
-        bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap_err();
-    assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
+    let error = install_local(&layout, &v, &archive, &digest).unwrap_err();
+    assert!(matches!(error, Error::InvalidArchive(_)), "{error}");
     assert!(error.to_string().contains("top-level directory"), "{error}");
     assert!(!layout.partial_dir(rosetta(), &v).exists());
     assert!(!layout.engine_dir(rosetta(), &v).exists());
@@ -355,24 +423,49 @@ fn install_removes_partial_when_rename_fails() {
     fs::create_dir_all(final_dir.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("missing-target", &final_dir).unwrap();
 
-    let error =
-        bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap_err();
+    let error = install_local(&layout, &v, &archive, &digest).unwrap_err();
     assert!(matches!(error, Error::Io { .. }), "{error}");
     assert!(!layout.partial_dir(rosetta(), &v).exists());
 }
 
 #[test]
 fn install_extracts_validates_and_renames() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().unwrap();
     let layout = layout(dir.path());
-    let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
     let v = version("10.0.0");
+    let tree = dir.path().join("tree");
+    write_bundle_tree(&tree, BUNDLE_TOML);
+    fs::set_permissions(
+        tree.join("wine/bin/wine64"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::set_permissions(
+        tree.join("wine/bin/wineserver"),
+        fs::Permissions::from_mode(0o4755),
+    )
+    .unwrap();
+    let archive = dir.path().join("rosetta-wine-10.0.0.tar.zst");
+    let digest = common::pack(&tree, &archive);
 
-    let installed =
-        bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap();
+    let installed = install_local(&layout, &v, &archive, &digest).unwrap();
     assert_eq!(installed.root, layout.engine_dir(rosetta(), &v));
     assert_eq!(installed.version, v);
-    assert!(installed.root.join("wine/bin/wine64").is_file());
+    let loader = installed.root.join("wine/bin/wine64");
+    assert!(loader.is_file());
+    let mode = loader.metadata().unwrap().permissions().mode();
+    assert_ne!(mode & 0o111, 0, "executable bit survives install: {mode:o}");
+    let server_mode = installed
+        .root
+        .join("wine/bin/wineserver")
+        .metadata()
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(server_mode & 0o7000, 0, "setuid stripped: {server_mode:o}");
+    assert_ne!(server_mode & 0o111, 0, "{server_mode:o}");
     assert!(!layout.partial_dir(rosetta(), &v).exists());
 
     let reopened = InstalledEngine::open(&layout, rosetta(), &v).unwrap();
@@ -396,8 +489,7 @@ fn installed_engine_records_overlay_root() {
     let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
     let v = version("10.0.0");
 
-    let installed =
-        bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap();
+    let installed = install_local(&layout, &v, &archive, &digest).unwrap();
     assert_eq!(installed.overlay_root, layout.overlay_dir(rosetta(), &v));
     assert!(
         !installed.overlay_root.exists(),
@@ -487,8 +579,7 @@ fn invalid_bundle_removes_partial_and_leaves_no_version() {
     let digest = common::pack(&tree, &archive);
     let v = version("10.0.0");
 
-    let error =
-        bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap_err();
+    let error = install_local(&layout, &v, &archive, &digest).unwrap_err();
     assert!(matches!(error, Error::MissingLoader { .. }), "{error}");
     assert!(!layout.partial_dir(rosetta(), &v).exists());
     assert!(!layout.engine_dir(rosetta(), &v).exists());
@@ -501,8 +592,7 @@ fn install_rejects_descriptor_naming_another_version() {
     let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
     let v = version("10.0.1");
 
-    let error =
-        bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap_err();
+    let error = install_local(&layout, &v, &archive, &digest).unwrap_err();
     assert!(
         matches!(error, Error::BundleIdentityMismatch { .. }),
         "{error}"
@@ -523,8 +613,7 @@ fn install_of_version_b_never_touches_version_a() {
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     let (archive, digest) = fixture_archive(dir.path(), "10.0.1");
-    bundle::install_from_archive(&layout, rosetta(), &version("10.0.1"), &archive, &digest)
-        .unwrap();
+    install_local(&layout, &version("10.0.1"), &archive, &digest).unwrap();
 
     assert_eq!(
         snapshot(&a_dir),

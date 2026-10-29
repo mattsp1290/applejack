@@ -170,7 +170,8 @@ impl BundleToml {
     /// - `arch` is the architecture `id` runs (`rosetta-wine` is `x86_64`);
     /// - every path is relative with no `.`, `..`, or empty component;
     /// - `wine.loader` and `wine.server` (and `wine.preloader` when set)
-    ///   resolve, through any symlink, to files inside the canonical root;
+    ///   resolve, through any symlink, to files inside the canonical root,
+    ///   as does every `[probes]` executable;
     /// - `sync_modes` is non-empty with no duplicates;
     /// - every override DLL ends in `.dll`, has a stem unique within its
     ///   table and architecture (ignoring case), and resolves to a file
@@ -181,7 +182,8 @@ impl BundleToml {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MissingLoader`] for an absent loader and
+    /// Returns [`Error::MissingLoader`] for an absent loader,
+    /// [`Error::Io`] when `bundle_root` cannot be canonicalized, and
     /// [`Error::InvalidBundle`] for every other failure.
     pub fn validate(&self, bundle_root: &Path) -> Result<()> {
         if self.arch != self.id.arch() {
@@ -223,14 +225,20 @@ impl BundleToml {
             }
         }
 
-        if !resolves_to_file_inside(bundle_root, &self.wine.loader) {
+        let root = fs::canonicalize(bundle_root).map_err(|error| Error::io(bundle_root, error))?;
+        if !resolves_to_file_inside(&root, &self.wine.loader) {
             return Err(Error::MissingLoader {
                 path: self.wine.loader.clone(),
             });
         }
-        file_present("wine.server", bundle_root, &self.wine.server)?;
+        file_present("wine.server", &root, &self.wine.server)?;
         if let Some(preloader) = &self.wine.preloader {
-            file_present("wine.preloader", bundle_root, preloader)?;
+            file_present("wine.preloader", &root, preloader)?;
+        }
+        if let Some(probes) = &self.probes {
+            file_present("probes.cpuid", &root, &probes.cpuid)?;
+            file_present("probes.dx11_sample", &root, &probes.dx11_sample)?;
+            file_present("probes.xinput_check", &root, &probes.xinput_check)?;
         }
 
         if !self.overrides.d3dmetal.is_empty() && self.d3dmetal.is_none() {
@@ -250,7 +258,7 @@ impl BundleToml {
             }
             for (arch, dlls) in [("x86_64", &overrides.x86_64), ("i386", &overrides.i386)] {
                 let field = format!("overrides.{table}.{arch}");
-                validate_dll_list(&field, bundle_root, dlls)?;
+                validate_dll_list(&field, &root, dlls)?;
             }
         }
         Ok(())
@@ -325,13 +333,10 @@ fn file_present(field: &str, root: &Path, path: &Path) -> Result<()> {
     }
 }
 
-// Canonical on both sides so a symlink that leaves the bundle is caught even
-// though the lexical path is relative.
+// `root` is canonical and the file is canonicalized too, so a symlink that
+// leaves the bundle is caught even though the lexical path is relative.
 fn resolves_to_file_inside(root: &Path, path: &Path) -> bool {
-    let (Ok(root), Ok(full)) = (fs::canonicalize(root), fs::canonicalize(root.join(path))) else {
-        return false;
-    };
-    full.starts_with(&root) && full.is_file()
+    fs::canonicalize(root.join(path)).is_ok_and(|full| full.starts_with(root) && full.is_file())
 }
 
 /// What a bundle can do, derived from its `BUNDLE.toml`.
@@ -453,6 +458,24 @@ impl InstallRequest {
             manifest: Some(entry.clone()),
         })
     }
+
+    /// A request for a local archive with no manifest cross-check: the
+    /// unsigned-bundle path.
+    #[must_use]
+    pub fn local(
+        id: EngineId,
+        version: Version,
+        archive: impl Into<PathBuf>,
+        sha256: Sha256,
+    ) -> Self {
+        Self {
+            id,
+            version,
+            source: ArchiveSource::LocalFile(archive.into()),
+            sha256,
+            manifest: None,
+        }
+    }
 }
 
 /// Installs a local `.tar.zst` archive as `engines/<id>/<version>/` with no
@@ -522,6 +545,7 @@ pub fn install(
     let actual = sha256_reader(&mut file, archive)?;
     if actual != request.sha256 {
         return Err(Error::Sha256Mismatch {
+            path: archive.clone(),
             expected: request.sha256.clone(),
             actual,
         });
@@ -532,17 +556,25 @@ pub fn install(
     remove_stale(&partial)?;
     fs::create_dir_all(&partial).map_err(|error| Error::io(&partial, error))?;
 
-    let result = extract_and_validate(file, archive, &partial, request, progress);
-    if let Err(error) = result {
-        // Best effort: the error the caller sees is the install failure.
-        let _ = fs::remove_dir_all(&partial);
-        return Err(error);
-    }
+    let bundle = match extract_and_validate(file, archive, &partial, request, progress) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            // Best effort: the error the caller sees is the install failure.
+            let _ = fs::remove_dir_all(&partial);
+            return Err(error);
+        }
+    };
     if let Err(error) = fs::rename(&partial, &final_dir) {
         let _ = fs::remove_dir_all(&partial);
         return Err(Error::io(&final_dir, error));
     }
-    InstalledEngine::open(layout, id, version)
+    Ok(InstalledEngine {
+        id,
+        version: version.clone(),
+        root: final_dir,
+        overlay_root: layout.overlay_dir(id, version),
+        bundle,
+    })
 }
 
 /// Removes whatever sits at `path`, whether a directory, a file, or a
@@ -557,18 +589,23 @@ fn remove_stale(path: &Path) -> Result<()> {
     result.map_err(|error| Error::io(path, error))
 }
 
+/// Extracts `file` into `partial` and loads the validated descriptor, so the
+/// caller never reads `BUNDLE.toml` a second time after the rename.
 fn extract_and_validate(
     file: File,
     archive: &Path,
     partial: &Path,
     request: &InstallRequest,
     progress: &mut dyn FnMut(Progress),
-) -> Result<()> {
+) -> Result<BundleToml> {
     progress(Progress::Extracting);
     let decoder = zstd::stream::read::Decoder::new(io::BufReader::new(file))
         .map_err(|error| Error::io(archive, error))?;
     let mut tar = tar::Archive::new(decoder);
     tar.set_preserve_permissions(true);
+    // The loader must stay executable, but no bundle needs setuid, setgid,
+    // or sticky bits.
+    tar.set_mask(0o7000);
     tar.set_overwrite(false);
     for entry in tar.entries().map_err(|error| Error::io(archive, error))? {
         let mut entry = entry.map_err(|error| Error::io(archive, error))?;
@@ -584,7 +621,7 @@ fn extract_and_validate(
                 .map(std::borrow::Cow::into_owned)
                 .unwrap_or_default();
             if !link_stays_inside(&entry_path, &target, kind.is_hard_link()) {
-                return Err(Error::InvalidBundle(format!(
+                return Err(Error::InvalidArchive(format!(
                     "archive entry `{}` links to `{}` outside the bundle",
                     entry_path.display(),
                     target.display()
@@ -597,7 +634,7 @@ fn extract_and_validate(
             .unpack_in(partial)
             .map_err(|error| Error::io(archive, error))?;
         if !unpacked {
-            return Err(Error::InvalidBundle(format!(
+            return Err(Error::InvalidArchive(format!(
                 "archive entry `{}` escapes the bundle root",
                 entry_path.display()
             )));
@@ -605,8 +642,9 @@ fn extract_and_validate(
     }
 
     progress(Progress::Validating);
-    if !fs::symlink_metadata(partial.join(BUNDLE_FILE)).is_ok_and(|meta| meta.is_file()) {
-        return Err(Error::InvalidBundle(
+    links_resolve_inside(partial)?;
+    if !has_descriptor(partial) {
+        return Err(Error::InvalidArchive(
             "archive has no BUNDLE.toml at its root; entries must not be nested under a top-level directory"
                 .to_owned(),
         ));
@@ -623,7 +661,108 @@ fn extract_and_validate(
     if let Some(entry) = &request.manifest {
         check_against_manifest(&bundle, entry)?;
     }
+    Ok(bundle)
+}
+
+/// True when `dir` holds a regular `BUNDLE.toml`: the one definition of an
+/// occupied `<version>/` directory shared by install, open, list, and remove.
+pub(crate) fn has_descriptor(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join(BUNDLE_FILE)).is_ok_and(|meta| meta.is_file())
+}
+
+/// Walks the extracted tree and refuses any symlink that does not resolve to
+/// a path inside the canonical `root`.
+///
+/// The lexical check at extraction time resolves a target against the entry's
+/// archive path, which an earlier symlink used as a directory (`p -> .`) can
+/// make deeper than the real one. This walk is the authoritative check: it
+/// follows each target component by component on disk and requires every
+/// intermediate path to stay inside `root`, so a target that climbs out and
+/// back in (`a/../<version>.partial/f`, which would point at a sibling once
+/// the directory is renamed) is refused along with dangling and looping
+/// links.
+fn links_resolve_inside(root: &Path) -> Result<()> {
+    let root = fs::canonicalize(root).map_err(|error| Error::io(root, error))?;
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|error| Error::io(&dir, error))? {
+            let entry = entry.map_err(|error| Error::io(&dir, error))?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| Error::io(&path, error))?;
+            if kind.is_symlink() {
+                if !link_resolves_inside(&root, &path) {
+                    return Err(Error::InvalidArchive(format!(
+                        "symlink `{}` does not resolve inside the bundle",
+                        path.strip_prefix(&root).unwrap_or(&path).display()
+                    )));
+                }
+            } else if kind.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Follows the symlink at `link` (whose parent is a real directory under the
+/// canonical `root`) one component at a time. Nested symlinks are followed
+/// in place, up to a fixed hop budget so a loop terminates.
+fn link_resolves_inside(root: &Path, link: &Path) -> bool {
+    const MAX_HOPS: usize = 40;
+    let Some(mut current) = link.parent().map(Path::to_path_buf) else {
+        return false;
+    };
+    let Ok(target) = fs::read_link(link) else {
+        return false;
+    };
+    let mut pending: Vec<PathBuf> = vec![target];
+    let mut hops = 0;
+    while let Some(target) = pending.pop() {
+        let mut components = target.components();
+        let Some(component) = components.next() else {
+            continue;
+        };
+        let rest = components.as_path().to_path_buf();
+        match component {
+            PathComponent::CurDir => {}
+            PathComponent::ParentDir => {
+                let Some(parent) = current.parent() else {
+                    return false;
+                };
+                current = parent.to_path_buf();
+            }
+            PathComponent::Normal(name) => {
+                let next = current.join(name);
+                let Ok(meta) = fs::symlink_metadata(&next) else {
+                    return false;
+                };
+                if meta.is_symlink() {
+                    hops += 1;
+                    let Ok(nested) = fs::read_link(&next) else {
+                        return false;
+                    };
+                    if hops > MAX_HOPS || nested.is_absolute() {
+                        return false;
+                    }
+                    // Resolve the nested target before the rest of this one.
+                    if !rest.as_os_str().is_empty() {
+                        pending.push(rest);
+                    }
+                    pending.push(nested);
+                    continue;
+                }
+                current = next;
+            }
+            PathComponent::RootDir | PathComponent::Prefix(_) => return false,
+        }
+        if !current.starts_with(root) {
+            return false;
+        }
+        if !rest.as_os_str().is_empty() {
+            pending.push(rest);
+        }
+    }
+    true
 }
 
 fn check_against_manifest(bundle: &BundleToml, entry: &applejack_manifest::Engine) -> Result<()> {

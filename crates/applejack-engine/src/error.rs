@@ -12,24 +12,42 @@ use crate::{EngineId, Version};
 #[non_exhaustive]
 pub enum Error {
     /// The downloaded or supplied archive does not hash to the pinned digest.
-    /// The archive is left in place for inspection.
-    #[error("archive SHA-256 mismatch: expected {expected}, actual {actual}")]
-    Sha256Mismatch { expected: Sha256, actual: Sha256 },
+    /// The archive at `path` is left in place for inspection.
+    #[error("archive `{}` SHA-256 mismatch: expected {expected}, actual {actual}", path.display())]
+    Sha256Mismatch {
+        /// The archive that was hashed.
+        path: PathBuf,
+        /// The digest the request pinned.
+        expected: Sha256,
+        /// The digest of the bytes on disk.
+        actual: Sha256,
+    },
 
-    /// `BUNDLE.toml` parsed but breaks an invariant, or the archive breaks a
-    /// layout rule.
+    /// The archive breaks a layout rule: an entry or link leaves the bundle
+    /// root, a symlink resolves outside the extracted tree, or `BUNDLE.toml`
+    /// is not a top-level entry.
+    #[error("invalid archive: {0}")]
+    InvalidArchive(String),
+
+    /// `BUNDLE.toml` parsed but breaks an invariant.
     #[error("invalid BUNDLE.toml: {0}")]
     InvalidBundle(String),
 
     /// `BUNDLE.toml` names a loader that is not a file in the bundle.
     #[error("BUNDLE.toml names loader `{}` but the bundle has no such file", path.display())]
-    MissingLoader { path: PathBuf },
+    MissingLoader {
+        /// The `wine.loader` path as written in `BUNDLE.toml`.
+        path: PathBuf,
+    },
 
     /// `BUNDLE.toml` disagrees with the manifest entry the install came from.
     #[error("BUNDLE.toml `{field}` is `{bundle}` but the manifest pins `{manifest}`")]
     ManifestMismatch {
+        /// The `BUNDLE.toml` field that disagrees.
         field: &'static str,
+        /// The value the manifest entry pins.
         manifest: String,
+        /// The value `BUNDLE.toml` carries.
         bundle: String,
     },
 
@@ -53,7 +71,9 @@ pub enum Error {
     /// A version string that cannot name a directory under `engines/<id>/`.
     #[error("invalid engine version `{version}`: {reason}")]
     InvalidVersion {
+        /// The rejected text.
         version: String,
+        /// The rule it broke.
         reason: &'static str,
     },
 
@@ -63,15 +83,32 @@ pub enum Error {
     #[error(
         "version {version} of engine {id} is protected (active, pinned by a game configuration, or in use)"
     )]
-    ProtectedVersion { id: EngineId, version: Version },
+    ProtectedVersion {
+        /// The engine.
+        id: EngineId,
+        /// The protected version.
+        version: Version,
+    },
 
-    /// The requested version has no `engines/<id>/<version>/` directory.
+    /// The requested version has no `engines/<id>/<version>/` directory, or
+    /// the directory holds no `BUNDLE.toml` and so is not a bundle.
     #[error("engine {id} version {version} is not installed")]
-    NotInstalled { id: EngineId, version: Version },
+    NotInstalled {
+        /// The engine.
+        id: EngineId,
+        /// The version that is absent.
+        version: Version,
+    },
 
-    /// Install refused because `engines/<id>/<version>/` already exists.
+    /// Install refused because `engines/<id>/<version>/` already holds a
+    /// bundle.
     #[error("engine {id} version {version} is already installed")]
-    AlreadyInstalled { id: EngineId, version: Version },
+    AlreadyInstalled {
+        /// The engine.
+        id: EngineId,
+        /// The version already present.
+        version: Version,
+    },
 
     /// The archive's `BUNDLE.toml` describes a different engine or version
     /// than the one being installed.
@@ -79,15 +116,33 @@ pub enum Error {
         "BUNDLE.toml describes engine {found} version {found_version}, expected {expected} version {expected_version}"
     )]
     BundleIdentityMismatch {
+        /// The engine the request named.
         expected: EngineId,
+        /// The version the request named.
         expected_version: Version,
+        /// The engine `BUNDLE.toml` names.
         found: EngineId,
+        /// The version `BUNDLE.toml` names.
         found_version: Version,
     },
 
     /// An allowed root for path-valued environment variables is unusable.
     #[error("allowed root `{}` {reason}", path.display())]
-    InvalidRoot { path: PathBuf, reason: &'static str },
+    InvalidRoot {
+        /// The root as given.
+        path: PathBuf,
+        /// The rule it broke.
+        reason: &'static str,
+    },
+
+    /// The engine did not set a variable every launch must carry
+    /// (`WINEPREFIX`, `APPLEJACK_SESSION`), or set one that failed its
+    /// check, so the child would start without it.
+    #[error("engine did not set the required launch variable {name}")]
+    MissingEngineVariable {
+        /// The allowlist row that stayed empty.
+        name: &'static str,
+    },
 
     /// Rosetta 2 is required and not installed.
     #[error(
@@ -98,7 +153,9 @@ pub enum Error {
     /// A filesystem operation failed; `path` is the file or directory involved.
     #[error("{}: {source}", path.display())]
     Io {
+        /// The file or directory involved.
         path: PathBuf,
+        /// The underlying failure.
         #[source]
         source: io::Error,
     },

@@ -53,6 +53,13 @@ pub fn bundle_toml_for_version(version: &str) -> String {
 
 /// Packs `tree` as `<out>` (`.tar.zst`) and returns its digest.
 pub fn pack(tree: &Path, out: &Path) -> Sha256 {
+    pack_with_links(tree, out, &[])
+}
+
+/// Packs `tree`, then appends one symlink entry per `(path, target)` in
+/// order, so an archive can carry links a directory tree cannot express
+/// (a link whose archive path runs through an earlier link).
+pub fn pack_with_links(tree: &Path, out: &Path, links: &[(&str, &str)]) -> Sha256 {
     let file = File::create(out).unwrap();
     let encoder = zstd::stream::write::Encoder::new(file, 3).unwrap();
     let mut builder = tar::Builder::new(encoder);
@@ -60,9 +67,33 @@ pub fn pack(tree: &Path, out: &Path) -> Sha256 {
     // carry them.
     builder.follow_symlinks(false);
     builder.append_dir_all(".", tree).unwrap();
+    for (path, target) in links {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        builder.append_link(&mut header, path, target).unwrap();
+    }
     let encoder = builder.into_inner().unwrap();
     encoder.finish().unwrap();
     applejack_engine::bundle::sha256_file(out).unwrap()
+}
+
+/// Installs `archive` as `version` through `bundle::install` with no manifest
+/// and no progress consumer.
+pub fn install_local(
+    layout: &EngineLayout,
+    version: &Version,
+    archive: &Path,
+    digest: &Sha256,
+) -> applejack_engine::Result<applejack_engine::InstalledEngine> {
+    let request = applejack_engine::InstallRequest::local(
+        EngineId::RosettaWine,
+        version.clone(),
+        archive,
+        digest.clone(),
+    );
+    applejack_engine::bundle::install(layout, &request, &mut |_| {})
 }
 
 /// A packed fixture archive for `version` under `dir`, with its digest.
