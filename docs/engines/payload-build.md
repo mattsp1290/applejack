@@ -238,19 +238,32 @@ Environment knobs:
    own name, which breaks once the installer renames the root), or whose real
    resolution leaves the payload; and on any `@rpath/`, `@loader_path/`, or
    `@executable_path/` dependency that names no file in the payload. The
-   lookup follows dyld. The payload's executables are the Mach-Os with
-   `LC_MAIN` (or `LC_UNIXTHREAD`); `@executable_path` relocates against each
-   executable's directory, in dependencies and `LC_RPATH` entries alike.
-   `@rpath/x` is searched through the binary's own relocated `LC_RPATH`
-   entries plus the executables', since dyld consults the rpaths of the image
-   and of the images that loaded it up to the main executable and never those
-   of unrelated images: a dlopen'd Unix module without an rpath resolves
-   through the loader's, and a library reachable only through another dylib's
-   rpath is reported. `@loader_path/x` resolves against the binary's own
-   directory. When the binary's `LC_RPATH` entries, or an executable's,
-   include a system root such as `/usr/lib/swift`, its unresolved `@rpath/`
-   references are left to dyld; other absolute `LC_RPATH` entries contribute
-   nothing to the lookup.
+   lookup follows dyld along the payload's load chains, which are only the
+   executables `BUNDLE.toml` declares: `wine.loader`, `wine.server`,
+   `wine.preloader` when present, and the `[probes]` entries that are
+   Mach-O (the `.exe` probes are PE). `--check` reads `BUNDLE.toml` from the
+   payload root for that list and fails with "no BUNDLE.toml: cannot
+   determine load chains" when it is absent. Every library and module must
+   resolve each `@rpath/` and `@executable_path/` reference under each
+   declared executable present in the tree: `@executable_path` relocates
+   against that executable's directory, in dependencies and `LC_RPATH`
+   entries alike, and `@rpath/x` is searched through that executable's
+   relocated `LC_RPATH` entries plus the binary's own, since dyld consults
+   the rpaths of the image and of the images that loaded it up to the main
+   executable and never those of unrelated images. A dlopen'd Unix module
+   without an rpath therefore resolves through the loader's; a library one
+   declared executable can load and another cannot is reported with the
+   chain that fails; and an executable the file does not declare (the
+   framework tools `gstreamer/fetch.sh` removes, for instance) contributes
+   nothing to any other binary's search and is checked through its own
+   rpaths alone. Before Wine is built no declared executable exists, so each
+   binary searches its own rpaths and `@executable_path/` references have
+   nothing to resolve against. `@loader_path/x` resolves against the
+   binary's own directory. When the binary's `LC_RPATH` entries, or the
+   chain's executable's, include a system root such as `/usr/lib/swift`, its
+   unresolved `@rpath/` references are left to dyld and `--check` prints how
+   many; other absolute `LC_RPATH` entries contribute nothing to the lookup.
+   The report also names the load chains it followed.
 
 ## Running the built Wine
 

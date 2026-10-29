@@ -16,7 +16,7 @@ use crate::denylist::{Denylist, Hit};
 use crate::pins::{Pin, Pins};
 use crate::self_contained::{
     Search, Violation, binary_dir, check_otool_listing, check_references_resolve, check_rpaths,
-    has_system_rpath, is_executable, normalize_relative, relocated_rpaths,
+    has_system_rpath, is_executable, normalize_relative, references_left_to_dyld, relocated_rpaths,
 };
 
 pub const USAGE: &str = "\
@@ -411,8 +411,14 @@ struct Report {
     payload: PathBuf,
     paths: usize,
     machos: usize,
+    /// The declared executables present in the tree, whose rpaths every
+    /// library and module resolves through.
+    chains: Vec<String>,
     hits: Vec<Hit>,
     violations: Vec<Violation>,
+    /// `@rpath/` references the payload does not satisfy that a system
+    /// `LC_RPATH` left to dyld instead of reporting.
+    left_to_dyld: Vec<(String, String)>,
 }
 
 fn check(root: &Path, payload: &Path) -> Result<(), String> {
@@ -423,6 +429,27 @@ fn check(root: &Path, payload: &Path) -> Result<(), String> {
     for violation in &report.violations {
         eprintln!("[xtask] self-contained: {violation}");
     }
+    if !report.left_to_dyld.is_empty() {
+        let binaries: BTreeSet<&str> = report
+            .left_to_dyld
+            .iter()
+            .map(|(binary, _)| binary.as_str())
+            .collect();
+        eprintln!(
+            "[xtask] self-contained: {} @rpath reference(s) left to dyld under a system LC_RPATH ({})",
+            report.left_to_dyld.len(),
+            binaries.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    println!(
+        "[xtask] check {}: load chains: {}",
+        report.payload.display(),
+        if report.chains.is_empty() {
+            "none present (no declared executable in the tree)".to_owned()
+        } else {
+            report.chains.join(", ")
+        }
+    );
     println!(
         "[xtask] check {}: {} paths, {} Mach-O files, {} denylist hits, {} link violations",
         report.payload.display(),
@@ -443,6 +470,7 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
         .canonicalize()
         .map_err(|error| format!("{}: {error}", payload.display()))?;
     let denylist = load_denylist(root)?;
+    let declared = declared_executables(&payload)?;
     // Canonical like `payload`, so a checkout reached through a symlink still
     // reports "links into the build directory" rather than the generic reason.
     let build_dir = root.join(WORK_DIR);
@@ -497,81 +525,187 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
             load_commands,
         });
     }
-    violations.extend(link_violations(&payload, &build_dir, &machos));
-    Ok(Report {
-        payload,
-        paths: entries.len(),
-        machos: machos.len(),
-        hits,
-        violations,
-    })
-}
-
-/// The self-containment violations of every Mach-O: absolute references,
-/// absolute rpaths, and relative references that name no payload file.
-fn link_violations(payload: &Path, build_dir: &Path, machos: &[MachO]) -> Vec<Violation> {
-    let mut violations = Vec::new();
-    // dyld resolves `@rpath/` through the rpaths of the image and of the
-    // executable that loaded (or dlopen'd) it, so each binary searches its
-    // own rpaths plus the executables'; a payload-wide union would accept a
-    // library the loader never looks for.
-    let executables: Vec<&MachO> = machos
-        .iter()
-        .filter(|macho| is_executable(&macho.load_commands))
-        .collect();
-    let exe_dirs: Vec<PathBuf> = executables
-        .iter()
-        .map(|macho| binary_dir(&macho.relative))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let exe_rpaths: BTreeSet<PathBuf> = executables
-        .iter()
-        .flat_map(|macho| relocated_rpaths(&macho.relative, &macho.load_commands, &exe_dirs))
-        .collect();
-    let exe_system_rpath = executables
-        .iter()
-        .any(|macho| has_system_rpath(&macho.load_commands));
-    let resolves = |candidate: &Path| {
-        fs::canonicalize(payload.join(candidate))
-            .is_ok_and(|real| real.starts_with(payload) && real.is_file())
-    };
-    for macho in machos {
+    for macho in &machos {
         violations.extend(check_otool_listing(
             &macho.relative,
             &macho.listing,
-            payload,
-            build_dir,
+            &payload,
+            &build_dir,
         ));
         violations.extend(check_rpaths(
             &macho.relative,
             &macho.load_commands,
-            payload,
-            build_dir,
-        ));
-        let mut rpath_dirs = exe_rpaths.clone();
-        rpath_dirs.extend(relocated_rpaths(
-            &macho.relative,
-            &macho.load_commands,
-            &exe_dirs,
-        ));
-        let search = Search {
-            rpath_dirs: &rpath_dirs,
-            exe_dirs: &exe_dirs,
-            system_rpath: exe_system_rpath || has_system_rpath(&macho.load_commands),
-        };
-        violations.extend(check_references_resolve(
-            &macho.relative,
-            &macho.load_commands,
-            &search,
-            &resolves,
+            &payload,
+            &build_dir,
         ));
     }
-    violations
+    let resolves = |candidate: &Path| {
+        fs::canonicalize(payload.join(candidate))
+            .is_ok_and(|real| real.starts_with(&payload) && real.is_file())
+    };
+    let declared: Vec<&str> = declared.iter().map(String::as_str).collect();
+    let chained = resolve_along_chains(&machos, &declared, &resolves);
+    violations.extend(chained.violations);
+    Ok(Report {
+        payload,
+        paths: entries.len(),
+        machos: machos.len(),
+        chains: chained.chains,
+        hits,
+        violations,
+        left_to_dyld: chained.left_to_dyld,
+    })
+}
+
+const BUNDLE_FILE: &str = "BUNDLE.toml";
+
+/// The executables `BUNDLE.toml` declares, bundle-relative: the loader, the
+/// server, the preloader when present, and the probes. Only these load
+/// chains exist at run time; an executable the file does not name (one of
+/// `GStreamer.framework`'s tools, say) loads nothing of the payload.
+fn declared_executables(payload: &Path) -> Result<Vec<String>, String> {
+    let path = payload.join(BUNDLE_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(format!(
+                "no {BUNDLE_FILE}: cannot determine load chains ({})",
+                path.display()
+            ));
+        }
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let spec = BundleSpec::parse(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut declared = vec![spec.wine.loader, spec.wine.server];
+    declared.extend(spec.wine.preloader);
+    declared.extend([
+        spec.probes.cpuid,
+        spec.probes.dx11_sample,
+        spec.probes.xinput_check,
+    ]);
+    Ok(declared)
+}
+
+/// One declared executable's load chain: where `@executable_path` lands
+/// and the rpaths dyld carries into every image loaded in its process.
+struct Chain {
+    relative: String,
+    dir: Vec<PathBuf>,
+    rpaths: Vec<PathBuf>,
+    system_rpath: bool,
+}
+
+impl Chain {
+    fn new(macho: &MachO) -> Self {
+        let dir = vec![binary_dir(&macho.relative)];
+        Self {
+            relative: macho.relative.clone(),
+            rpaths: relocated_rpaths(&macho.relative, &macho.load_commands, &dir),
+            system_rpath: has_system_rpath(&macho.load_commands),
+            dir,
+        }
+    }
+}
+
+struct Resolved {
+    chains: Vec<String>,
+    violations: Vec<Violation>,
+    left_to_dyld: Vec<(String, String)>,
+}
+
+/// Resolves the relative references of every Mach-O along the load chains
+/// of the declared executables present in the tree (`declared` holds
+/// bundle-relative paths; absent ones and PE probes are skipped).
+///
+/// dyld searches `@rpath/` through the rpaths of the image and of the
+/// executable whose process loaded it, so a library or module must resolve
+/// under each declared executable's rpaths plus its own; a library one
+/// executable can load and another cannot is a violation. An executable
+/// loads only through itself, and an undeclared one contributes nothing to
+/// any other binary's search. With no declared executable present (a tree
+/// before Wine is built) each binary searches its own rpaths alone.
+fn resolve_along_chains(
+    machos: &[MachO],
+    declared: &[&str],
+    resolves: &dyn Fn(&Path) -> bool,
+) -> Resolved {
+    let chains: Vec<Chain> = machos
+        .iter()
+        .filter(|macho| {
+            declared.contains(&macho.relative.as_str()) && is_executable(&macho.load_commands)
+        })
+        .map(Chain::new)
+        .collect();
+    let mut violations = Vec::new();
+    let mut left_to_dyld = Vec::new();
+    for macho in machos {
+        let own_chain;
+        let via: Vec<&Chain> = if is_executable(&macho.load_commands) {
+            own_chain = Chain::new(macho);
+            vec![&own_chain]
+        } else {
+            chains.iter().collect()
+        };
+        let own_system_rpath = has_system_rpath(&macho.load_commands);
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        let mut deferred: BTreeSet<&str> = BTreeSet::new();
+        let mut search_chain = |exe_dirs: &[PathBuf],
+                                rpaths: &[PathBuf],
+                                system_rpath: bool,
+                                suffix: &str| {
+            let mut rpath_dirs: BTreeSet<PathBuf> = rpaths.iter().cloned().collect();
+            rpath_dirs.extend(relocated_rpaths(
+                &macho.relative,
+                &macho.load_commands,
+                exe_dirs,
+            ));
+            let search = Search {
+                rpath_dirs: &rpath_dirs,
+                exe_dirs,
+                system_rpath: system_rpath || own_system_rpath,
+            };
+            for mut violation in
+                check_references_resolve(&macho.relative, &macho.load_commands, &search, resolves)
+            {
+                if reported.insert(violation.reference.clone()) {
+                    violation.reason.push_str(suffix);
+                    violations.push(violation);
+                }
+            }
+            deferred.extend(references_left_to_dyld(
+                &macho.relative,
+                &macho.load_commands,
+                &search,
+                resolves,
+            ));
+        };
+        if via.is_empty() {
+            search_chain(&[], &[], false, "");
+        }
+        for chain in via {
+            let suffix = if chain.relative == macho.relative {
+                String::new()
+            } else {
+                format!("; load chain {}", chain.relative)
+            };
+            search_chain(&chain.dir, &chain.rpaths, chain.system_rpath, &suffix);
+        }
+        left_to_dyld.extend(
+            deferred
+                .into_iter()
+                .filter(|reference| !reported.contains(*reference))
+                .map(|reference| (macho.relative.clone(), reference.to_owned())),
+        );
+    }
+    Resolved {
+        chains: chains.into_iter().map(|chain| chain.relative).collect(),
+        violations,
+        left_to_dyld,
+    }
 }
 
 /// One Mach-O of the payload with both `otool` outputs, kept so the
-/// executables' rpath set exists before any reference is resolved.
+/// declared executables' load chains exist before any reference is resolved.
 struct MachO {
     relative: String,
     listing: String,
@@ -822,9 +956,17 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        ArchiveKind, archive_kind, check_listing, inspect, is_macho, list_archive, load_denylist,
-        pkg_boms, reject_denylisted,
+        ArchiveKind, BUNDLE_FILE, MachO, archive_kind, check_listing, inspect, is_macho,
+        list_archive, load_denylist, pkg_boms, reject_denylisted, resolve_along_chains,
     };
+
+    /// The committed rendering of `build/bundle-spec.toml`: every `--check`
+    /// reads the declared executables from it.
+    const BUNDLE_TOML: &str = include_str!("../tests/fixtures/BUNDLE.toml");
+
+    fn write_bundle_fixture(payload: &Path) {
+        fs::write(payload.join(BUNDLE_FILE), BUNDLE_TOML).expect("BUNDLE.toml");
+    }
 
     fn root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -904,6 +1046,7 @@ mod tests {
         let dir = scratch("symlinks");
         let payload = dir.join("payload");
         fs::create_dir_all(payload.join("wine/lib")).expect("payload");
+        write_bundle_fixture(&payload);
         fs::write(payload.join("wine/lib/libreal.dylib"), b"not a mach-o").expect("file");
         symlink(
             "/usr/local/lib/libfreetype.6.dylib",
@@ -960,6 +1103,7 @@ mod tests {
             deep.push(format!("d{level}"));
         }
         fs::create_dir_all(&deep).expect("deep tree");
+        write_bundle_fixture(&payload);
         // 16 levels below the payload root; `up` resolves to that root.
         symlink("../".repeat(16).trim_end_matches('/'), deep.join("up")).expect("up link");
         symlink(
@@ -991,6 +1135,7 @@ mod tests {
         let dir = scratch("symlink-reenter");
         let payload = dir.join("payload");
         fs::create_dir_all(payload.join("wine/lib")).expect("payload");
+        write_bundle_fixture(&payload);
         fs::write(payload.join("wine/lib/libfoo.real.dylib"), b"not a mach-o").expect("file");
         symlink(
             "../../../payload/wine/lib/libfoo.real.dylib",
@@ -1095,6 +1240,220 @@ mod tests {
         let error = list_archive(ArchiveKind::Pkg, &bomless).unwrap_err();
         assert!(error.contains("Payload has no Bom"), "{error}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_payload_without_bundle_toml_cannot_be_checked() {
+        let dir = scratch("no-bundle");
+        let payload = dir.join("payload");
+        fs::create_dir_all(payload.join("wine/lib")).expect("payload");
+        let Err(error) = inspect(&root(), &payload) else {
+            panic!("a payload without BUNDLE.toml was checked");
+        };
+        assert!(
+            error.starts_with("no BUNDLE.toml: cannot determine load chains"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn macho(relative: &str, load_commands: &str) -> MachO {
+        MachO {
+            relative: relative.to_owned(),
+            listing: String::new(),
+            load_commands: format!("{relative}:\n{load_commands}"),
+        }
+    }
+
+    fn files(paths: &[&str]) -> std::collections::BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    fn describe(violations: &[super::Violation]) -> Vec<(String, String, String)> {
+        violations
+            .iter()
+            .map(|violation| {
+                (
+                    violation.binary.clone(),
+                    violation.reference.clone(),
+                    violation.reason.clone(),
+                )
+            })
+            .collect()
+    }
+
+    // The Fix Verifier's `two-exe` fixture: `wine/bin/a` reaches `deps/`
+    // through its rpath, `tools/bin/b` has none; both load `libmid.dylib`,
+    // which names `@rpath/libfoo.dylib` with no rpath of its own. dyld loads
+    // it under `a` and fails under `b`.
+    const TWO_EXE_A: &str = "\
+Load command 10
+          cmd LC_MAIN
+Load command 11
+          cmd LC_LOAD_DYLIB
+         name @loader_path/../lib/libmid.dylib (offset 24)
+Load command 12
+          cmd LC_RPATH
+         path @loader_path/../lib/deps (offset 12)
+";
+    const TWO_EXE_B: &str = "\
+Load command 10
+          cmd LC_MAIN
+Load command 11
+          cmd LC_LOAD_DYLIB
+         name @loader_path/../../wine/lib/libmid.dylib (offset 24)
+";
+    const TWO_EXE_MID: &str = "\
+Load command 0
+          cmd LC_ID_DYLIB
+         name @loader_path/../lib/libmid.dylib (offset 24)
+Load command 1
+          cmd LC_LOAD_DYLIB
+         name @rpath/libfoo.dylib (offset 24)
+";
+    const TWO_EXE_FOO: &str = "\
+Load command 0
+          cmd LC_ID_DYLIB
+         name @rpath/libfoo.dylib (offset 24)
+";
+
+    #[test]
+    fn a_library_only_one_declared_executable_can_load_is_a_violation() {
+        let machos = [
+            macho("tools/bin/b", TWO_EXE_B),
+            macho("wine/bin/a", TWO_EXE_A),
+            macho("wine/lib/deps/libfoo.dylib", TWO_EXE_FOO),
+            macho("wine/lib/libmid.dylib", TWO_EXE_MID),
+        ];
+        let files = files(&[
+            "tools/bin/b",
+            "wine/bin/a",
+            "wine/lib/deps/libfoo.dylib",
+            "wine/lib/libmid.dylib",
+        ]);
+        let resolves = |candidate: &Path| files.contains(candidate);
+
+        let outcome = resolve_along_chains(&machos, &["wine/bin/a", "tools/bin/b"], &resolves);
+        assert_eq!(outcome.chains, ["tools/bin/b", "wine/bin/a"]);
+        assert_eq!(
+            describe(&outcome.violations),
+            [(
+                "wine/lib/libmid.dylib".to_owned(),
+                "@rpath/libfoo.dylib".to_owned(),
+                "@rpath reference resolves through no LC_RPATH of the binary or of the executable loading it; load chain tools/bin/b".to_owned(),
+            )]
+        );
+        assert_eq!(outcome.left_to_dyld, Vec::<(String, String)>::new());
+
+        // Declared alone, `a` loads everything; `b` is then an undeclared
+        // executable that contributes nothing and loads only through itself.
+        let outcome = resolve_along_chains(&machos, &["wine/bin/a"], &resolves);
+        assert_eq!(outcome.chains, ["wine/bin/a"]);
+        assert_eq!(describe(&outcome.violations), []);
+
+        // Declared alone, `b` cannot load `libmid.dylib`; `a`'s rpath no
+        // longer stands in for it.
+        let outcome = resolve_along_chains(&machos, &["tools/bin/b"], &resolves);
+        assert_eq!(outcome.violations.len(), 1, "{:?}", outcome.violations);
+        assert_eq!(outcome.violations[0].binary, "wine/lib/libmid.dylib");
+    }
+
+    // The Fix Verifier's `realtree-nobin` fixture: GStreamer's
+    // `gst-plugin-scanner` (undeclared) reaches the framework's `lib/`
+    // through `@executable_path/../../lib`; a dlopen'd Wine module with no
+    // rpath names `@rpath/libfreetype.6.dylib` from that directory. Under
+    // the declared loader `wine/bin/wine` dyld tries `wine/lib` only.
+    const LOADER: &str = "\
+Load command 8
+          cmd LC_MAIN
+Load command 9
+          cmd LC_RPATH
+         path @loader_path/../lib (offset 12)
+";
+    const SCANNER: &str = "\
+Load command 8
+          cmd LC_MAIN
+Load command 9
+          cmd LC_LOAD_DYLIB
+         name @rpath/libglib-2.0.0.dylib (offset 24)
+Load command 10
+          cmd LC_RPATH
+         path @executable_path/../../lib (offset 12)
+";
+    const MODULE: &str = "\
+Load command 0
+          cmd LC_ID_DYLIB
+         name @rpath/winefake.so (offset 24)
+Load command 1
+          cmd LC_LOAD_DYLIB
+         name @rpath/libfreetype.6.dylib (offset 24)
+";
+    const GST_LIB: &str = "wine/lib/GStreamer.framework/Versions/1.0/lib";
+    const GST_SCANNER: &str =
+        "wine/lib/GStreamer.framework/Versions/1.0/libexec/gstreamer-1.0/gst-plugin-scanner";
+
+    #[test]
+    fn a_module_resolvable_only_through_an_undeclared_executable_is_a_violation() {
+        let module = "wine/lib/wine/x86_64-unix/winefake.so";
+        let machos = [
+            macho("wine/bin/wine", LOADER),
+            macho(GST_SCANNER, SCANNER),
+            macho(module, MODULE),
+        ];
+        let files = files(&[
+            "wine/bin/wine",
+            GST_SCANNER,
+            module,
+            &format!("{GST_LIB}/libfreetype.6.dylib"),
+            &format!("{GST_LIB}/libglib-2.0.0.dylib"),
+        ]);
+        let resolves = |candidate: &Path| files.contains(candidate);
+        let declared = ["wine/bin/wine", "wine/bin/wineserver", "probes/cpuid"];
+
+        let outcome = resolve_along_chains(&machos, &declared, &resolves);
+        assert_eq!(outcome.chains, ["wine/bin/wine"]);
+        assert_eq!(
+            describe(&outcome.violations),
+            [(
+                module.to_owned(),
+                "@rpath/libfreetype.6.dylib".to_owned(),
+                "@rpath reference resolves through no LC_RPATH of the binary or of the executable loading it; load chain wine/bin/wine".to_owned(),
+            )]
+        );
+
+        // The scanner's own reference resolves through its own rpath, and
+        // the module stays a violation when no declared executable is
+        // present yet (the tree before Wine is built).
+        let outcome = resolve_along_chains(&machos, &["wine/bin/wineserver"], &resolves);
+        assert_eq!(outcome.chains, Vec::<String>::new());
+        assert_eq!(outcome.violations.len(), 1, "{:?}", outcome.violations);
+        assert_eq!(outcome.violations[0].binary, module);
+        assert!(
+            !outcome.violations[0].reason.contains("load chain"),
+            "{}",
+            outcome.violations[0]
+        );
+    }
+
+    #[test]
+    fn a_system_rpath_on_the_chain_counts_what_it_leaves_to_dyld() {
+        let swift_loader = "\
+Load command 8
+          cmd LC_MAIN
+Load command 9
+          cmd LC_RPATH
+         path /usr/lib/swift (offset 12)
+";
+        let module = "wine/lib/wine/x86_64-unix/winefake.so";
+        let machos = [macho("wine/bin/wine", swift_loader), macho(module, MODULE)];
+        let files = files(&["wine/bin/wine", module]);
+        let resolves = |candidate: &Path| files.contains(candidate);
+        let outcome = resolve_along_chains(&machos, &["wine/bin/wine"], &resolves);
+        assert_eq!(describe(&outcome.violations), []);
+        assert_eq!(
+            outcome.left_to_dyld,
+            [(module.to_owned(), "@rpath/libfreetype.6.dylib".to_owned())]
+        );
     }
 
     #[test]

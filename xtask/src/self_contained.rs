@@ -154,10 +154,10 @@ pub fn has_system_rpath(load_commands: &str) -> bool {
 
 /// The payload-relative directories a binary's relocatable `LC_RPATH`
 /// entries name: `@loader_path` against the binary's own directory,
-/// `@executable_path` against each of `exe_dirs`, the directories of the
-/// payload's executables (a dylib's loader is only known at run time). An
-/// entry that climbs out of the payload or is absolute names nothing here;
-/// `check_rpaths` reports the absolute ones.
+/// `@executable_path` against each of `exe_dirs`, the directory of the
+/// executable whose load chain is being followed. An entry that climbs out
+/// of the payload or is absolute names nothing here; `check_rpaths` reports
+/// the absolute ones.
 pub fn relocated_rpaths(binary: &str, load_commands: &str, exe_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let bin_dir = binary_dir(binary);
     rpath_entries(load_commands)
@@ -180,19 +180,30 @@ pub fn relocated_rpaths(binary: &str, load_commands: &str, exe_dirs: &[PathBuf])
 }
 
 /// What one binary's `@rpath/` and `@executable_path/` references resolve
-/// through. dyld consults the rpaths of the image itself and of the images
-/// that loaded it up to the main executable, never those of unrelated
-/// images, so the set is the binary's own rpaths plus the executables'
-/// (which also covers a dlopen'd Unix module or plugin).
+/// through along one load chain. dyld consults the rpaths of the image
+/// itself and of the images that loaded it up to the main executable, never
+/// those of unrelated images, so the set is the binary's own rpaths plus the
+/// chain's executable's (which also covers a dlopen'd Unix module or plugin).
 pub struct Search<'a> {
-    /// Relocated `LC_RPATH` directories of the binary and of the payload's
-    /// executables.
+    /// Relocated `LC_RPATH` directories of the binary and of the chain's
+    /// executable.
     pub rpath_dirs: &'a BTreeSet<PathBuf>,
-    /// Directories of the payload's executables.
+    /// The directory of the chain's executable; empty when no executable
+    /// can load the binary.
     pub exe_dirs: &'a [PathBuf],
-    /// An `LC_RPATH` of the binary or of an executable is a system root, so
-    /// an `@rpath/` reference the payload does not satisfy is left to dyld.
+    /// An `LC_RPATH` of the binary or of the chain's executable is a system
+    /// root, so an `@rpath/` reference the payload does not satisfy is left
+    /// to dyld.
     pub system_rpath: bool,
+}
+
+/// How one relative dependency fared under a [`Search`].
+enum Outcome {
+    Resolved,
+    Unresolved(&'static str),
+    /// An `@rpath/` reference the payload does not satisfy under a system
+    /// `LC_RPATH`: dyld may still find it in the shared cache.
+    LeftToDyld,
 }
 
 /// Checks that every `@rpath/`, `@loader_path/`, and `@executable_path/`
@@ -200,64 +211,88 @@ pub struct Search<'a> {
 ///
 /// `@rpath/x` is tried through `search.rpath_dirs`; `@loader_path/x`
 /// resolves against the binary's own directory and `@executable_path/x`
-/// against each executable's. `resolves` says whether a payload-relative
-/// candidate is a file inside the payload; it follows symlinks, so a
-/// framework's `Versions/Current` link works.
+/// against the chain's executable directory. `resolves` says whether a
+/// payload-relative candidate is a file inside the payload; it follows
+/// symlinks, so a framework's `Versions/Current` link works.
 pub fn check_references_resolve(
     binary: &str,
     load_commands: &str,
     search: &Search<'_>,
     resolves: &dyn Fn(&Path) -> bool,
 ) -> Vec<Violation> {
-    let bin_dir = binary_dir(binary);
-    dependency_entries(load_commands)
-        .filter_map(|reference| {
-            let (prefix, rest) = RELATIVE_PREFIXES
-                .iter()
-                .find_map(|prefix| reference.strip_prefix(prefix).map(|rest| (*prefix, rest)))?;
-            let (candidates, reason): (Vec<PathBuf>, &str) = match prefix {
-                "@rpath/" => {
-                    if search.system_rpath {
-                        return None;
-                    }
-                    (
-                        search
-                            .rpath_dirs
-                            .iter()
-                            .filter_map(|dir| normalize_relative(&dir.join(rest)))
-                            .collect(),
-                        "@rpath reference resolves through no LC_RPATH of the binary or of an executable",
-                    )
-                }
-                "@loader_path/" => (
-                    normalize_relative(&bin_dir.join(rest))
-                        .into_iter()
-                        .collect(),
-                    "@loader_path reference does not resolve to a file in the payload",
-                ),
-                _ => (
-                    search
-                        .exe_dirs
-                        .iter()
-                        .filter_map(|dir| normalize_relative(&dir.join(rest)))
-                        .collect(),
-                    if search.exe_dirs.is_empty() {
-                        "@executable_path reference, and the payload has no executable to resolve it against"
-                    } else {
-                        "@executable_path reference does not resolve against any executable's directory"
-                    },
-                ),
-            };
-            if candidates.iter().any(|candidate| resolves(candidate)) {
-                return None;
-            }
-            Some(Violation {
+    resolve_references(binary, load_commands, search, resolves)
+        .filter_map(|(reference, outcome)| match outcome {
+            Outcome::Unresolved(reason) => Some(Violation {
                 binary: binary.to_owned(),
                 reference: reference.to_owned(),
                 reason: reason.to_owned(),
-            })
+            }),
+            Outcome::Resolved | Outcome::LeftToDyld => None,
         })
         .collect()
+}
+
+/// The `@rpath/` dependencies of one Mach-O that the payload does not
+/// satisfy and [`check_references_resolve`] left to dyld because the search
+/// carries a system `LC_RPATH`.
+pub fn references_left_to_dyld<'a>(
+    binary: &str,
+    load_commands: &'a str,
+    search: &Search<'_>,
+    resolves: &dyn Fn(&Path) -> bool,
+) -> Vec<&'a str> {
+    resolve_references(binary, load_commands, search, resolves)
+        .filter_map(|(reference, outcome)| {
+            matches!(outcome, Outcome::LeftToDyld).then_some(reference)
+        })
+        .collect()
+}
+
+fn resolve_references<'a>(
+    binary: &str,
+    load_commands: &'a str,
+    search: &Search<'_>,
+    resolves: &dyn Fn(&Path) -> bool,
+) -> impl Iterator<Item = (&'a str, Outcome)> {
+    let loader_dirs = vec![binary_dir(binary)];
+    let rpath_dirs: Vec<PathBuf> = search.rpath_dirs.iter().cloned().collect();
+    let exe_dirs: Vec<PathBuf> = search.exe_dirs.to_vec();
+    let system_rpath = search.system_rpath;
+    dependency_entries(load_commands).filter_map(move |reference| {
+        let (prefix, rest) = RELATIVE_PREFIXES
+            .iter()
+            .find_map(|prefix| reference.strip_prefix(prefix).map(|rest| (*prefix, rest)))?;
+        let (bases, reason): (&[PathBuf], &'static str) = match prefix {
+            "@rpath/" => (
+                &rpath_dirs,
+                "@rpath reference resolves through no LC_RPATH of the binary or of the executable loading it",
+            ),
+            "@loader_path/" => (
+                &loader_dirs,
+                "@loader_path reference does not resolve to a file in the payload",
+            ),
+            _ => (
+                &exe_dirs,
+                if exe_dirs.is_empty() {
+                    "@executable_path reference, and the payload has no executable to resolve it against"
+                } else {
+                    "@executable_path reference does not resolve against the executable's directory"
+                },
+            ),
+        };
+        let found = bases
+            .iter()
+            .filter_map(|base| normalize_relative(&base.join(rest)))
+            .any(|candidate| resolves(&candidate));
+        let outcome = if found {
+            Outcome::Resolved
+        } else if prefix == "@rpath/" && system_rpath {
+            Outcome::LeftToDyld
+        } else {
+            Outcome::Unresolved(reason)
+        };
+        Some((reference, outcome))
+    })
 }
 
 /// The payload-relative directory of a payload-relative binary path.
