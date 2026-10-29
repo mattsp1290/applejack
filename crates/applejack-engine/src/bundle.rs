@@ -2,8 +2,9 @@
 //! into `<version>.partial/`, validation, and the final rename.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
 use applejack_manifest::{Arch, HttpsUrl, Sha256};
@@ -22,9 +23,9 @@ pub struct Wine {
     pub version: String,
     pub source_url: HttpsUrl,
     pub source_rev: String,
-    /// Loader executable, relative to the bundle root (`bin/wine64`).
+    /// Loader executable, relative to the bundle root (`wine/bin/wine64`).
     pub loader: PathBuf,
-    /// `wineserver`, relative to the bundle root.
+    /// `wineserver`, relative to the bundle root (`wine/bin/wineserver`).
     pub server: PathBuf,
     /// Preloader, relative to the bundle root, when the build has one.
     #[serde(default)]
@@ -150,10 +151,10 @@ impl BundleToml {
     /// Checks the invariants against the bundle tree at `bundle_root`:
     ///
     /// - every path is relative with no `.`, `..`, or empty component;
-    /// - `wine.loader` and `wine.server` (and `wine.preloader` when set) are
-    ///   files under the root;
+    /// - `wine.loader` and `wine.server` (and `wine.preloader` when set)
+    ///   resolve, through any symlink, to files inside the canonical root;
     /// - `sync_modes` is non-empty with no duplicates;
-    /// - every override DLL is a file under the root;
+    /// - every override DLL resolves to a file inside the canonical root;
     /// - `entitlements` keys are relative paths.
     ///
     /// # Errors
@@ -192,7 +193,7 @@ impl BundleToml {
             }
         }
 
-        if !bundle_root.join(&self.wine.loader).is_file() {
+        if !resolves_to_file_inside(bundle_root, &self.wine.loader) {
             return Err(Error::MissingLoader {
                 path: self.wine.loader.clone(),
             });
@@ -239,14 +240,23 @@ fn relative(field: &str, path: &Path) -> Result<()> {
 }
 
 fn file_present(field: &str, root: &Path, path: &Path) -> Result<()> {
-    if root.join(path).is_file() {
+    if resolves_to_file_inside(root, path) {
         Ok(())
     } else {
         Err(Error::InvalidBundle(format!(
-            "{field}: `{}` is not a file in the bundle",
+            "{field}: `{}` is not a file inside the bundle",
             path.display()
         )))
     }
+}
+
+// Canonical on both sides so a symlink that leaves the bundle is caught even
+// though the lexical path is relative.
+fn resolves_to_file_inside(root: &Path, path: &Path) -> bool {
+    let (Ok(root), Ok(full)) = (fs::canonicalize(root), fs::canonicalize(root.join(path))) else {
+        return false;
+    };
+    full.starts_with(&root) && full.is_file()
 }
 
 /// What a bundle can do, derived from its `BUNDLE.toml`.
@@ -354,14 +364,18 @@ pub fn install_from_archive(
 /// Installs an engine bundle:
 ///
 /// 1. refuses when `engines/<id>/<version>/` already exists;
-/// 2. hashes the archive and refuses on mismatch, leaving the archive as is;
-/// 3. extracts into `engines/<id>/<version>.partial/` (a stale one is
-///    replaced);
+/// 2. opens the archive once, hashes it, and refuses on mismatch, leaving
+///    the archive as is;
+/// 3. replaces a stale `engines/<id>/<version>.partial` (file or directory)
+///    and extracts the same open archive into it, refusing any entry that
+///    escapes the root or links outside it;
 /// 4. loads and validates `BUNDLE.toml`, checking it names `id` and
 ///    `version`; on failure removes `.partial`;
-/// 5. renames `.partial` to `<version>/`.
+/// 5. renames `.partial` to `<version>/`, removing `.partial` if that fails.
 ///
-/// No other version directory is read or written.
+/// The archive's entries must sit at its root: `BUNDLE.toml` is the first
+/// path component, not `<name>/BUNDLE.toml`. No other version directory is
+/// read or written.
 ///
 /// # Errors
 ///
@@ -383,46 +397,99 @@ pub fn install(
         });
     }
     let ArchiveSource::LocalFile(archive) = source;
-    let actual = sha256_file(archive)?;
+    // One handle for hashing and extraction so the bytes verified are the
+    // bytes unpacked.
+    let mut file = File::open(archive).map_err(|error| Error::io(archive, error))?;
+    let actual = sha256_reader(&mut file, archive)?;
     if &actual != expected {
         return Err(Error::Sha256Mismatch {
             expected: expected.clone(),
             actual,
         });
     }
+    file.rewind().map_err(|error| Error::io(archive, error))?;
 
     let partial = layout.partial_dir(id, version);
-    if partial.exists() {
-        fs::remove_dir_all(&partial).map_err(|error| Error::io(&partial, error))?;
-    }
+    remove_stale(&partial)?;
     fs::create_dir_all(&partial).map_err(|error| Error::io(&partial, error))?;
 
-    let result = extract_and_validate(archive, &partial, id, version);
+    let result = extract_and_validate(file, archive, &partial, id, version);
     if let Err(error) = result {
         // Best effort: the error the caller sees is the install failure.
         let _ = fs::remove_dir_all(&partial);
         return Err(error);
     }
-    fs::rename(&partial, &final_dir).map_err(|error| Error::io(&final_dir, error))?;
+    if let Err(error) = fs::rename(&partial, &final_dir) {
+        let _ = fs::remove_dir_all(&partial);
+        return Err(Error::io(&final_dir, error));
+    }
     InstalledEngine::open(layout, id, version)
 }
 
+/// Removes whatever sits at `path`, whether a directory, a file, or a
+/// dangling symlink.
+fn remove_stale(path: &Path) -> Result<()> {
+    let result = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    };
+    result.map_err(|error| Error::io(path, error))
+}
+
 fn extract_and_validate(
+    file: File,
     archive: &Path,
     partial: &Path,
     id: EngineId,
     version: &Version,
 ) -> Result<()> {
-    let file = File::open(archive).map_err(|error| Error::io(archive, error))?;
     let decoder = zstd::stream::read::Decoder::new(io::BufReader::new(file))
         .map_err(|error| Error::io(archive, error))?;
     let mut tar = tar::Archive::new(decoder);
     tar.set_preserve_permissions(true);
     tar.set_overwrite(false);
-    // `tar` refuses entries that would escape `partial`.
-    tar.unpack(partial)
-        .map_err(|error| Error::io(archive, error))?;
+    for entry in tar.entries().map_err(|error| Error::io(archive, error))? {
+        let mut entry = entry.map_err(|error| Error::io(archive, error))?;
+        let entry_path = entry
+            .path()
+            .map_err(|error| Error::io(archive, error))?
+            .into_owned();
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            let target = entry
+                .link_name()
+                .map_err(|error| Error::io(archive, error))?
+                .map(std::borrow::Cow::into_owned)
+                .unwrap_or_default();
+            if !link_stays_inside(&entry_path, &target, kind.is_hard_link()) {
+                return Err(Error::InvalidBundle(format!(
+                    "archive entry `{}` links to `{}` outside the bundle",
+                    entry_path.display(),
+                    target.display()
+                )));
+            }
+        }
+        // `unpack_in` reports an entry whose own path would leave `partial`
+        // by returning false instead of failing.
+        let unpacked = entry
+            .unpack_in(partial)
+            .map_err(|error| Error::io(archive, error))?;
+        if !unpacked {
+            return Err(Error::InvalidBundle(format!(
+                "archive entry `{}` escapes the bundle root",
+                entry_path.display()
+            )));
+        }
+    }
 
+    if !fs::symlink_metadata(partial.join(BUNDLE_FILE)).is_ok_and(|meta| meta.is_file()) {
+        return Err(Error::InvalidBundle(
+            "archive has no BUNDLE.toml at its root; entries must not be nested under a top-level directory"
+                .to_owned(),
+        ));
+    }
     let bundle = BundleToml::load(partial)?;
     if bundle.id != id || &bundle.version != version {
         return Err(Error::BundleIdentityMismatch {
@@ -435,6 +502,38 @@ fn extract_and_validate(
     Ok(())
 }
 
+/// Lexically resolves a link target and reports whether it stays under the
+/// archive root. A hard-link target is root-relative; a symlink target is
+/// relative to the entry's own directory.
+fn link_stays_inside(entry: &Path, target: &Path, hard_link: bool) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+    let mut depth: Vec<&OsStr> = Vec::new();
+    if !hard_link && let Some(parent) = entry.parent() {
+        for component in parent.components() {
+            match component {
+                PathComponent::Normal(name) => depth.push(name),
+                PathComponent::CurDir => {}
+                _ => return false,
+            }
+        }
+    }
+    for component in target.components() {
+        match component {
+            PathComponent::Normal(name) => depth.push(name),
+            PathComponent::CurDir => {}
+            PathComponent::ParentDir => {
+                if depth.pop().is_none() {
+                    return false;
+                }
+            }
+            PathComponent::RootDir | PathComponent::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
 /// SHA-256 of a file's contents as lowercase hex.
 ///
 /// # Errors
@@ -442,10 +541,15 @@ fn extract_and_validate(
 /// Returns [`Error::Io`].
 pub fn sha256_file(path: &Path) -> Result<Sha256> {
     let mut file = File::open(path).map_err(|error| Error::io(path, error))?;
+    sha256_reader(&mut file, path)
+}
+
+/// SHA-256 of everything `reader` yields; `path` names it in errors.
+fn sha256_reader(reader: &mut impl Read, path: &Path) -> Result<Sha256> {
     let mut hasher = sha2::Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        let read = file
+        let read = reader
             .read(&mut buffer)
             .map_err(|error| Error::io(path, error))?;
         if read == 0 {
@@ -462,4 +566,37 @@ pub fn sha256_file(path: &Path) -> Result<Sha256> {
             hex
         });
     Sha256::try_from(hex).map_err(Error::Manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_targets_are_resolved_against_the_entry_directory() {
+        let p = Path::new;
+        assert!(link_stays_inside(
+            p("wine/bin/wine64"),
+            p("../lib/wine64"),
+            false
+        ));
+        assert!(link_stays_inside(
+            p("./wine/bin/wine64"),
+            p("../../lib/x"),
+            false
+        ));
+        assert!(!link_stays_inside(
+            p("wine/bin/wine64"),
+            p("../../../etc"),
+            false
+        ));
+        assert!(!link_stays_inside(
+            p("wine/bin/wine64"),
+            p("/usr/bin/true"),
+            false
+        ));
+        assert!(link_stays_inside(p("a/b"), p("c/d"), true));
+        assert!(!link_stays_inside(p("a/b"), p("../x"), true));
+        assert!(!link_stays_inside(p("a/b"), p("/etc/hosts"), true));
+    }
 }

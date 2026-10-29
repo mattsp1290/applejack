@@ -55,6 +55,9 @@ pub fn pack(tree: &Path, out: &Path) -> Sha256 {
     let file = File::create(out).unwrap();
     let encoder = zstd::stream::write::Encoder::new(file, 3).unwrap();
     let mut builder = tar::Builder::new(encoder);
+    // Symlinks in the tree become symlink entries, as a hostile bundle would
+    // carry them.
+    builder.follow_symlinks(false);
     builder.append_dir_all(".", tree).unwrap();
     let encoder = builder.into_inner().unwrap();
     encoder.finish().unwrap();
