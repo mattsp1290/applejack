@@ -213,6 +213,13 @@ pub struct HelloResult {
     pub core_version: String,
 }
 
+/// The result of a method with nothing to return; encodes as `{}`. A result
+/// is never `null` on the wire (see `to_result`), so the Swift mirror can
+/// decode every success into a typed value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyResult {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostDoctorParams {}

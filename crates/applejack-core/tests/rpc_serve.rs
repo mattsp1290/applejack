@@ -1,6 +1,6 @@
 //! The serve loop over in-memory pipes.
 
-use applejack_core::rpc::methods::{LoginMode, Method, MethodStatus};
+use applejack_core::rpc::methods::{EmptyResult, LoginMode, Method, MethodStatus};
 use applejack_core::rpc::wire::{Body, ErrorCode, Id, Response, RpcError};
 use applejack_core::rpc::{self, CoreHandler, ExitStatus, Handler, Logged, PROTOCOL_VERSION};
 use serde_json::{Value, json};
@@ -428,6 +428,115 @@ fn logged_handler_writes_redacted_lines_to_the_sink_only() {
     assert!(wire.contains("hunter2"));
     assert!(wire.contains("rejected for account swordfish"));
     assert_eq!(wire.lines().count(), 4);
+}
+
+#[test]
+fn unit_results_are_answered_as_empty_objects_never_null() {
+    struct Unit;
+    impl Handler for Unit {
+        fn handle(&mut self, method: &Method) -> Result<Value, RpcError> {
+            match method {
+                Method::Hello(_) => rpc::to_result(&()),
+                Method::HostDoctor(_) => Ok(Value::Null),
+                _ => rpc::to_result(&EmptyResult {}),
+            }
+        }
+    }
+    let input = format!(
+        "{HELLO}\n{DOCTOR}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"engine.list","params":{}}"#
+    );
+    let mut output = Vec::new();
+    rpc::serve(input.as_bytes(), &mut output, &mut Unit).unwrap();
+    let wire = String::from_utf8(output).unwrap();
+    for line in wire.lines() {
+        assert!(line.ends_with(r#""result":{}}"#), "{line}");
+        let response: Response = serde_json::from_str(line).unwrap();
+        let _: EmptyResult = serde_json::from_value(result_of(&response).clone()).unwrap();
+    }
+    assert_eq!(wire.lines().count(), 3);
+    assert_eq!(serde_json::to_value(EmptyResult {}).unwrap(), json!({}));
+}
+
+#[test]
+fn logged_handler_writes_loop_refusals_by_code_for_login_methods() {
+    let bad_login = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "steam.login.start",
+        "params": {"mode": {"kind": "credentials", "account_name": "swordfish", "password": 42}},
+    });
+    let input = format!(
+        "{DOCTOR}\n{{not json\n{}\n{HELLO}\n{bad_login}\n{}\n{}\n",
+        r#"{"jsonrpc":"1.0","id":3,"method":"steam.logout","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"nope","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"engine.install","params":{"engine":"x"}}"#,
+    );
+    let mut handler = Logged::new(Echo::default(), Vec::new());
+    let mut output = Vec::new();
+    rpc::serve(input.as_bytes(), &mut output, &mut handler).unwrap();
+    let (echo, sink) = handler.into_parts();
+    let log = String::from_utf8(sink).unwrap();
+    assert_eq!(
+        echo.seen,
+        ["hello"],
+        "refused requests never reach the handler"
+    );
+    assert!(
+        log.contains(
+            "<- host.doctor error HelloRequired (1001): send `hello` before `host.doctor`\n"
+        ),
+        "{log}"
+    );
+    assert!(log.contains("<- ? error ParseError (-32700): "), "{log}");
+    assert!(
+        log.contains(
+            "<- steam.logout error InvalidRequest (-32600): jsonrpc must be \"2.0\", got \"1.0\""
+        ),
+        "{log}"
+    );
+    assert!(
+        log.contains("<- steam.login.start error InvalidParams (-32602)\n"),
+        "{log}"
+    );
+    assert!(
+        log.contains("<- nope error MethodNotFound (-32601): unknown method `nope`\n"),
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            "<- engine.install error InvalidParams (-32602): invalid params for `engine.install`: "
+        ),
+        "{log}"
+    );
+    for secret in ["swordfish", "42"] {
+        assert!(
+            !log.contains(secret),
+            "`{secret}` leaked into the log:\n{log}"
+        );
+    }
+    assert_eq!(String::from_utf8(output).unwrap().lines().count(), 7);
+}
+
+#[test]
+fn logged_handler_writes_a_protocol_mismatch_refusal() {
+    let mut handler = Logged::new(Echo::default(), Vec::new());
+    let mut output = Vec::new();
+    let status = rpc::serve(
+        format!("{MISMATCH}\n").as_bytes(),
+        &mut output,
+        &mut handler,
+    )
+    .unwrap();
+    assert_eq!(status, ExitStatus::ProtocolMismatch);
+    let (_, sink) = handler.into_parts();
+    let log = String::from_utf8(sink).unwrap();
+    assert!(
+        log.contains(
+            "<- hello error ProtocolMismatch (1000): core speaks protocol 1, shell sent 99\n"
+        ),
+        "{log}"
+    );
 }
 
 #[test]

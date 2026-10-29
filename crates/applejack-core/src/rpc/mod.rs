@@ -11,7 +11,7 @@ use crate::host::HostFacts;
 use methods::{HelloResult, Method, MethodStatus};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
-use wire::{ErrorCode, Id, Request, Response, RpcError};
+use wire::{Body, ErrorCode, Id, Request, Response, RpcError};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -40,11 +40,23 @@ impl ExitStatus {
 
 /// Answers parsed requests. The loop owns framing, `hello`, and the version
 /// check; the handler sees `hello` only once those passed.
+///
+/// The `engine.install` unit, which runs jobs on threads, will add a way to
+/// emit notifications to `handle` and change [`serve`]'s `writer` into a
+/// shared, locked one; both have one implementor and one caller today.
 pub trait Handler {
     /// # Errors
     ///
     /// The error becomes the response's `error` member.
     fn handle(&mut self, method: &Method) -> Result<Value, RpcError>;
+
+    /// Told about an error response the loop produced without calling
+    /// `handle` (a parse, envelope, method, params, or `hello` problem).
+    /// `method` is the request's method name when it could be read. The
+    /// default does nothing; [`Logged`] writes it to the sink.
+    fn refused(&mut self, method: Option<&str>, error: &RpcError) {
+        let _ = (method, error);
+    }
 }
 
 /// The real core: `hello` and `host.doctor` now, `NotImplemented` for the
@@ -65,13 +77,22 @@ impl Handler for CoreHandler {
     }
 }
 
-fn to_result<T: serde::Serialize>(value: &T) -> Result<Value, RpcError> {
-    serde_json::to_value(value).map_err(|error| {
-        RpcError::new(
-            ErrorCode::InternalError,
-            format!("cannot encode result: {error}"),
-        )
-    })
+/// Encodes a handler's result. A value that encodes as `null` (unit, `()`)
+/// becomes `{}` ([`methods::EmptyResult`]): a success never carries a null
+/// result, so the shell can decode every result into a typed value.
+///
+/// # Errors
+///
+/// `InternalError` when the value cannot be encoded.
+pub fn to_result<T: serde::Serialize>(value: &T) -> Result<Value, RpcError> {
+    serde_json::to_value(value)
+        .map(|value| if value.is_null() { json!({}) } else { value })
+        .map_err(|error| {
+            RpcError::new(
+                ErrorCode::InternalError,
+                format!("cannot encode result: {error}"),
+            )
+        })
 }
 
 #[must_use]
@@ -146,6 +167,23 @@ impl<H: Handler, W: Write> Handler for Logged<H, W> {
         };
         outcome
     }
+
+    fn refused(&mut self, method: Option<&str>, error: &RpcError) {
+        let name = method.unwrap_or("?");
+        // An `InvalidParams` message quotes the offending value, so a login
+        // request is logged by code only, like a login error.
+        let _ = if is_redacted(name) {
+            writeln!(
+                self.sink,
+                "<- {name} error {} ({})",
+                error.code.name(),
+                error.code.code()
+            )
+        } else {
+            writeln!(self.sink, "<- {name} error {error}")
+        };
+        self.inner.refused(method, error);
+    }
 }
 
 /// The longest request line the loop reads into memory. Longer lines are
@@ -186,11 +224,13 @@ pub fn serve<H: Handler + ?Sized>(
                 ErrorCode::InvalidRequest,
                 format!("request line exceeds {MAX_LINE_BYTES} bytes"),
             );
+            handler.refused(None, &error);
             respond(&mut writer, &Response::error(None, error))?;
             continue;
         }
         let Ok(text) = std::str::from_utf8(&line) else {
             let error = RpcError::new(ErrorCode::ParseError, "line is not UTF-8");
+            handler.refused(None, &error);
             respond(&mut writer, &Response::error(None, error))?;
             continue;
         };
@@ -200,7 +240,10 @@ pub fn serve<H: Handler + ?Sized>(
         }
         let request = match parse_request(text) {
             Ok(request) => request,
-            Err(response) => {
+            Err((method, response)) => {
+                if let Body::Error(error) = &response.body {
+                    handler.refused(method.as_deref(), error);
+                }
                 respond(&mut writer, &response)?;
                 continue;
             }
@@ -231,29 +274,38 @@ fn skip_line(reader: &mut impl BufRead) -> io::Result<()> {
     }
 }
 
-fn parse_request(text: &str) -> Result<Request, Response> {
+/// On failure, the method name when the line carried one (for the log) and
+/// the error response.
+fn parse_request(text: &str) -> Result<Request, (Option<String>, Response)> {
     let value = serde_json::from_str::<Value>(text).map_err(|error| {
-        Response::error(
+        let response = Response::error(
             None,
             RpcError::new(ErrorCode::ParseError, error.to_string()),
-        )
+        );
+        (None, response)
     })?;
     // Serde would also read a request out of an array; JSON-RPC does not.
     let Value::Object(object) = value else {
-        return Err(Response::error(
+        let response = Response::error(
             None,
             RpcError::new(ErrorCode::InvalidRequest, "request must be a JSON object"),
-        ));
+        );
+        return Err((None, response));
     };
     // Valid JSON but not a request: echo the id when one is readable.
     let id = object
         .get("id")
         .and_then(|id| serde_json::from_value::<Id>(id.clone()).ok());
+    let method = object
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     serde_json::from_value::<Request>(Value::Object(object)).map_err(|error| {
-        Response::error(
+        let response = Response::error(
             id,
             RpcError::new(ErrorCode::InvalidRequest, error.to_string()),
-        )
+        );
+        (method, response)
     })
 }
 
@@ -271,11 +323,15 @@ fn dispatch<H: Handler + ?Sized>(
             ErrorCode::HelloRequired,
             format!("send `hello` before `{method}`"),
         );
+        handler.refused(Some(&method), &error);
         return (Response::error(Some(id), error), None);
     }
     let method = match Method::from_request(&method, params) {
         Ok(method) => method,
-        Err(error) => return (Response::error(Some(id), error), None),
+        Err(error) => {
+            handler.refused(Some(&method), &error);
+            return (Response::error(Some(id), error), None);
+        }
     };
     if let Method::Hello(params) = &method
         && params.protocol_version != PROTOCOL_VERSION
@@ -291,12 +347,15 @@ fn dispatch<H: Handler + ?Sized>(
             "expected": PROTOCOL_VERSION,
             "received": params.protocol_version,
         }));
+        handler.refused(Some(method.name()), &error);
         return (
             Response::error(Some(id), error),
             Some(ExitStatus::ProtocolMismatch),
         );
     }
     let response = match handler.handle(&method) {
+        // Belt and braces for a handler that bypasses `to_result`.
+        Ok(result) if result.is_null() => Response::result(id, json!({})),
         Ok(result) => Response::result(id, result),
         Err(error) => Response::error(Some(id), error),
     };
