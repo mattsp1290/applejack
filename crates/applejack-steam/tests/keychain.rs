@@ -10,7 +10,7 @@ const FIXTURE_TOKEN: &str = "fixture-refresh-token-not-a-real-value";
 
 fn exercise(store: &dyn RefreshTokenStore) {
     store.delete().unwrap();
-    assert_eq!(store.get().unwrap(), None);
+    assert!(store.get().unwrap().is_none());
 
     store.put(&RefreshToken::new(FIXTURE_TOKEN)).unwrap();
     assert_eq!(
@@ -25,7 +25,7 @@ fn exercise(store: &dyn RefreshTokenStore) {
     );
 
     store.delete().unwrap();
-    assert_eq!(store.get().unwrap(), None);
+    assert!(store.get().unwrap().is_none());
     store.delete().unwrap();
 }
 

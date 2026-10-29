@@ -120,22 +120,35 @@ pub struct Credentials {
     pub password: Password,
 }
 
-/// What a completed auth session yields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a completed auth session yields. Not comparable: the tokens are
+/// secrets, and nothing needs to compare them.
+#[derive(Debug, Clone)]
 pub struct Tokens {
     pub account_name: String,
     pub refresh_token: RefreshToken,
     pub access_token: AccessToken,
 }
 
-/// One entry of `CMsgClientLicenseList`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One entry of `CMsgClientLicenseList`. `Debug` omits `access_token`, the
+/// per-package PICS access token.
+#[derive(Clone, PartialEq, Eq)]
 pub struct License {
     pub package_id: u32,
     pub license_type: u32,
     pub flags: u32,
     pub owner_id: u32,
     pub access_token: u64,
+}
+
+impl fmt::Debug for License {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("License")
+            .field("package_id", &self.package_id)
+            .field("license_type", &self.license_type)
+            .field("flags", &self.flags)
+            .field("owner_id", &self.owner_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The calls that reach Steam. Each method advances one connection's state;

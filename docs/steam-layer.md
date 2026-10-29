@@ -51,8 +51,14 @@ them. The CM does not report a retry-after, so the value is a fixed 60 s floor.
 - `RefreshToken`, `AccessToken`, and `Password` redact themselves in `Debug`
   and `Display`; a value is readable only through `expose()`.
 - No token is ever passed on a process command line. The crate constructs no
-  `std::process::Command`; `tests/no_token_argv.rs` greps `src/` and
-  `examples/` for one on every test run.
+  `std::process::Command`: `crates/applejack-steam/clippy.toml` lists it and
+  `tokio::process::Command` under `disallowed-types`, which the gate's Clippy
+  run (`-D warnings`) enforces by resolved type, so an import alias cannot
+  hide one; `tests/no_token_argv.rs` greps `src/` and `examples/` as a
+  textual backstop.
+- `RefreshToken` is not comparable (no `PartialEq`), `License::Debug` omits
+  the PICS `access_token`, and the `CMsgClientLogon` built in `live::logon`
+  carries the refresh token and is never logged or `Debug`-formatted.
 - Fixtures and docs contain no credential values. The fixture token in tests is
   the literal `fixture-refresh-token-not-a-real-value`.
 - The `applejack` CLI and the copy embedded in the app are the same signed

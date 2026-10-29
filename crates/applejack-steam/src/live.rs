@@ -233,7 +233,8 @@ impl SteamConnection for SteamroomConnection {
             cell_id: Some(0),
             client_os_type: Some(CLIENT_OS_WINDOWS_11),
             account_name: Some(account_name.to_owned()),
-            // Steam's wire name for the refresh-token slot.
+            // Steam's wire name for the refresh-token slot. This struct now
+            // holds the secret: never log it or format it with `Debug`.
             access_token: Some(refresh_token.expose().to_owned()),
             obfuscated_private_ip: Some(CMsgIpAddress {
                 ip: Some(c_msg_ip_address::Ip::V4(LOGIN_ID)),

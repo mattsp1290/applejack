@@ -94,7 +94,7 @@ async fn qr_login_stores_the_refresh_token() {
             payload: "https://s.team/q/fixture".to_owned()
         }
     );
-    assert_eq!(store.get().unwrap(), None);
+    assert!(store.get().unwrap().is_none());
     let step = auth.finish().await.unwrap();
     assert_eq!(
         step,
@@ -151,7 +151,7 @@ async fn credentials_login_with_guard_code() {
 
     let error = auth.submit_guard_code("BAD").await.unwrap_err();
     assert!(matches!(error, Error::Auth(AuthError::InvalidGuardCode)));
-    assert_eq!(store.get().unwrap(), None);
+    assert!(store.get().unwrap().is_none());
 
     let step = auth.submit_guard_code("GOOD1").await.unwrap();
     assert!(matches!(step, LoginStep::Done { .. }));
@@ -222,7 +222,7 @@ async fn refresh_uses_the_stored_token_and_logout_deletes_it() {
     store.put(&RefreshToken::new(FIXTURE_TOKEN)).unwrap();
     auth.refresh("redacted").await.unwrap();
     auth.logout().unwrap();
-    assert_eq!(store.get().unwrap(), None);
+    assert!(store.get().unwrap().is_none());
     assert_eq!(
         fake.logged_on_with,
         Some(("redacted".to_owned(), FIXTURE_TOKEN.to_owned()))
@@ -241,4 +241,21 @@ fn secrets_never_print_their_values() {
     assert!(!debug.contains(FIXTURE_TOKEN));
     assert!(!debug.contains("access-fixture"));
     assert!(!format!("{:?}", credentials()).contains("not-a-real-password"));
+    let license = License {
+        package_id: 1,
+        license_type: 1,
+        flags: 0,
+        owner_id: 0,
+        access_token: 0xDEAD_BEEF_CAFE,
+    };
+    let debug = format!("{license:?}");
+    assert!(debug.contains("package_id: 1"));
+    assert!(!debug.contains("access_token"));
+    assert!(!debug.contains("DEAD_BEEF_CAFE"), "{debug}");
+    assert!(
+        !debug
+            .to_lowercase()
+            .contains(&format!("{:x}", 0xDEAD_BEEF_CAFEu64))
+    );
+    assert!(!debug.contains(&0xDEAD_BEEF_CAFEu64.to_string()));
 }

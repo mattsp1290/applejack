@@ -1,0 +1,6 @@
+# Tokens must never reach argv: this crate spawns no process at all.
+# `tests/no_token_argv.rs` greps for the same thing as a textual backstop.
+disallowed-types = [
+  { path = "std::process::Command", reason = "tokens must never reach argv; this crate spawns no process" },
+  { path = "tokio::process::Command", reason = "tokens must never reach argv; this crate spawns no process" },
+]

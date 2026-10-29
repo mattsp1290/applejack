@@ -1,5 +1,7 @@
 //! No token ever rides on a process command line: this crate constructs no
 //! `std::process::Command` at all, and the spike example does not either.
+//! `clippy.toml` (`disallowed-types`) is the type-resolved guard that an
+//! import alias cannot bypass; this grep is the textual backstop.
 
 use std::fs;
 use std::path::{Path, PathBuf};

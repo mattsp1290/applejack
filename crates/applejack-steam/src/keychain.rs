@@ -21,8 +21,10 @@ pub const ACCOUNT: &str = "steam-refresh-token";
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
 /// A Steam refresh token. `Debug` and `Display` never reveal the value; call
-/// [`RefreshToken::expose`] to read it.
-#[derive(Clone, PartialEq, Eq)]
+/// [`RefreshToken::expose`] to read it. Deliberately not comparable: nothing
+/// outside tests needs equality, and a derived comparison is not constant
+/// time.
+#[derive(Clone)]
 pub struct RefreshToken(String);
 
 impl RefreshToken {
