@@ -20,7 +20,7 @@ usage: cargo xtask engine-payload <mode>
   --fetch [id ...]                    download every pin (or the named ones) into build/work/, verify SHA-256, and denylist-scan the listing
   --check <payload-dir>               denylist scan plus self-containment check of every Mach-O and symlink
   --check-listing <file|->            denylist scan of an archive listing, one path per line (an empty listing fails)
-  --write-bundle-toml <spec> <out>    render a BUNDLE.toml from a typed spec file
+  --write-bundle-toml <spec> <out>    render BUNDLE.toml from a typed spec file, plus THIRD_PARTY_NOTICES.md beside it
   --print-pin <id> [field]            print a pin (all fields as key=value, or one field)
   --build                             run the build scripts under build/ in order";
 
@@ -534,13 +534,24 @@ fn check_listing(root: &Path, listing: &str) -> Result<(), String> {
     }
 }
 
+const NOTICES_FILE: &str = "THIRD_PARTY_NOTICES.md";
+
+/// Renders `BUNDLE.toml` to `out` and `THIRD_PARTY_NOTICES.md` beside it.
 fn write_bundle_toml(spec: &Path, out: &Path) -> Result<(), String> {
     let text = fs::read_to_string(spec).map_err(|error| format!("{}: {error}", spec.display()))?;
-    let rendered = BundleSpec::parse(&text)
-        .and_then(|spec| spec.to_toml())
+    let parsed =
+        BundleSpec::parse(&text).map_err(|error| format!("{}: {error}", spec.display()))?;
+    let rendered = parsed
+        .to_toml()
         .map_err(|error| format!("{}: {error}", spec.display()))?;
     fs::write(out, rendered).map_err(|error| format!("{}: {error}", out.display()))?;
     println!("[xtask] wrote {}", out.display());
+    let notices = out.with_file_name(NOTICES_FILE);
+    let rendered = parsed
+        .to_notices()
+        .map_err(|error| format!("{}: {error}", spec.display()))?;
+    fs::write(&notices, rendered).map_err(|error| format!("{}: {error}", notices.display()))?;
+    println!("[xtask] wrote {}", notices.display());
     Ok(())
 }
 

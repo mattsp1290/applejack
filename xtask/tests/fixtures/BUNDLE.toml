@@ -1,0 +1,49 @@
+id = "rosetta-wine"
+version = "11.0-1"
+arch = "x86_64"
+min_macos = "14.0"
+sync_modes = ["esync", "none"]
+
+[wine]
+version = "11.0"
+source_url = "https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz"
+source_rev = "wine-11.0"
+loader = "wine/bin/wine"
+server = "wine/bin/wineserver"
+wow64 = "new"
+
+[components.dxmt]
+version = "0.80"
+license = "MIT"
+
+[components.vkd3d_proton]
+version = "3.1"
+license = "LGPL-2.1-or-later"
+
+[components.moltenvk]
+version = "1.4.2"
+license = "Apache-2.0"
+
+[components.gstreamer]
+version = "1.28.8"
+license = "LGPL-2.1-or-later"
+
+[components.osslsigncode]
+version = "2.14"
+license = "GPL-3.0-or-later"
+
+[overrides.dxmt]
+x86_64 = ["dxmt/x86_64-windows/d3d11.dll", "dxmt/x86_64-windows/dxgi.dll", "dxmt/x86_64-windows/d3d10core.dll", "dxmt/x86_64-windows/winemetal.dll"]
+i386 = ["dxmt/i386-windows/d3d11.dll", "dxmt/i386-windows/dxgi.dll", "dxmt/i386-windows/d3d10core.dll", "dxmt/i386-windows/winemetal.dll"]
+
+[overrides.vkd3d]
+x86_64 = ["vkd3d/x64/d3d12.dll", "vkd3d/x64/d3d12core.dll"]
+i386 = ["vkd3d/x86/d3d12.dll", "vkd3d/x86/d3d12core.dll"]
+
+[probes]
+cpuid = "probes/cpuid"
+dx11_sample = "probes/dx11-sample.exe"
+xinput_check = "probes/xinput-check.exe"
+
+[registry]
+hidraw_key = 'HKLM\System\CurrentControlSet\Services\WineBus\DisableHidraw'
