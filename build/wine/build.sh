@@ -78,6 +78,10 @@ FLEX=$(command -v flex || true)
 [ -n "$BISON" ] || fail "bison (sh build/bootstrap.sh --install-brew-deps)" bootstrap
 [ -n "$FLEX" ] || fail "flex (sh build/bootstrap.sh --install-brew-deps)" bootstrap
 export CPPFLAGS="-I$BREW_PREFIX/include"
+# Keep this order: configure's conftests put $LDFLAGS before $LIBS, so a
+# GStreamer link test binds glib from Homebrew, but only in the conftest; the
+# real winegstreamer.so link (makedep: UNIXLDFLAGS, objects, UNIX_LIBS, then
+# LDFLAGS) searches the stage first.
 export LDFLAGS="-L$BREW_PREFIX/lib"
 # The devel tree stays off this path: its lib/pkgconfig also carries
 # freetype2.pc, fontconfig.pc, zlib.pc, and the rest of GStreamer's base
@@ -129,8 +133,15 @@ if [ -n "$GST_PKG_CONFIG" ]; then
   # $GST_PKGS is a word list, as in the loop above.
   # shellcheck disable=SC2086
   GSTREAMER_CFLAGS=$(gst_pkg_config --cflags $GST_PKGS 2>/dev/null || true)
+  # Empty, configure's WINE_PACKAGE_FLAGS would ask pkg-config itself on the
+  # real PKG_CONFIG_PATH, the one way Homebrew's gstreamer or glib could
+  # still reach it.
+  [ -n "$GSTREAMER_CFLAGS" ] || fail "GSTREAMER_CFLAGS from $GST_DEVEL/lib/pkgconfig (pkg-config --cflags $GST_PKGS failed; sh build/gstreamer/fetch.sh)"
   # The link references name the staged, thinned libraries (what ships, and
   # what the closure step rewrites), so every -l must exist there.
+  # --libs-only-l also drops the devel .pc's -Wl,-rpath,${libdir} entry on
+  # purpose: a plain --libs would embed an absolute LC_RPATH into the devel
+  # tree in winegstreamer.so, which --check rejects.
   # shellcheck disable=SC2086
   GST_LIBS_L=$(gst_pkg_config --libs-only-l $GST_PKGS 2>/dev/null || true)
   GSTREAMER_LIBS="-L$GST_STAGE/lib $GST_LIBS_L"

@@ -127,8 +127,14 @@ Environment knobs:
    tree), and `GSTREAMER_LIBS` is `-L<stage>/lib` plus
    `pkg-config --libs-only-l`, pointed at the staged, thinned `lib/` so the
    link references name what ships and the closure in step 7 rewrites them;
-   the script fails if any `-l` has no dylib in the stage. The devel tree
-   stays off `PKG_CONFIG_PATH`: it also carries `freetype2.pc`,
+   the script fails if any `-l` has no dylib in the stage. `--libs-only-l`
+   also drops the devel `.pc`'s `-Wl,-rpath,${libdir}` entry on purpose: a
+   plain `--libs` would embed an absolute `LC_RPATH` into the devel tree in
+   `winegstreamer.so`, which step 9 rejects as a link into the build
+   directory. The script also fails when `GSTREAMER_CFLAGS` comes back
+   empty, since `configure`'s `WINE_PACKAGE_FLAGS` would then ask
+   pkg-config on the real `PKG_CONFIG_PATH`. The devel tree stays off
+   `PKG_CONFIG_PATH`: it also carries `freetype2.pc`,
    `fontconfig.pc`, and the rest of GStreamer's base system, which must not
    shadow the Homebrew packages Wine links. `--with-gstreamer` makes a miss
    a configure error instead of the silent "GStreamer won't be supported"
@@ -257,32 +263,49 @@ Environment knobs:
    own name, which breaks once the installer renames the root), or whose real
    resolution leaves the payload; and on any `@rpath/`, `@loader_path/`, or
    `@executable_path/` dependency that names no file in the payload. The
-   lookup follows dyld along the payload's load chains, which are only the
-   executables `BUNDLE.toml` declares: `wine.loader`, `wine.server`,
+   lookup follows dyld along the payload's load chains, which are (1) the
+   executables `BUNDLE.toml` declares, `wine.loader`, `wine.server`,
    `wine.preloader` when present, and the `[probes]` entries that are
-   Mach-O (the `.exe` probes are PE). `--check` reads `BUNDLE.toml` from the
-   payload root for that list and fails with "no BUNDLE.toml: cannot
-   determine load chains" when it is absent. Every library and module must
-   resolve each `@rpath/` and `@executable_path/` reference under each
-   declared executable present in the tree: `@executable_path` relocates
-   against that executable's directory, in dependencies and `LC_RPATH`
-   entries alike, and `@rpath/x` is searched through that executable's
-   relocated `LC_RPATH` entries plus the binary's own, since dyld consults
-   the rpaths of the image and of the images that loaded it up to the main
-   executable and never those of unrelated images. A dlopen'd Unix module
-   without an rpath therefore resolves through the loader's; a library one
-   declared executable can load and another cannot is reported with the
-   chain that fails; and an executable the file does not declare (the
-   framework tools `gstreamer/fetch.sh` removes, for instance) contributes
-   nothing to any other binary's search and is checked through its own
-   rpaths alone. Before Wine is built no declared executable exists, so each
+   Mach-O (the `.exe` probes are PE), each resolved through symlinks to its
+   real file, which is the chain (dyld sets `@executable_path` from the
+   real file); and (2) every Mach-O executable (`LC_MAIN` or
+   `LC_UNIXTHREAD`) under the payload's `wine/` subtree. Rule 2 covers
+   Wine 11's real Unix loader: `wine/bin/wine` is a wrapper built from
+   `tools/wine` that dlopens `ntdll.so` and re-execs
+   `wine/lib/wine/x86_64-unix/wine` (`dlls/ntdll/unix/loader.c`,
+   `wineloader`; macOS builds no preloader), so that binary is the main
+   executable of every Windows process and the one that dlopens
+   `winemac.so`, `winemetal.so`, and `winegstreamer.so`. Executables
+   elsewhere in the payload are not chains. `--check` reads `BUNDLE.toml`
+   from the payload root for the declared list and fails with "no
+   BUNDLE.toml: cannot determine load chains" when it is absent; a declared
+   path with no entry at all is tolerated (the tree before Wine is built),
+   while a declared path that is a dangling link, resolves outside the
+   payload, or names a Mach-O that is no executable is a violation reported
+   against `BUNDLE.toml`. Every library and module must resolve each
+   `@rpath/` and `@executable_path/` reference under each chain present in
+   the tree: `@executable_path` relocates against that executable's
+   directory, in dependencies and `LC_RPATH` entries alike, and `@rpath/x`
+   is searched through that executable's relocated `LC_RPATH` entries plus
+   the binary's own, since dyld consults the rpaths of the image and of the
+   images that loaded it up to the main executable and never those of
+   unrelated images. A dlopen'd Unix module without an rpath therefore
+   resolves through the real loader's; a library one chain can load and
+   another cannot is reported once, with every chain that fails named on
+   the line (`load chain X`, or `load chains X, Y`); and an executable that
+   is no chain (one outside `wine/`, such as a component's tool)
+   contributes nothing to any other binary's search and is checked through
+   its own rpaths alone. Before Wine is built no chain exists, so each
    binary searches its own rpaths and `@executable_path/` references have
    nothing to resolve against. `@loader_path/x` resolves against the
    binary's own directory. When the binary's `LC_RPATH` entries, or the
    chain's executable's, include a system root such as `/usr/lib/swift`, its
    unresolved `@rpath/` references are left to dyld and `--check` prints how
    many; other absolute `LC_RPATH` entries contribute nothing to the lookup.
-   The report also names the load chains it followed.
+   The report prints the chain list it derived. After the real build
+   `wineserver` is a chain too, although it dlopens no Unix module: a
+   violation reported only under its chain is a candidate for a rule
+   change, not a payload defect.
 
 ## Running the built Wine
 
