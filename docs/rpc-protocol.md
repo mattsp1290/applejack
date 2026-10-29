@@ -15,10 +15,20 @@ describes them.
   core is serving.
 - Blank lines are ignored.
 - A line that is not UTF-8 or not JSON is answered with `ParseError` and
-  `"id": null`. A JSON value that is not a valid request (wrong `jsonrpc`,
-  missing `method`, unknown members) is answered with `InvalidRequest` and
-  the line's `id` when it can be read. In both cases the core keeps serving.
-- EOF on stdin ends the loop. The core exits 0.
+  `"id": null`. A JSON value that is not a valid request (not an object,
+  wrong `jsonrpc`, missing `method`, unknown members) is answered with
+  `InvalidRequest` and the line's `id` when it can be read, `null` otherwise.
+  In both cases the core keeps serving.
+- A request line longer than 16 MiB (`rpc::MAX_LINE_BYTES`) is answered with
+  `InvalidRequest` and `"id": null`. The core discards the rest of the line
+  without buffering it.
+- Notifications are core-to-shell only. The shell must not send one: a line
+  without an `id` is answered with `InvalidRequest` and `"id": null`, which
+  JSON-RPC forbids for a notification but which keeps the loop simple.
+- A notification may arrive between a request and its response. The shell
+  matches responses by `id`, never by order.
+- EOF on stdin ends the loop. The core exits 0 whether or not `hello` was
+  ever sent; an empty session is not an error.
 
 Request:
 
@@ -55,7 +65,8 @@ current version is `1` (`PROTOCOL_VERSION`).
 - Any other request before a successful `hello` is answered with
   `HelloRequired` and does not run.
 
-`hello` may be sent again later; it is answered the same way.
+`hello` may be sent again later; it is answered the same way, and a repeated
+`hello` with another version exits 65 even after a good one.
 
 ## Error codes
 
@@ -78,11 +89,19 @@ Codes are serialized as integers.
 
 Parameter types are in `crates/applejack-core/src/rpc/methods.rs`. Each
 method has an example request in `crates/applejack-core/tests/rpc_golden/`.
+`host.doctor` returns `HostFacts`, the same shape as `applejack doctor
+--json`.
 
+The table between the markers is rendered from the method table by
+`docs_method_table_matches_the_types` in `tests/rpc_golden.rs`; edit
+`methods.rs` and rerun with `APPLEJACK_UPDATE_GOLDENS=1` instead of editing it
+by hand.
+
+<!-- method-table:begin -->
 | Method | Status |
 |---|---|
 | `hello` | implemented |
-| `host.doctor` | implemented; result is `HostFacts` (same shape as `applejack doctor --json`) |
+| `host.doctor` | implemented |
 | `engine.list` | pending (work package 2) |
 | `engine.install` | pending (work package 2) |
 | `engine.use` | pending (work package 2) |
@@ -109,6 +128,7 @@ method has an example request in `crates/applejack-core/tests/rpc_golden/`.
 | `prefix.restore` | pending (work package 2) |
 | `prefix.reset` | pending (work package 2) |
 | `session.list` | pending (work package 5) |
+<!-- method-table:end -->
 
 A pending method still validates its params. Bad params get `InvalidParams`;
 good params get `NotImplemented`.
@@ -124,7 +144,15 @@ then emits notifications for that id:
   `{job_id, code, message}`, where `code` is an integer from the table above.
 
 No method runs as a job yet. The first job methods (`engine.install`,
-`app.install`) land with their work packages.
+`app.install`) land with their work packages. When they do, job threads and
+the request loop must write through one shared, locked writer so a
+notification and a response never interleave on stdout; the handler API for
+emitting notifications is that unit's to define.
+
+Children the core spawns (wine, wineserver, Steam) must not inherit the
+core's stdout: give them `Stdio::null()` or a pipe. An inherited stdout would
+let a child write into the protocol stream and would keep the shell's pipe
+open after the core exits.
 
 ## Logging and redaction
 
@@ -139,11 +167,26 @@ log still shows the shape. Values on the wire itself are not redacted.
 ## Restart policy
 
 `CoreClient` (`apps/Applejack/Sources/ApplejackShell/CoreClient.swift`) spawns
-the core, sends `hello` on every spawn, and matches responses to requests by
-`id`. If the core exits unexpectedly, the requests in flight fail with
-`coreExited(status)`. The next call respawns the core, at most three times.
-After that, every call fails with `restartLimit`. A protocol mismatch is
-final: the client does not respawn into the same mismatch.
+the core, sends one `hello` per spawn, and matches responses to requests by
+`id`. Every caller that arrives while the handshake is in flight awaits the
+same `hello`; cancelling one of them does not cancel the handshake. A `hello`
+that fails for any reason other than a protocol mismatch tears the core down.
+
+The client observes the core's exit through its termination status, not
+through EOF on stdout. After the core exits it drains stdout for 250 ms, then
+stops reading and fails the requests in flight with `coreExited(status)`.
+Restarts are lazy: the next call respawns the core, at most three times, and
+a spawn that fails outright (`launchFailed`) does not count. After the third
+restart every call fails with `restartLimit`. A protocol mismatch is final:
+the client does not respawn into the same mismatch.
+
+`shutdown()` closes the core's stdin, which ends a healthy core's loop with
+exit 0, and terminates the core if it is still running two seconds later.
+
+A response with `"id": null` (`ParseError` or `InvalidRequest` for a line the
+core could not attribute) matches no request; the client logs it to stderr.
+The request that caused it keeps waiting, because the client cannot tell
+which one it was.
 
 Cancelling a Swift task abandons its request. Nothing is sent to the core, and
 a late response is dropped. `app.cancel` (work package 5) is the method that
@@ -169,5 +212,7 @@ every method, plus `<method>.result.json` for methods with a result type
   JSON.
 
 Adding a method means adding a row to `methods!` and an example to
-`Method::examples` in `methods.rs`, regenerating the goldens, and adding a
-row to the method table above.
+`Method::examples` in `methods.rs`, then regenerating the goldens and the
+method table above with `APPLEJACK_UPDATE_GOLDENS=1`. The same test run
+fails until both match, and `CoreHandler` must answer `NotImplemented` for
+exactly the methods whose status is pending.
