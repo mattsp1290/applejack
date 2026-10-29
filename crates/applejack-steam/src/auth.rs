@@ -182,7 +182,12 @@ pub trait SteamConnection {
         refresh_token: &RefreshToken,
     ) -> impl Future<Output = Result<(), AuthError>> + Send;
 
-    /// Reads `CMsgClientLicenseList` from the logged-in session.
+    /// Reads `CMsgClientLicenseList` from the logged-in session. Call it
+    /// once, directly after `logon` and before any PICS or heartbeat call:
+    /// the live implementation drops every other message that arrives while
+    /// it waits, and Steam sends the list unprompted after logon (and again
+    /// whenever the account's licenses change), so a later call can eat
+    /// another reply or wait out its timeout.
     fn license_list(&mut self) -> impl Future<Output = Result<Vec<License>, AuthError>> + Send;
 }
 

@@ -11,8 +11,12 @@
 //! rejected. Duplicate keys are kept in order.
 //!
 //! The writer emits Valve's layout (tab indentation, `"key"<tab><tab>"value"`,
-//! braces on their own lines, LF line ends), so a client-written LF file
-//! round-trips byte for byte; a CRLF file parses and is written back with LF.
+//! braces on their own lines, LF line ends). A client-written file (LF line
+//! ends, no BOM, control characters inside quoted strings escaped, which is
+//! what Valve's writer produces) round-trips byte for byte. Input the client
+//! does not write is normalised: CRLF between tokens becomes LF, a leading
+//! BOM is dropped, and a raw tab, carriage return, or newline inside a quoted
+//! string is written back as its escape.
 
 use crate::Error;
 

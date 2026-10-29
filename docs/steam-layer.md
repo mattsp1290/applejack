@@ -42,6 +42,13 @@ and a `RefreshTokenStore`. Unit tests use a scripted fake connection;
 - **License list.** After `refresh`, `SteamConnection::license_list` reads
   `EMsg::CLIENT_LICENSE_LIST` from the same connection (also inside `MULTI`
   batches) and decodes `CMsgClientLicenseList`. It times out after 30 s.
+  Call it exactly once, directly after `logon` and before any PICS or
+  heartbeat call: the live implementation drops every other message it
+  receives while waiting, and Steam re-sends the list unprompted whenever
+  the account's licenses change, so once PICS calls and heartbeats share
+  the session a stray `license_list` can eat a PICS reply and a PICS call
+  can eat the list. The unit that shares the session must own one
+  receive-and-dispatch loop (see the design note under "Follow-ups").
 
 Rate limits and Steam Guard surface as typed errors (`AuthError::RateLimited
 { retry_after }`, `AuthError::GuardRequired { factor }`); nothing loops on
@@ -157,8 +164,14 @@ skipped, never evaluated, only where it follows a value on the same line or
 a key whose value is a `{` block; a `[` anywhere else is part of a bare token
 (`a[b]` is one token, `v [b]` is a value and a conditional). Top-level
 `#base` and `#include` directives are rejected with `VdfParse`. The writer
-emits Valve's layout with LF line ends, so a client-written LF file
-round-trips byte for byte and a CRLF file is normalised to LF.
+emits Valve's layout with LF line ends. A client-written file (LF, no BOM,
+control characters inside quoted strings escaped, which is what Valve's
+writer produces) round-trips byte for byte; input the client does not write
+is normalised: CRLF between tokens becomes LF, a leading BOM is dropped, and
+a raw tab, CR, or newline inside a quoted string is written back as its
+escape. `AppManifest::parse` rejects a `Universe` other than `1` with
+`AcfField`, so a manifest from another universe is never rewritten as
+public.
 `acf::AppManifest` reads and `acf::AcfWriter`
 writes `appmanifest_<appid>.acf` with `appid`, `Universe` (always `1`, the
 public universe; some client versions treat its absence as a foreign
@@ -214,6 +227,10 @@ never prints the token.
   `CMsgClientLogonResponse` eresult): the real red case. Rate limits and
   Steam Guard surface as typed errors; retry after the floor or complete the
   factor rather than counting them as red.
+- `refresh logon ok` followed by `Steam EResult ...`, `rate limited by
+  Steam`, or `Steam refused the login` from the license list: the CM
+  accepted the logon but answered `CMsgClientLicenseList` with a non-OK
+  `eresult`. Red for the decode path; record the EResult in the table.
 - `refresh logon ok` followed by `timed out waiting for CLIENT_LICENSE_LIST`:
   **not red**. This is the known MULTI-drain behaviour of
   `SteamClient<Ready>::login` (`steamroom-0.3.0/src/client/mod.rs:286-350`):
@@ -281,7 +298,7 @@ real ones are listed in the unit report's DEVIATIONS.
 | EResult mapping | `steamroom::enums::EResultError::{RateLimitExceeded, LoginDeniedThrottle, TwoFactorRequired, TwoFactorCodeMismatch, InvalidPassword, AccessDenied, Expired, Revoked, Banned}` | `steamroom-0.3.0/src/enums/mod.rs:33-72` |
 | `fd-lock` / `rustix` flock | `rustix::fs::flock(fd, FlockOperation::{LockExclusive, NonBlockingLockExclusive, Unlock})` | `rustix-1.1.6/src/fs/fd.rs:322`, `src/backend/libc/fs/types.rs:943` (what `fd-lock-4.0.4/src/sys/unix/rw_lock.rs:20-32` calls) |
 | `set_generic_password` | `security_framework::passwords::set_generic_password(service, account, &[u8])` | `security-framework-3.7.0/src/passwords.rs:26` |
-| `find_generic_password` | `security_framework::passwords::generic_password(PasswordOptions::new_generic_password(..))` (SecItem API) | `security-framework-3.7.0/src/passwords.rs:51`, `src/passwords_options.rs:63` |
+| `find_generic_password` | `security_framework::passwords::generic_password(PasswordOptions::new_generic_password(..))` (SecItem API) | `security-framework-3.7.0/src/passwords.rs:53`, `src/passwords_options.rs:63` |
 | delete | `security_framework::passwords::delete_generic_password(service, account)` | `security-framework-3.7.0/src/passwords.rs:63` |
 | not-found code | `errSecItemNotFound = -25300` | `security-framework-sys-2.17.0/src/base.rs:61` |
 | password prompt | `rpassword::prompt_password` | `rpassword-7.5.4/src/lib.rs:270` |

@@ -47,7 +47,8 @@ const ROOT_KEY: &str = "AppState";
 
 /// `Universe` is constant for the public Steam universe; the writer always
 /// emits it because some client versions treat its absence as a foreign
-/// manifest.
+/// manifest, and the reader rejects any other value so a manifest from
+/// another universe is never rewritten as public.
 const UNIVERSE_PUBLIC: &str = "1";
 
 /// One entry of `InstalledDepots`.
@@ -59,7 +60,8 @@ pub struct InstalledDepot {
 }
 
 /// The fields applejack reads and writes in an `appmanifest`. `Universe` is
-/// not modelled: the writer always emits `1`.
+/// not modelled: the writer always emits `1`, and `parse` accepts only `1`
+/// or its absence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppManifest {
     pub appid: u32,
@@ -79,10 +81,21 @@ impl AppManifest {
     /// # Errors
     ///
     /// Returns [`Error::VdfParse`] for malformed text and [`Error::AcfField`]
-    /// when a required field is missing or not a number.
+    /// when a required field is missing or not a number, or when `Universe`
+    /// names anything but the public universe.
     pub fn parse(text: &str) -> Result<Self, Error> {
         let document = Document::parse(text)?;
         let root = document.get(ROOT_KEY).ok_or_else(|| missing(ROOT_KEY))?;
+        if let Some(universe) = root.get_str("Universe")
+            && universe != UNIVERSE_PUBLIC
+        {
+            return Err(Error::AcfField {
+                path: "Universe".to_owned(),
+                reason: format!(
+                    "unsupported universe `{universe}`; only `{UNIVERSE_PUBLIC}` (public) is handled"
+                ),
+            });
+        }
         let installed_depots = match root.get("InstalledDepots") {
             Some(Value::Map(children)) => children
                 .iter()

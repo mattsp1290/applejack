@@ -162,6 +162,15 @@ fn unknown_escapes_are_rejected() {
 }
 
 #[test]
+fn raw_control_characters_inside_quotes_are_written_back_escaped() {
+    // Valve's writer escapes these, so a client file is unaffected; a
+    // hand-edited one is normalised rather than kept byte for byte.
+    let document = Document::parse("\"k\" \"a\tb\r\nc\"\n").unwrap();
+    assert_eq!(document.get_str("k"), Some("a\tb\r\nc"));
+    assert_eq!(document.to_text(), "\"k\"\t\t\"a\\tb\\r\\nc\"\n");
+}
+
+#[test]
 fn crlf_input_parses_and_is_written_back_with_lf() {
     let lf = fixture("libraryfolders.vdf");
     let crlf = lf.replace('\n', "\r\n");

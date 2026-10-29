@@ -84,6 +84,17 @@ fn writer_emits_universe_1_between_appid_and_name() {
 }
 
 #[test]
+fn universe_other_than_public_is_rejected() {
+    let text = fixture().replace("\"Universe\"\t\t\"1\"", "\"Universe\"\t\t\"2\"");
+    assert_ne!(text, fixture(), "the fixture carries `Universe`");
+    let error = AppManifest::parse(&text).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "acf: field `Universe`: unsupported universe `2`; only `1` (public) is handled"
+    );
+}
+
+#[test]
 fn missing_and_malformed_fields_name_their_path() {
     let missing = AppManifest::parse("\"AppState\"\n{\n\t\"appid\"\t\t\"0\"\n}\n").unwrap_err();
     assert_eq!(missing.to_string(), "acf: field `name`: missing");
