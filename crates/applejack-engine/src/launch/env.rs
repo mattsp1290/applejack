@@ -81,12 +81,19 @@ impl RootSet {
 /// One allowlist row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
+    /// The variable name.
     pub name: &'static str,
+    /// How the value is checked.
     pub kind: Kind,
+    /// Who may set it.
     pub owner: Owner,
     /// Roots a [`Kind::Path`] or [`Kind::PathList`] value may point into;
     /// [`RootSet::NONE`] for [`Kind::Plain`].
     pub roots: RootSet,
+    /// The variable must be present after every launch's tiers are applied;
+    /// [`assemble`] fails when it is not. Only engine-owned rows are
+    /// required, so the engine alone can satisfy them.
+    pub required: bool,
 }
 
 const fn plain(name: &'static str, owner: Owner) -> Entry {
@@ -95,6 +102,7 @@ const fn plain(name: &'static str, owner: Owner) -> Entry {
         kind: Kind::Plain,
         owner,
         roots: RootSet::NONE,
+        required: false,
     }
 }
 
@@ -108,6 +116,7 @@ pub const ALLOWLIST: &[Entry] = &[
         kind: Kind::Path,
         owner: Owner::Engine,
         roots: RootSet::PREFIX,
+        required: true,
     },
     plain("WINEDEBUG", Owner::Game),
     plain("WINEDLLOVERRIDES", Owner::Engine),
@@ -121,6 +130,7 @@ pub const ALLOWLIST: &[Entry] = &[
         kind: Kind::Path,
         owner: Owner::Game,
         roots: RootSet::ALL,
+        required: false,
     },
     plain("DXMT_LOG_LEVEL", Owner::Game),
     plain("MTL_HUD_ENABLED", Owner::Game),
@@ -130,13 +140,21 @@ pub const ALLOWLIST: &[Entry] = &[
         kind: Kind::PathList,
         owner: Owner::Game,
         roots: RootSet::ALL,
+        required: false,
     },
-    plain("APPLEJACK_SESSION", Owner::Engine),
+    Entry {
+        name: "APPLEJACK_SESSION",
+        kind: Kind::Plain,
+        owner: Owner::Engine,
+        roots: RootSet::NONE,
+        required: true,
+    },
     Entry {
         name: "VK_ICD_FILENAMES",
         kind: Kind::PathList,
         owner: Owner::Game,
         roots: RootSet::ALL,
+        required: false,
     },
 ];
 
@@ -152,9 +170,11 @@ pub struct AllowedRoots {
 
 impl AllowedRoots {
     /// Validates and canonicalizes the three roots. Each must be absolute,
-    /// not `/`, and free of `..`; the longest existing ancestor of each is
-    /// canonicalized so `/var` and `/private/var` spellings agree, and the
-    /// result may not be `/` either. The directories need not exist yet.
+    /// not `/`, free of `..`, and not itself a symlink (a link would widen
+    /// the root to wherever it points); the longest existing ancestor of
+    /// each is canonicalized so `/var` and `/private/var` spellings agree,
+    /// and the result may not be `/` either. The directories need not exist
+    /// yet.
     ///
     /// # Errors
     ///
@@ -213,6 +233,9 @@ fn check_root(root: &Path) -> Result<PathBuf> {
     {
         return Err(invalid("must not contain `..`"));
     }
+    if fs::symlink_metadata(root).is_ok_and(|meta| meta.is_symlink()) {
+        return Err(invalid("must not be a symlink"));
+    }
     let resolved = resolve(root).ok_or_else(|| invalid("cannot be resolved"))?;
     if resolved.parent().is_none() {
         return Err(invalid("must not be the filesystem root"));
@@ -222,7 +245,10 @@ fn check_root(root: &Path) -> Result<PathBuf> {
 
 /// Canonicalizes the longest existing ancestor of `path` and re-appends the
 /// components that do not exist yet, so a path through a symlink is seen at
-/// its real location while a not-yet-created file still resolves.
+/// its real location while a not-yet-created file still resolves. A
+/// component that exists but cannot be canonicalized is a dangling or
+/// looping symlink; its target could appear later, outside every root, so
+/// the path is unresolvable rather than "not created yet".
 fn resolve(path: &Path) -> Option<PathBuf> {
     let mut existing = path;
     let mut missing: Vec<&OsStr> = Vec::new();
@@ -234,6 +260,9 @@ fn resolve(path: &Path) -> Option<PathBuf> {
                     .rev()
                     .fold(canonical, |path, component| path.join(component)),
             );
+        }
+        if fs::symlink_metadata(existing).is_ok() {
+            return None;
         }
         missing.push(existing.file_name()?);
         existing = existing.parent()?;
@@ -260,8 +289,12 @@ pub enum DropReason {
 /// A variable that did not make it into the child environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dropped {
+    /// The variable name as supplied.
     pub name: OsString,
+    /// Why it was dropped.
     pub reason: DropReason,
+    /// The tier that supplied the dropped value.
+    pub from: Owner,
 }
 
 /// Filters `base` (the host environment), `extras` (per-game variables),
@@ -275,17 +308,24 @@ pub struct Dropped {
 /// value that fails its path check is dropped without unsetting the earlier
 /// tier's value, so a rejected extra falls back to the base value. Among
 /// duplicates within one list the last wins. The accepted pairs come back in
-/// allowlist order; `dropped` names every pair that was not used so the
-/// caller can log them.
-#[must_use]
+/// allowlist order; `dropped` names every pair that was not used, with the
+/// tier it came from, so the caller can log them.
+///
+/// # Errors
+///
+/// Returns [`Error::MissingEngineVariable`] when a required row
+/// (`WINEPREFIX`, `APPLEJACK_SESSION`) has no accepted value after the
+/// tiers are applied: the engine did not set it, or set a value that failed
+/// its check. Without `WINEPREFIX` Wine would use `~/.wine`; without the
+/// session id process discovery finds nothing.
 pub fn assemble(
     base: &[EnvPair],
     extras: &[EnvPair],
     engine_set: &[EnvPair],
     roots: &AllowedRoots,
-) -> (Vec<EnvPair>, Vec<Dropped>) {
+) -> Result<(Vec<EnvPair>, Vec<Dropped>)> {
     let mut dropped = Vec::new();
-    let mut chosen: Vec<Option<&OsStr>> = vec![None; ALLOWLIST.len()];
+    let mut chosen: Vec<Option<(&OsStr, Owner)>> = vec![None; ALLOWLIST.len()];
 
     let tiers = [
         (base, Owner::Host),
@@ -296,27 +336,38 @@ pub fn assemble(
         for (name, value) in pairs {
             match classify(name, value, from, roots) {
                 Ok(slot) => {
-                    if chosen[slot].replace(value.as_os_str()).is_some() {
+                    if let Some((_, earlier)) = chosen[slot].replace((value.as_os_str(), from)) {
                         dropped.push(Dropped {
                             name: name.clone(),
                             reason: DropReason::Superseded,
+                            from: earlier,
                         });
                     }
                 }
                 Err(reason) => dropped.push(Dropped {
                     name: name.clone(),
                     reason,
+                    from,
                 }),
             }
         }
     }
 
+    if let Some(entry) = ALLOWLIST
+        .iter()
+        .zip(&chosen)
+        .find(|(entry, value)| entry.required && value.is_none())
+        .map(|(entry, _)| entry)
+    {
+        return Err(Error::MissingEngineVariable { name: entry.name });
+    }
+
     let accepted = ALLOWLIST
         .iter()
         .zip(chosen)
-        .filter_map(|(entry, value)| Some((OsString::from(entry.name), value?.to_owned())))
+        .filter_map(|(entry, value)| Some((OsString::from(entry.name), value?.0.to_owned())))
         .collect();
-    (accepted, dropped)
+    Ok((accepted, dropped))
 }
 
 fn classify(

@@ -177,8 +177,15 @@ A value from a tier the owner does not accept is dropped as `NotOwner`, so a
 game preset cannot replace `APPLEJACK_SESSION` (which process discovery keys
 on), `WINEPREFIX`, or the sync variables. A value that fails its path check is
 dropped without unsetting the earlier tier's value: a rejected extra falls
-back to the base value. Everything dropped is reported with a reason so it
-can be logged.
+back to the base value. Everything dropped is reported with a reason and the
+tier it came from so it can be logged.
+
+`WINEPREFIX` and `APPLEJACK_SESSION` are required: `assemble` returns
+`Error::MissingEngineVariable` when either has no accepted value after the
+tiers are applied, whether the engine forgot it or set a value that failed
+its check. Without `WINEPREFIX` Wine would create or mutate `~/.wine`;
+without the session id process discovery finds nothing. Only the engine can
+satisfy a required row, so a host value never papers over the gap.
 
 | Variable | Owner | Check | Roots |
 | --- | --- | --- | --- |
@@ -204,14 +211,19 @@ string.
 
 Allowed roots are built with `AllowedRoots::new(engine_dir, overlay_dir,
 prefix_dir)`, which rejects an empty, relative, `/`, or `..`-containing root
-and canonicalizes the longest existing ancestor of each (so `/var` and
-`/private/var` agree, and a root that is itself a link to `/` is refused).
-A path value must be absolute and contain no `..`; it is then resolved the
-same way and must start with one of the roots its row accepts. A Wine prefix
-always contains `dosdevices/z: -> /`, so `<prefix>/dosdevices/z:/etc/hosts`
-resolves to `/etc/hosts` and is dropped. Any `DYLD_*` variable is always
-dropped; the hardened runtime strips them anyway, so the bundle must be
-self-contained. Names outside the table are dropped.
+and a root that is itself a symlink (it would widen the root to wherever it
+points), then canonicalizes the longest existing ancestor of each (so `/var`
+and `/private/var` agree). A path value must be absolute and contain no
+`..`; it is then resolved the same way and must start with one of the roots
+its row accepts. A Wine prefix always contains `dosdevices/z: -> /`, so
+`<prefix>/dosdevices/z:/etc/hosts` resolves to `/etc/hosts` and is dropped.
+A component that exists but cannot be resolved, a dangling or looping
+symlink such as `dosdevices/<x>:` to an unmounted volume, makes the value
+unresolvable and it is dropped too: its target could appear later, outside
+every root. Only components that do not exist at all are re-appended
+lexically. Any `DYLD_*` variable is always dropped; the hardened runtime
+strips them anyway, so the bundle must be self-contained. Names outside the
+table are dropped.
 
 ## What comes next
 
