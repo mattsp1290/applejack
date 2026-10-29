@@ -91,7 +91,7 @@ public struct RpcRequest: Codable, Equatable, Sendable {
 }
 
 /// A response whose `result` is decoded as `Result`; `error` is set instead
-/// when the call failed.
+/// when the call failed. Only `"jsonrpc": "2.0"` decodes, as on the Rust side.
 public struct RpcTypedResponse<Result: Decodable & Sendable>: Decodable, Sendable {
     public var jsonrpc: String
     public var id: RpcId?
@@ -105,8 +105,22 @@ public struct RpcTypedResponse<Result: Decodable & Sendable>: Decodable, Sendabl
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         jsonrpc = try container.decode(String.self, forKey: .jsonrpc)
+        guard jsonrpc == RpcVersion.text else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .jsonrpc, in: container,
+                debugDescription: "jsonrpc must be \"\(RpcVersion.text)\", got \"\(jsonrpc)\""
+            )
+        }
         id = try container.decodeIfPresent(RpcId.self, forKey: .id)
-        result = try container.decodeIfPresent(Result.self, forKey: .result)
+        // A present `result` is decoded even when it is `null`: `JSONValue`
+        // reads `.null`, a typed result fails to decode. The core never sends
+        // `null` (a method with nothing to return answers `{}`), so neither
+        // is mistaken for an absent result.
+        if container.contains(.result) {
+            result = try container.decode(Result.self, forKey: .result)
+        } else {
+            result = nil
+        }
         error = try container.decodeIfPresent(RpcError.self, forKey: .error)
     }
 }
@@ -171,6 +185,12 @@ public struct HelloResult: Codable, Equatable, Sendable {
 
 /// Params for methods that take none; encodes as `{}`.
 public struct EmptyParams: Codable, Equatable, Sendable {
+    public init() {}
+}
+
+/// The result of a method with nothing to return (`EmptyResult` in
+/// `methods.rs`). The core sends `{}`, never `null`.
+public struct EmptyResult: Codable, Equatable, Sendable {
     public init() {}
 }
 

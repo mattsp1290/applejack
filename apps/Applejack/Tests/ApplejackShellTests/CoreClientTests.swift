@@ -20,13 +20,34 @@ final class CoreClientTests: XCTestCase {
         }
     }
 
-    func makeClient(environment: [String: String] = [:], protocolVersion: UInt32 = 1) -> CoreClient {
+    func makeClient(
+        environment: [String: String] = [:],
+        protocolVersion: UInt32 = 1,
+        handshakeTimeout: Duration = CoreClient.handshakeTimeout
+    ) -> CoreClient {
         CoreClient(
             executable: Self.fakeCore,
             arguments: [],
             environment: environment,
-            protocolVersion: protocolVersion
+            protocolVersion: protocolVersion,
+            handshakeTimeout: handshakeTimeout
         )
+    }
+
+    func makePidFile() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
+    }
+
+    func readPid(_ pidFile: URL) throws -> Int32 {
+        let text = try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        return try XCTUnwrap(Int32(text), text)
+    }
+
+    func waitUntilGone(_ pid: Int32, within limit: Duration = .seconds(5)) async throws {
+        let deadline = ContinuousClock.now + limit
+        while processState(pid) != nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(100))
+        }
     }
 
     func testFakeCoreIsExecutable() {
@@ -195,21 +216,63 @@ final class CoreClientTests: XCTestCase {
     }
 
     func testShutdownTerminatesACoreThatIgnoresEof() async throws {
-        let pidFile = FileManager.default.temporaryDirectory
-            .appendingPathComponent("fake-core-\(UUID().uuidString).pid")
+        let pidFile = makePidFile()
         defer { try? FileManager.default.removeItem(at: pidFile) }
         let client = makeClient(environment: ["FAKE_CORE_IGNORE_EOF": "1", "FAKE_CORE_PID_FILE": pidFile.path])
         _ = try await client.hello()
-        let pidText = try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
-        let pid = try XCTUnwrap(Int32(pidText), pidText)
-        XCTAssertTrue(processExists(pid))
+        let pid = try readPid(pidFile)
+        XCTAssertNotNil(processState(pid))
 
         await client.shutdown()
-        let deadline = ContinuousClock.now + .seconds(5)
-        while processExists(pid), ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(100))
+        try await waitUntilGone(pid)
+        // An empty `ps` state means terminated and reaped; a zombie would show `Z`.
+        XCTAssertNil(processState(pid), "a core that ignores EOF must be terminated and reaped after the grace period")
+    }
+
+    func testHandshakeTimeoutTearsDownAMuteCoreAndReleasesTheClient() async throws {
+        let pidFile = makePidFile()
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        var client: CoreClient? = makeClient(
+            environment: ["FAKE_CORE_MUTE": "1", "FAKE_CORE_PID_FILE": pidFile.path],
+            handshakeTimeout: .milliseconds(500)
+        )
+        weak var released = client
+        let start = ContinuousClock.now
+        do {
+            _ = try await client?.hello()
+            XCTFail("expected the handshake to time out")
+        } catch CoreClientError.handshakeTimedOut {
         }
-        XCTAssertFalse(processExists(pid), "a core that ignores EOF must be terminated after the grace period")
+        XCTAssertLessThan(ContinuousClock.now - start, .seconds(3), "hello must fail at the deadline")
+        let pid = try readPid(pidFile)
+        try await waitUntilGone(pid)
+        XCTAssertNil(processState(pid), "a mute core must be torn down")
+        let helloResult = await client?.helloResult
+        XCTAssertNil(helloResult)
+
+        // Nothing but the caller holds the client: no handshake task, no
+        // strong capture in the reader or the deadline.
+        client = nil
+        let releaseDeadline = ContinuousClock.now + .seconds(2)
+        while released != nil, ContinuousClock.now < releaseDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNil(released, "the client must deallocate once its last caller drops it")
+    }
+
+    func testCancelledCallerReturnsWhileTheCoreIsMute() async throws {
+        let client = makeClient(environment: ["FAKE_CORE_MUTE": "1"], handshakeTimeout: .seconds(5))
+        let task = Task { try await client.hostDoctor() }
+        try await Task.sleep(for: .milliseconds(100))
+        let start = ContinuousClock.now
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+        }
+        XCTAssertLessThan(ContinuousClock.now - start, .seconds(1), "a cancelled caller must not wait for the handshake")
+        await client.shutdown()
     }
 
     func testBackgroundEchoDoesNotInterleaveWithSplitWrites() async throws {
@@ -233,19 +296,19 @@ final class CoreClientTests: XCTestCase {
         await client.shutdown()
     }
 
-    private func processExists(_ pid: Int32) -> Bool {
-        guard kill(pid, 0) == 0 else { return false }
-        // A reaped-but-not-yet-collected child still answers `kill`; ask ps.
+    /// The process's `ps` state, or `nil` once it is gone. A zombie answers
+    /// `kill(pid, 0)` and shows as `Z`, so the state is what the tests check.
+    private func processState(_ pid: Int32) -> String? {
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")
         ps.arguments = ["-o", "stat=", "-p", "\(pid)"]
         let output = Pipe()
         ps.standardOutput = output
-        guard (try? ps.run()) != nil else { return true }
+        guard (try? ps.run()) != nil else { return "ps failed" }
         let stat = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         ps.waitUntilExit()
-        return !stat.isEmpty && !stat.hasPrefix("Z")
+        return stat.isEmpty ? nil : stat
     }
 
     private func assertCoreExited(_ client: CoreClient, file: StaticString = #filePath, line: UInt = #line) async {

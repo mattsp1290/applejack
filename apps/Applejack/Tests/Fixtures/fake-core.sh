@@ -13,7 +13,8 @@
 #                              fake exit 1 without answering
 #   FAKE_CORE_ORPHAN=1         leave a `sleep` child holding stdout, then exit
 #                              3 on the first request without answering
-#   FAKE_CORE_IGNORE_EOF=1     keep running after stdin closes
+#   FAKE_CORE_IGNORE_EOF=1     keep running after stdin closes (SIGTERM ends it)
+#   FAKE_CORE_MUTE=1           read every request and answer none of them
 #   FAKE_CORE_PID_FILE=<path>  write the fake's pid there at startup
 set -u
 
@@ -33,7 +34,9 @@ fi
 # interleave on stdout.
 write() {
   while ! mkdir "$lock" 2>/dev/null; do
-    [ -d "$lockdir" ] || exit 0
+    # In a `( ... ) &` subshell `$$` is still the parent; a parent that was
+    # killed without running its EXIT trap must not leave this loop spinning.
+    { [ -d "$lockdir" ] && kill -0 $$ 2>/dev/null; } || exit 0
     sleep 0.01
   done
   if [ "${FAKE_CORE_SPLIT:-0}" = "1" ]; then
@@ -54,6 +57,9 @@ emit() {
 }
 
 while IFS= read -r line; do
+  if [ "${FAKE_CORE_MUTE:-0}" = "1" ]; then
+    continue
+  fi
   if [ "${FAKE_CORE_ORPHAN:-0}" = "1" ]; then
     exit 3
   fi
@@ -104,5 +110,9 @@ while IFS= read -r line; do
 done
 wait
 if [ "${FAKE_CORE_IGNORE_EOF:-0}" = "1" ]; then
-  sleep 30
+  # `Process.terminate()` signals this shell only; take the sleep down with it.
+  sleep 30 &
+  child=$!
+  trap 'kill "$child" 2>/dev/null; rm -rf "$lockdir"; exit 0' TERM
+  wait "$child"
 fi
