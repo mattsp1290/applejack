@@ -135,7 +135,12 @@ All commands run from the repository root. Output goes under `build/work/`
    (BSD-2-Clause); Cisco's H.264 patent coverage applies to Cisco's own
    binaries only, so that plugin carries H.264 patent exposure of its own,
    while VideoToolbox in `system` already decodes H.264.
-6. `sh crates/applejack-engine/probes/<probe>/build.sh` for `hello32`,
+6. `sh build/osslsigncode/build.sh` — the host-arch Authenticode tool for
+   `probes/`, built with `-DOPENSSL_USE_STATIC_LIBS=ON` so Homebrew's
+   `libcrypto`/`libssl` are linked in rather than referenced from
+   `/opt/homebrew` (the script asserts with `otool -L` that nothing outside
+   `/usr/lib` and `/System` remains, the rule step 9 enforces); then
+   `sh crates/applejack-engine/probes/<probe>/build.sh` for `hello32`,
    `dx11-sample`, `xinput-check`, `cpuid` — outputs under `build/work/probes/`.
 7. `sh build/assemble.sh` — builds the plan 02 layout under
    `<payload>.tmp` and moves it into place, so nothing from an earlier run
