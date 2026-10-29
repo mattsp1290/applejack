@@ -3,8 +3,9 @@
 //! payload. The hardened runtime drops `DYLD_*`, so anything else fails at
 //! load time on a machine without the build host's Homebrew.
 
+use std::collections::BTreeSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// One dependency reference that would not resolve on a clean machine.
 #[derive(Debug, PartialEq, Eq)]
@@ -22,6 +23,14 @@ impl fmt::Display for Violation {
 
 const SYSTEM_ROOTS: [&str; 2] = ["/System/", "/usr/lib/"];
 const RELATIVE_PREFIXES: [&str; 3] = ["@rpath/", "@loader_path/", "@executable_path/"];
+/// Load commands that name a dependency, as opposed to `LC_ID_DYLIB`, which
+/// names the binary itself.
+const DEPENDENCY_COMMANDS: [&str; 4] = [
+    "LC_LOAD_DYLIB",
+    "LC_LOAD_WEAK_DYLIB",
+    "LC_REEXPORT_DYLIB",
+    "LC_LOAD_UPWARD_DYLIB",
+];
 
 /// Checks the text of `otool -L <binary>` for one Mach-O.
 ///
@@ -89,22 +98,145 @@ pub fn check_rpaths(
 
 /// The `path` of every `LC_RPATH` load command in `otool -l` output.
 fn rpath_entries(load_commands: &str) -> impl Iterator<Item = &str> {
-    let mut in_rpath = false;
+    command_values(load_commands, "path ", |command| command == "LC_RPATH")
+}
+
+/// The `name` of every dependency load command in `otool -l` output. The
+/// binary's own `LC_ID_DYLIB` is not a dependency and is left out.
+fn dependency_entries(load_commands: &str) -> impl Iterator<Item = &str> {
+    command_values(load_commands, "name ", |command| {
+        DEPENDENCY_COMMANDS.contains(&command)
+    })
+}
+
+/// The `<field> <value> (offset N)` line of each load command `wanted`
+/// accepts.
+fn command_values<'a>(
+    load_commands: &'a str,
+    field: &'static str,
+    wanted: impl Fn(&str) -> bool,
+) -> impl Iterator<Item = &'a str> {
+    let mut in_wanted = false;
     load_commands
         .lines()
         .map(str::trim)
         .filter_map(move |line| {
             if let Some(command) = line.strip_prefix("cmd ") {
-                in_rpath = command.trim() == "LC_RPATH";
+                in_wanted = wanted(command.trim());
                 return None;
             }
-            if !in_rpath {
+            if !in_wanted {
                 return None;
             }
-            let rest = line.strip_prefix("path ")?;
-            let path = rest.rsplit_once(" (offset ").map_or(rest, |(path, _)| path);
-            Some(path.trim())
+            let rest = line.strip_prefix(field)?;
+            let value = rest
+                .rsplit_once(" (offset ")
+                .map_or(rest, |(value, _)| value);
+            Some(value.trim())
         })
+}
+
+/// The payload-relative directories a binary's relocatable `LC_RPATH`
+/// entries name. `@loader_path` and `@executable_path` both relocate against
+/// the binary's own directory (for a dylib the executable is unknown, so
+/// this is the best static reading). An entry that climbs out of the payload
+/// or is absolute names nothing here; `check_rpaths` reports the absolute
+/// ones.
+pub fn relocated_rpaths(binary: &str, load_commands: &str) -> Vec<PathBuf> {
+    let bin_dir = binary_dir(binary);
+    rpath_entries(load_commands)
+        .filter_map(|path| {
+            let rest = path
+                .strip_prefix("@loader_path")
+                .or_else(|| path.strip_prefix("@executable_path"))?;
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            normalize_relative(&bin_dir.join(rest))
+        })
+        .collect()
+}
+
+/// Checks that every `@rpath/`, `@loader_path/`, and `@executable_path/`
+/// dependency of one Mach-O names a file in the payload.
+///
+/// `@rpath/x` is tried through every directory in `rpath_dirs`, the
+/// relocated `LC_RPATH` entries of the whole payload: dyld searches the
+/// rpaths of the executable and of every dylib in the load chain, so a Unix
+/// module without `LC_RPATH` of its own still resolves through the loader's.
+/// An absolute `LC_RPATH` contributes nothing (a system one such as
+/// `/usr/lib/swift` is not expected in this payload). `@loader_path/x` and
+/// `@executable_path/x` resolve against the binary's own directory.
+/// `resolves` says whether a payload-relative candidate is a file inside the
+/// payload; it follows symlinks, so a framework's `Versions/Current` link
+/// works.
+pub fn check_references_resolve(
+    binary: &str,
+    load_commands: &str,
+    rpath_dirs: &BTreeSet<PathBuf>,
+    resolves: &dyn Fn(&Path) -> bool,
+) -> Vec<Violation> {
+    let bin_dir = binary_dir(binary);
+    dependency_entries(load_commands)
+        .filter_map(|reference| {
+            let (prefix, rest) = RELATIVE_PREFIXES
+                .iter()
+                .find_map(|prefix| reference.strip_prefix(prefix).map(|rest| (*prefix, rest)))?;
+            let (candidates, reason): (Vec<PathBuf>, &str) = match prefix {
+                "@rpath/" => (
+                    rpath_dirs
+                        .iter()
+                        .filter_map(|dir| normalize_relative(&dir.join(rest)))
+                        .collect(),
+                    "@rpath reference resolves through no LC_RPATH in the payload",
+                ),
+                "@loader_path/" => (
+                    normalize_relative(&bin_dir.join(rest))
+                        .into_iter()
+                        .collect(),
+                    "@loader_path reference does not resolve to a file in the payload",
+                ),
+                _ => (
+                    normalize_relative(&bin_dir.join(rest))
+                        .into_iter()
+                        .collect(),
+                    "@executable_path reference does not resolve to a file next to the binary",
+                ),
+            };
+            if candidates.iter().any(|candidate| resolves(candidate)) {
+                return None;
+            }
+            Some(Violation {
+                binary: binary.to_owned(),
+                reference: reference.to_owned(),
+                reason: reason.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn binary_dir(binary: &str) -> PathBuf {
+    Path::new(binary)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// Resolves `.` and `..` lexically; `None` when the path climbs above its
+/// root or is not relative.
+fn normalize_relative(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => out.push(name),
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 fn classify(reference: &str, payload_root: &Path, build_dir: &Path) -> Option<&'static str> {
@@ -153,9 +285,10 @@ fn starts_with_dir(reference: &str, dir: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
 
-    use super::{check_otool_listing, check_rpaths};
+    use super::{check_otool_listing, check_references_resolve, check_rpaths, relocated_rpaths};
 
     const LISTING: &str = "\
 wine/bin/wine64:
@@ -323,6 +456,100 @@ Load command 18
             violations
                 .iter()
                 .all(|violation| violation.binary == "wine/bin/rpath_exe")
+        );
+    }
+
+    // A Unix module after the step 7 rewrite: its own LC_RPATH reaches
+    // wine/lib two levels up.
+    const MODULE_LOAD_COMMANDS: &str = "\
+wine/lib/wine/x86_64-unix/ntdll.so:
+Load command 0
+          cmd LC_ID_DYLIB
+         name @rpath/ntdll.so (offset 24)
+Load command 1
+          cmd LC_LOAD_DYLIB
+         name @rpath/libfreetype.6.dylib (offset 24)
+Load command 2
+          cmd LC_LOAD_DYLIB
+         name @loader_path/../../libgnutls.30.dylib (offset 24)
+Load command 3
+          cmd LC_LOAD_WEAK_DYLIB
+         name @rpath/libmissing.dylib (offset 24)
+Load command 4
+          cmd LC_LOAD_DYLIB
+         name @loader_path/../../../../../../escape.dylib (offset 24)
+Load command 5
+          cmd LC_LOAD_DYLIB
+         name @executable_path/../lib/libz.1.dylib (offset 24)
+Load command 6
+          cmd LC_LOAD_DYLIB
+         name /usr/lib/libSystem.B.dylib (offset 24)
+Load command 7
+          cmd LC_RPATH
+         path @loader_path/../.. (offset 12)
+Load command 8
+          cmd LC_RPATH
+         path /usr/local/lib (offset 12)
+";
+
+    #[test]
+    fn relative_references_must_resolve_to_payload_files() {
+        let binary = "wine/lib/wine/x86_64-unix/ntdll.so";
+        let own = relocated_rpaths(binary, MODULE_LOAD_COMMANDS);
+        assert_eq!(own, [PathBuf::from("wine/lib")]);
+        let files: BTreeSet<PathBuf> = [
+            "wine/lib/libfreetype.6.dylib",
+            "wine/lib/libgnutls.30.dylib",
+            "wine/lib/wine/x86_64-unix/ntdll.so",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        let resolves = |candidate: &Path| files.contains(candidate);
+        let rpath_dirs: BTreeSet<PathBuf> = own.into_iter().collect();
+        let violations =
+            check_references_resolve(binary, MODULE_LOAD_COMMANDS, &rpath_dirs, &resolves);
+        let references: Vec<&str> = violations
+            .iter()
+            .map(|violation| violation.reference.as_str())
+            .collect();
+        assert_eq!(
+            references,
+            [
+                "@rpath/libmissing.dylib",
+                "@loader_path/../../../../../../escape.dylib",
+                "@executable_path/../lib/libz.1.dylib",
+            ],
+            "{violations:?}"
+        );
+        assert!(
+            violations[0].reason.contains("LC_RPATH"),
+            "{}",
+            violations[0]
+        );
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.binary == binary)
+        );
+
+        // A module with no LC_RPATH of its own resolves through the loader's.
+        let bare = "wine/lib/wine/x86_64-unix/ntdll.so:\n\
+Load command 1\n          cmd LC_LOAD_DYLIB\n         name @rpath/libfreetype.6.dylib (offset 24)\n";
+        assert_eq!(relocated_rpaths(binary, bare), Vec::<PathBuf>::new());
+        assert_eq!(
+            check_references_resolve(binary, bare, &BTreeSet::new(), &resolves).len(),
+            1
+        );
+        let loader_rpaths = relocated_rpaths(
+            "wine/bin/wine",
+            "wine/bin/wine:\nLoad command 9\n          cmd LC_RPATH\n         path @loader_path/../lib (offset 12)\n",
+        );
+        let rpath_dirs: BTreeSet<PathBuf> = loader_rpaths.into_iter().collect();
+        assert_eq!(rpath_dirs, BTreeSet::from([PathBuf::from("wine/lib")]));
+        assert_eq!(
+            check_references_resolve(binary, bare, &rpath_dirs, &resolves),
+            []
         );
     }
 

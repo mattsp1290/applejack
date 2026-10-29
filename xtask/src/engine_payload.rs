@@ -2,6 +2,7 @@
 //! engine payload, checks an assembled payload tree, and writes `BUNDLE.toml`.
 //! The Wine build itself runs through the scripts under `build/`.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
@@ -13,12 +14,14 @@ use sha2::{Digest, Sha256};
 use crate::bundle_toml::BundleSpec;
 use crate::denylist::{Denylist, Hit};
 use crate::pins::{Pin, Pins};
-use crate::self_contained::{Violation, check_otool_listing, check_rpaths};
+use crate::self_contained::{
+    Violation, check_otool_listing, check_references_resolve, check_rpaths, relocated_rpaths,
+};
 
 pub const USAGE: &str = "\
 usage: cargo xtask engine-payload <mode>
   --fetch [id ...]                    download every pin (or the named ones) into build/work/, verify SHA-256, and denylist-scan the listing
-  --check <payload-dir>               denylist scan plus self-containment check of every Mach-O and symlink
+  --check <payload-dir>               denylist scan plus self-containment and reference resolution of every Mach-O and symlink
   --check-listing <file|->            denylist scan of an archive listing, one path per line (an empty listing fails)
   --write-bundle-toml <spec> <out>    render BUNDLE.toml from a typed spec file, plus THIRD_PARTY_NOTICES.md beside it
   --print-pin <id> [field]            print a pin (all fields as key=value, or one field)
@@ -272,23 +275,19 @@ fn list_archive(kind: ArchiveKind, archive: &Path) -> Result<Vec<String>, String
     }
 }
 
-/// A product archive's listing: its xar entries plus, for each component,
-/// the paths in that component's `Bom`. `pkgutil --payload-files` lists only
-/// the first component of a product archive, so the Boms are read instead;
-/// they are a few kilobytes each and no Payload is expanded.
+/// A package's listing: its xar entries plus the paths in the `Bom` beside
+/// every `Payload` (the root `Bom` of a flat component package, or each
+/// `<component>.pkg/Bom` of a product archive). `pkgutil --payload-files`
+/// lists only the first component of a product archive, so the Boms are read
+/// instead; they are a few kilobytes each and no Payload is expanded.
+///
+/// A Bom is unauthenticated metadata: nothing ties it to the Payload it sits
+/// beside, so this listing is the pre-extraction gate only and the staged
+/// tree scan after extraction (`build/gstreamer/fetch.sh`) stays mandatory
+/// for every `.pkg` pin.
 fn list_pkg(archive: &Path) -> Result<Vec<String>, String> {
     let entries = command_lines("xar", &["-tf"], archive)?;
-    let boms: Vec<&str> = entries
-        .iter()
-        .map(String::as_str)
-        .filter(|entry| entry.ends_with("/Bom"))
-        .collect();
-    if boms.is_empty() {
-        return Err(format!(
-            "{}: no component Bom in the package",
-            archive.display()
-        ));
-    }
+    let boms = pkg_boms(&entries).map_err(|message| format!("{}: {message}", archive.display()))?;
     let scratch = std::env::temp_dir().join(format!("xtask-pkg-listing-{}", std::process::id()));
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
@@ -299,6 +298,34 @@ fn list_pkg(archive: &Path) -> Result<Vec<String>, String> {
     });
     let _ = fs::remove_dir_all(&scratch);
     result
+}
+
+/// The `Bom` beside every `Payload` in a xar listing. A `Payload` without
+/// its `Bom` is refused: the listing would say nothing about what that
+/// Payload expands to, and `pkgutil --expand-full` expands it all the same.
+fn pkg_boms(entries: &[String]) -> Result<Vec<&str>, String> {
+    let payloads = entries
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry == "Payload" || entry.ends_with("/Payload"));
+    let mut count = 0;
+    for payload in payloads {
+        let bom = format!("{}Bom", payload.strip_suffix("Payload").unwrap_or_default());
+        if !entries.contains(&bom) {
+            return Err(format!(
+                "{payload} has no {bom} beside it; refusing to trust the listing"
+            ));
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return Err("no Payload in the package".into());
+    }
+    Ok(entries
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry == "Bom" || entry.ends_with("/Bom"))
+        .collect())
 }
 
 fn list_boms(archive: &Path, scratch: &Path, boms: &[&str]) -> Result<Vec<String>, String> {
@@ -318,13 +345,17 @@ fn list_boms(archive: &Path, scratch: &Path, boms: &[&str]) -> Result<Vec<String
     }
     let mut listing = Vec::new();
     for bom in boms {
-        let component = bom.strip_suffix("/Bom").unwrap_or(bom);
+        // `None` for a flat package's root `Bom`: its paths are the listing.
+        let component = bom.strip_suffix("/Bom");
         for line in command_lines("lsbom", &["-s"], &scratch.join(bom))? {
             let relative = line.strip_prefix("./").unwrap_or(&line);
             if relative == "." {
                 continue;
             }
-            listing.push(format!("{component}/{relative}"));
+            listing.push(match component {
+                Some(component) => format!("{component}/{relative}"),
+                None => relative.to_owned(),
+            });
         }
     }
     Ok(listing)
@@ -423,7 +454,7 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
         .collect();
     let mut hits = denylist.scan(paths.iter().copied());
     let mut violations: Vec<Violation> = Vec::new();
-    let mut machos = 0_usize;
+    let mut machos: Vec<MachO> = Vec::new();
     for entry in &entries {
         if let Some(target) = &entry.link_target {
             let target_text = target.to_string_lossy();
@@ -448,32 +479,76 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
         if !entry.is_file || !is_macho(&entry.absolute)? {
             continue;
         }
-        machos += 1;
         let listing = otool(&entry.absolute, "-L")?;
+        let load_commands = otool(&entry.absolute, "-l")?;
+        if !load_commands
+            .lines()
+            .any(|line| line.trim_start().starts_with("cmd "))
+        {
+            return Err(format!(
+                "otool -l {}: no load commands in a file with a Mach-O magic",
+                entry.absolute.display()
+            ));
+        }
+        machos.push(MachO {
+            relative: entry.relative.clone(),
+            listing,
+            load_commands,
+        });
+    }
+    // Every relocated LC_RPATH in the payload: the search path dyld builds
+    // from the whole load chain, which a module without its own rpath uses.
+    let rpath_dirs: BTreeSet<PathBuf> = machos
+        .iter()
+        .flat_map(|macho| relocated_rpaths(&macho.relative, &macho.load_commands))
+        .collect();
+    let resolves = |candidate: &Path| {
+        fs::canonicalize(payload.join(candidate))
+            .is_ok_and(|real| real.starts_with(&payload) && real.is_file())
+    };
+    for macho in &machos {
         violations.extend(check_otool_listing(
-            &entry.relative,
-            &listing,
+            &macho.relative,
+            &macho.listing,
             &payload,
             &build_dir,
         ));
-        let load_commands = otool(&entry.absolute, "-l")?;
         violations.extend(check_rpaths(
-            &entry.relative,
-            &load_commands,
+            &macho.relative,
+            &macho.load_commands,
             &payload,
             &build_dir,
+        ));
+        violations.extend(check_references_resolve(
+            &macho.relative,
+            &macho.load_commands,
+            &rpath_dirs,
+            &resolves,
         ));
     }
     Ok(Report {
         payload,
         paths: entries.len(),
-        machos,
+        machos: machos.len(),
         hits,
         violations,
     })
 }
 
+/// One Mach-O of the payload with both `otool` outputs, kept so the
+/// payload-wide rpath set exists before any reference is resolved.
+struct MachO {
+    relative: String,
+    listing: String,
+    load_commands: String,
+}
+
 /// Why a symlink would not survive the payload moving to another machine.
+///
+/// The lexical test is the fast path and names the obvious escape; the real
+/// resolution is the authority, since a `..` after a component that is itself
+/// a symlink is popped lexically as though it were a directory. `payload` is
+/// canonical, so `starts_with` on the canonical target is exact.
 fn symlink_reason(payload: &Path, link: &Path, target: &Path) -> Option<&'static str> {
     if target.is_absolute() {
         return Some("absolute symlink target");
@@ -482,10 +557,11 @@ fn symlink_reason(payload: &Path, link: &Path, target: &Path) -> Option<&'static
     if !resolved.starts_with(payload) {
         return Some("symlink target escapes the payload");
     }
-    if fs::metadata(link).is_err() {
-        return Some("dangling symlink");
+    match fs::canonicalize(link) {
+        Err(_) => Some("dangling symlink"),
+        Ok(real) if !real.starts_with(payload) => Some("symlink resolves outside the payload"),
+        Ok(_) => None,
     }
-    None
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -699,12 +775,14 @@ fn otool(path: &Path, flag: &str) -> Result<String, String> {
         .arg(path)
         .output()
         .map_err(|error| format!("otool failed to start: {error}"))?;
-    if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // `otool -l` reports a malformed fat file on stderr and still exits 0.
+    if !output.status.success() || stderr.contains("error:") {
         return Err(format!(
             "otool {flag} {} failed ({}): {}",
             path.display(),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -719,7 +797,7 @@ mod tests {
 
     use super::{
         ArchiveKind, archive_kind, check_listing, inspect, is_macho, list_archive, load_denylist,
-        reject_denylisted,
+        pkg_boms, reject_denylisted,
     };
 
     fn root() -> PathBuf {
@@ -837,6 +915,125 @@ mod tests {
             report.hits[0]
         );
         assert_eq!(report.machos, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `..` after a component that is itself a symlink: lexically the
+    /// target stays inside, on disk it does not (the Fix Verifier's
+    /// `fv/esc/payload` shape, with `/bin/sh` as the outside file so the test
+    /// does not depend on Homebrew).
+    #[test]
+    fn a_relative_symlink_through_an_upward_link_is_a_violation() {
+        let dir = scratch("symlink-escape");
+        let payload = dir.join("payload");
+        let mut deep = payload.join("wine/lib");
+        for level in 1..=14 {
+            deep.push(format!("d{level}"));
+        }
+        fs::create_dir_all(&deep).expect("deep tree");
+        // 16 levels below the payload root; `up` resolves to that root.
+        symlink("../".repeat(16).trim_end_matches('/'), deep.join("up")).expect("up link");
+        symlink(
+            format!("up/{}bin/sh", "../".repeat(12)),
+            deep.join("libfreetype.6.dylib"),
+        )
+        .expect("escaping link");
+        let report = inspect(&root(), &payload).expect("report");
+        let violations: Vec<(&str, &str)> = report
+            .violations
+            .iter()
+            .map(|violation| (violation.binary.as_str(), violation.reason.as_str()))
+            .collect();
+        assert_eq!(
+            violations,
+            [(
+                "wine/lib/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/libfreetype.6.dylib",
+                "symlink resolves outside the payload"
+            )]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pkg_payload_without_a_bom_is_refused() {
+        let listing =
+            |entries: &[&str]| entries.iter().map(|e| (*e).to_owned()).collect::<Vec<_>>();
+        let flat = listing(&["Bom", "Payload", "PackageInfo"]);
+        assert_eq!(pkg_boms(&flat), Ok(vec!["Bom"]));
+        let product = listing(&[
+            "Distribution",
+            "a.pkg",
+            "a.pkg/Bom",
+            "a.pkg/Payload",
+            "a.pkg/PackageInfo",
+            "bad.pkg",
+            "bad.pkg/Bom",
+            "bad.pkg/Payload",
+            "bad.pkg/PackageInfo",
+        ]);
+        assert_eq!(pkg_boms(&product), Ok(vec!["a.pkg/Bom", "bad.pkg/Bom"]));
+        let bomless = listing(&[
+            "Distribution",
+            "a.pkg",
+            "a.pkg/Bom",
+            "a.pkg/Payload",
+            "a.pkg/PackageInfo",
+            "bad.pkg",
+            "bad.pkg/Payload",
+            "bad.pkg/PackageInfo",
+        ]);
+        let error = pkg_boms(&bomless).unwrap_err();
+        assert!(
+            error.contains("bad.pkg/Payload has no bad.pkg/Bom"),
+            "{error}"
+        );
+        assert!(pkg_boms(&listing(&["Distribution"])).is_err());
+
+        // The real lister: a flat package built with pkgbuild lists its
+        // denylisted file; the same package with its Bom removed is refused.
+        let dir = scratch("pkg");
+        let tree = dir.join("root/lib/external/D3DMetal.framework");
+        fs::create_dir_all(&tree).expect("tree");
+        fs::write(tree.join("D3DMetal"), b"x").expect("file");
+        let flat = dir.join("flat.pkg");
+        let status = Command::new("pkgbuild")
+            .args(["--root"])
+            .arg(dir.join("root"))
+            .args(["--identifier", "com.applejack.xtask.test", "--version", "1"])
+            .arg(&flat)
+            .output()
+            .expect("pkgbuild");
+        assert!(status.status.success(), "{status:?}");
+        let listed = list_archive(ArchiveKind::Pkg, &flat).expect("flat listing");
+        assert!(
+            listed.contains(&"lib/external/D3DMetal.framework/D3DMetal".to_owned()),
+            "{listed:?}"
+        );
+        let unpacked = dir.join("unpacked");
+        fs::create_dir_all(&unpacked).expect("unpack dir");
+        let status = Command::new("xar")
+            .arg("-xf")
+            .arg(&flat)
+            .arg("-C")
+            .arg(&unpacked)
+            .args(["Payload", "PackageInfo"])
+            .status()
+            .expect("xar -x");
+        assert!(status.success());
+        // `-C` applies to extraction only; creation names paths from the cwd.
+        let bomless = dir.join("bomless.pkg");
+        let status = Command::new("xar")
+            .arg("-cf")
+            .arg(&bomless)
+            .args(["Payload", "PackageInfo"])
+            .current_dir(&unpacked)
+            .status()
+            .expect("xar -c");
+        assert!(status.success());
+        let entries = super::command_lines("xar", &["-tf"], &bomless).expect("xar -t");
+        assert_eq!(entries, ["Payload", "PackageInfo"]);
+        let error = list_archive(ArchiveKind::Pkg, &bomless).unwrap_err();
+        assert!(error.contains("Payload has no Bom"), "{error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
