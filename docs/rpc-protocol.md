@@ -21,7 +21,8 @@ describes them.
   In both cases the core keeps serving.
 - A request line longer than 16 MiB (`rpc::MAX_LINE_BYTES`) is answered with
   `InvalidRequest` and `"id": null`. The core discards the rest of the line
-  without buffering it.
+  without buffering it. The cap counts every byte before the `\n`, so a
+  trailing `\r` counts too: 16 MiB of content plus `\r\n` is refused.
 - Notifications are core-to-shell only. The shell must not send one: a line
   without an `id` is answered with `InvalidRequest` and `"id": null`, which
   JSON-RPC forbids for a notification but which keeps the loop simple.
@@ -45,6 +46,13 @@ Response, success or failure:
 {"jsonrpc":"2.0","id":1,"result":{"protocol_version":1,"core_version":"0.1.0"}}
 {"jsonrpc":"2.0","id":2,"error":{"code":1002,"message":"`engine.list` is pending (work package 2)","data":{"method":"engine.list"}}}
 ```
+
+A success never carries `"result": null`. A method with nothing to return
+answers `{}` (`EmptyResult` in `methods.rs`, mirrored in `RpcTypes.swift`);
+`rpc::to_result` maps a unit value to `{}` and the loop does the same for a
+handler that returns `null` directly. The Swift client decodes a present
+`result` whatever its value, so a `null` would fail a typed decode loudly
+instead of reading as "no result".
 
 Notification (core to shell only, no `id`, no reply):
 
@@ -161,6 +169,13 @@ the request loop must write through one shared, locked writer so a
 notification and a response never interleave on stdout; the handler API for
 emitting notifications is that unit's to define.
 
+What that unit reshapes in `rpc/mod.rs`: `serve` takes `writer` by value
+today, so it becomes a shared, locked writer (an `Arc<Mutex<_>>` built inside
+`serve`, or passed in) that job threads clone; `Handler::handle` is
+synchronous and cannot emit, so it gains a parameter for notifications. Each
+has one implementor and one caller; the method table, `Logged`, and the tests
+are unaffected.
+
 Children the core spawns (wine, wineserver, Steam) must not inherit the
 core's stdout: give them `Stdio::null()` or a pipe. An inherited stdout would
 let a child write into the protocol stream and would keep the shell's pipe
@@ -176,33 +191,51 @@ Before anything is logged, `rpc::redact` replaces every param and every result
 of a `steam.login.*` method with `"<redacted>"`. Object keys are kept, so the
 log still shows the shape. Values on the wire itself are not redacted.
 
+Error responses the loop produces without running a method (`ParseError`,
+`InvalidRequest`, `MethodNotFound`, `InvalidParams`, `HelloRequired`,
+`ProtocolMismatch`) are logged too, as `<- <method> error ...` with `?` for a
+line whose method could not be read. For a `steam.login.*` method only the
+code and name are logged, because an `InvalidParams` message quotes the
+offending value.
+
 ## Restart policy
 
 `CoreClient` (`apps/Applejack/Sources/ApplejackShell/CoreClient.swift`) spawns
 the core, sends one `hello` per spawn, and matches responses to requests by
-`id`. Every caller that arrives while the handshake is in flight awaits the
-same `hello`; cancelling one of them does not cancel the handshake. A `hello`
-that fails for any reason other than a protocol mismatch tears the core down.
+`id`. Every caller that arrives while the handshake is in flight waits for the
+same `hello`; cancelling one of them releases that caller at once and does not
+cancel the handshake. A `hello` that is not answered within ten seconds
+(`handshakeTimeout`) fails every waiter with `handshakeTimedOut` and tears the
+core down; a `hello` that fails for any reason other than a protocol mismatch
+tears the core down the same way, and the next call respawns it.
 
 The client observes the core's exit through its termination status, not
 through EOF on stdout. After the core exits it drains stdout for 250 ms, then
 stops reading and fails the requests in flight with `coreExited(status)`.
+`coreExited` means the outcome is unknown: the core may have acted on the
+request before it exited. Check state before retrying a non-idempotent call
+such as `app.install` or `prefix.reset`. A request sent while no core is
+running, or whose write failed because the core closed its stdin, fails with
+`notRunning`.
+
 Restarts are lazy: the next call respawns the core, at most three times, and
 a spawn that fails outright (`launchFailed`) does not count. After the third
 restart every call fails with `restartLimit`. A protocol mismatch is final:
 the client does not respawn into the same mismatch.
 
 `shutdown()` closes the core's stdin, which ends a healthy core's loop with
-exit 0, and terminates the core if it is still running two seconds later.
+exit 0, terminates the core if it is still running two seconds later, and
+kills it one second after that if it ignored the termination.
 
 A response with `"id": null` (`ParseError` or `InvalidRequest` for a line the
 core could not attribute) matches no request; the client logs it to stderr.
 The request that caused it keeps waiting, because the client cannot tell
 which one it was.
 
-Cancelling a Swift task abandons its request. Nothing is sent to the core, and
-a late response is dropped. `app.cancel` (work package 5) is the method that
-stops work in the core.
+Cancelling a Swift task stops its wait. A request not yet written is never
+sent; one already written still runs in the core, and its late response is
+dropped. `app.cancel` (work package 5) is the method that stops work in the
+core.
 
 Reattaching running game sessions after a core restart is work package 5.
 
