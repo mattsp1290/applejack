@@ -64,9 +64,12 @@ All commands run from the repository root. Output goes under `build/work/`
    `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests`
    with `CC=clang`, `BISON=`, `FLEX=`, `GSTREAMER_LIBS=`, `make`,
    `make install-lib` into `build/work/wine/stage/`. Hours. GStreamer
-   reaches `configure` through `PKG_CONFIG_PATH`, which starts with the
-   devel package's `lib/pkgconfig` (its `.pc` files are relocatable, so
-   `GSTREAMER_CFLAGS` comes from them), while `GSTREAMER_LIBS` points at the
+   reaches `configure` through `PKG_CONFIG_PATH`, which ends with the devel
+   package's `lib/pkgconfig` (its `.pc` files are relocatable, so
+   `GSTREAMER_CFLAGS` comes from them; it goes last because it also carries
+   `freetype2.pc`, `fontconfig.pc`, and the rest of GStreamer's base system,
+   which must not shadow the Homebrew packages Wine links), while
+   `GSTREAMER_LIBS` points at the
    staged, thinned `lib/` so the link references name what ships and the
    closure in step 7 rewrites them; `--with-gstreamer` makes a miss a
    configure error instead of the silent "GStreamer won't be supported"

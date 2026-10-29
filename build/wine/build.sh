@@ -77,8 +77,11 @@ FLEX=$(command -v flex || true)
 export CPPFLAGS="-I$BREW_PREFIX/include"
 export LDFLAGS="-L$BREW_PREFIX/lib"
 # The upstream .pc files are relocatable (prefix=${pcfiledir}/../..), so the
-# expanded devel tree resolves through PKG_CONFIG_PATH alone.
-export PKG_CONFIG_PATH="$GST_DEVEL/lib/pkgconfig:$BREW_PREFIX/lib/pkgconfig:$BREW_PREFIX/opt/openssl/lib/pkgconfig"
+# expanded devel tree resolves through PKG_CONFIG_PATH alone. It goes last:
+# it also carries freetype2.pc, fontconfig.pc, zlib.pc, and the rest of
+# GStreamer's base system, which must not shadow the Homebrew packages Wine
+# links (the devel lib/ holds static archives and dangling .dylib links).
+export PKG_CONFIG_PATH="$BREW_PREFIX/lib/pkgconfig:$BREW_PREFIX/opt/openssl/lib/pkgconfig:$GST_DEVEL/lib/pkgconfig"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 JOBS=${WINE_JOBS:-$(sysctl -n hw.ncpu)}
 
