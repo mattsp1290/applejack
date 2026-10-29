@@ -42,7 +42,10 @@ final class GoldenTests: XCTestCase {
 
     func testEveryResultGoldenDecodes() throws {
         let results = try goldens(suffix: ".result.json")
-        XCTAssertEqual(results.map(\.lastPathComponent), ["hello.result.json", "host.doctor.result.json"])
+        XCTAssertEqual(
+            results.map(\.lastPathComponent),
+            ["empty.result.json", "hello.result.json", "host.doctor.result.json"]
+        )
         for file in results {
             let response = try RpcCoding.decoder().decode(RpcResponse.self, from: Data(contentsOf: file))
             XCTAssertNotNil(response.result, file.lastPathComponent)
@@ -50,24 +53,75 @@ final class GoldenTests: XCTestCase {
         }
     }
 
+    /// Decodes a result golden as `Result` and checks that the Swift mirror
+    /// re-encodes to the same bytes, so a field added on the Rust side fails
+    /// here rather than going unnoticed until a view needs it.
+    func typedResult<Result: Codable & Sendable>(_ file: String, as _: Result.Type) throws -> Result {
+        let data = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent(file))
+        let response = try RpcCoding.decoder().decode(RpcTypedResponse<Result>.self, from: data)
+        let result = try XCTUnwrap(response.result, file)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any], file)
+        let compact = try JSONSerialization.data(
+            withJSONObject: try XCTUnwrap(object["result"], file),
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        XCTAssertEqual(try RpcCoding.encoder().encode(result), compact, "\(file): the Swift mirror drops or adds a field")
+        return result
+    }
+
     func testHelloResultGoldenIsTyped() throws {
-        let data = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent("hello.result.json"))
-        let response = try RpcCoding.decoder().decode(RpcTypedResponse<HelloResult>.self, from: data)
-        XCTAssertEqual(response.result?.protocolVersion, CoreClient.protocolVersion)
+        let hello = try typedResult("hello.result.json", as: HelloResult.self)
+        XCTAssertEqual(hello.protocolVersion, CoreClient.protocolVersion)
     }
 
     func testHostDoctorResultGoldenIsTyped() throws {
-        let data = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent("host.doctor.result.json"))
-        let response = try RpcCoding.decoder().decode(RpcTypedResponse<HostFacts>.self, from: data)
-        let facts = try XCTUnwrap(response.result)
+        let facts = try typedResult("host.doctor.result.json", as: HostFacts.self)
         XCTAssertEqual(facts.macosVersion, "26.0.1")
         XCTAssertEqual(facts.freeDiskBytes, 1_168_608_788_480)
         XCTAssertEqual(facts.screenRecording, .unknown)
+    }
+
+    func testEmptyResultGoldenIsTyped() throws {
+        let empty = try typedResult("empty.result.json", as: EmptyResult.self)
+        XCTAssertEqual(empty, EmptyResult())
+        let untyped = try typedResult("empty.result.json", as: JSONValue.self)
+        XCTAssertEqual(untyped, .object([:]))
+    }
+
+    func testNullResultIsPresentNotAbsent() throws {
+        let line = Data(#"{"jsonrpc":"2.0","id":1,"result":null}"#.utf8)
+        let untyped = try RpcCoding.decoder().decode(RpcResponse.self, from: line)
+        XCTAssertEqual(untyped.result, .null)
+        XCTAssertThrowsError(try RpcCoding.decoder().decode(RpcTypedResponse<HelloResult>.self, from: line))
+    }
+
+    func testResponseWithAnotherJsonrpcVersionIsRejected() {
+        let line = Data(#"{"jsonrpc":"1.0","id":1,"result":{}}"#.utf8)
+        XCTAssertThrowsError(try RpcCoding.decoder().decode(RpcResponse.self, from: line))
+    }
+
+    func testErrorCodesGoldenMatchesTheSwiftEnum() throws {
+        let data = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent("error_codes.json"))
+        let golden = try RpcCoding.decoder().decode([String: Int].self, from: data)
+        XCTAssertEqual(golden.count, RpcErrorCode.allCases.count, "RpcErrorCode has a different number of cases than ErrorCode")
+        XCTAssertEqual(Set(RpcErrorCode.allCases.map(\.rawValue)), Set(golden.values))
     }
 
     func testHelloRequestMatchesWhatTheClientSends() throws {
         let data = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent("hello.request.json"))
         let request = try RpcCoding.decoder().decode(RpcRequest.self, from: data)
         XCTAssertEqual(request.params, .object(["protocol_version": .integer(Int64(CoreClient.protocolVersion))]))
+        // The bytes `CoreClient` writes, not just the public mirror.
+        let outgoing = CoreClient.OutgoingRequest(
+            id: .number(1), method: "hello", params: HelloParams(protocolVersion: CoreClient.protocolVersion)
+        )
+        var line = try CoreClient.encodeLine(outgoing)
+        XCTAssertEqual(line.last, UInt8(ascii: "\n"))
+        line.removeLast()
+        let compact = try JSONSerialization.data(
+            withJSONObject: JSONSerialization.jsonObject(with: data),
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        XCTAssertEqual(line, compact)
     }
 }
