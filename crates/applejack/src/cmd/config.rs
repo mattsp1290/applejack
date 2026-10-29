@@ -1,5 +1,6 @@
 //! `applejack config <appid> show|set|export|import`.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -13,7 +14,8 @@ const EXIT_CONFIRMATION_REQUIRED: u8 = 65;
 
 /// Largest preset file `import` reads. A preset is a few hundred bytes of
 /// settings; anything bigger is read into memory, written into the database,
-/// and echoed back, so it is refused before `read_to_string`.
+/// and echoed back, so the read stops one byte past the cap and the file is
+/// refused.
 const MAX_PRESET_BYTES: u64 = 1 << 20;
 
 #[derive(Args)]
@@ -131,6 +133,10 @@ fn show(db: &ConfigDb, appid: u32, json: bool) -> Result<String, Failure> {
     Ok(render(&config))
 }
 
+/// One line per field. Set values are Debug-quoted, the form `set` echoes
+/// and the import report uses: control and bidirectional formatting
+/// characters come out escaped, so a stored value cannot move the cursor,
+/// reverse a line, or forge a `show` line. `--json` gives the exact form.
 fn render(config: &GameConfig) -> String {
     let width = Field::names()
         .iter()
@@ -140,27 +146,13 @@ fn render(config: &GameConfig) -> String {
     Field::ALL
         .iter()
         .map(|field| {
-            let value = config.get(*field).unwrap_or_else(|| "(unset)".to_owned());
-            format!("{:<width$}  {}", field.name(), escape_control(&value))
+            let value = config
+                .get(*field)
+                .map_or_else(|| "(unset)".to_owned(), |value| format!("{value:?}"));
+            format!("{:<width$}  {value}", field.name())
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Escapes control characters the way `{:?}` does, without quoting the rest:
-/// a stored value cannot move the cursor or forge a `show` line, and JSON
-/// `extra_env` stays readable.
-fn escape_control(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_debug().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
 }
 
 fn export(
@@ -187,15 +179,19 @@ fn import(
     let cannot_read = |error: &dyn std::fmt::Display| {
         Failure::Message(format!("cannot read {}: {error}", file.display()))
     };
-    let size = std::fs::metadata(file)
+    // Bound the read itself: a FIFO or character device reports no size, and
+    // a regular file can grow between a size check and the read.
+    let mut text = String::new();
+    std::fs::File::open(file)
         .map_err(|error| cannot_read(&error))?
-        .len();
-    if size > MAX_PRESET_BYTES {
+        .take(MAX_PRESET_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| cannot_read(&error))?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_PRESET_BYTES {
         return Err(cannot_read(&format!(
-            "{size} bytes is larger than the {MAX_PRESET_BYTES} byte preset limit"
+            "larger than the {MAX_PRESET_BYTES} byte preset limit"
         )));
     }
-    let text = std::fs::read_to_string(file).map_err(|error| cannot_read(&error))?;
     let mut preset = Preset::from_json(&text)?;
     // The CLI's appid wins: a preset exported for one title may be applied to
     // another entry (a different depot of the same game, for instance). Say
@@ -208,12 +204,25 @@ fn import(
         );
         preset.appid = appid;
     }
-    let db = config::open_db(data_dir)?;
     let policy = DefaultEnvPolicy::new(data_dir);
     let options = ImportOptions {
         accept_launch_overrides,
     };
-    let plan = config::presets::import(&preset, &policy, &db, data_dir, home, options)?;
+    // A missing database holds no rows, so the plan reads an empty in-memory
+    // one: a refused or unconfirmed import never creates `db.sqlite`.
+    let existing = data_dir
+        .join(config::DB_FILE)
+        .exists()
+        .then(|| config::open_db(data_dir))
+        .transpose()?;
+    let scratch;
+    let plan_db = if let Some(db) = &existing {
+        db
+    } else {
+        scratch = ConfigDb::open_in_memory()?;
+        &scratch
+    };
+    let plan = config::presets::import(&preset, &policy, plan_db, data_dir, home, options)?;
     let mut lines = render_plan(&plan);
     if plan.needs_confirmation() {
         lines.push(
@@ -224,9 +233,14 @@ fn import(
         super::emit("config", &lines.join("\n"));
         return Err(Failure::ConfirmationRequired);
     }
+    let db = if let Some(db) = existing {
+        db
+    } else {
+        config::open_db(data_dir)?
+    };
     plan.apply(&db)?;
     lines.push(format!(
-        "applied {} field(s) to appid {appid}",
+        "applied {} item(s) to appid {appid}",
         plan.accepted.len()
     ));
     Ok(lines.join("\n"))
@@ -271,12 +285,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn show_escapes_control_characters_only() {
-        assert_eq!(escape_control("plain"), "plain");
-        assert_eq!(escape_control("{\"A\":\"1\"}"), "{\"A\":\"1\"}");
+    fn show_quotes_values_and_escapes_control_and_bidi_characters() {
+        let config = GameConfig {
+            notes: Some("\u{1b}[1A\u{1b}[2K launch_exe_override (unset)\n".to_owned()),
+            launch_args_override: Some("safe \u{202e} hs/nib/ \u{2066}x \u{200e}".to_owned()),
+            extra_env: std::collections::BTreeMap::from([("A".to_owned(), "1".to_owned())]),
+            ..GameConfig::default()
+        };
+        let text = render(&config);
+        let line = |name: &str| {
+            text.lines()
+                .find(|line| line.starts_with(name))
+                .unwrap_or_else(|| panic!("{name} missing in {text}"))
+                .to_owned()
+        };
+        assert!(line("notes").ends_with("\"\\u{1b}[1A\\u{1b}[2K launch_exe_override (unset)\\n\""));
+        assert!(
+            line("launch_args_override")
+                .ends_with("\"safe \\u{202e} hs/nib/ \\u{2066}x \\u{200e}\"")
+        );
+        assert!(line("extra_env").ends_with("\"{\\\"A\\\":\\\"1\\\"}\""));
+        assert!(line("engine_id").ends_with("(unset)"));
         assert_eq!(
-            escape_control("\u{1b}[1A\u{1b}[2K launch_exe_override (unset)\n"),
-            "\\u{1b}[1A\\u{1b}[2K launch_exe_override (unset)\\n"
+            text.lines()
+                .filter(|line| line.starts_with("launch_exe_override"))
+                .count(),
+            1
         );
     }
 }
