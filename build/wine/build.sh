@@ -85,17 +85,14 @@ export PKG_CONFIG_PATH="$BREW_PREFIX/lib/pkgconfig:$BREW_PREFIX/opt/openssl/lib/
 export MACOSX_DEPLOYMENT_TARGET=14.0
 JOBS=${WINE_JOBS:-$(sysctl -n hw.ncpu)}
 
-# The same grammar wine-11.0's configure feeds bison (wine_cv_recent_bison);
-# failing here names the fix instead of "Your bison version is too old".
+# Failing the conftest here names the fix instead of configure's "Your bison
+# version is too old".
 if [ -n "$BISON" ]; then
-  conftest="$WORK/wine/conftest.y"
-  printf '%%define parse.error verbose\n%%%%\nempty: ;\n' >"$conftest"
-  if "$BISON" -o /dev/null "$conftest" 2>/dev/null; then
+  if bison_accepts "$BISON"; then
     echo "bison: $("$BISON" --version | head -1) at $BISON accepts '%define parse.error verbose'"
   else
     fail "bison >= 3.0: $BISON is $("$BISON" --version | head -1) and rejects '%define parse.error verbose' (sh build/bootstrap.sh --install-brew-deps)" bootstrap
   fi
-  rm -f "$conftest"
 fi
 [ -z "$FLEX" ] || echo "flex: $("$FLEX" --version | head -1) at $FLEX"
 
@@ -187,26 +184,32 @@ else
     trial="$WORK/wine/patch-trial"
     rm -rf "$trial"
     cp -cR "$WINE_SRC" "$trial"
+    failed=""
     for patch in "$@"; do
       if ! report=$(cd "$trial" && patch -p1 -N -f -s <"$patch" 2>&1); then
-        echo "project patch $(basename "$patch") does not apply in sequence to wine-$WINE_VERSION:" >&2
+        failed=$(basename "$patch")
+        echo "project patch $failed does not apply in sequence to wine-$WINE_VERSION:" >&2
         printf '%s\n' "$report" | sed 's/^/  /' >&2
-        rm -rf "$trial"
-        exit 1
+        break
       fi
     done
     rm -rf "$trial"
-    names=""
-    for patch in "$@"; do
-      apply_patch "$patch"
-      names="$names $(basename "$patch")"
-    done
-    if [ "$PREFLIGHT" = 1 ]; then
-      echo "preflight: $# project patch(es) apply in sequence (trial on the tree without msync applied):$names"
+    if [ -n "$failed" ]; then
+      # Fatal in the real run; preflight records the gap and reports the rest.
+      fail "project patch set that applies in sequence ($failed fails; fix build/wine/patches)"
     else
-      echo "applied $# project patch(es):$names"
+      names=""
+      for patch in "$@"; do
+        apply_patch "$patch"
+        names="$names $(basename "$patch")"
+      done
+      if [ "$PREFLIGHT" = 1 ]; then
+        echo "preflight: $# project patch(es) apply in sequence (trial on the tree without msync applied):$names"
+      else
+        echo "applied $# project patch(es):$names"
+      fi
+      write_stamp "$PATCHES_STAMP" "${names# }"
     fi
-    write_stamp "$PATCHES_STAMP" "${names# }"
   else
     echo "project patches: none"
     write_stamp "$PATCHES_STAMP" ""

@@ -39,8 +39,19 @@ step 7. Neither installing mode has been run yet.
 
 All commands run from the repository root. Output goes under `build/work/`
 (git-ignored); the payload tree is assembled under
-`fixtures/payloads/rosetta-wine-<wine version>/` (git-ignored) or
-`$APPLEJACK_PAYLOAD_DIR`.
+`fixtures/payloads/rosetta-wine-<wine version>/` (git-ignored; the Wine
+version by design, one bundle per Wine version) or `$APPLEJACK_PAYLOAD_DIR`.
+
+Environment knobs:
+
+| Knob | Read by | Effect |
+| --- | --- | --- |
+| `APPLEJACK_PAYLOAD_DIR` | `build/lib.sh` (every script) | assemble into this directory instead of `fixtures/payloads/rosetta-wine-<wine version>/` |
+| `ASSEMBLE_PARTIAL=1` | `build/assemble.sh` | tolerate unbuilt probes and an unbuilt `osslsigncode`; the tree is announced as partial and is not installable |
+| `WINE_JOBS=<n>` | `build/wine/build.sh` | `make` parallelism (default `hw.ncpu`) |
+| `WINE_SKIP_MSYNC=1` | `build/wine/build.sh` | skip the msync patch attempt; gate G4b records "skipped" |
+| `PROBE_ARCH=i686` | `probes/dx11-sample/build.sh`, `probes/xinput-check/build.sh` | 32-bit build of the probe (default `x86_64`) |
+| `OPENSSL_ROOT_DIR` | `build/osslsigncode/build.sh` | OpenSSL prefix (default `brew --prefix openssl@3`) |
 
 1. `cargo xtask pins-verify` — parses both data files offline (also part of
    `cargo xtask check`).
@@ -52,12 +63,12 @@ All commands run from the repository root. Output goes under `build/work/`
    run. `--fetch <id>` fetches one pin. Verified on the planning host for all
    nine pins.
 3. `sh build/wine/fetch.sh` — extracts Wine and the msync patch set (the
-   loader in step 2 scanned both archives; the scripts do not scan again),
-   removes the patch stamps, and reports whether `configure.ac` has
-   `--with-metal`. At wine-11.0 it does
-   not: Metal support is detected automatically (`configure.ac` checks
-   `MTLDevice.registryID` and defines `HAVE_MTLDEVICE_REGISTRYID`); there is
-   no option to pass.
+   loader in step 2 scanned both archives; the scripts do not scan again)
+   and removes the patch stamps. `build.sh` adds `--with-metal` to
+   `configure` when `configure.ac` offers it; at wine-11.0 it does not:
+   Metal support is detected automatically (`configure.ac` checks
+   `MTLDevice.registryID` and defines `HAVE_MTLDEVICE_REGISTRYID`), so there
+   is no option to pass.
 4. `sh build/wine/build.sh` (after step 5's `sh build/gstreamer/fetch.sh`,
    which it needs) — tool checks, the bison conftest, the pkg-config report,
    gate G4b (below), project patches from `build/wine/patches/`, then

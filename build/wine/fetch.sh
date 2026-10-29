@@ -1,6 +1,6 @@
 #!/bin/sh
-# Fetches the pinned Wine source and the msync patch set into build/work/wine/
-# and reports whether the pinned configure.ac knows --with-metal.
+# Fetches the pinned Wine source and the msync patch set into build/work/wine/.
+# build/wine/build.sh adds --with-metal to configure when configure.ac offers it.
 set -eu
 . "$(dirname "$0")/../lib.sh"
 
@@ -18,9 +18,4 @@ extract "$msync" "$WORK/wine/msync"
 echo "msync patches:"
 ls "$WORK"/wine/msync/*/*.patch
 
-if grep -q 'AC_ARG_WITH(metal' "$WINE_SRC/configure.ac"; then
-  echo "configure.ac: --with-metal exists at wine-$WINE_VERSION"
-else
-  echo "configure.ac: no --with-metal option at wine-$WINE_VERSION (Metal is auto-detected; see docs/engines/payload-build.md)"
-fi
 echo "wine source: $WINE_SRC"

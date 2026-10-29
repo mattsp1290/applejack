@@ -60,6 +60,31 @@ llvm_mingw_bin() {
   return 1
 }
 
+# mingw_cc <i686|x86_64>: the PE compiler for the probes, llvm-mingw pin
+# first, Homebrew mingw-w64 gcc as fallback; prints the compiler.
+mingw_cc() {
+  bin=$(llvm_mingw_bin || true)
+  if [ -n "$bin" ] && [ -x "$bin/$1-w64-mingw32-clang" ]; then
+    printf '%s\n' "$bin/$1-w64-mingw32-clang"
+  elif command -v "$1-w64-mingw32-gcc" >/dev/null 2>&1; then
+    printf '%s\n' "$1-w64-mingw32-gcc"
+  else
+    echo "missing: $1-w64-mingw32-clang (llvm-mingw pin) or $1-w64-mingw32-gcc" >&2
+    return 1
+  fi
+}
+
+# bison_accepts <bison>: true when <bison> takes the grammar wine-11.0's
+# configure feeds it (wine_cv_recent_bison); Apple's bison 2.3 does not.
+bison_accepts() {
+  conftest=$(mktemp -t bison-conftest) || return 1
+  printf '%%define parse.error verbose\n%%%%\nempty: ;\n' >"$conftest"
+  "$1" -o /dev/null "$conftest" 2>/dev/null
+  status=$?
+  rm -f "$conftest"
+  return "$status"
+}
+
 # need <tool> [hint]: fail with a message when a tool is not on PATH.
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then

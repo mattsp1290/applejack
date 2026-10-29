@@ -94,17 +94,14 @@ else
 fi
 
 echo "== bison (Wine's configure needs 3.0 or newer; Apple's /usr/bin/bison is 2.3)"
-conftest=$(mktemp -t bison-conftest)
-printf '%%define parse.error verbose\n%%%%\nempty: ;\n' >"$conftest"
 bison_found=""
 for candidate in ${X86_PREFIX:+$X86_PREFIX/opt/bison/bin/bison} "$(command -v bison || true)"; do
   [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-  if "$candidate" -o /dev/null "$conftest" 2>/dev/null; then
+  if bison_accepts "$candidate"; then
     bison_found=$candidate
     break
   fi
 done
-rm -f "$conftest"
 if [ -n "$bison_found" ]; then
   ok "bison >= 3.0 at $bison_found ($("$bison_found" --version | head -1))"
 else

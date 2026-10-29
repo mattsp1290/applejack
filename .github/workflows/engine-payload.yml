@@ -73,6 +73,11 @@ jobs:
           key: pins-${{ hashFiles('build/pins.toml') }}
       - name: Verify the pin and denylist files
         run: cargo xtask pins-verify
+      # `--fetch` lists each archive before it lands: `tar --zstd` for the
+      # vkd3d-proton release, `xar` and `lsbom` for the .pkg pins. A missing
+      # lister fails here in a second rather than after the gigabyte download.
+      - name: Require the archive listers
+        run: command -v zstd xar lsbom
       - name: Fetch and scan every pin
         run: cargo xtask engine-payload --fetch
       - name: Check build prerequisites

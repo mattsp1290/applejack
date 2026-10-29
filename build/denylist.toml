@@ -1,8 +1,10 @@
 # Paths that must never appear in an engine payload or in a fetched archive.
-# `cargo xtask engine-payload --check <payload>` scans the assembled tree and
-# `--check-listing` scans archive listings before extraction. A pattern without
-# `/` matches any single path component; one with `/` matches a component-aligned
-# suffix of the path. See ADR-0004.
+# `cargo xtask engine-payload --fetch` scans every archive's listing before it
+# lands, `--check <payload>` scans the assembled tree, and `--check-listing`
+# scans a staged tree (the GStreamer stage). Rules with `scope = "payload"`
+# are skipped by the archive scan only. A pattern without `/` matches any
+# single path component; one with `/` matches a component-aligned suffix of
+# the path. See ADR-0004.
 
 [[deny]]
 pattern = "D3DMetal*"

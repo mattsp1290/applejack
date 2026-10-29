@@ -81,11 +81,15 @@ copy_probe "$WORK/osslsigncode/osslsigncode" osslsigncode "sh build/osslsigncode
 
 xtask engine-payload --write-bundle-toml "$ROOT/build/bundle-spec.toml" "$T/BUNDLE.toml"
 
+# A run that died between the two mv's below left the last good tree as
+# $P.old only; put it back before it is discarded.
+[ -e "$P" ] || [ ! -e "$P.old" ] || mv "$P.old" "$P"
 rm -rf "$P.old"
 [ ! -e "$P" ] || mv "$P" "$P.old"
 mv "$T" "$P"
 rm -rf "$P.old"
 
 echo "assembled $P ($(du -sh "$P" | cut -f1)):"
+[ "${ASSEMBLE_PARTIAL:-0}" != 1 ] || echo "assemble: PARTIAL tree: BUNDLE.toml names files that are absent (wine/bin/wine, wine/bin/wineserver, probes), so the engine reader's validate rejects it; not installable"
 (cd "$P" && find . -maxdepth 2 -not -path './wine/lib/GStreamer.framework/*' | sort | sed 's|^\./|  |')
 echo "next: the dylib closure (docs/engines/payload-build.md step 7), then cargo xtask engine-payload --check $P"
