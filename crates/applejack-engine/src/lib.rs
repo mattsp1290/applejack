@@ -1,30 +1,407 @@
-//! Engine abstraction: the `Engine` trait, the on-disk engine bundle layout
-//! and `BUNDLE.toml`, engine install and rollback, prefix creation and
-//! snapshots, and launch. Accepts and returns plain structs and never depends
-//! on `applejack-config`.
+//! Engine abstraction: the [`Engine`] trait, the on-disk engine bundle layout
+//! and `BUNDLE.toml`, engine install and rollback, and the launch environment
+//! allowlist. Accepts and returns plain structs and never depends on
+//! `applejack-config`.
+//!
+//! This crate holds the domain model. The first implementation of [`Engine`]
+//! (`rosetta-wine`: prefix creation, process spawning, process discovery,
+//! `D3DMetal` overlay, CPUID probe) lands in a later unit. See
+//! `docs/engines/rosetta-wine.md`.
 
-use applejack_manifest::{Error, Manifest};
+use std::ffi::OsString;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-// Embedded so the pins travel inside the signed binary and change only with a
-// release.
-const EMBEDDED_MANIFEST: &str = include_str!("../../../engines/manifest.toml");
+use serde::{Deserialize, Serialize};
 
-/// Parses and validates the `engines/manifest.toml` compiled into this crate.
-///
-/// # Errors
-///
-/// Returns the parse or validation error. `cargo xtask manifest-verify`
-/// rejects such a manifest before it can ship.
-pub fn embedded_manifest() -> Result<Manifest, Error> {
-    let manifest = Manifest::parse(EMBEDDED_MANIFEST)?;
-    manifest.validate()?;
-    Ok(manifest)
+pub mod bundle;
+mod error;
+pub mod launch;
+pub mod manifest;
+pub mod versions;
+
+pub use applejack_manifest::{Arch, Sha256};
+pub use bundle::{BundleToml, Capabilities, InstalledEngine};
+pub use error::{Error, Result};
+pub use launch::{LaunchSpec, Session};
+pub use manifest::embedded_manifest;
+pub use versions::Version;
+
+/// Which engine a bundle, prefix, or configuration refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineId {
+    /// x86-64 Wine under Rosetta 2.
+    RosettaWine,
+    /// Native arm64 engine (gated track).
+    NativeArm64,
 }
+
+impl EngineId {
+    /// The directory and manifest name of the engine.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RosettaWine => "rosetta-wine",
+            Self::NativeArm64 => "native-arm64",
+        }
+    }
+}
+
+impl fmt::Display for EngineId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EngineId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "rosetta-wine" => Ok(Self::RosettaWine),
+            "native-arm64" => Ok(Self::NativeArm64),
+            other => Err(Error::UnknownEngineId(other.to_owned())),
+        }
+    }
+}
+
+/// Direct3D translation layer applied to a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphicsBackend {
+    /// DXMT for DirectX 10 and 11 (default for those).
+    Dxmt,
+    /// Wine's built-in Direct3D over OpenGL; no DLL overrides.
+    #[serde(rename = "wined3d")]
+    WineD3D,
+    /// vkd3d-proton for DirectX 12 over a Vulkan-on-Metal driver.
+    Vkd3dProton,
+    /// Apple's `D3DMetal`, user-supplied through the per-user overlay.
+    #[serde(rename = "d3dmetal")]
+    D3DMetal,
+}
+
+/// Wine synchronization primitive implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum SyncMode {
+    /// `WINEMSYNC=1`.
+    Msync,
+    /// `WINEESYNC=1`.
+    Esync,
+    /// Neither variable set.
+    None,
+}
+
+impl SyncMode {
+    /// The name used in `BUNDLE.toml` and on the command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Msync => "msync",
+            Self::Esync => "esync",
+            Self::None => "none",
+        }
+    }
+}
+
+impl fmt::Display for SyncMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SyncMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "msync" => Ok(Self::Msync),
+            "esync" => Ok(Self::Esync),
+            "none" => Ok(Self::None),
+            other => Err(Error::UnknownSyncMode(other.to_owned())),
+        }
+    }
+}
+
+impl TryFrom<String> for SyncMode {
+    type Error = Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl From<SyncMode> for String {
+    fn from(mode: SyncMode) -> Self {
+        mode.as_str().to_owned()
+    }
+}
+
+/// Whether Wine's `winebus.sys` exposes raw HID devices to the prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HidrawMode {
+    Enabled,
+    Disabled,
+}
+
+/// How a bundle's Wine runs 32-bit Windows code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Wow64 {
+    /// Upstream "new WoW64": 32-bit PE on a 64-bit Unix side.
+    #[serde(rename = "new")]
+    New,
+    /// CrossOver-style `x86_32on64-unix`.
+    #[serde(rename = "32on64")]
+    ThirtyTwoOn64,
+    /// 64-bit only.
+    #[serde(rename = "none")]
+    None,
+}
+
+impl Wow64 {
+    /// True when 32-bit Windows executables can run in this bundle.
+    #[must_use]
+    pub const fn supports_32bit(self) -> bool {
+        matches!(self, Self::New | Self::ThirtyTwoOn64)
+    }
+}
+
+/// Where engines live under the launcher's data directory.
+///
+/// ```text
+/// <data_dir>/engines/<id>/<version>/          installed bundle
+/// <data_dir>/engines/<id>/<version>.partial/  extraction in progress
+/// <data_dir>/engines/<id>/<version>.user/     per-user overlay (D3DMetal)
+/// <data_dir>/engines/<id>/ACTIVE              selected version
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineLayout {
+    data_dir: PathBuf,
+}
+
+impl EngineLayout {
+    /// Directory name suffix of an extraction in progress.
+    pub const PARTIAL_SUFFIX: &'static str = ".partial";
+    /// Directory name suffix of a per-user overlay.
+    pub const OVERLAY_SUFFIX: &'static str = ".user";
+    /// File that records the active version of an engine.
+    pub const ACTIVE_FILE: &'static str = "ACTIVE";
+
+    #[must_use]
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// `<data_dir>/engines/<id>`.
+    #[must_use]
+    pub fn engine_root(&self, id: EngineId) -> PathBuf {
+        self.data_dir.join("engines").join(id.as_str())
+    }
+
+    /// `<data_dir>/engines/<id>/<version>`.
+    #[must_use]
+    pub fn engine_dir(&self, id: EngineId, version: &Version) -> PathBuf {
+        self.engine_root(id).join(version.as_str())
+    }
+
+    /// `<data_dir>/engines/<id>/<version>.partial`.
+    #[must_use]
+    pub fn partial_dir(&self, id: EngineId, version: &Version) -> PathBuf {
+        self.engine_root(id)
+            .join(format!("{version}{}", Self::PARTIAL_SUFFIX))
+    }
+
+    /// `<data_dir>/engines/<id>/<version>.user`.
+    #[must_use]
+    pub fn overlay_dir(&self, id: EngineId, version: &Version) -> PathBuf {
+        self.engine_root(id)
+            .join(format!("{version}{}", Self::OVERLAY_SUFFIX))
+    }
+
+    /// `<data_dir>/engines/<id>/ACTIVE`.
+    #[must_use]
+    pub fn active_file(&self, id: EngineId) -> PathBuf {
+        self.engine_root(id).join(Self::ACTIVE_FILE)
+    }
+}
+
+/// Facts about the machine, gathered by the core and handed to
+/// [`Engine::doctor`]. Read-only input; the engine never probes the host
+/// itself inside `doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Host {
+    /// `ProductVersion` from `sw_vers`, for example `15.1`.
+    pub macos_version: String,
+    /// Native CPU architecture of the host.
+    pub arch: Arch,
+    /// Whether Rosetta 2 is installed; `None` when the core could not tell.
+    pub rosetta_present: Option<bool>,
+}
+
+/// Severity of one [`DoctorReport`] finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// One line of a [`DoctorReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub severity: Severity,
+    pub message: String,
+}
+
+/// Result of [`Engine::doctor`]: whether the engine can run on this host and
+/// why not when it cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub runnable: bool,
+    pub findings: Vec<Finding>,
+}
+
+/// What [`Engine::create_prefix`] applies to a fresh prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixSpec {
+    pub backend: GraphicsBackend,
+    pub sync_mode: SyncMode,
+    pub hidraw: HidrawMode,
+    /// Shared game library mounted as drive `S:`; `None` leaves the drive
+    /// unmapped.
+    pub library_dir: Option<PathBuf>,
+}
+
+/// A Wine prefix created by an engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefix {
+    pub dir: PathBuf,
+    /// Engine version that last touched the prefix.
+    pub engine_version: Version,
+}
+
+/// Reported by [`Engine::install`] as work proceeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Progress {
+    Downloading { received: u64, total: Option<u64> },
+    Verifying,
+    Extracting,
+    Validating,
+}
+
+/// The operations the launcher programs against. Each engine bundle is
+/// described by its `BUNDLE.toml`; the first implementation, `rosetta-wine`,
+/// lands in the unit after this one.
+pub trait Engine {
+    /// The engine's identity.
+    fn id(&self) -> EngineId;
+
+    /// What the bundle can do, derived from its `BUNDLE.toml`.
+    fn capabilities(&self, bundle: &BundleToml) -> Capabilities;
+
+    /// Read-only, network-free check of the host and an installed bundle.
+    fn doctor(&self, host: &Host, installed: Option<&InstalledEngine>) -> DoctorReport;
+
+    /// Downloads, verifies, extracts, and validates the manifest's pinned
+    /// bundle into `layout`. Writes only under `engines/<id>/<version>.partial/`
+    /// until the final rename and never touches another version.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure; a failed install leaves no `<version>/`.
+    fn install(
+        &self,
+        entry: &applejack_manifest::Engine,
+        layout: &EngineLayout,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<InstalledEngine>;
+
+    /// Creates a prefix at `prefix_dir` and applies `spec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure; the prefix directory is removed on error.
+    fn create_prefix(
+        &self,
+        installed: &InstalledEngine,
+        prefix_dir: &Path,
+        spec: &PrefixSpec,
+    ) -> Result<Prefix>;
+
+    /// Re-applies DLL overrides, sync mode, and the HID toggle to a prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure, including a refusal when `backend` is not
+    /// available for the installed bundle.
+    fn apply_overrides(
+        &self,
+        prefix: &Prefix,
+        backend: GraphicsBackend,
+        sync_mode: SyncMode,
+        hidraw: HidrawMode,
+    ) -> Result<()>;
+
+    /// Spawns the loader with the allowlisted environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns the spawn failure.
+    fn launch(&self, prefix: &Prefix, spec: &LaunchSpec) -> Result<Session>;
+}
+
+/// An environment variable pair as handed to a child process.
+pub type EnvPair = (OsString, OsString);
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn name<T: Serialize>(value: T) -> String {
+        #[derive(Serialize)]
+        struct Wrap<T> {
+            v: T,
+        }
+        toml::to_string(&Wrap { v: value })
+            .unwrap()
+            .trim()
+            .trim_start_matches("v = ")
+            .to_owned()
+    }
+
     #[test]
-    fn embedded_manifest_parses_and_validates() {
-        super::embedded_manifest().expect("embedded manifest is valid");
+    fn serde_names_match_the_bundle_schema() {
+        assert_eq!(name(EngineId::RosettaWine), "\"rosetta-wine\"");
+        assert_eq!(name(EngineId::NativeArm64), "\"native-arm64\"");
+        assert_eq!(name(GraphicsBackend::Dxmt), "\"dxmt\"");
+        assert_eq!(name(GraphicsBackend::WineD3D), "\"wined3d\"");
+        assert_eq!(name(GraphicsBackend::Vkd3dProton), "\"vkd3d-proton\"");
+        assert_eq!(name(GraphicsBackend::D3DMetal), "\"d3dmetal\"");
+        assert_eq!(name(SyncMode::Msync), "\"msync\"");
+        assert_eq!(name(Wow64::New), "\"new\"");
+        assert_eq!(name(Wow64::ThirtyTwoOn64), "\"32on64\"");
+        assert_eq!(name(Wow64::None), "\"none\"");
+        assert_eq!(name(HidrawMode::Enabled), "\"enabled\"");
+        assert_eq!(
+            "rosetta-wine".parse::<EngineId>().unwrap(),
+            EngineId::RosettaWine
+        );
+        assert!(matches!(
+            "fsync".parse::<SyncMode>().unwrap_err(),
+            Error::UnknownSyncMode(_)
+        ));
     }
 }

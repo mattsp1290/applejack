@@ -1,0 +1,47 @@
+# Well-formed sample bundle descriptor. The integration tests write a tree
+# that matches it and derive every invalid case from this text.
+
+id = "rosetta-wine"
+version = "10.0.0"
+arch = "x86_64"
+min_macos = "14.0"
+sync_modes = ["msync", "esync", "none"]
+notarization_submission_id = ""
+
+[wine]
+version = "10.0"
+source_url = "https://example.invalid/wine.git"
+source_rev = "0123abcd"
+loader = "wine/bin/wine64"
+server = "wine/bin/wineserver"
+preloader = "wine/bin/wine64-preloader"
+wow64 = "new"
+
+[components]
+dxmt = { version = "0.60", license = "MIT" }
+vkd3d_proton = { version = "2.14", license = "LGPL-2.1-or-later" }
+moltenvk = { version = "1.3.0", license = "Apache-2.0" }
+gstreamer = { version = "1.26.0", license = "LGPL-2.1-or-later" }
+
+[overrides.dxmt]
+dlls = ["dxmt/d3d11.dll", "dxmt/dxgi.dll", "dxmt/d3d10core.dll"]
+
+[overrides.vkd3d]
+dlls = ["vkd3d/d3d12.dll", "vkd3d/d3d12core.dll"]
+
+[overrides.d3dmetal]
+dlls = []
+
+[d3dmetal]
+overlay_dir = "wine/lib/external"
+
+[probes]
+cpuid = "probes/cpuid"
+dx11_sample = "probes/dx11-sample.exe"
+xinput_check = "probes/xinput-check.exe"
+
+[registry]
+hidraw_key = "HKLM\\System\\CurrentControlSet\\Services\\winebus\\Parameters\\DisableHidraw"
+
+[entitlements]
+"wine/bin/wine64" = ["com.apple.security.cs.allow-unsigned-executable-memory"]
