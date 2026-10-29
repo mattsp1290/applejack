@@ -64,20 +64,28 @@ impl std::error::Error for Error {}
 
 impl Pins {
     /// Parses the file text and rejects entries without a usable hash, with
-    /// a non-HTTPS URL, with an unsafe destination, or with a duplicate id.
+    /// a non-HTTPS URL, with an unsafe destination, or with a duplicate id or
+    /// destination.
     ///
     /// # Errors
     ///
     /// Returns the first TOML or validation error.
     pub fn parse(text: &str) -> Result<Self, Error> {
         let pins: Self = toml::from_str(text).map_err(Error::Toml)?;
-        let mut seen = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        let mut dests = BTreeSet::new();
         for pin in &pins.pin {
             pin.validate()?;
-            if !seen.insert(pin.id.as_str()) {
+            if !ids.insert(pin.id.as_str()) {
                 return Err(Error::Invalid {
                     id: pin.id.clone(),
                     message: "duplicate id".into(),
+                });
+            }
+            if !dests.insert(pin.dest.as_str()) {
+                return Err(Error::Invalid {
+                    id: pin.id.clone(),
+                    message: format!("dest `{}` is already used by another pin", pin.dest),
                 });
             }
         }
@@ -181,6 +189,15 @@ mod tests {
         let text = entry("a", "https://x/a", HASH, "a") + &entry("a", "https://x/b", HASH, "b");
         let error = Pins::parse(&text).unwrap_err();
         assert!(error.to_string().contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_dest() {
+        let text = entry("a", "https://x/a", HASH, "same.tar")
+            + &entry("b", "https://x/b", HASH, "same.tar");
+        let error = Pins::parse(&text).unwrap_err();
+        assert!(error.to_string().contains("pin `b`"), "{error}");
+        assert!(error.to_string().contains("same.tar"), "{error}");
     }
 
     #[test]

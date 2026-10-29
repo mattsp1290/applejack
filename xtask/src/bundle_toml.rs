@@ -183,8 +183,36 @@ impl BundleSpec {
         if !self.wine.source_url.starts_with("https://") {
             return Err(Error::Invalid("`wine.source_url` must be https".into()));
         }
+        let paths = [
+            ("wine.loader", Some(&self.wine.loader)),
+            ("wine.server", Some(&self.wine.server)),
+            ("wine.preloader", self.wine.preloader.as_ref()),
+            ("d3dmetal.overlay_dir", Some(&self.d3dmetal.overlay_dir)),
+            ("probes.cpuid", Some(&self.probes.cpuid)),
+            ("probes.dx11_sample", Some(&self.probes.dx11_sample)),
+            ("probes.xinput_check", Some(&self.probes.xinput_check)),
+        ];
+        for (name, value) in paths {
+            if let Some(value) = value {
+                relative_path(name, value)?;
+            }
+        }
         Ok(())
     }
+}
+
+/// A bundle path must stay inside the payload (or the overlay root): relative,
+/// with no empty or `..` component. The same rule `pins.rs` applies to `dest`.
+fn relative_path(name: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.split('/').any(|part| part.is_empty() || part == "..")
+    {
+        return Err(Error::Invalid(format!(
+            "`{name}` must be a relative path without `..` (got `{value}`)"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -317,5 +345,25 @@ mod tests {
         bad.wine.loader = String::new();
         let error = bad.to_toml().unwrap_err();
         assert!(error.to_string().contains("wine.loader"), "{error}");
+    }
+
+    #[test]
+    fn rejects_absolute_and_escaping_paths() {
+        let mut bad = spec();
+        bad.wine.loader = "/usr/local/bin/wine".into();
+        let error = bad.to_toml().unwrap_err();
+        assert!(error.to_string().contains("wine.loader"), "{error}");
+        let mut bad = spec();
+        bad.probes.cpuid = "../cpuid".into();
+        let error = bad.to_toml().unwrap_err();
+        assert!(error.to_string().contains("probes.cpuid"), "{error}");
+        let mut bad = spec();
+        bad.wine.preloader = Some("wine/bin/../../x".into());
+        let error = bad.to_toml().unwrap_err();
+        assert!(error.to_string().contains("wine.preloader"), "{error}");
+        let mut bad = spec();
+        bad.d3dmetal.overlay_dir = "wine//lib".into();
+        let error = bad.to_toml().unwrap_err();
+        assert!(error.to_string().contains("overlay_dir"), "{error}");
     }
 }

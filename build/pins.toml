@@ -1,8 +1,16 @@
 # Every input of the Rosetta engine payload build, pinned by HTTPS URL and
 # SHA-256. `cargo xtask engine-payload --fetch` downloads each `dest` under
-# build/work/ and verifies it; `cargo xtask pins-verify` parses this file
+# build/work/, verifies it, and scans its listing against build/denylist.toml
+# before any script extracts it; `cargo xtask pins-verify` parses this file
 # offline. Hashes were computed from the downloaded files on 2026-10-28.
-# `kind` is "source", "release-asset", or "toolchain".
+# `kind` is "source", "release-asset", or "toolchain". Each `dest` is unique.
+#
+# GitHub `/archive/` tarballs (wine-msync, osslsigncode) are generated on
+# demand and their bytes are not guaranteed stable (the 2023 gzip change
+# altered them once). A change breaks `--fetch` with a hash mismatch and ships
+# nothing; `--fetch` re-verifies every present archive on each run. If it
+# happens, mirror the verified archive as a release asset under our control
+# and repoint the pin.
 
 # WineHQ stable 11.0 (ADR-0010, gate G4a Option A). The sha256 here matches the
 # tarball whose sha512 is listed in https://dl.winehq.org/wine/source/11.0/sha512sums.asc.
@@ -60,6 +68,11 @@ dest = "vulkan/MoltenVK-1.4.2-macos.tar"
 
 # Upstream GStreamer runtime package for macOS. Since 1.22 upstream ships one
 # universal (arm64 + x86_64) package; the x86_64 slices are what the payload uses.
+# The product archive also carries GPL and patent-restricted sub-packages
+# (codecs-gpl, codecs-gpl-restricted, codecs-restricted, net-restricted,
+# dvd-gpl, libav). build/gstreamer/fetch.sh stages only the allowlisted
+# LGPL/MIT/BSD/Apache sub-packages, which is what `license` describes; the
+# payload-scoped rules in build/denylist.toml reject the rest.
 [[pin]]
 id = "gstreamer"
 kind = "release-asset"
