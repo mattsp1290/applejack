@@ -70,8 +70,14 @@ current version is `1` (`PROTOCOL_VERSION`).
 
 ## Error codes
 
-Codes are serialized as integers.
+Codes are serialized as integers. The table between the markers is rendered
+from `ErrorCode::ALL` in `rpc/wire.rs` by `docs_error_table_matches_the_types`
+in `tests/rpc_golden.rs`, which also emits `tests/rpc_golden/error_codes.json`
+(name to integer) for the Swift suite to check `RpcErrorCode` against. Add a
+code to the Rust enum, rerun with `APPLEJACK_UPDATE_GOLDENS=1`, and add the
+Swift case; do not edit the table by hand.
 
+<!-- error-table:begin -->
 | Code | Name | Meaning |
 |---:|---|---|
 | -32700 | `ParseError` | The line is not UTF-8 or not JSON. |
@@ -83,7 +89,13 @@ Codes are serialized as integers.
 | 1001 | `HelloRequired` | A request arrived before a successful `hello`. |
 | 1002 | `NotImplemented` | The method is in the table, but its work package has not landed. `data.method` names it. |
 | 1003 | `Internal` | The method's own work failed (I/O, database, child process). |
-| 1004 | `JobFailed` | The typed code carried by a `job.failed` notification. |
+| 1004 | `JobFailed` | The typed code carried by a `job.failed` notification. A placeholder until `engine.install` adds reason codes. |
+<!-- error-table:end -->
+
+`JobFailed` is a placeholder. The `engine.install` unit adds one reason code
+per failure kind (download, checksum, disk full) to `ErrorCode`, so a
+`job.failed` says why, and the lever above carries them to the docs and to
+Swift.
 
 ## Methods
 
@@ -198,7 +210,9 @@ Reattaching running game sessions after a core restart is work package 5.
 
 `crates/applejack-core/tests/rpc_golden/` holds `<method>.request.json` for
 every method, plus `<method>.result.json` for methods with a result type
-(`hello`, `host.doctor`). They are generated from the Rust types:
+(`hello`, `host.doctor`), `empty.result.json` for the `{}` result, and
+`error_codes.json` (error name to integer). They are generated from the Rust
+types:
 
 - `cargo test -p applejack-core --test rpc_golden` fails when a committed
   golden differs from what the types produce, when one is missing, or when
@@ -208,8 +222,11 @@ every method, plus `<method>.result.json` for methods with a result type
 - The same test file deserializes every committed request into the method
   table.
 - The Swift suite (`GoldenTests`) decodes every golden into the Swift mirrors
-  in `RpcTypes.swift`. It also checks that each request re-encodes to the same
-  JSON.
+  in `RpcTypes.swift`. It checks that each request, and each typed result,
+  re-encodes to the same JSON, so a field added on the Rust side fails the
+  Swift suite until the mirror carries it; that `CoreClient`'s own request
+  encoder writes `hello` byte-for-byte as the golden; and that `RpcErrorCode`
+  has exactly the values in `error_codes.json`.
 
 Adding a method means adding a row to `methods!` and an example to
 `Method::examples` in `methods.rs`, then regenerating the goldens and the

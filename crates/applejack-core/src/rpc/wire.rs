@@ -179,8 +179,9 @@ impl fmt::Display for RpcError {
 impl std::error::Error for RpcError {}
 
 /// Error codes on the wire. The five JSON-RPC codes keep their reserved
-/// values; application codes start at 1000. `docs/rpc-protocol.md` carries
-/// the same table.
+/// values; application codes start at 1000. The table in
+/// `docs/rpc-protocol.md` and `tests/rpc_golden/error_codes.json` are
+/// rendered from [`ErrorCode::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     ParseError,
@@ -197,7 +198,9 @@ pub enum ErrorCode {
     NotImplemented,
     /// The method's own work failed (I/O, database, child process).
     Internal,
-    /// A `job.failed` notification's typed code.
+    /// A `job.failed` notification's typed code. A placeholder: the
+    /// `engine.install` unit adds one reason code per failure kind (download,
+    /// checksum, disk) to this enum rather than a parallel one.
     JobFailed,
 }
 
@@ -251,6 +254,33 @@ impl ErrorCode {
             Self::NotImplemented => "NotImplemented",
             Self::Internal => "Internal",
             Self::JobFailed => "JobFailed",
+        }
+    }
+
+    /// The meaning column of the docs table.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::ParseError => "The line is not UTF-8 or not JSON.",
+            Self::InvalidRequest => "Valid JSON that is not a JSON-RPC 2.0 request.",
+            Self::MethodNotFound => "The method is not in the table.",
+            Self::InvalidParams => {
+                "`params` does not match the method's type. Unknown members are rejected."
+            }
+            Self::InternalError => {
+                "The serve loop itself failed, for example a result could not be encoded."
+            }
+            Self::ProtocolMismatch => {
+                "`hello` carried another protocol version. The core exits 65."
+            }
+            Self::HelloRequired => "A request arrived before a successful `hello`.",
+            Self::NotImplemented => {
+                "The method is in the table, but its work package has not landed. `data.method` names it."
+            }
+            Self::Internal => "The method's own work failed (I/O, database, child process).",
+            Self::JobFailed => {
+                "The typed code carried by a `job.failed` notification. A placeholder until `engine.install` adds reason codes."
+            }
         }
     }
 }

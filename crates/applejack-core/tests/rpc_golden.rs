@@ -1,15 +1,16 @@
-//! Goldens under `tests/rpc_golden/` and the method table in
+//! Goldens under `tests/rpc_golden/` and the method and error-code tables in
 //! `docs/rpc-protocol.md` are generated from the Rust types and must match
 //! what is committed. `APPLEJACK_UPDATE_GOLDENS=1` rewrites both.
 
 use applejack_core::host::{HostFacts, ScreenRecordingState};
 use applejack_core::rpc::PROTOCOL_VERSION;
-use applejack_core::rpc::methods::{HelloResult, Method, MethodStatus};
-use applejack_core::rpc::wire::{Id, Request, Response};
+use applejack_core::rpc::methods::{EmptyResult, HelloResult, Method, MethodStatus};
+use applejack_core::rpc::wire::{ErrorCode, Id, Request, Response};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const UPDATE_ENV: &str = "APPLEJACK_UPDATE_GOLDENS";
 
@@ -17,6 +18,11 @@ const UPDATE_ENV: &str = "APPLEJACK_UPDATE_GOLDENS";
 const DOC_PATH: &str = "../../docs/rpc-protocol.md";
 const TABLE_BEGIN: &str = "<!-- method-table:begin -->";
 const TABLE_END: &str = "<!-- method-table:end -->";
+const ERROR_TABLE_BEGIN: &str = "<!-- error-table:begin -->";
+const ERROR_TABLE_END: &str = "<!-- error-table:end -->";
+
+/// Both table tests may rewrite the docs file; one at a time.
+static DOC_LOCK: Mutex<()> = Mutex::new(());
 
 fn update_requested() -> bool {
     std::env::var_os(UPDATE_ENV).is_some_and(|value| value == "1")
@@ -64,6 +70,16 @@ fn expected() -> BTreeMap<String, String> {
         .expect("encodes"),
     );
     files.insert("host.doctor.result.json".to_owned(), pretty(&facts));
+    let empty = Response::result(
+        Id::Number(3),
+        serde_json::to_value(EmptyResult {}).expect("encodes"),
+    );
+    files.insert("empty.result.json".to_owned(), pretty(&empty));
+    let codes: BTreeMap<&str, i64> = ErrorCode::ALL
+        .into_iter()
+        .map(|code| (code.name(), code.code()))
+        .collect();
+    files.insert("error_codes.json".to_owned(), pretty(&codes));
     files
 }
 
@@ -113,27 +129,62 @@ fn render_method_table() -> String {
     table
 }
 
-#[test]
-fn docs_method_table_matches_the_types() {
+/// The error-code table as `docs/rpc-protocol.md` carries it between the
+/// markers.
+fn render_error_table() -> String {
+    let mut table = String::from("| Code | Name | Meaning |\n|---:|---|---|\n");
+    for code in ErrorCode::ALL {
+        writeln!(
+            table,
+            "| {} | `{}` | {} |",
+            code.code(),
+            code.name(),
+            code.description()
+        )
+        .expect("string write");
+    }
+    table
+}
+
+/// Checks (or, under `APPLEJACK_UPDATE_GOLDENS=1`, rewrites) the table between
+/// `begin` and `end` in the docs.
+fn assert_doc_table(what: &str, begin: &str, end: &str, expected: &str) {
+    let _guard = DOC_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DOC_PATH);
     let doc = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let start = doc.find(TABLE_BEGIN).expect("begin marker in docs") + TABLE_BEGIN.len();
-    let end = doc.find(TABLE_END).expect("end marker in docs");
-    assert!(start <= end, "method table markers are out of order");
-    let expected = render_method_table();
-    let actual = doc[start..end].trim();
+    let start = doc.find(begin).expect("begin marker in docs") + begin.len();
+    let stop = doc.find(end).expect("end marker in docs");
+    assert!(start <= stop, "{what} table markers are out of order");
+    let actual = doc[start..stop].trim();
     if actual == expected.trim() {
         return;
     }
     if update_requested() {
-        let rewritten = format!("{}\n{expected}{}", &doc[..start], &doc[end..]);
+        let rewritten = format!("{}\n{expected}{}", &doc[..start], &doc[stop..]);
         fs::write(&path, rewritten).expect("docs written");
         return;
     }
     panic!(
-        "{} method table drifted from methods.rs (set {UPDATE_ENV}=1 to rewrite):\n{}",
+        "{} {what} table drifted from the types (set {UPDATE_ENV}=1 to rewrite):\n{}",
         path.display(),
         diff(expected.trim(), actual)
+    );
+}
+
+#[test]
+fn docs_method_table_matches_the_types() {
+    assert_doc_table("method", TABLE_BEGIN, TABLE_END, &render_method_table());
+}
+
+#[test]
+fn docs_error_table_matches_the_types() {
+    assert_doc_table(
+        "error-code",
+        ERROR_TABLE_BEGIN,
+        ERROR_TABLE_END,
+        &render_error_table(),
     );
 }
 
@@ -215,4 +266,27 @@ fn result_goldens_decode_into_their_types() {
     };
     let facts: HostFacts = serde_json::from_value(value).unwrap();
     assert_eq!(facts.screen_recording, ScreenRecordingState::Unknown);
+
+    let empty: Response =
+        serde_json::from_str(&fs::read_to_string(dir.join("empty.result.json")).unwrap()).unwrap();
+    let applejack_core::rpc::wire::Body::Result(value) = empty.body else {
+        panic!("empty.result.json is an error");
+    };
+    assert_eq!(value, serde_json::json!({}));
+    let _: EmptyResult = serde_json::from_value(value).unwrap();
+}
+
+#[test]
+fn error_codes_golden_lists_every_code() {
+    let text = fs::read_to_string(golden_dir().join("error_codes.json")).unwrap();
+    let codes: BTreeMap<String, i64> = serde_json::from_str(&text).unwrap();
+    assert_eq!(codes.len(), ErrorCode::ALL.len());
+    for code in ErrorCode::ALL {
+        assert_eq!(
+            codes.get(code.name()),
+            Some(&code.code()),
+            "{}",
+            code.name()
+        );
+    }
 }
