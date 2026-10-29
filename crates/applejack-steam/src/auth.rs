@@ -255,13 +255,26 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
     ///
     /// # Errors
     ///
-    /// [`AuthError::OutOfOrder`] when no code is pending;
-    /// [`AuthError::InvalidGuardCode`] leaves the session open for a retry.
+    /// [`AuthError::OutOfOrder`] when no code is pending.
+    /// [`AuthError::InvalidGuardCode`] leaves the session open: call again
+    /// with another code. Any other error ends the login, because the
+    /// connection has dropped its session; the next call must be
+    /// [`Authenticator::begin`], and `finish` or `submit_guard_code` before
+    /// that is [`AuthError::OutOfOrder`].
     pub async fn submit_guard_code(&mut self, code: &str) -> Result<LoginStep, Error> {
         let Pending::AwaitingGuardCode(_) = self.pending else {
             return Err(AuthError::OutOfOrder("no Steam Guard code is pending").into());
         };
-        self.connection.submit_guard_code(code).await?;
+        match self.connection.submit_guard_code(code).await {
+            Ok(()) => {}
+            // The challenge survives a wrong code; anything else ends the
+            // session, and a driver that kept asking for codes would loop.
+            Err(AuthError::InvalidGuardCode) => return Err(AuthError::InvalidGuardCode.into()),
+            Err(error) => {
+                self.pending = Pending::Idle;
+                return Err(error.into());
+            }
+        }
         self.pending = Pending::AwaitingTokens;
         self.finish().await
     }
@@ -271,8 +284,11 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
     ///
     /// # Errors
     ///
-    /// [`AuthError::GuardRequired`] when a code is still pending;
-    /// [`AuthError::OutOfOrder`] when no login was begun.
+    /// [`AuthError::GuardRequired`] when a code is still pending and
+    /// [`AuthError::OutOfOrder`] when no login is in progress; both leave the
+    /// login where it was. Any other error, from the connection or from
+    /// storing the token, ends the login: the auth flow is consumed on
+    /// failure, so the next call must be [`Authenticator::begin`].
     pub async fn finish(&mut self) -> Result<LoginStep, Error> {
         match self.pending {
             Pending::AwaitingTokens => {}
@@ -281,9 +297,10 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
             }
             Pending::Idle => return Err(AuthError::OutOfOrder("no login in progress").into()),
         }
+        // The flow is consumed whether `wait_for_tokens` succeeds or fails.
+        self.pending = Pending::Idle;
         let tokens = self.connection.wait_for_tokens().await?;
         self.store.put(&tokens.refresh_token)?;
-        self.pending = Pending::Idle;
         Ok(LoginStep::Done {
             account_name: tokens.account_name,
         })

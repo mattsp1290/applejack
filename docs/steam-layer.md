@@ -24,7 +24,13 @@ and a `RefreshTokenStore`. Unit tests use a scripted fake connection;
   factor), `GuardRequired { factor: EmailCode | DeviceCode }` (call
   `submit_guard_code`, which may answer `InvalidGuardCode` and keep the session
   open), or `GuardRequired { factor: DeviceConfirmation }` (call `finish()`
-  and wait for the mobile approval).
+  and wait for the mobile approval). Any error other than `InvalidGuardCode`
+  from `submit_guard_code` or `finish` (a rate limit, a transport failure, a
+  missing field, a store that rejects the token) ends the login: the
+  connection has consumed its auth session, the driver returns to idle, and
+  the next call must be `begin` again; `finish` or `submit_guard_code` before
+  that is `OutOfOrder`, never `GuardRequired`, so a shell that re-prompts on
+  `GuardRequired` cannot loop.
 - **Refresh.** `refresh(account_name)` reads the stored refresh token and sends
   `CMsgClientLogon` with it on a fresh connection. The account name is not a
   secret; `steamroom-client`'s token logon requires it alongside the token, so

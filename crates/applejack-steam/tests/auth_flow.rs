@@ -1,6 +1,7 @@
 //! The login driver against a scripted fake connection.
 
 use std::future::{Future, ready};
+use std::time::Duration;
 
 use applejack_steam::Error;
 use applejack_steam::auth::{
@@ -14,8 +15,33 @@ const FIXTURE_TOKEN: &str = "fixture-refresh-token-not-a-real-value";
 #[derive(Default)]
 struct Fake {
     guard: Option<GuardFactor>,
+    /// Returned once by the next `submit_guard_code` call.
+    submit_guard_code_error: Option<AuthError>,
+    /// Returned once by the next `wait_for_tokens` call.
+    wait_for_tokens_error: Option<AuthError>,
     calls: Vec<String>,
     logged_on_with: Option<(String, String)>,
+}
+
+/// A store whose writes fail, for the path where tokens arrive but cannot
+/// be kept.
+struct RejectingStore;
+
+impl RefreshTokenStore for RejectingStore {
+    fn put(&self, _token: &RefreshToken) -> Result<(), Error> {
+        Err(Error::Keychain {
+            code: -1,
+            message: "rejected by the fixture store".to_owned(),
+        })
+    }
+
+    fn get(&self) -> Result<Option<RefreshToken>, Error> {
+        Ok(None)
+    }
+
+    fn delete(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 impl SteamConnection for Fake {
@@ -38,20 +64,23 @@ impl SteamConnection for Fake {
         code: &str,
     ) -> impl Future<Output = Result<(), AuthError>> + Send {
         self.calls.push(format!("submit_guard_code {code}"));
-        ready(if code == "BAD" {
-            Err(AuthError::InvalidGuardCode)
-        } else {
-            Ok(())
+        ready(match self.submit_guard_code_error.take() {
+            Some(error) => Err(error),
+            None if code == "BAD" => Err(AuthError::InvalidGuardCode),
+            None => Ok(()),
         })
     }
 
     fn wait_for_tokens(&mut self) -> impl Future<Output = Result<Tokens, AuthError>> + Send {
         self.calls.push("wait_for_tokens".into());
-        ready(Ok(Tokens {
-            account_name: "redacted".to_owned(),
-            refresh_token: RefreshToken::new(FIXTURE_TOKEN),
-            access_token: AccessToken::new("access"),
-        }))
+        ready(match self.wait_for_tokens_error.take() {
+            Some(error) => Err(error),
+            None => Ok(Tokens {
+                account_name: "redacted".to_owned(),
+                refresh_token: RefreshToken::new(FIXTURE_TOKEN),
+                access_token: AccessToken::new("access"),
+            }),
+        })
     }
 
     fn logon(
@@ -204,6 +233,116 @@ async fn out_of_order_steps_are_rejected() {
     ));
     assert!(matches!(
         auth.begin(AuthMode::Credentials, None).await.unwrap_err(),
+        Error::Auth(AuthError::OutOfOrder(_))
+    ));
+    assert_eq!(fake.calls, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn rate_limit_from_submit_guard_code_ends_the_login() {
+    let store = InMemoryStore::default();
+    let mut fake = Fake {
+        guard: Some(GuardFactor::EmailCode),
+        submit_guard_code_error: Some(AuthError::RateLimited {
+            retry_after: Duration::from_secs(60),
+        }),
+        ..Fake::default()
+    };
+    let mut auth = Authenticator::new(&mut fake, &store);
+    auth.begin(AuthMode::Credentials, Some(&credentials()))
+        .await
+        .unwrap();
+    let error = auth.submit_guard_code("12345").await.unwrap_err();
+    assert!(matches!(error, Error::Auth(AuthError::RateLimited { .. })));
+
+    // The connection dropped its session, so the driver must not report
+    // `GuardRequired` again: a CLI that re-prompts on it would never stop.
+    assert!(matches!(
+        auth.finish().await.unwrap_err(),
+        Error::Auth(AuthError::OutOfOrder(_))
+    ));
+    assert!(matches!(
+        auth.submit_guard_code("12345").await.unwrap_err(),
+        Error::Auth(AuthError::OutOfOrder(_))
+    ));
+    assert!(store.get().unwrap().is_none());
+
+    let step = auth
+        .begin(AuthMode::Credentials, Some(&credentials()))
+        .await
+        .unwrap();
+    assert_eq!(
+        step,
+        LoginStep::GuardRequired {
+            factor: GuardFactor::EmailCode
+        }
+    );
+    assert_eq!(
+        fake.calls,
+        [
+            "begin_credentials redacted",
+            "submit_guard_code 12345",
+            "begin_credentials redacted"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn error_from_wait_for_tokens_ends_the_login() {
+    let store = InMemoryStore::default();
+    let mut fake = Fake {
+        wait_for_tokens_error: Some(AuthError::Connection("socket closed".to_owned())),
+        ..Fake::default()
+    };
+    let mut auth = Authenticator::new(&mut fake, &store);
+    auth.begin(AuthMode::Qr, None).await.unwrap();
+    let error = auth.finish().await.unwrap_err();
+    assert!(matches!(error, Error::Auth(AuthError::Connection(_))));
+
+    assert!(matches!(
+        auth.finish().await.unwrap_err(),
+        Error::Auth(AuthError::OutOfOrder(_))
+    ));
+    assert!(store.get().unwrap().is_none());
+
+    assert!(matches!(
+        auth.begin(AuthMode::Qr, None).await.unwrap(),
+        LoginStep::QrReady { .. }
+    ));
+    assert!(matches!(
+        auth.finish().await.unwrap(),
+        LoginStep::Done { .. }
+    ));
+    assert_eq!(
+        fake.calls,
+        ["begin_qr", "wait_for_tokens", "begin_qr", "wait_for_tokens"]
+    );
+}
+
+#[tokio::test]
+async fn store_failure_after_wait_for_tokens_ends_the_login() {
+    let mut fake = Fake::default();
+    let mut auth = Authenticator::new(&mut fake, &RejectingStore);
+    auth.begin(AuthMode::Qr, None).await.unwrap();
+    assert!(matches!(
+        auth.finish().await.unwrap_err(),
+        Error::Keychain { .. }
+    ));
+    // The tokens were consumed; a second `finish` has nothing to wait for.
+    assert!(matches!(
+        auth.finish().await.unwrap_err(),
+        Error::Auth(AuthError::OutOfOrder(_))
+    ));
+    assert_eq!(fake.calls, ["begin_qr", "wait_for_tokens"]);
+}
+
+#[tokio::test]
+async fn submit_guard_code_before_begin_is_out_of_order() {
+    let store = InMemoryStore::default();
+    let mut fake = Fake::default();
+    let mut auth = Authenticator::new(&mut fake, &store);
+    assert!(matches!(
+        auth.submit_guard_code("12345").await.unwrap_err(),
         Error::Auth(AuthError::OutOfOrder(_))
     ));
     assert_eq!(fake.calls, Vec::<String>::new());
