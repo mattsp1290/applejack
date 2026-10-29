@@ -11,7 +11,9 @@ use applejack_manifest::{Arch, HttpsUrl, Sha256};
 use serde::Deserialize;
 use sha2::Digest;
 
-use crate::{EngineId, EngineLayout, Error, GraphicsBackend, Result, SyncMode, Version, Wow64};
+use crate::{
+    EngineId, EngineLayout, Error, GraphicsBackend, Progress, Result, SyncMode, Version, Wow64,
+};
 
 /// File name of the bundle descriptor at the bundle root.
 pub const BUNDLE_FILE: &str = "BUNDLE.toml";
@@ -42,16 +44,31 @@ pub struct Component {
     pub license: String,
 }
 
-/// DLLs a graphics backend copies into the prefix and overrides.
+/// DLLs a graphics backend copies into the prefix and overrides, one list
+/// per Windows architecture.
 ///
-/// Every entry is a path relative to the bundle root (`dxmt/d3d11.dll`), so
-/// the file is found by one rule for all backends and the DLL name for
-/// `WINEDLLOVERRIDES` is its file stem.
+/// Every entry is a path relative to the bundle root (`dxmt/d3d11.dll`)
+/// with a `.dll` extension, so the file is found by one rule for all
+/// backends and the DLL name for `WINEDLLOVERRIDES` is its file stem. Stems
+/// are unique per architecture, ignoring case.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DllOverrides {
+    /// 64-bit DLLs, copied into `system32`.
     #[serde(default)]
-    pub dlls: Vec<PathBuf>,
+    pub x86_64: Vec<PathBuf>,
+    /// 32-bit DLLs, copied into `syswow64`. Must be empty when
+    /// `wine.wow64 = "none"`.
+    #[serde(default)]
+    pub i386: Vec<PathBuf>,
+}
+
+impl DllOverrides {
+    /// True when neither architecture lists a DLL.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.x86_64.is_empty() && self.i386.is_empty()
+    }
 }
 
 /// The `[overrides]` tables, one per backend that needs DLL overrides.
@@ -150,11 +167,16 @@ impl BundleToml {
 
     /// Checks the invariants against the bundle tree at `bundle_root`:
     ///
+    /// - `arch` is the architecture `id` runs (`rosetta-wine` is `x86_64`);
     /// - every path is relative with no `.`, `..`, or empty component;
     /// - `wine.loader` and `wine.server` (and `wine.preloader` when set)
     ///   resolve, through any symlink, to files inside the canonical root;
     /// - `sync_modes` is non-empty with no duplicates;
-    /// - every override DLL resolves to a file inside the canonical root;
+    /// - every override DLL ends in `.dll`, has a stem unique within its
+    ///   table and architecture (ignoring case), and resolves to a file
+    ///   inside the canonical root; `i386` lists are empty when
+    ///   `wine.wow64 = "none"`; a non-empty `[overrides.d3dmetal]` needs a
+    ///   `[d3dmetal]` table;
     /// - `entitlements` keys are relative paths.
     ///
     /// # Errors
@@ -162,6 +184,14 @@ impl BundleToml {
     /// Returns [`Error::MissingLoader`] for an absent loader and
     /// [`Error::InvalidBundle`] for every other failure.
     pub fn validate(&self, bundle_root: &Path) -> Result<()> {
+        if self.arch != self.id.arch() {
+            return Err(Error::InvalidBundle(format!(
+                "arch `{}` does not match engine `{}` (expected `{}`)",
+                arch_name(self.arch),
+                self.id,
+                arch_name(self.id.arch())
+            )));
+        }
         relative("wine.loader", &self.wine.loader)?;
         relative("wine.server", &self.wine.server)?;
         if let Some(preloader) = &self.wine.preloader {
@@ -203,15 +233,24 @@ impl BundleToml {
             file_present("wine.preloader", bundle_root, preloader)?;
         }
 
+        if !self.overrides.d3dmetal.is_empty() && self.d3dmetal.is_none() {
+            return Err(Error::InvalidBundle(
+                "overrides.d3dmetal lists DLLs but there is no [d3dmetal] table".to_owned(),
+            ));
+        }
         for (table, overrides) in [
             ("dxmt", &self.overrides.dxmt),
             ("vkd3d", &self.overrides.vkd3d),
             ("d3dmetal", &self.overrides.d3dmetal),
         ] {
-            let field = format!("overrides.{table}.dlls");
-            for dll in &overrides.dlls {
-                relative(&field, dll)?;
-                file_present(&field, bundle_root, dll)?;
+            if !self.wine.wow64.supports_32bit() && !overrides.i386.is_empty() {
+                return Err(Error::InvalidBundle(format!(
+                    "overrides.{table}.i386 must be empty when wine.wow64 is \"none\""
+                )));
+            }
+            for (arch, dlls) in [("x86_64", &overrides.x86_64), ("i386", &overrides.i386)] {
+                let field = format!("overrides.{table}.{arch}");
+                validate_dll_list(&field, bundle_root, dlls)?;
             }
         }
         Ok(())
@@ -221,6 +260,42 @@ impl BundleToml {
     #[must_use]
     pub fn default_sync_mode(&self) -> Option<SyncMode> {
         self.sync_modes.first().copied()
+    }
+}
+
+fn validate_dll_list(field: &str, bundle_root: &Path, dlls: &[PathBuf]) -> Result<()> {
+    let mut stems = BTreeSet::new();
+    for dll in dlls {
+        relative(field, dll)?;
+        let is_dll = dll
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"));
+        if !is_dll {
+            return Err(Error::InvalidBundle(format!(
+                "{field}: `{}` must have a `.dll` extension",
+                dll.display()
+            )));
+        }
+        let stem = dll
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !stems.insert(stem) {
+            return Err(Error::InvalidBundle(format!(
+                "{field}: `{}` repeats a DLL name already listed",
+                dll.display()
+            )));
+        }
+        file_present(field, bundle_root, dll)?;
+    }
+    Ok(())
+}
+
+fn arch_name(arch: Arch) -> &'static str {
+    match arch {
+        Arch::X86_64 => "x86_64",
+        Arch::Arm64 => "arm64",
     }
 }
 
@@ -276,10 +351,10 @@ impl Capabilities {
     #[must_use]
     pub fn from_bundle(bundle: &BundleToml) -> Self {
         let mut backends = vec![GraphicsBackend::WineD3D];
-        if !bundle.overrides.dxmt.dlls.is_empty() {
+        if !bundle.overrides.dxmt.is_empty() {
             backends.insert(0, GraphicsBackend::Dxmt);
         }
-        if !bundle.overrides.vkd3d.dlls.is_empty() {
+        if !bundle.overrides.vkd3d.is_empty() {
             backends.push(GraphicsBackend::Vkd3dProton);
         }
         if bundle.d3dmetal.is_some() {
@@ -300,7 +375,11 @@ impl Capabilities {
 pub struct InstalledEngine {
     pub id: EngineId,
     pub version: Version,
+    /// `engines/<id>/<version>/`, the signed bundle.
     pub root: PathBuf,
+    /// `engines/<id>/<version>.user/`, the per-user overlay. May not exist
+    /// yet; the `D3DMetal` payload lives under it.
+    pub overlay_root: PathBuf,
     pub bundle: BundleToml,
 }
 
@@ -324,14 +403,15 @@ impl InstalledEngine {
             id,
             version: version.clone(),
             root,
+            overlay_root: layout.overlay_dir(id, version),
             bundle,
         })
     }
 }
 
 /// Where an engine archive comes from. Only local files today; a download
-/// variant arrives with the network unit without changing [`install`]
-/// callers.
+/// variant arrives with the network unit, reporting
+/// [`Progress::Downloading`] through the same callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ArchiveSource {
@@ -339,8 +419,44 @@ pub enum ArchiveSource {
     LocalFile(PathBuf),
 }
 
-/// Installs a local `.tar.zst` archive as `engines/<id>/<version>/`.
-/// See [`install`].
+/// Everything [`install`] needs: which bundle, where its archive comes from,
+/// and the digest it must hash to. Built from a manifest entry with
+/// [`InstallRequest::from_manifest`] or by hand for a local, unsigned bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallRequest {
+    pub id: EngineId,
+    pub version: Version,
+    pub source: ArchiveSource,
+    pub sha256: Sha256,
+    /// The manifest entry the request came from, when any. Its `arch`,
+    /// `version`, and `min_macos` are cross-checked against `BUNDLE.toml`.
+    pub manifest: Option<applejack_manifest::Engine>,
+}
+
+impl InstallRequest {
+    /// Builds a request for the bundle a manifest entry pins, taking the
+    /// archive from `source`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownEngineId`] or [`Error::InvalidVersion`] when
+    /// the entry's `id` or `version` is not one this crate can install.
+    pub fn from_manifest(
+        entry: &applejack_manifest::Engine,
+        source: ArchiveSource,
+    ) -> Result<Self> {
+        Ok(Self {
+            id: entry.id.parse()?,
+            version: Version::new(entry.version.clone())?,
+            source,
+            sha256: entry.sha256.clone(),
+            manifest: Some(entry.clone()),
+        })
+    }
+}
+
+/// Installs a local `.tar.zst` archive as `engines/<id>/<version>/` with no
+/// manifest cross-check and no progress reporting. See [`install`].
 ///
 /// # Errors
 ///
@@ -352,16 +468,17 @@ pub fn install_from_archive(
     archive: &Path,
     expected: &Sha256,
 ) -> Result<InstalledEngine> {
-    install(
-        layout,
+    let request = InstallRequest {
         id,
-        version,
-        &ArchiveSource::LocalFile(archive.to_path_buf()),
-        expected,
-    )
+        version: version.clone(),
+        source: ArchiveSource::LocalFile(archive.to_path_buf()),
+        sha256: expected.clone(),
+        manifest: None,
+    };
+    install(layout, &request, &mut |_| {})
 }
 
-/// Installs an engine bundle:
+/// Installs an engine bundle, reporting [`Progress`] as it goes:
 ///
 /// 1. refuses when `engines/<id>/<version>/` already exists;
 /// 2. opens the archive once, hashes it, and refuses on mismatch, leaving
@@ -370,7 +487,9 @@ pub fn install_from_archive(
 ///    and extracts the same open archive into it, refusing any entry that
 ///    escapes the root or links outside it;
 /// 4. loads and validates `BUNDLE.toml`, checking it names `id` and
-///    `version`; on failure removes `.partial`;
+///    `version` and, when the request came from a manifest entry, that
+///    `arch`, `version`, and `min_macos` match it; on failure removes
+///    `.partial`;
 /// 5. renames `.partial` to `<version>/`, removing `.partial` if that fails.
 ///
 /// The archive's entries must sit at its root: `BUNDLE.toml` is the first
@@ -380,15 +499,14 @@ pub fn install_from_archive(
 /// # Errors
 ///
 /// [`Error::AlreadyInstalled`], [`Error::Sha256Mismatch`],
-/// [`Error::BundleIdentityMismatch`], the validation error, or
-/// [`Error::Io`].
+/// [`Error::BundleIdentityMismatch`], [`Error::ManifestMismatch`], the
+/// validation error, or [`Error::Io`].
 pub fn install(
     layout: &EngineLayout,
-    id: EngineId,
-    version: &Version,
-    source: &ArchiveSource,
-    expected: &Sha256,
+    request: &InstallRequest,
+    progress: &mut dyn FnMut(Progress),
 ) -> Result<InstalledEngine> {
+    let (id, version) = (request.id, &request.version);
     let final_dir = layout.engine_dir(id, version);
     if final_dir.exists() {
         return Err(Error::AlreadyInstalled {
@@ -396,14 +514,15 @@ pub fn install(
             version: version.clone(),
         });
     }
-    let ArchiveSource::LocalFile(archive) = source;
+    let ArchiveSource::LocalFile(archive) = &request.source;
+    progress(Progress::Verifying);
     // One handle for hashing and extraction so the bytes verified are the
     // bytes unpacked.
     let mut file = File::open(archive).map_err(|error| Error::io(archive, error))?;
     let actual = sha256_reader(&mut file, archive)?;
-    if &actual != expected {
+    if actual != request.sha256 {
         return Err(Error::Sha256Mismatch {
-            expected: expected.clone(),
+            expected: request.sha256.clone(),
             actual,
         });
     }
@@ -413,7 +532,7 @@ pub fn install(
     remove_stale(&partial)?;
     fs::create_dir_all(&partial).map_err(|error| Error::io(&partial, error))?;
 
-    let result = extract_and_validate(file, archive, &partial, id, version);
+    let result = extract_and_validate(file, archive, &partial, request, progress);
     if let Err(error) = result {
         // Best effort: the error the caller sees is the install failure.
         let _ = fs::remove_dir_all(&partial);
@@ -442,9 +561,10 @@ fn extract_and_validate(
     file: File,
     archive: &Path,
     partial: &Path,
-    id: EngineId,
-    version: &Version,
+    request: &InstallRequest,
+    progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
+    progress(Progress::Extracting);
     let decoder = zstd::stream::read::Decoder::new(io::BufReader::new(file))
         .map_err(|error| Error::io(archive, error))?;
     let mut tar = tar::Archive::new(decoder);
@@ -484,6 +604,7 @@ fn extract_and_validate(
         }
     }
 
+    progress(Progress::Validating);
     if !fs::symlink_metadata(partial.join(BUNDLE_FILE)).is_ok_and(|meta| meta.is_file()) {
         return Err(Error::InvalidBundle(
             "archive has no BUNDLE.toml at its root; entries must not be nested under a top-level directory"
@@ -491,13 +612,38 @@ fn extract_and_validate(
         ));
     }
     let bundle = BundleToml::load(partial)?;
-    if bundle.id != id || &bundle.version != version {
+    if bundle.id != request.id || bundle.version != request.version {
         return Err(Error::BundleIdentityMismatch {
-            expected: id,
-            expected_version: version.clone(),
+            expected: request.id,
+            expected_version: request.version.clone(),
             found: bundle.id,
             found_version: bundle.version,
         });
+    }
+    if let Some(entry) = &request.manifest {
+        check_against_manifest(&bundle, entry)?;
+    }
+    Ok(())
+}
+
+fn check_against_manifest(bundle: &BundleToml, entry: &applejack_manifest::Engine) -> Result<()> {
+    let mismatch = |field, manifest: &str, bundle: &str| Error::ManifestMismatch {
+        field,
+        manifest: manifest.to_owned(),
+        bundle: bundle.to_owned(),
+    };
+    if bundle.arch != entry.arch {
+        return Err(mismatch(
+            "arch",
+            arch_name(entry.arch),
+            arch_name(bundle.arch),
+        ));
+    }
+    if bundle.version.as_str() != entry.version {
+        return Err(mismatch("version", &entry.version, bundle.version.as_str()));
+    }
+    if bundle.min_macos != entry.min_macos {
+        return Err(mismatch("min_macos", &entry.min_macos, &bundle.min_macos));
     }
     Ok(())
 }

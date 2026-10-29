@@ -22,7 +22,7 @@ pub mod manifest;
 pub mod versions;
 
 pub use applejack_manifest::{Arch, Sha256};
-pub use bundle::{BundleToml, Capabilities, InstalledEngine};
+pub use bundle::{ArchiveSource, BundleToml, Capabilities, InstallRequest, InstalledEngine};
 pub use error::{Error, Result};
 pub use launch::{LaunchSpec, Session};
 pub use manifest::embedded_manifest;
@@ -45,6 +45,15 @@ impl EngineId {
         match self {
             Self::RosettaWine => "rosetta-wine",
             Self::NativeArm64 => "native-arm64",
+        }
+    }
+
+    /// The architecture a bundle of this engine must declare.
+    #[must_use]
+    pub const fn arch(self) -> Arch {
+        match self {
+            Self::RosettaWine => Arch::X86_64,
+            Self::NativeArm64 => Arch::Arm64,
         }
     }
 }
@@ -81,6 +90,40 @@ pub enum GraphicsBackend {
     /// Apple's `D3DMetal`, user-supplied through the per-user overlay.
     #[serde(rename = "d3dmetal")]
     D3DMetal,
+}
+
+impl GraphicsBackend {
+    /// The name used in `BUNDLE.toml`, the config database, and on the
+    /// command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dxmt => "dxmt",
+            Self::WineD3D => "wined3d",
+            Self::Vkd3dProton => "vkd3d-proton",
+            Self::D3DMetal => "d3dmetal",
+        }
+    }
+}
+
+impl fmt::Display for GraphicsBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for GraphicsBackend {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "dxmt" => Ok(Self::Dxmt),
+            "wined3d" => Ok(Self::WineD3D),
+            "vkd3d-proton" => Ok(Self::Vkd3dProton),
+            "d3dmetal" => Ok(Self::D3DMetal),
+            other => Err(Error::UnknownGraphicsBackend(other.to_owned())),
+        }
+    }
 }
 
 /// Wine synchronization primitive implementation.
@@ -146,6 +189,35 @@ impl From<SyncMode> for String {
 pub enum HidrawMode {
     Enabled,
     Disabled,
+}
+
+impl HidrawMode {
+    /// The name used in the config database and on the command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl fmt::Display for HidrawMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for HidrawMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(Error::UnknownHidrawMode(other.to_owned())),
+        }
+    }
 }
 
 /// How a bundle's Wine runs 32-bit Windows code.
@@ -295,6 +367,8 @@ pub struct PrefixSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefix {
     pub dir: PathBuf,
+    /// Engine that created the prefix.
+    pub engine: EngineId,
     /// Engine version that last touched the prefix.
     pub engine_version: Version,
 }
@@ -322,8 +396,10 @@ pub trait Engine {
     /// Read-only, network-free check of the host and an installed bundle.
     fn doctor(&self, host: &Host, installed: Option<&InstalledEngine>) -> DoctorReport;
 
-    /// Downloads, verifies, extracts, and validates the manifest's pinned
-    /// bundle into `layout`. Writes only under `engines/<id>/<version>.partial/`
+    /// Fetches, verifies, extracts, and validates the requested bundle into
+    /// `layout`, after the engine's own checks (for `rosetta-wine`, that
+    /// Rosetta is present). Same shape as [`bundle::install`], which does
+    /// the bundle part. Writes only under `engines/<id>/<version>.partial/`
     /// until the final rename and never touches another version.
     ///
     /// # Errors
@@ -331,8 +407,8 @@ pub trait Engine {
     /// Returns the first failure; a failed install leaves no `<version>/`.
     fn install(
         &self,
-        entry: &applejack_manifest::Engine,
         layout: &EngineLayout,
+        request: &InstallRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<InstalledEngine>;
 
@@ -348,26 +424,34 @@ pub trait Engine {
         spec: &PrefixSpec,
     ) -> Result<Prefix>;
 
-    /// Re-applies DLL overrides, sync mode, and the HID toggle to a prefix.
+    /// Re-applies DLL overrides from `installed`, the sync mode, and the HID
+    /// toggle to a prefix.
     ///
     /// # Errors
     ///
     /// Returns the failure, including a refusal when `backend` is not
-    /// available for the installed bundle.
+    /// available for the installed bundle or `prefix` belongs to another
+    /// engine.
     fn apply_overrides(
         &self,
+        installed: &InstalledEngine,
         prefix: &Prefix,
         backend: GraphicsBackend,
         sync_mode: SyncMode,
         hidraw: HidrawMode,
     ) -> Result<()>;
 
-    /// Spawns the loader with the allowlisted environment.
+    /// Spawns the loader of `installed` with the allowlisted environment.
     ///
     /// # Errors
     ///
     /// Returns the spawn failure.
-    fn launch(&self, prefix: &Prefix, spec: &LaunchSpec) -> Result<Session>;
+    fn launch(
+        &self,
+        installed: &InstalledEngine,
+        prefix: &Prefix,
+        spec: &LaunchSpec,
+    ) -> Result<Session>;
 }
 
 /// An environment variable pair as handed to a child process.
@@ -410,5 +494,39 @@ mod tests {
             "fsync".parse::<SyncMode>().unwrap_err(),
             Error::UnknownSyncMode(_)
         ));
+    }
+
+    #[test]
+    fn graphics_backend_and_hidraw_mode_round_trip() {
+        for backend in [
+            GraphicsBackend::Dxmt,
+            GraphicsBackend::WineD3D,
+            GraphicsBackend::Vkd3dProton,
+            GraphicsBackend::D3DMetal,
+        ] {
+            assert_eq!(
+                backend.as_str().parse::<GraphicsBackend>().unwrap(),
+                backend
+            );
+            assert_eq!(
+                name(backend),
+                format!("\"{backend}\""),
+                "serde and as_str agree"
+            );
+        }
+        for mode in [HidrawMode::Enabled, HidrawMode::Disabled] {
+            assert_eq!(mode.as_str().parse::<HidrawMode>().unwrap(), mode);
+            assert_eq!(name(mode), format!("\"{mode}\""));
+        }
+        assert!(matches!(
+            "d3d9".parse::<GraphicsBackend>().unwrap_err(),
+            Error::UnknownGraphicsBackend(_)
+        ));
+        assert!(matches!(
+            "on".parse::<HidrawMode>().unwrap_err(),
+            Error::UnknownHidrawMode(_)
+        ));
+        assert_eq!(EngineId::RosettaWine.arch(), Arch::X86_64);
+        assert_eq!(EngineId::NativeArm64.arch(), Arch::Arm64);
     }
 }

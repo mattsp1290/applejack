@@ -20,6 +20,7 @@ pub const BUNDLE_FILES: &[&str] = &[
     "dxmt/d3d11.dll",
     "dxmt/dxgi.dll",
     "dxmt/d3d10core.dll",
+    "dxmt/i386/d3d11.dll",
     "vkd3d/d3d12.dll",
     "vkd3d/d3d12core.dll",
     "probes/cpuid",

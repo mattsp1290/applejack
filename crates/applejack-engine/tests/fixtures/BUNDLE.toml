@@ -24,13 +24,14 @@ moltenvk = { version = "1.3.0", license = "Apache-2.0" }
 gstreamer = { version = "1.26.0", license = "LGPL-2.1-or-later" }
 
 [overrides.dxmt]
-dlls = ["dxmt/d3d11.dll", "dxmt/dxgi.dll", "dxmt/d3d10core.dll"]
+x86_64 = ["dxmt/d3d11.dll", "dxmt/dxgi.dll", "dxmt/d3d10core.dll"]
+i386 = ["dxmt/i386/d3d11.dll"]
 
 [overrides.vkd3d]
-dlls = ["vkd3d/d3d12.dll", "vkd3d/d3d12core.dll"]
+x86_64 = ["vkd3d/d3d12.dll", "vkd3d/d3d12core.dll"]
 
 [overrides.d3dmetal]
-dlls = []
+x86_64 = []
 
 [d3dmetal]
 overlay_dir = "wine/lib/external"

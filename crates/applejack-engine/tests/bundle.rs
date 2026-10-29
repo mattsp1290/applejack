@@ -5,8 +5,8 @@ mod common;
 use std::fs;
 use std::time::SystemTime;
 
-use applejack_engine::bundle::{self, ArchiveSource, BundleToml, Capabilities};
-use applejack_engine::{Error, GraphicsBackend, InstalledEngine, SyncMode};
+use applejack_engine::bundle::{self, ArchiveSource, BundleToml, Capabilities, InstallRequest};
+use applejack_engine::{Arch, Error, GraphicsBackend, InstalledEngine, Progress, SyncMode};
 use common::{
     BUNDLE_TOML, fake_installed, fixture_archive, layout, rosetta, version, write_bundle_tree,
     wrong_digest,
@@ -14,10 +14,30 @@ use common::{
 
 fn validate_variant(replace: &str, with: &str) -> Result<BundleToml, Error> {
     assert!(BUNDLE_TOML.contains(replace), "fixture lacks {replace:?}");
-    let text = BUNDLE_TOML.replace(replace, with);
+    validate_text(&BUNDLE_TOML.replace(replace, with))
+}
+
+/// Writes the fixture tree with `text` as its descriptor and loads it.
+fn validate_text(text: &str) -> Result<BundleToml, Error> {
     let dir = tempfile::tempdir().unwrap();
-    write_bundle_tree(dir.path(), &text);
+    write_bundle_tree(dir.path(), text);
     BundleToml::load(dir.path())
+}
+
+fn manifest_entry(version: &str, sha256: &applejack_engine::Sha256) -> applejack_manifest::Engine {
+    applejack_manifest::Engine {
+        id: "rosetta-wine".to_owned(),
+        version: version.to_owned(),
+        arch: Arch::X86_64,
+        min_macos: "14.0".to_owned(),
+        url: applejack_manifest::HttpsUrl::try_from(
+            "https://example.invalid/rosetta-wine.tar.zst".to_owned(),
+        )
+        .unwrap(),
+        sha256: sha256.clone(),
+        components: std::collections::BTreeMap::new(),
+        notarization_submission_id: String::new(),
+    }
 }
 
 #[test]
@@ -88,7 +108,10 @@ fn validation_rejects_absolute_path() {
 fn validation_rejects_parent_component() {
     let error = validate_variant("\"dxmt/dxgi.dll\"", "\"dxmt/../dxmt/dxgi.dll\"").unwrap_err();
     assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
-    assert!(error.to_string().contains("overrides.dxmt.dlls"), "{error}");
+    assert!(
+        error.to_string().contains("overrides.dxmt.x86_64"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -121,10 +144,76 @@ fn capabilities_follow_the_descriptor() {
     );
     assert_eq!(caps.sync_modes, bundle.sync_modes);
 
-    let bundle = validate_variant("wow64 = \"new\"", "wow64 = \"none\"").unwrap();
+    let no_wow64 = BUNDLE_TOML
+        .replace("wow64 = \"new\"", "wow64 = \"none\"")
+        .replace("i386 = [\"dxmt/i386/d3d11.dll\"]", "i386 = []");
+    let bundle = validate_text(&no_wow64).unwrap();
     assert!(!Capabilities::from_bundle(&bundle).supports_32bit);
     let bundle = validate_variant("wow64 = \"new\"", "wow64 = \"32on64\"").unwrap();
     assert!(Capabilities::from_bundle(&bundle).supports_32bit);
+}
+
+#[test]
+fn validation_checks_dll_entries_per_arch() {
+    let i386_line = "i386 = [\"dxmt/i386/d3d11.dll\"]";
+    assert!(BUNDLE_TOML.contains(i386_line));
+
+    // A 32-bit list needs a Wine that runs 32-bit code.
+    let error = validate_variant("wow64 = \"new\"", "wow64 = \"none\"").unwrap_err();
+    assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("overrides.dxmt.i386 must be empty"),
+        "{error}"
+    );
+
+    // Only `.dll` files can be overrides; `winemetal.so` is not one.
+    let text = BUNDLE_TOML.replace(i386_line, "i386 = [\"dxmt/winemetal.so\"]");
+    let error = validate_text(&text).unwrap_err();
+    assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
+    assert!(error.to_string().contains("`.dll` extension"), "{error}");
+
+    // Stems are unique per architecture, ignoring case.
+    let text = BUNDLE_TOML.replace(
+        "\"dxmt/d3d10core.dll\"]",
+        "\"dxmt/d3d10core.dll\", \"dxmt/i386/D3D11.dll\"]",
+    );
+    let error = validate_text(&text).unwrap_err();
+    assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
+    assert!(error.to_string().contains("repeats a DLL name"), "{error}");
+
+    // The same stem in the other architecture's list is fine; the fixture
+    // already lists `d3d11.dll` for both.
+    let bundle = validate_variant("", "").unwrap();
+    assert_eq!(bundle.overrides.dxmt.x86_64.len(), 3);
+    assert_eq!(bundle.overrides.dxmt.i386.len(), 1);
+    assert!(bundle.overrides.d3dmetal.is_empty());
+}
+
+#[test]
+fn validation_requires_d3dmetal_table_for_its_overrides() {
+    let text = BUNDLE_TOML
+        .replace(
+            "[overrides.d3dmetal]\nx86_64 = []",
+            "[overrides.d3dmetal]\nx86_64 = [\"dxmt/dxgi.dll\"]",
+        )
+        .replace("[d3dmetal]\noverlay_dir = \"wine/lib/external\"\n", "");
+    let error = validate_text(&text).unwrap_err();
+    assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
+    assert!(error.to_string().contains("[d3dmetal] table"), "{error}");
+}
+
+#[test]
+fn validation_rejects_arch_not_matching_engine_id() {
+    let error = validate_variant("arch = \"x86_64\"", "arch = \"arm64\"").unwrap_err();
+    assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match engine `rosetta-wine`"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -289,15 +378,102 @@ fn install_extracts_validates_and_renames() {
     let reopened = InstalledEngine::open(&layout, rosetta(), &v).unwrap();
     assert_eq!(reopened, installed);
 
-    let again = bundle::install(
-        &layout,
-        rosetta(),
-        &v,
-        &ArchiveSource::LocalFile(archive),
-        &digest,
-    )
-    .unwrap_err();
+    let request = InstallRequest {
+        id: rosetta(),
+        version: v.clone(),
+        source: ArchiveSource::LocalFile(archive),
+        sha256: digest,
+        manifest: None,
+    };
+    let again = bundle::install(&layout, &request, &mut |_| {}).unwrap_err();
     assert!(matches!(again, Error::AlreadyInstalled { .. }), "{again}");
+}
+
+#[test]
+fn installed_engine_records_overlay_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
+    let v = version("10.0.0");
+
+    let installed =
+        bundle::install_from_archive(&layout, rosetta(), &v, &archive, &digest).unwrap();
+    assert_eq!(installed.overlay_root, layout.overlay_dir(rosetta(), &v));
+    assert!(
+        !installed.overlay_root.exists(),
+        "install never creates the overlay"
+    );
+}
+
+#[test]
+fn install_reports_progress_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
+    let request = InstallRequest {
+        id: rosetta(),
+        version: version("10.0.0"),
+        source: ArchiveSource::LocalFile(archive),
+        sha256: digest,
+        manifest: None,
+    };
+    let mut seen = Vec::new();
+    bundle::install(&layout, &request, &mut |progress| seen.push(progress)).unwrap();
+    assert_eq!(
+        seen,
+        [
+            Progress::Verifying,
+            Progress::Extracting,
+            Progress::Validating
+        ]
+    );
+}
+
+#[test]
+fn install_from_manifest_cross_checks_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let (archive, digest) = fixture_archive(dir.path(), "10.0.0");
+    let v = version("10.0.0");
+    let source = ArchiveSource::LocalFile(archive);
+
+    let mut entry = manifest_entry("10.0.0", &digest);
+    entry.min_macos = "15.0".to_owned();
+    let request = InstallRequest::from_manifest(&entry, source.clone()).unwrap();
+    let error = bundle::install(&layout, &request, &mut |_| {}).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::ManifestMismatch {
+                field: "min_macos",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("15.0"), "{error}");
+    assert!(!layout.partial_dir(rosetta(), &v).exists());
+    assert!(!layout.engine_dir(rosetta(), &v).exists());
+
+    let mut entry = manifest_entry("10.0.0", &digest);
+    entry.arch = Arch::Arm64;
+    let request = InstallRequest::from_manifest(&entry, source.clone()).unwrap();
+    let error = bundle::install(&layout, &request, &mut |_| {}).unwrap_err();
+    assert!(
+        matches!(error, Error::ManifestMismatch { field: "arch", .. }),
+        "{error}"
+    );
+
+    let entry = manifest_entry("10.0.0", &digest);
+    let request = InstallRequest::from_manifest(&entry, source).unwrap();
+    assert_eq!(request.id, rosetta());
+    assert_eq!(request.version, v);
+    let installed = bundle::install(&layout, &request, &mut |_| {}).unwrap();
+    assert_eq!(installed.version, v);
+
+    let bad = manifest_entry("10.0.0-RC1", &digest);
+    let error = InstallRequest::from_manifest(&bad, request.source.clone()).unwrap_err();
+    assert!(matches!(error, Error::InvalidVersion { .. }), "{error}");
 }
 
 #[test]
