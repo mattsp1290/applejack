@@ -1,12 +1,21 @@
 # Builds the Rosetta engine payload. `pins-verify` and `--fetch` (with the
-# denylist scan of every archive) pass on a stock runner; `bootstrap.sh --check`
-# fails there until the installing mode is exercised, and the multi-hour Wine
-# build has not run yet. Actions are pinned to commit SHAs; the tag each SHA
-# carried when it was looked up is recorded beside it.
+# denylist scan of every archive) pass on a stock runner. `bootstrap.sh --check`
+# fails there: it requires an x86-64 Homebrew at /usr/local, which the arm64
+# `macos-latest` image does not ship and no script installs (its installer is
+# an unpinned script). The job stops at that step until a provisioning step
+# for x86-64 Homebrew is decided; the Wine build and the payload check run
+# only when the `build` input is set on a manual dispatch. Actions are pinned
+# to commit SHAs; the tag each SHA carried when it was looked up is recorded
+# beside it.
 name: engine-payload
 
 on:
   workflow_dispatch:
+    inputs:
+      build:
+        description: Run the multi-hour Wine build and the payload check (needs x86-64 Homebrew on the runner)
+        type: boolean
+        default: false
   push:
     tags: ["engine-*"]
 
@@ -21,6 +30,27 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Require Apple Silicon
         run: test "$(uname -m)" = arm64
+      - name: Select the newest release Xcode 26
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)
+          if [ -z "$xcode" ]; then
+            echo "no release Xcode 26 bundle found under /Applications" >&2
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+      - name: Require Xcode 26.2 or newer
+        run: |
+          version=$(xcodebuild -version | awk '/^Xcode / { print $2 }')
+          echo "found Xcode ${version:-unknown}"
+          if [ -z "$version" ]; then
+            echo "could not read the Xcode version from xcodebuild -version" >&2
+            exit 1
+          fi
+          if [ "$(printf '%s\n' 26.2 "$version" | sort -V | head -1)" != 26.2 ]; then
+            echo "Xcode $version is older than the required 26.2" >&2
+            exit 1
+          fi
       - name: Install the pinned Rust toolchain
         run: |
           rustup toolchain install
@@ -33,6 +63,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-registry-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      # The fetched archives (about a gigabyte). `--fetch` re-verifies and
+      # re-scans a present archive, so a cache hit is still gated.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            build/work/*/*.tar*
+            build/work/*/*.pkg
+          key: pins-${{ hashFiles('build/pins.toml') }}
       - name: Verify the pin and denylist files
         run: cargo xtask pins-verify
       - name: Fetch and scan every pin
@@ -40,6 +78,8 @@ jobs:
       - name: Check build prerequisites
         run: sh build/bootstrap.sh --check
       - name: Build the payload
+        if: github.event_name == 'workflow_dispatch' && inputs.build
         run: cargo xtask engine-payload --build
       - name: Check the payload
+        if: github.event_name == 'workflow_dispatch' && inputs.build
         run: cargo xtask engine-payload --check "fixtures/payloads/rosetta-wine-$(cargo xtask engine-payload --print-pin wine version)"

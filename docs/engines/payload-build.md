@@ -13,7 +13,8 @@ not run. Every gate below is **not yet run**.
 Run `sh build/bootstrap.sh --check` from the repository root. It lists each
 missing item with the command that installs it and exits non-zero while any
 is missing. It installs nothing. Exit 0 means every script that
-`cargo xtask engine-payload --build` runs can start.
+`cargo xtask engine-payload --build` runs can start. The Rust loader scans
+every archive once at `--fetch`; the scripts extract without a second scan.
 
 | Prerequisite | Why | Status on the planning host (2026-10-29) |
 | --- | --- | --- |
@@ -49,9 +50,10 @@ All commands run from the repository root. Output goes under `build/work/`
    denylist rule. A present archive is re-verified and re-scanned on every
    run. `--fetch <id>` fetches one pin. Verified on the planning host for all
    eight pins.
-3. `sh build/wine/fetch.sh` — extracts Wine and the msync patch set, scans
-   each listing against the denylist again, removes the patch stamps, and
-   reports whether `configure.ac` has `--with-metal`. At wine-11.0 it does
+3. `sh build/wine/fetch.sh` — extracts Wine and the msync patch set (the
+   loader in step 2 scanned both archives; the scripts do not scan again),
+   removes the patch stamps, and reports whether `configure.ac` has
+   `--with-metal`. At wine-11.0 it does
    not: Metal support is detected automatically (`configure.ac` checks
    `MTLDevice.registryID` and defines `HAVE_MTLDEVICE_REGISTRYID`); there is
    no option to pass.
@@ -60,13 +62,22 @@ All commands run from the repository root. Output goes under `build/work/`
    `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --disable-tests`
    with `CC=clang`, `BISON=`, `FLEX=`, `make`, `make install-lib` into
    `build/work/wine/stage/`. Hours. Writes `build/work/wine/build.log` and
-   `build/work/wine/g4b.txt`. Patches are dry-run as a set before any is
-   applied, so the tree is never half patched; the stamps
-   `build/work/wine/.msync-applied` and `.patches-applied` make a rerun after
-   a failed `make` skip the patch steps, and the stage is replaced only after
-   `make` succeeded. `sh build/wine/build.sh --preflight` runs everything up
-   to `configure` without changing the tree (it reports the patch dry runs and
-   the bison outcome, and exits non-zero if a prerequisite is missing).
+   `build/work/wine/g4b.txt`. The project patches are applied in file-name
+   order to a clone of the tree first (`cp -c`, an APFS clonefile) and to the
+   real tree only when every patch applied there, so the tree is never half
+   patched and patches may build on earlier ones; a missing msync patch set
+   is a missing prerequisite (rerun `fetch.sh`), not a "deferred" gate
+   result. The stamps `build/work/wine/.msync-applied` and
+   `.patches-applied` make a rerun after a failed `make` skip the patch
+   steps, and the stage is replaced only after `make` succeeded.
+   `sh build/wine/build.sh --preflight` runs everything up to `configure`
+   without changing the tree: it reports the msync dry runs, the project-patch
+   trial (on the tree without msync applied, since preflight applies nothing),
+   and the bison outcome. It exits 0 when the build can start, 3 when the
+   only gaps are ones `sh build/bootstrap.sh` installs (llvm-mingw, the
+   Homebrew bison and flex), and 1 for anything else (Rosetta, the x86-64
+   Homebrew, the msync patch set), so CI can run it before bootstrap and
+   still catch a recipe defect.
 5. `sh build/dxmt/fetch.sh`, `sh build/vkd3d/fetch.sh`, `sh build/vulkan/fetch.sh`,
    `sh build/gstreamer/fetch.sh` — extract each component under `build/work/`
    after a denylist scan of its listing. `vulkan/fetch.sh` thins the universal
@@ -80,40 +91,111 @@ All commands run from the repository root. Output goes under `build/work/`
    x86-64 with `lipo`, and scans the staged listing against the denylist,
    whose `scope = "payload"` rules name the excluded plugin dylibs. The
    `LGPL-2.1-or-later` recorded for the component describes that allowlist,
-   not the whole upstream package. Games whose cutscenes are WMV or MPEG-TS
-   will not decode through winegstreamer with this set.
+   not the whole upstream package. With this set winegstreamer decodes
+   H.264/HEVC and AAC through VideoToolbox/AudioToolbox, VP8/VP9/AV1, Theora,
+   Vorbis, Opus, FLAC, MP3, and PCM in MP4, Matroska, WebM, Ogg, AVI, and
+   WAV. It does not decode WMV/VC-1, WMA, MPEG-1/2 video, MPEG-PS/TS, or
+   MPEG-4 Part 2 (DivX/Xvid/MS-MPEG4), nor Cinepak, Indeo, or ADPCM in AVI:
+   `codecs-restricted` holds the ASF, MPEG-PS/TS, and RealMedia demuxers,
+   and `libav` is the only decoder in the package for those formats (it has
+   no `mpeg2dec` or `faad`). Games with such cutscenes show a black or
+   skipped video until a codec decision (an ADR) adds `libav`. Bink and
+   Smacker are decoded by the games themselves and are unaffected. The
+   staged `codecs` set also carries `libgstopenh264`, built from source
+   (BSD-2-Clause); Cisco's H.264 patent coverage applies to Cisco's own
+   binaries only, so that plugin carries H.264 patent exposure of its own,
+   while VideoToolbox in `system` already decodes H.264.
 6. `sh crates/applejack-engine/probes/<probe>/build.sh` for `hello32`,
    `dx11-sample`, `xinput-check`, `cpuid` — outputs under `build/work/probes/`.
-7. `sh build/assemble.sh` — copies the staged components into the plan 02
-   layout: `wine/` from `build/work/wine/stage` (stripped; skipped with a
-   message when no built Wine exists), `wine/lib/wine/x86_64-unix/winemetal.so`,
-   `wine/lib/GStreamer.framework`, `dxmt/{x86_64-windows,i386-windows}`,
-   `vkd3d/{x64,x86}`, `vulkan/`, `probes/`. `ASSEMBLE_PARTIAL=1` tolerates
-   unbuilt probes. `cargo xtask engine-payload --build` runs steps 3 through 7
+7. `sh build/assemble.sh` — builds the plan 02 layout under
+   `<payload>.tmp` and moves it into place, so nothing from an earlier run
+   survives and a failed run leaves the previous payload untouched: `wine/`
+   from `build/work/wine/stage` (stripped, a `strip` failure is fatal;
+   skipped with a message when no built Wine exists),
+   `wine/lib/wine/x86_64-unix/winemetal.so`, `wine/lib/GStreamer.framework`,
+   `dxmt/{x86_64-windows,i386-windows}`, `vkd3d/{x64,x86}`, `vulkan/`,
+   `probes/` (the three PE probes, `cpuid`, and `osslsigncode` as a host-arch
+   tool; GPL-3.0, listed in the notices), then `BUNDLE.toml` and
+   `THIRD_PARTY_NOTICES.md` rendered from `build/bundle-spec.toml` (step 8).
+   `ASSEMBLE_PARTIAL=1` tolerates unbuilt probes and an unbuilt
+   `osslsigncode`. `cargo xtask engine-payload --build` runs steps 3 through 7
    in order and stops here. What remains unscripted is the dylib closure: walk
    every Mach-O with `otool -L`, copy non-system dependencies (the x86-64
    Homebrew dylibs recorded in `brew-versions.txt`) into `wine/lib/`, rewrite
    install names and `LC_RPATH` entries to `@rpath`/`@loader_path` with
-   `install_name_tool`, repeat until stable.
-8. `cargo xtask engine-payload --write-bundle-toml <spec.toml> <payload>/BUNDLE.toml`
-   — renders `BUNDLE.toml` from a typed spec. The override DLL lists come from
-   the archive listings (DXMT 0.80: `d3d11`, `dxgi`, `d3d10core`, plus
-   `winemetal` as its native component and `nvapi64`/`nvngx` optional;
-   vkd3d-proton 3.1: `d3d12`, `d3d12core`). `registry.hidraw_key` at
-   wine-11.0 is the `DisableHidraw` DWORD under
+   `install_name_tool`, repeat until stable. A reassembly discards that work.
+8. `cargo xtask engine-payload --write-bundle-toml build/bundle-spec.toml <payload>/BUNDLE.toml`
+   — renders `BUNDLE.toml` and, beside it, `THIRD_PARTY_NOTICES.md` (one row
+   per `[components]` entry plus Wine, with version, SPDX license, and
+   location) from the committed spec, which has the same shape as the output
+   and carries the real pin values; `assemble.sh` runs this, so the step is
+   only rerun after editing the spec. The engine crate's reader parses the
+   rendered file, and `xtask/tests/fixtures/BUNDLE.toml` is the committed
+   rendering of the spec, which a test keeps in sync. The shape, abridged:
+
+   ```toml
+   id = "rosetta-wine"          # the reader's engine set; arch must match it
+   version = "11.0-1"           # lowercase [0-9a-z._+-], leading digit, no layout suffix
+   arch = "x86_64"
+   min_macos = "14.0"
+   sync_modes = ["esync", "none"]   # ordered, first is the default, no duplicates
+
+   [wine]
+   version = "11.0"
+   source_url = "https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz"
+   source_rev = "wine-11.0"
+   loader = "wine/bin/wine"
+   server = "wine/bin/wineserver"
+   wow64 = "new"                # "new" | "32on64" | "none"; G4e confirms it
+
+   [components]                 # versions and licenses from build/pins.toml
+   dxmt = { version = "0.80", license = "MIT" }
+   osslsigncode = { version = "2.14", license = "GPL-3.0-or-later" }
+
+   [overrides.dxmt]             # bundle-relative .dll paths per architecture;
+   x86_64 = ["dxmt/x86_64-windows/d3d11.dll", ...]   # the stem is the override name
+   i386 = ["dxmt/i386-windows/d3d11.dll", ...]       # empty when wow64 = "none"
+
+   # [d3dmetal] overlay_dir = "wine/lib/external"   # present only once G4d passes
+
+   [probes]
+   cpuid = "probes/cpuid"
+   dx11_sample = "probes/dx11-sample.exe"
+   xinput_check = "probes/xinput-check.exe"
+
+   [registry]
+   hidraw_key = 'HKLM\System\CurrentControlSet\Services\WineBus\DisableHidraw'
+   ```
+
+   The DXMT 0.80 override set is `d3d11`, `dxgi`, `d3d10core`, and
+   `winemetal` (the bridge to its native half); `nvapi64` and `nvngx` are
+   optional and not shipped. vkd3d-proton 3.1 is `d3d12` and `d3d12core`.
+   `registry.hidraw_key` at wine-11.0 is the `DisableHidraw` DWORD under
    `HKLM\System\CurrentControlSet\Services\WineBus` (`dlls/winebus.sys/main.c`,
-   `check_bus_option`). Every loader, server, preloader, probe, and
-   `overlay_dir` path must be relative without `..`.
+   `check_bus_option`). Every path must be relative without `.` or `..`. The
+   writer rejects what the reader rejects: an unknown `id`, an `arch` that
+   does not match it, a malformed version, duplicate sync modes, an override
+   entry without `.dll` or with a stem already listed for that architecture,
+   an `i386` list under `wow64 = "none"`, and a non-empty `overrides.d3dmetal`
+   without the `[d3dmetal]` table.
 9. `cargo xtask engine-payload --check <payload>` — denylist scan of every
    path and every symlink target (case-insensitive, as APFS resolves them),
    plus the self-containment check of every Mach-O (by magic number, fat and
-   fat64 included, then `otool -L` and the `LC_RPATH` entries from `otool -l`).
+   fat64 included, then `otool -L` and the load commands from `otool -l`; an
+   `otool` error on stderr or an empty load-command list fails the run).
    Fails on any reference or rpath into `/usr/local`, `/opt/homebrew`,
    `build/work/`, the payload's own absolute path, any absolute path outside
    `/System` and `/usr/lib`, any `..` component, or `/System/Volumes/`
-   (a firmlink back into the data volume); and on any symlink that is
-   absolute, dangling, or resolves outside the payload. `@rpath`,
-   `@loader_path`, and `@executable_path` references pass.
+   (a firmlink back into the data volume); on any symlink that is absolute,
+   dangling, or whose real resolution (not only the lexical one) leaves the
+   payload; and on any `@rpath/`, `@loader_path/`, or `@executable_path/`
+   dependency that names no file in the payload. `@rpath/x` is looked up
+   through every relocated `LC_RPATH` in the payload, as dyld searches the
+   rpaths of the whole load chain, so a Unix module without its own rpath
+   resolves through the loader's; `@loader_path/x` and `@executable_path/x`
+   resolve against the binary's own directory (for a dylib the executable is
+   unknown, so an `@executable_path` dependency that is not next to the dylib
+   is reported). Absolute `LC_RPATH` entries contribute nothing to the lookup.
 
 ## Running the built Wine
 
@@ -163,8 +245,15 @@ a rerun of every gate above.
 
 `.github/workflows/engine-payload.yml` runs on manual dispatch and on
 `engine-*` tags only, with `actions/checkout` and `actions/cache` pinned to
-commit SHAs and only the cargo registry cached. It runs `pins-verify`,
-`--fetch` (every archive scanned), `bootstrap.sh --check`, `--build`, and
-`--check`. On a stock runner it fails at `bootstrap.sh --check` until the
-installing mode and the Wine build are exercised; the steps before it give
-signal today.
+commit SHAs, the cargo registry cached, and the fetched archives cached under
+a key on `build/pins.toml` (`--fetch` re-verifies and re-scans a cached
+archive). It selects Xcode 26.2 or newer like `check.yml`, then runs
+`pins-verify`, `--fetch` (every archive scanned), and `bootstrap.sh --check`.
+On a stock runner the job stops there: `--check` requires an x86-64 Homebrew
+at `/usr/local`, which the arm64 `macos-latest` image does not ship and no
+script installs (its installer is an unpinned script), so the bootstrap
+installing mode cannot unblock it. The job stays at that step until a
+provisioning step for x86-64 Homebrew is decided (a pinned clone of the
+Homebrew tag plus the dependency list, or a self-hosted runner). `--build`
+and the payload `--check` run only on a manual dispatch with the `build`
+input set.

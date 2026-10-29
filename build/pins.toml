@@ -2,7 +2,9 @@
 # SHA-256. `cargo xtask engine-payload --fetch` downloads each `dest` under
 # build/work/, verifies it, and scans its listing against build/denylist.toml
 # before any script extracts it; `cargo xtask pins-verify` parses this file
-# offline. Hashes were computed from the downloaded files on 2026-10-28.
+# offline. Hashes were computed from the downloaded files on 2026-10-28; each
+# pin's `# verified:` line says what cross-checked that hash: an upstream
+# digest, or TOFU (trust on first use, no published digest to compare with).
 # `kind` is "source", "release-asset", or "toolchain". Each `dest` is unique.
 #
 # GitHub `/archive/` tarballs (wine-msync, osslsigncode) are generated on
@@ -14,6 +16,7 @@
 
 # WineHQ stable 11.0 (ADR-0010, gate G4a Option A). The sha256 here matches the
 # tarball whose sha512 is listed in https://dl.winehq.org/wine/source/11.0/sha512sums.asc.
+# verified: upstream sha512sums.asc (the sha512 of the same bytes), 2026-10-28
 [[pin]]
 id = "wine"
 kind = "source"
@@ -25,6 +28,7 @@ dest = "wine/wine-11.0.tar.xz"
 
 # marzent/wine-msync, newest commit on main (2024-08-13, "Add staging patch for
 # 9.15"). Gate G4b decides whether any of its patches applies to Wine 11.0.
+# verified: TOFU 2026-10-28 (GitHub /archive/ tarball, no published digest)
 [[pin]]
 id = "wine-msync"
 kind = "source"
@@ -37,6 +41,7 @@ dest = "wine/wine-msync-be7f3e2.tar.gz"
 # DXMT v0.80, the last MIT release (later releases are LGPL-2.1). Archive layout:
 # v0.80/{x86_64-windows,i386-windows}/{d3d10core,d3d11,dxgi,winemetal}.dll,
 # v0.80/x86_64-windows/{nvapi64,nvngx}.dll, v0.80/x86_64-unix/winemetal.so.
+# verified: TOFU 2026-10-28 (release asset, no published digest)
 [[pin]]
 id = "dxmt"
 kind = "release-asset"
@@ -47,6 +52,7 @@ license = "MIT"
 dest = "dxmt/dxmt-v0.80-builtin.tar.gz"
 
 # vkd3d-proton v3.1 release build. Archive layout: vkd3d-proton-3.1/{x64,x86}/{d3d12,d3d12core}.dll.
+# verified: TOFU 2026-10-28 (release asset, no published digest)
 [[pin]]
 id = "vkd3d-proton"
 kind = "release-asset"
@@ -57,6 +63,7 @@ license = "LGPL-2.1-or-later"
 dest = "vkd3d/vkd3d-proton-3.1.tar.zst"
 
 # MoltenVK v1.4.2 macOS release (universal arm64+x86_64 dylib and xcframework).
+# verified: TOFU 2026-10-28 (release asset, no published digest)
 [[pin]]
 id = "moltenvk"
 kind = "release-asset"
@@ -73,6 +80,7 @@ dest = "vulkan/MoltenVK-1.4.2-macos.tar"
 # dvd-gpl, libav). build/gstreamer/fetch.sh stages only the allowlisted
 # LGPL/MIT/BSD/Apache sub-packages, which is what `license` describes; the
 # payload-scoped rules in build/denylist.toml reject the rest.
+# verified: TOFU 2026-10-28 (upstream publishes no digest for the macOS package)
 [[pin]]
 id = "gstreamer"
 kind = "release-asset"
@@ -84,6 +92,7 @@ dest = "gstreamer/gstreamer-1.0-1.28.8-universal.pkg"
 
 # osslsigncode 2.14 source (GitHub tag archive; the release has no separate
 # source tarball). Built as a host-arch tool for Authenticode verification.
+# verified: TOFU 2026-10-28 (GitHub /archive/ tarball, no published digest)
 [[pin]]
 id = "osslsigncode"
 kind = "source"
@@ -95,6 +104,7 @@ dest = "osslsigncode/osslsigncode-2.14.tar.gz"
 
 # llvm-mingw 20261020, macOS universal, UCRT. Provides i686- and
 # x86_64-w64-mingw32-clang for Wine's PE side and the probes.
+# verified: TOFU 2026-10-28 (release asset, no published digest)
 [[pin]]
 id = "llvm-mingw"
 kind = "toolchain"
