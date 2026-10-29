@@ -84,6 +84,14 @@ reported and a reused pid is only reported while that process exists).
 `Lock::holder` reads the same record without locking and applies the same
 filter.
 
+`Wait(duration)` adds the duration to the current instant with a checked
+add; a duration too large to represent (`Duration::MAX`) polls without a
+deadline instead of panicking. `locks/` is recreated on every poll, so a
+directory removed while a caller waits does not end the wait. The holder in
+`LockHeld` is the last line written into the file: after a crash, a reused
+pid names an unrelated process, so the message says "last recorded holder"
+and nothing in applejack kills it.
+
 Lock order is per-appid first, then the library. What the types guarantee,
 within one process:
 
@@ -91,17 +99,26 @@ within one process:
   `LockDir` mutably, so one `LockDir` holds at most one app lock, and the
   sequence app-1, library, app-2 on one `LockDir` does not compile (the
   `compile_fail` doc test on `LockDir::app` pins it).
-- Only `AppLock::library(mode)` yields a `LibraryLock`, which borrows the
-  `AppLock` and so cannot outlive it. `Lock::acquire` and the library lock's
-  name are crate-private; there is no other constructor.
+- Only `AppLock::library(&mut self, mode)` yields a `LibraryLock`, which
+  borrows the `AppLock` mutably and so cannot outlive it; one `AppLock` holds
+  at most one `LibraryLock`, so a second `library()` call while the first is
+  alive does not compile (the `compile_fail` doc test on `AppLock::library`
+  pins it). `flock` conflicts between two open descriptions of one file even
+  inside one process, so without that rule the second call would wait on
+  itself. `Lock::acquire` and the library lock's name are crate-private; there
+  is no other constructor.
 - `LockDir` is not `Clone`.
 
 What they do not guarantee: a process can construct two `LockDir`s and take
 app-1 then library on one and app-2 on the other, and two processes can take
 the locks in different orders. Across `LockDir`s and across processes the
-order is a convention: one `LockDir` per subcommand, app lock before library
-lock, and `Wait` rather than `Blocking` wherever a hung holder must not wedge
-the caller.
+order is a convention: a subcommand that needs several titles takes all of
+its app locks first, in ascending appid order (one `LockDir` per app lock),
+then the library lock from the `AppLock` it took last, and never an app lock
+while holding the library lock; `Wait` rather than `Blocking` wherever a hung
+holder must not wedge the caller. A typed multi-app acquire (`LockDir::apps`
+over a sorted, deduplicated appid list) is a follow-up for the depot unit if
+it needs more than one title per process.
 
 Every applejack process sends the same `LOGIN_ID` in `CMsgClientLogon`, so two
 concurrent logged-in applejack connections on one account displace each

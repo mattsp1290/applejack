@@ -5,14 +5,16 @@
 //! Lock order is per-appid first, then the library. Within one process the
 //! types enforce it: [`LockDir::app`] borrows the [`LockDir`] mutably for as
 //! long as the [`AppLock`] lives, so one `LockDir` holds at most one app lock,
-//! and a [`LibraryLock`] exists only as a borrow of an [`AppLock`]. Across
-//! processes the order is a convention every applejack subcommand follows.
+//! and [`AppLock::library`] borrows the [`AppLock`] mutably for as long as the
+//! [`LibraryLock`] lives, so one `AppLock` holds at most one library lock.
+//! Across processes the order is a convention every applejack subcommand
+//! follows.
 //!
 //! ```no_run
 //! use applejack_steam::lock::{LockDir, Mode};
 //!
 //! let mut locks = LockDir::new("/path/to/data", "install");
-//! let app = locks.app(730, Mode::NonBlocking)?;
+//! let mut app = locks.app(730, Mode::NonBlocking)?;
 //! let library = app.library(Mode::Wait(std::time::Duration::from_secs(5)))?;
 //! # drop(library);
 //! # Ok::<(), applejack_steam::Error>(())
@@ -20,6 +22,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
+use std::marker::PhantomData;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -87,13 +90,17 @@ impl Lock {
             path: path.clone(),
             source,
         };
-        std::fs::create_dir_all(dir).map_err(lock_io)?;
         let deadline = match mode {
-            Mode::Wait(limit) => Some(Instant::now() + limit),
+            // `None` here means the limit lies past any representable
+            // instant: poll without a deadline rather than panic.
+            Mode::Wait(limit) => Instant::now().checked_add(limit),
             Mode::Blocking | Mode::NonBlocking => None,
         };
         let mut replaced = 0;
         loop {
+            // Inside the loop so a `locks/` directory removed while waiting
+            // is recreated on the next attempt.
+            std::fs::create_dir_all(dir).map_err(lock_io)?;
             let mut file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -169,7 +176,8 @@ impl Drop for Lock {
 }
 
 /// `Ok(true)` when the lock is taken, `Ok(false)` when another process holds
-/// it and `mode` does not wait any longer.
+/// it and `mode` does not wait any longer. A [`Mode::Wait`] without a
+/// `deadline` polls until the lock is free.
 fn try_flock(file: &File, mode: Mode, deadline: Option<Instant>) -> io::Result<bool> {
     let operation = match mode {
         Mode::Blocking => FlockOperation::LockExclusive,
@@ -179,10 +187,12 @@ fn try_flock(file: &File, mode: Mode, deadline: Option<Instant>) -> io::Result<b
         match flock(file, operation) {
             Ok(()) => return Ok(true),
             Err(Errno::WOULDBLOCK) => {
-                let Some(deadline) = deadline else {
+                if !matches!(mode, Mode::Wait(_)) {
                     return Ok(false);
-                };
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                }
+                let remaining = deadline.map_or(WAIT_POLL, |deadline| {
+                    deadline.saturating_duration_since(Instant::now())
+                });
                 if remaining.is_zero() {
                     return Ok(false);
                 }
@@ -227,9 +237,11 @@ fn write_holder(file: &mut File, holder: &Holder) -> io::Result<()> {
 }
 
 /// `<data>/locks`, plus the command label every lock taken through it carries.
-/// One `LockDir` holds at most one [`AppLock`] at a time; a subcommand that
-/// needs locks on two titles takes them from two `LockDir`s in a fixed appid
-/// order, never while holding the library lock.
+/// One `LockDir` holds at most one [`AppLock`] at a time. A subcommand that
+/// needs several titles takes all of its app locks first, in ascending appid
+/// order (one `LockDir` per app lock), and the library lock last, from the
+/// `AppLock` it took last; it never takes an app lock while holding the
+/// library lock.
 #[derive(Debug)]
 pub struct LockDir {
     root: PathBuf,
@@ -261,10 +273,12 @@ impl LockDir {
     /// use applejack_steam::lock::{LockDir, Mode};
     ///
     /// let mut locks = LockDir::new("/path/to/data", "install");
-    /// let first = locks.app(1, Mode::NonBlocking).unwrap();
+    /// let mut first = locks.app(1, Mode::NonBlocking).unwrap();
     /// let library = first.library(Mode::NonBlocking).unwrap();
     /// let second = locks.app(2, Mode::NonBlocking).unwrap(); // `locks` is still borrowed
-    /// drop((library, first, second));
+    /// drop(library);
+    /// drop(first);
+    /// drop(second);
     /// ```
     ///
     /// # Errors
@@ -307,22 +321,42 @@ impl AppLock<'_> {
     }
 
     /// Takes the library lock, the second lock in the order. The result borrows
-    /// this lock, so it cannot outlive the per-appid lock.
+    /// this lock mutably, so it cannot outlive the per-appid lock and a second
+    /// library lock cannot be taken until it is dropped. `flock` conflicts
+    /// between two open descriptions of one file even inside one process, so
+    /// a second call would otherwise report the caller's own pid as the holder
+    /// or, in [`Mode::Blocking`], wait on itself forever:
+    ///
+    /// ```compile_fail,E0499
+    /// use applejack_steam::lock::{LockDir, Mode};
+    ///
+    /// let mut locks = LockDir::new("/path/to/data", "install");
+    /// let mut app = locks.app(1, Mode::NonBlocking).unwrap();
+    /// let first = app.library(Mode::NonBlocking).unwrap();
+    /// let second = app.library(Mode::NonBlocking).unwrap(); // `app` is still borrowed
+    /// drop(first);
+    /// drop(second);
+    /// ```
     ///
     /// # Errors
     ///
     /// See [`LockDir::app`].
-    pub fn library(&self, mode: Mode) -> Result<LibraryLock<'_>, Error> {
+    pub fn library(&mut self, mode: Mode) -> Result<LibraryLock<'_>, Error> {
         let lock = Lock::acquire(&self.dir.root, LIBRARY_LOCK_NAME, mode, &self.dir.command)?;
-        Ok(LibraryLock { lock, _app: self })
+        Ok(LibraryLock {
+            lock,
+            _app: PhantomData,
+        })
     }
 }
 
-/// The shared library lock, held under an [`AppLock`].
+/// The shared library lock, held under an [`AppLock`]. The marker carries the
+/// exclusive borrow of the `AppLock` without tying the two lifetimes together,
+/// which `&'a mut AppLock<'a>` would do.
 #[derive(Debug)]
 pub struct LibraryLock<'a> {
     lock: Lock,
-    _app: &'a AppLock<'a>,
+    _app: PhantomData<&'a mut ()>,
 }
 
 impl LibraryLock<'_> {

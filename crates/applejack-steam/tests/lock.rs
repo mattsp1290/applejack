@@ -14,7 +14,7 @@ const DEAD_PID: u32 = i32::MAX as u32;
 fn non_blocking_acquire_fails_with_the_holders_pid_and_command() {
     let dir = tempfile::tempdir().unwrap();
     let mut locks = LockDir::new(dir.path(), "install 0");
-    let app = locks.app(0, Mode::NonBlocking).unwrap();
+    let mut app = locks.app(0, Mode::NonBlocking).unwrap();
     let library = app.library(Mode::NonBlocking).unwrap();
 
     let holder: Holder =
@@ -31,7 +31,7 @@ fn non_blocking_acquire_fails_with_the_holders_pid_and_command() {
         let mut other = LockDir::new(&data_dir, "run 9");
         let library = other
             .app(9, Mode::NonBlocking)
-            .and_then(|app| app.library(Mode::NonBlocking).map(|_| ()));
+            .and_then(|mut app| app.library(Mode::NonBlocking).map(|_| ()));
         tx.send((app, library)).unwrap();
     });
     let (app_result, library_result) = rx.recv().unwrap();
@@ -181,16 +181,63 @@ fn stale_holder_line_is_not_reported_after_release() {
 fn lock_files_are_private_and_live_under_data_locks() {
     let dir = tempfile::tempdir().unwrap();
     let mut locks = LockDir::new(dir.path(), "x");
-    let app = locks.app(42, Mode::NonBlocking).unwrap();
+    let mut app = locks.app(42, Mode::NonBlocking).unwrap();
     assert_eq!(app.appid(), 42);
     assert_eq!(app.lock().name(), "app-42");
-    assert_eq!(app.lock().path(), dir.path().join("locks/app-42.lock"));
+    let app_path = app.lock().path().to_path_buf();
+    assert_eq!(app_path, dir.path().join("locks/app-42.lock"));
+    // The library lock borrows `app` mutably, so its path is captured first.
     let library = app.library(Mode::Blocking).unwrap();
     assert_eq!(library.lock().path(), dir.path().join("locks/library.lock"));
-    for path in [app.lock().path(), library.lock().path()] {
+    for path in [app_path.as_path(), library.lock().path()] {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
+}
+
+#[test]
+fn wait_mode_with_duration_max_polls_without_a_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut locks = LockDir::new(dir.path(), "holder");
+    // Unheld: `Instant + Duration::MAX` would panic before the first poll.
+    drop(locks.app(4, Mode::Wait(Duration::MAX)).unwrap());
+
+    let held = locks.app(4, Mode::NonBlocking).unwrap();
+    let data_dir = dir.path().to_path_buf();
+    let waiter = thread::spawn(move || {
+        let mut other = LockDir::new(&data_dir, "waiter");
+        other
+            .app(4, Mode::Wait(Duration::MAX))
+            .map(|lock| lock.lock().name().to_owned())
+    });
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !waiter.is_finished(),
+        "a Wait(MAX) acquire gave up on a held lock"
+    );
+    drop(held);
+    assert_eq!(waiter.join().unwrap().unwrap(), "app-4");
+}
+
+#[test]
+fn removed_locks_dir_is_recreated_while_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut locks = LockDir::new(dir.path(), "holder");
+    let root = locks.root().to_path_buf();
+    let held = locks.app(6, Mode::NonBlocking).unwrap();
+
+    let data_dir = dir.path().to_path_buf();
+    let waiter = thread::spawn(move || {
+        let mut other = LockDir::new(&data_dir, "waiter");
+        other.app(6, Mode::Wait(Duration::from_secs(5))).map(|_| ())
+    });
+    thread::sleep(Duration::from_millis(50));
+    // Unlinking the held file releases nobody; the waiter's next poll must
+    // recreate `locks/` and lock the new file once `held` is dropped.
+    fs::remove_dir_all(&root).unwrap();
+    drop(held);
+    waiter.join().unwrap().unwrap();
+    assert!(root.join("app-6.lock").is_file());
 }

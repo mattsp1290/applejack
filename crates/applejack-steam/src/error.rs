@@ -14,11 +14,14 @@ pub enum Error {
     /// An `appmanifest` is missing a field or holds a value of the wrong shape.
     #[error("acf: field `{path}`: {reason}")]
     AcfField { path: String, reason: String },
-    /// Another process holds the lock. `holder` is the line that process
+    /// Another process holds the lock. `holder` is the last line a holder
     /// wrote into the lock file; it is `None` while the new holder has not
     /// written its line yet, when the line does not parse, or when the
-    /// recorded pid is no longer alive (a stale line left by a crash).
-    #[error("lock `{name}` is held{}", holder.as_ref().map_or_else(|| " (holder unknown)".to_owned(), |holder| format!(" by pid {} ({})", holder.pid, holder.command)))]
+    /// recorded pid is no longer alive (a stale line left by a crash). A
+    /// line left by a crash whose pid has since been reused names an
+    /// unrelated process, so the message calls it the last recorded holder
+    /// rather than inviting a `kill`.
+    #[error("lock `{name}` is held{}", holder.as_ref().map_or_else(|| " (holder unknown)".to_owned(), |holder| format!(" (last recorded holder: pid {} `{}`)", holder.pid, holder.command)))]
     LockHeld {
         name: String,
         holder: Option<Holder>,
