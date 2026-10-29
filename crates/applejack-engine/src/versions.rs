@@ -195,10 +195,11 @@ impl From<Version> for String {
     }
 }
 
-/// Installed versions of `id`, oldest first. Only a directory whose name is a
-/// version and that holds a regular `BUNDLE.toml` counts; extraction,
-/// overlay, download, and stale directories (a `<version>/` without a
-/// descriptor, left by an interrupted removal) are not versions.
+/// Installed versions of `id`, oldest first. Only a real directory (not a
+/// symlink) whose name is a version and that holds a regular `BUNDLE.toml`
+/// counts; extraction, overlay, download, and stale directories (a
+/// `<version>/` without a descriptor, left by an interrupted removal) are
+/// not versions.
 ///
 /// # Errors
 ///
@@ -213,11 +214,7 @@ pub fn list(layout: &EngineLayout, id: EngineId) -> Result<Vec<Version>> {
     let mut versions = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| Error::io(&root, error))?;
-        let is_dir = entry
-            .file_type()
-            .map_err(|error| Error::io(entry.path(), error))?
-            .is_dir();
-        if !is_dir || !crate::bundle::has_descriptor(&entry.path()) {
+        if !crate::bundle::is_bundle_dir(&entry.path()) {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {

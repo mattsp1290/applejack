@@ -48,7 +48,11 @@ canonical `.partial` root. That refuses `a/b -> ..` followed by
 `a/b/c -> ..`, a target that climbs out and back in through
 `<version>.partial` (inside while checked, a sibling once renamed), dangling
 links, and loops, while `wine/bin/wine64 -> ../lib/wine64-real` and other
-`..` links that stay inside install as they are. Validation then
+`..` links that stay inside install as they are. The walk counts every link
+met in one lookup against the macOS limit of 32 (`MAXSYMLINKS`, past which
+the kernel fails with `ELOOP`), and the kernel must agree: a link the walk
+accepts but `canonicalize` cannot follow is refused, so an installed bundle
+never holds a link that does not resolve. Validation then
 canonicalizes every file it names, including the `[probes]` executables, and
 requires it to stay inside the canonical bundle root. Setuid, setgid, and
 sticky bits are stripped on extraction; the executable bit is kept. Every
@@ -132,16 +136,22 @@ saw, so the engine never probes the host itself.
 (`Downloading` once a download source exists). The steps:
 
 1. Refuses when `engines/<id>/<version>/` already holds a bundle, that is a
-   regular `BUNDLE.toml`. A directory, file, or dangling link at that path
-   without one is stale (an interrupted removal) and is removed first.
+   real directory (not a symlink) with a regular `BUNDLE.toml`.
 2. Opens the archive once and hashes it with SHA-256 against the request's
-   digest. On mismatch it stops before extracting anything and leaves the
-   archive in place, reporting expected and actual digests. The same open
-   handle is rewound and extracted, so the bytes verified are the bytes
+   digest. On mismatch it stops before touching anything on disk and leaves
+   the archive in place, reporting expected and actual digests. The same
+   open handle is rewound and extracted, so the bytes verified are the bytes
    unpacked.
-3. Replaces a stale `engines/<id>/<version>.partial` from an earlier attempt,
-   whatever it is (directory, file, or dangling link), and extracts into it.
-   An entry whose path or link target would leave the root is refused.
+3. Removes a stale `engines/<id>/<version>` without a bundle (a directory,
+   file, or symlink left by an interrupted removal or placed by hand; a
+   symlink is unlinked, its target untouched) and a stale
+   `engines/<id>/<version>.partial` from an earlier attempt, whatever it is,
+   then extracts into a fresh `.partial`. An entry whose path or link target
+   would leave the root is refused. Removing a large stale directory is a
+   one-time cost paid here, after the archive has verified. The launcher
+   does not detect a volume mounted at `<version>`; mounting one there is a
+   deliberate user action, and its contents would be removed with the stale
+   directory.
 4. Walks the extracted tree and refuses any symlink that does not resolve
    inside it (below). Checks that `BUNDLE.toml` is a top-level entry, then
    loads and validates it and checks that it names the same engine and
@@ -163,12 +173,14 @@ callback.
   trailing `.`, and never ends in `.partial`, `.user`, or `.download`. Byte
   equality is therefore filesystem identity on the case-insensitive default
   volume, and `10.0.0-RC1` is rejected rather than silently aliased.
-- `versions::list` returns installed versions, oldest first. Only a directory
-  whose name is a version and that holds a regular `BUNDLE.toml` counts;
-  anything else under `engines/<id>/` is ignored and never pruned. That is
-  the one definition of "installed": `InstalledEngine::open` reports
-  `NotInstalled` for a `<version>/` without a descriptor, `install` replaces
-  such a directory, and `remove` deletes it.
+- `versions::list` returns installed versions, oldest first. Only a real
+  directory (not a symlink) whose name is a version and that holds a regular
+  `BUNDLE.toml` counts; anything else under `engines/<id>/` is ignored and
+  never pruned. That is the one definition of "installed", shared through
+  `bundle::is_bundle_dir`: `InstalledEngine::open` reports `NotInstalled`
+  for a `<version>/` without a descriptor or a symlinked `<version>`,
+  `install` replaces either (unlinking a symlink, not its target), and
+  `remove` deletes it.
 - Version order compares dot- and dash-separated segments left to right, each
   split into digit and letter runs: numbers by value (of any width, so a
   digit run wider than a machine word still sorts numerically), letters
@@ -212,25 +224,36 @@ dropped without unsetting the earlier tier's value: a rejected extra falls
 back to the base value. Everything dropped is reported with a reason and the
 tier it came from so it can be logged.
 
-`WINEPREFIX` and `APPLEJACK_SESSION` are required: `assemble` returns
-`Error::MissingEngineVariable` when either has no accepted value after the
-tiers are applied, whether the engine forgot it or set a value that failed
-its check. Without `WINEPREFIX` Wine would create or mutate `~/.wine`;
-without the session id process discovery finds nothing. Only the engine can
-satisfy a required row, so a host value never papers over the gap.
+`WINEPREFIX` and `APPLEJACK_SESSION` are required and strict: `WINEPREFIX`
+must resolve to the prefix directory itself (any other path inside it would
+make Wine create a fresh prefix there) and `APPLEJACK_SESSION` must be
+non-empty (an empty id would match nothing, or everything, in process
+discovery). `assemble` returns `Error::MissingEngineVariable` when either
+has no accepted value after the tiers are applied; the error says whether
+the engine did not set the variable or set a value that was rejected, and
+carries the `DropReason` in the latter case. Without `WINEPREFIX` Wine would
+create or mutate `~/.wine`; without the session id process discovery finds
+nothing. Only the engine can satisfy a required row, so a host value never
+papers over the gap. The same table is the `ALLOWLIST` rustdoc.
 
-| Variable | Owner | Check | Roots |
-| --- | --- | --- | --- |
-| `PATH`, `HOME`, `TMPDIR` | host | any value | |
-| `WINEPREFIX` | engine | one absolute path | prefix only |
-| `WINEDEBUG` | game | any value | |
-| `WINEDLLOVERRIDES`, `WINEMSYNC`, `WINEESYNC` | engine | any value | |
-| `DXMT_CONFIG` | game | any value: inline `key=value;` options | |
-| `DXMT_CONFIG_FILE` | game | one absolute path to a config file | engine, overlay, prefix |
-| `DXMT_LOG_LEVEL`, `MTL_HUD_ENABLED`, `ROSETTA_ADVERTISE_AVX` | game | any value | |
-| `GST_PLUGIN_PATH` | game | colon-separated absolute paths | engine, overlay, prefix |
-| `APPLEJACK_SESSION` | engine | any value | |
-| `VK_ICD_FILENAMES` | game | colon-separated absolute paths | engine, overlay, prefix |
+| Variable | Owner | Check | Roots | Required |
+| --- | --- | --- | --- | --- |
+| `PATH`, `HOME`, `TMPDIR` | host | any value | | |
+| `WINEPREFIX` | engine | one absolute path resolving to the prefix directory itself | prefix | yes |
+| `WINEDEBUG` | game | any value | | |
+| `WINEDLLOVERRIDES`, `WINEMSYNC`, `WINEESYNC` | engine | any value | | |
+| `DXMT_CONFIG` | game | any value: inline `key=value;` options | | |
+| `DXMT_CONFIG_FILE` | game | one absolute path to a config file | engine, overlay, prefix | |
+| `DXMT_LOG_LEVEL`, `MTL_HUD_ENABLED`, `ROSETTA_ADVERTISE_AVX` | game | any value | | |
+| `GST_PLUGIN_PATH` | game | colon-separated absolute paths | engine, overlay, prefix | |
+| `APPLEJACK_SESSION` | engine | any non-empty value | | yes |
+| `VK_ICD_FILENAMES` | game | colon-separated absolute paths | engine, overlay, prefix | |
+
+`WINEARCH` is deliberately not a row. The prefix architecture is fixed by
+the loader: a 64-bit `wine` creates a `win64` prefix, and `WINEARCH` only
+forces a 32-bit one, which no engine creates. Prefix creation therefore
+runs `wineboot --init` through `assemble` like any launch, with no extra
+variable.
 
 DXMT split, as checked against the pinned DXMT 0.80 payload (the pin ships
 binaries without a README; `d3d11.dll` and `dxgi.dll` both embed
@@ -266,8 +289,10 @@ table are dropped.
 The `rosetta-wine` implementation of the `Engine` trait adds:
 
 - `doctor`: Rosetta presence, macOS version against `min_macos`, bundle state.
-- Prefix creation: `wineboot --init`, `WINEARCH=win64`, backend DLL overrides
-  copied from the `InstalledEngine` per architecture, sync mode variables,
+- Prefix creation: `wineboot --init` through `assemble` (the loader fixes
+  the prefix architecture at `win64`; see the allowlist), backend DLL
+  overrides copied from the `InstalledEngine` per architecture, sync mode
+  variables,
   registry seeds including the `hidraw_key`, the `S:` library drive,
   snapshots before an engine version change. The `Prefix` records the engine
   id and version that made it and the `backend`, `sync_mode`, and `hidraw`
@@ -278,7 +303,8 @@ The `rosetta-wine` implementation of the `Engine` trait adds:
   `VK_ICD_FILENAMES` from `prefix.sync_mode` and `prefix.backend` (Wine
   does not persist them, so the prefix is the one record). Log capture to
   `~/Library/Logs/applejack/<session>/wine.log`, cancellation through
-  `wineserver -k`.
+  `<server> -k` against the prefix; the `Session` already carries `server`
+  and `prefix_dir` for it.
 - Process discovery: same-user processes carrying the session id, and the
   `wineserver` liveness check for a prefix.
 - D3DMetal: import from a mounted Game Porting Toolkit image into

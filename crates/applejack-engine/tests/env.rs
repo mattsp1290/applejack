@@ -127,7 +127,7 @@ fn allowlist_matches_the_plan() {
         .collect();
     assert_eq!(required, ["WINEPREFIX", "APPLEJACK_SESSION"]);
     for entry in ALLOWLIST {
-        let is_path = entry.kind != Kind::Plain;
+        let is_path = matches!(entry.kind, Kind::Path | Kind::PrefixDir | Kind::PathList);
         let has_roots = entry.roots.engine || entry.roots.overlay || entry.roots.prefix;
         assert_eq!(
             is_path, has_roots,
@@ -318,43 +318,126 @@ fn host_owned_variables_ignore_game_extras() {
 
 #[test]
 fn wineprefix_accepts_only_the_prefix_root() {
-    // An engine-set prefix outside the prefix root is dropped, and since no
-    // other tier may supply it, the launch cannot proceed.
-    for bad in [format!("{ENGINE_DIR}/wine"), format!("{OVERLAY_DIR}/pfx")] {
+    // An engine-set prefix that is not the prefix directory itself is
+    // dropped (Wine would create a fresh prefix at `<prefix>/game-1`), and
+    // since no other tier may supply it, the launch cannot proceed. The
+    // error says the engine set a value and why it was rejected.
+    for bad in [
+        format!("{ENGINE_DIR}/wine"),
+        format!("{OVERLAY_DIR}/pfx"),
+        format!("{PREFIX_DIR}/game-1"),
+        format!("{PREFIX_DIR}/drive_c"),
+        "/data/prefixes".to_owned(),
+    ] {
         let engine = [pair("WINEPREFIX", &bad), pair("APPLEJACK_SESSION", SESSION)];
         let error = assemble(&[], &[], &engine, &roots()).unwrap_err();
         assert!(
-            matches!(error, Error::MissingEngineVariable { name: "WINEPREFIX" }),
-            "{bad}: {error}"
+            matches!(
+                &error,
+                Error::MissingEngineVariable {
+                    name: "WINEPREFIX",
+                    rejected: Some(DropReason::OutsideRoots { value })
+                } if *value == OsString::from(&bad)
+            ),
+            "{bad}: {error:?}"
         );
+        let message = error.to_string();
+        assert!(message.contains("rejected value"), "{bad}: {message}");
+        assert!(message.contains(&bad), "{bad}: {message}");
+        assert!(!message.contains("did not set"), "{bad}: {message}");
     }
 
-    let inside = format!("{PREFIX_DIR}/game-1");
+    // Any spelling that resolves to the prefix directory is the prefix.
+    for exact in [
+        PREFIX_DIR.to_owned(),
+        format!("{PREFIX_DIR}/"),
+        format!("{PREFIX_DIR}/."),
+    ] {
+        let engine = [
+            pair("WINEPREFIX", &exact),
+            pair("APPLEJACK_SESSION", SESSION),
+        ];
+        let (env, dropped) = assemble(&[], &[], &engine, &roots()).unwrap();
+        assert_eq!(
+            env,
+            [
+                pair("WINEPREFIX", &exact),
+                pair("APPLEJACK_SESSION", SESSION)
+            ]
+        );
+        assert_eq!(dropped, []);
+    }
+}
+
+#[test]
+fn empty_session_id_is_rejected() {
     let engine = [
-        pair("WINEPREFIX", &inside),
+        pair("WINEPREFIX", PREFIX_DIR),
+        pair("APPLEJACK_SESSION", ""),
+    ];
+    let error = assemble(&[], &[], &engine, &roots()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::MissingEngineVariable {
+                name: "APPLEJACK_SESSION",
+                rejected: Some(DropReason::Empty)
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("rejected value: empty"),
+        "{error}"
+    );
+
+    // A good engine value is kept when a later engine value is rejected;
+    // the rejection is reported, not the launch refused.
+    let engine = [
+        pair("WINEPREFIX", PREFIX_DIR),
         pair("APPLEJACK_SESSION", SESSION),
+        pair("APPLEJACK_SESSION", ""),
     ];
     let (env, dropped) = assemble(&[], &[], &engine, &roots()).unwrap();
     assert_eq!(
         env,
         [
-            pair("WINEPREFIX", &inside),
+            pair("WINEPREFIX", PREFIX_DIR),
             pair("APPLEJACK_SESSION", SESSION)
         ]
     );
-    assert_eq!(dropped, []);
+    assert_eq!(
+        dropped,
+        [drop_of(
+            "APPLEJACK_SESSION",
+            DropReason::Empty,
+            Owner::Engine
+        )]
+    );
 }
 
 #[test]
 fn missing_required_engine_variable_is_an_error() {
     let base = [pair("PATH", "/usr/bin"), pair("WINEPREFIX", PREFIX_DIR)];
-    // A host WINEPREFIX does not count: only the engine may set it.
+    // A host WINEPREFIX does not count: only the engine may set it, and the
+    // host value's rejection is not what the error reports.
     let error = assemble(&base, &[], &[], &roots()).unwrap_err();
     assert!(
-        matches!(error, Error::MissingEngineVariable { name: "WINEPREFIX" }),
+        matches!(
+            error,
+            Error::MissingEngineVariable {
+                name: "WINEPREFIX",
+                rejected: None
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("did not set the required launch variable WINEPREFIX"),
         "{error}"
     );
-    assert!(error.to_string().contains("WINEPREFIX"), "{error}");
 
     let engine = [pair("WINEPREFIX", PREFIX_DIR)];
     let error = assemble(&base, &[], &engine, &roots()).unwrap_err();
@@ -362,10 +445,11 @@ fn missing_required_engine_variable_is_an_error() {
         matches!(
             error,
             Error::MissingEngineVariable {
-                name: "APPLEJACK_SESSION"
+                name: "APPLEJACK_SESSION",
+                rejected: None
             }
         ),
-        "{error}"
+        "{error:?}"
     );
 
     let (env, _) = assemble(&base, &[], &required(PREFIX_DIR), &roots()).unwrap();

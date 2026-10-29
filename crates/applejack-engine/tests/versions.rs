@@ -37,6 +37,12 @@ fn list_counts_only_directories_with_a_descriptor() {
     let stale = layout.engine_root(rosetta()).join("10.0.5");
     fs::create_dir_all(&stale).unwrap();
     fs::create_dir_all(layout.engine_root(rosetta()).join("10.0.6/BUNDLE.toml")).unwrap();
+    // A symlink at `<version>`, even to a directory holding a bundle, is not
+    // an installed version: a launch root may not be a symlink.
+    let outside = dir.path().join("outside-bundle");
+    common::write_bundle_tree(&outside, &common::bundle_toml_for_version("10.0.7"));
+    let linked = layout.engine_root(rosetta()).join("10.0.7");
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
 
     assert_eq!(
         versions::list(&layout, rosetta()).unwrap(),
@@ -46,6 +52,7 @@ fn list_counts_only_directories_with_a_descriptor() {
     assert_eq!(removed, [version("10.0.0")]);
     assert!(stale.is_dir());
     assert!(layout.engine_root(rosetta()).join("10.0.6").is_dir());
+    assert!(linked.symlink_metadata().unwrap().is_symlink());
 
     // `remove` deletes a stale directory, so the three agree on what is
     // there: an interrupted removal can always be finished.
@@ -53,6 +60,10 @@ fn list_counts_only_directories_with_a_descriptor() {
     assert!(!stale.exists());
     versions::remove(&layout, rosetta(), &version("10.0.6"), &[]).unwrap();
     assert!(!layout.engine_root(rosetta()).join("10.0.6").exists());
+    // Removing the linked version unlinks it and leaves the target alone.
+    versions::remove(&layout, rosetta(), &version("10.0.7"), &[]).unwrap();
+    assert!(linked.symlink_metadata().is_err());
+    assert!(outside.join("BUNDLE.toml").is_file());
 }
 
 #[test]

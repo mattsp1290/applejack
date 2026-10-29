@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use applejack_manifest::Sha256;
 
+use crate::launch::env::DropReason;
 use crate::{EngineId, Version};
 
 /// Errors from engine install, validation, version management, and launch.
@@ -135,13 +136,17 @@ pub enum Error {
         reason: &'static str,
     },
 
-    /// The engine did not set a variable every launch must carry
-    /// (`WINEPREFIX`, `APPLEJACK_SESSION`), or set one that failed its
-    /// check, so the child would start without it.
-    #[error("engine did not set the required launch variable {name}")]
+    /// A variable every launch must carry (`WINEPREFIX`,
+    /// `APPLEJACK_SESSION`) has no accepted value: the engine did not set
+    /// it, or set one that failed its check, so the child would start
+    /// without it.
+    #[error("{}", required_variable_message(name, rejected.as_ref()))]
     MissingEngineVariable {
         /// The allowlist row that stayed empty.
         name: &'static str,
+        /// Why the engine's own value was dropped, when it set one; `None`
+        /// when the engine never set the variable.
+        rejected: Option<DropReason>,
     },
 
     /// Rosetta 2 is required and not installed.
@@ -167,6 +172,15 @@ pub enum Error {
     /// The engine manifest failed to parse or validate.
     #[error("engine manifest: {0}")]
     Manifest(#[from] applejack_manifest::Error),
+}
+
+fn required_variable_message(name: &str, rejected: Option<&DropReason>) -> String {
+    match rejected {
+        Some(reason) => {
+            format!("engine set the required launch variable {name} to a rejected value: {reason}")
+        }
+        None => format!("engine did not set the required launch variable {name}"),
+    }
 }
 
 impl Error {

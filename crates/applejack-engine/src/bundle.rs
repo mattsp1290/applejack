@@ -422,11 +422,11 @@ impl InstalledEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NotInstalled`] when the directory is absent or holds
-    /// no `BUNDLE.toml`, else the load error.
+    /// Returns [`Error::NotInstalled`] when the directory is absent, is a
+    /// symlink, or holds no `BUNDLE.toml`, else the load error.
     pub fn open(layout: &EngineLayout, id: EngineId, version: &Version) -> Result<Self> {
         let root = layout.engine_dir(id, version);
-        if !root.is_dir() || !has_descriptor(&root) {
+        if !is_bundle_dir(&root) {
             return Err(Error::NotInstalled {
                 id,
                 version: version.clone(),
@@ -541,14 +541,15 @@ impl InstallRequest {
 
 /// Installs an engine bundle, reporting [`Progress`] as it goes:
 ///
-/// 1. refuses when `engines/<id>/<version>/` already holds a bundle (a
-///    regular `BUNDLE.toml`); a stale directory or link without one, left
-///    by an interrupted removal, is removed instead;
+/// 1. refuses when `engines/<id>/<version>/` already holds a bundle (a real
+///    directory with a regular `BUNDLE.toml`);
 /// 2. opens the archive once, hashes it, and refuses on mismatch, leaving
-///    the archive as is;
-/// 3. replaces a stale `engines/<id>/<version>.partial` (file or directory)
-///    and extracts the same open archive into it, refusing any entry that
-///    escapes the root or links outside it;
+///    the archive as is; nothing on disk has been touched yet;
+/// 3. removes a stale `engines/<id>/<version>` without a bundle (a
+///    directory, file, or symlink left by an interrupted removal or placed
+///    by hand) and a stale `engines/<id>/<version>.partial`, then extracts
+///    the same open archive into a fresh `.partial`, refusing any entry
+///    that escapes the root or links outside it;
 /// 4. loads and validates `BUNDLE.toml`, checking it names `id` and
 ///    `version` and, when the request came from a manifest entry, that the
 ///    entry's `id` and `sha256` match the request and its `arch`,
@@ -572,14 +573,11 @@ pub fn install(
 ) -> Result<InstalledEngine> {
     let (id, version) = (request.id, &request.version);
     let final_dir = layout.engine_dir(id, version);
-    if fs::symlink_metadata(&final_dir).is_ok() {
-        if final_dir.is_dir() && has_descriptor(&final_dir) {
-            return Err(Error::AlreadyInstalled {
-                id,
-                version: version.clone(),
-            });
-        }
-        remove_stale(&final_dir)?;
+    if is_bundle_dir(&final_dir) {
+        return Err(Error::AlreadyInstalled {
+            id,
+            version: version.clone(),
+        });
     }
     let ArchiveSource::LocalFile(archive) = &request.source;
     progress(Progress::Verifying);
@@ -596,6 +594,9 @@ pub fn install(
     }
     file.rewind().map_err(|error| Error::io(archive, error))?;
 
+    // Nothing is removed before the archive verifies, so a request that
+    // fails its hash has no side effects.
+    remove_stale(&final_dir)?;
     let partial = layout.partial_dir(id, version);
     remove_stale(&partial)?;
     fs::create_dir_all(&partial).map_err(|error| Error::io(&partial, error))?;
@@ -643,7 +644,7 @@ fn extract_and_validate(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<BundleToml> {
     progress(Progress::Extracting);
-    let decoder = zstd::stream::read::Decoder::new(io::BufReader::new(file))
+    let decoder = zstd::stream::read::Decoder::with_buffer(io::BufReader::new(file))
         .map_err(|error| Error::io(archive, error))?;
     let mut tar = tar::Archive::new(decoder);
     tar.set_preserve_permissions(true);
@@ -687,7 +688,7 @@ fn extract_and_validate(
 
     progress(Progress::Validating);
     links_resolve_inside(partial)?;
-    if !has_descriptor(partial) {
+    if !is_bundle_dir(partial) {
         return Err(Error::InvalidArchive(
             "archive has no BUNDLE.toml at its root; entries must not be nested under a top-level directory"
                 .to_owned(),
@@ -708,10 +709,16 @@ fn extract_and_validate(
     Ok(bundle)
 }
 
-/// True when `dir` holds a regular `BUNDLE.toml`: the one definition of an
-/// occupied `<version>/` directory shared by install, open, list, and remove.
-pub(crate) fn has_descriptor(dir: &Path) -> bool {
-    fs::symlink_metadata(dir.join(BUNDLE_FILE)).is_ok_and(|meta| meta.is_file())
+/// True when `dir` is a real directory (not a symlink to one) holding a
+/// regular `BUNDLE.toml`: the one definition of an installed `<version>/`
+/// shared by [`install`], [`InstalledEngine::open`], and
+/// [`crate::versions::list`]. A symlink at `<version>` is never a bundle: it
+/// is not listed, does not open, and `install` replaces the link (not its
+/// target), which is what a launch would refuse anyway since an engine root
+/// may not be a symlink.
+pub(crate) fn is_bundle_dir(dir: &Path) -> bool {
+    fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir())
+        && fs::symlink_metadata(dir.join(BUNDLE_FILE)).is_ok_and(|meta| meta.is_file())
 }
 
 /// Walks the extracted tree and refuses any symlink that does not resolve to
@@ -724,7 +731,9 @@ pub(crate) fn has_descriptor(dir: &Path) -> bool {
 /// intermediate path to stay inside `root`, so a target that climbs out and
 /// back in (`a/../<version>.partial/f`, which would point at a sibling once
 /// the directory is renamed) is refused along with dangling and looping
-/// links.
+/// links. The kernel must agree: a link the walk accepts but `canonicalize`
+/// cannot follow (a chain longer than the host allows) is refused too, so
+/// an installed bundle never holds a link that does not resolve.
 fn links_resolve_inside(root: &Path) -> Result<()> {
     let root = fs::canonicalize(root).map_err(|error| Error::io(root, error))?;
     let mut stack = vec![root.clone()];
@@ -734,7 +743,7 @@ fn links_resolve_inside(root: &Path) -> Result<()> {
             let path = entry.path();
             let kind = entry.file_type().map_err(|error| Error::io(&path, error))?;
             if kind.is_symlink() {
-                if !link_resolves_inside(&root, &path) {
+                if !link_resolves_inside(&root, &path) || fs::canonicalize(&path).is_err() {
                     return Err(Error::InvalidArchive(format!(
                         "symlink `{}` does not resolve inside the bundle",
                         path.strip_prefix(&root).unwrap_or(&path).display()
@@ -750,9 +759,12 @@ fn links_resolve_inside(root: &Path) -> Result<()> {
 
 /// Follows the symlink at `link` (whose parent is a real directory under the
 /// canonical `root`) one component at a time. Nested symlinks are followed
-/// in place, up to a fixed hop budget so a loop terminates.
+/// in place, counting every link met in one lookup (`link` itself included)
+/// against the macOS limit of 32 (`MAXSYMLINKS`, past which the kernel
+/// fails the lookup with `ELOOP`), so a loop terminates and a chain the
+/// walk accepts also resolves on the host.
 fn link_resolves_inside(root: &Path, link: &Path) -> bool {
-    const MAX_HOPS: usize = 40;
+    const MAX_LINKS: usize = 32;
     let Some(mut current) = link.parent().map(Path::to_path_buf) else {
         return false;
     };
@@ -760,7 +772,7 @@ fn link_resolves_inside(root: &Path, link: &Path) -> bool {
         return false;
     };
     let mut pending: Vec<PathBuf> = vec![target];
-    let mut hops = 0;
+    let mut links = 1;
     while let Some(target) = pending.pop() {
         let mut components = target.components();
         let Some(component) = components.next() else {
@@ -781,11 +793,11 @@ fn link_resolves_inside(root: &Path, link: &Path) -> bool {
                     return false;
                 };
                 if meta.is_symlink() {
-                    hops += 1;
+                    links += 1;
                     let Ok(nested) = fs::read_link(&next) else {
                         return false;
                     };
-                    if hops > MAX_HOPS || nested.is_absolute() {
+                    if links > MAX_LINKS || nested.is_absolute() {
                         return false;
                     }
                     // Resolve the nested target before the rest of this one.

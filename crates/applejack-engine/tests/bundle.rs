@@ -227,6 +227,11 @@ fn hash_is_checked_before_extraction() {
     let partial = layout.partial_dir(id, &v);
     fs::create_dir_all(&partial).unwrap();
     fs::write(partial.join("stale-marker"), b"x").unwrap();
+    // A stale `<version>/` (no descriptor) is removed only once the archive
+    // verifies, so a failed request has no side effects.
+    let stale = layout.engine_dir(id, &v);
+    fs::create_dir_all(&stale).unwrap();
+    fs::write(stale.join("leftover"), b"x").unwrap();
     let archive = dir.path().join("garbage.tar.zst");
     fs::write(&archive, b"not zstd").unwrap();
 
@@ -242,8 +247,58 @@ fn hash_is_checked_before_extraction() {
         partial.join("stale-marker").is_file(),
         "nothing touched before the hash check"
     );
-    assert!(!layout.engine_dir(id, &v).exists(), "no version directory");
+    assert!(stale.join("leftover").is_file(), "stale directory kept");
     assert_eq!(fs::read(&archive).unwrap(), b"not zstd", "archive kept");
+}
+
+/// A chain of `n` nested links under `top`, so a lookup of `top` meets
+/// `n + 1` links: `top -> h<n-1> -> ... -> h0 -> BUNDLE.toml`.
+fn link_chain(n: usize) -> Vec<(String, String)> {
+    let mut links = vec![("h0".to_owned(), "BUNDLE.toml".to_owned())];
+    links.extend((1..n).map(|i| (format!("h{i}"), format!("h{}", i - 1))));
+    links.push(("top".to_owned(), format!("h{}", n - 1)));
+    links
+}
+
+#[test]
+fn install_refuses_symlink_chains_beyond_the_kernel_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    // macOS resolves at most 32 links in one lookup (`MAXSYMLINKS`).
+    for (n, resolves) in [(31, true), (32, false)] {
+        let v = version(&format!("10.0.{n}"));
+        let tree = dir.path().join(format!("tree-{n}"));
+        write_bundle_tree(
+            &tree,
+            &common::bundle_toml_for_version(&format!("10.0.{n}")),
+        );
+        let archive = dir.path().join(format!("chain-{n}.tar.zst"));
+        let chain = link_chain(n);
+        let links: Vec<(&str, &str)> = chain
+            .iter()
+            .map(|(path, target)| (path.as_str(), target.as_str()))
+            .collect();
+        let digest = common::pack_with_links(&tree, &archive, &links);
+
+        let result = install_local(&layout, &v, &archive, &digest);
+        if resolves {
+            let installed = result.unwrap();
+            let top = fs::canonicalize(installed.root.join("top")).unwrap();
+            assert_eq!(
+                top,
+                fs::canonicalize(installed.root.join("BUNDLE.toml")).unwrap()
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidArchive(_)), "{n}: {error}");
+            assert!(
+                error.to_string().contains("does not resolve inside"),
+                "{n}: {error}"
+            );
+            assert!(!layout.partial_dir(rosetta(), &v).exists(), "{n}");
+            assert!(!layout.engine_dir(rosetta(), &v).exists(), "{n}");
+        }
+    }
 }
 
 #[test]
@@ -462,6 +517,22 @@ fn install_replaces_stale_version_directory() {
     install_local(&layout, &v, &archive, &digest).unwrap();
     assert!(final_dir.is_dir());
     assert!(!final_dir.symlink_metadata().unwrap().is_symlink());
+
+    // Nor is a link to a directory that holds a valid bundle: `open` and
+    // `install` agree with `list`, and only the link is replaced.
+    fs::remove_dir_all(&final_dir).unwrap();
+    let outside = dir.path().join("outside-bundle");
+    write_bundle_tree(&outside, common::BUNDLE_TOML);
+    std::os::unix::fs::symlink(&outside, &final_dir).unwrap();
+    let error = InstalledEngine::open(&layout, rosetta(), &v).unwrap_err();
+    assert!(matches!(error, Error::NotInstalled { .. }), "{error}");
+    install_local(&layout, &v, &archive, &digest).unwrap();
+    assert!(!final_dir.symlink_metadata().unwrap().is_symlink());
+    assert!(
+        outside.join("BUNDLE.toml").is_file(),
+        "link target untouched"
+    );
+    InstalledEngine::open(&layout, rosetta(), &v).unwrap();
 }
 
 #[test]
@@ -596,6 +667,16 @@ fn install_from_manifest_cross_checks_descriptor() {
     let bad = manifest_entry("10.0.0-RC1", &digest);
     let error = InstallRequest::from_manifest(&bad, request.source().clone()).unwrap_err();
     assert!(matches!(error, Error::InvalidVersion { .. }), "{error}");
+}
+
+#[test]
+fn install_request_rejects_unknown_engine_id() {
+    let mut bad = manifest_entry("10.0.0", &wrong_digest());
+    bad.id = "proton".to_owned();
+    let source = ArchiveSource::LocalFile(std::path::PathBuf::from("/nonexistent.tar.zst"));
+    let error = InstallRequest::from_manifest(&bad, source).unwrap_err();
+    assert!(matches!(error, Error::UnknownEngineId(_)), "{error}");
+    assert!(error.to_string().contains("proton"), "{error}");
 }
 
 #[test]

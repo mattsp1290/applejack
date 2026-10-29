@@ -442,8 +442,9 @@ pub trait Engine {
     /// `layout`, after the engine's own checks against `host`. Same shape as
     /// [`bundle::install`], which does the bundle part. Writes only
     /// `engines/<id>/<version>.download` and under
-    /// `engines/<id>/<version>.partial/` until the final rename, and never
-    /// touches another version.
+    /// `engines/<id>/<version>.partial/` until the final rename, apart from
+    /// removing a stale `engines/<id>/<version>` that holds no bundle once
+    /// the archive has verified, and never touches another version.
     ///
     /// `rosetta-wine` refuses with [`Error::RosettaMissing`] when
     /// `host.rosetta_present == Some(false)` and proceeds when it is `None`:
@@ -548,6 +549,10 @@ mod tests {
         assert!(matches!(
             "fsync".parse::<SyncMode>().unwrap_err(),
             Error::UnknownSyncMode(_)
+        ));
+        assert!(matches!(
+            "wine".parse::<EngineId>().unwrap_err(),
+            Error::UnknownEngineId(_)
         ));
     }
 

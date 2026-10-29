@@ -9,6 +9,7 @@
 //! symlink such as the prefix's `dosdevices/z:` cannot lead outside a root.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -19,8 +20,14 @@ use crate::{EnvPair, Error, Result};
 pub enum Kind {
     /// Any value.
     Plain,
+    /// Any non-empty value.
+    NonEmpty,
     /// One absolute path inside one of the row's roots.
     Path,
+    /// One absolute path that resolves to the prefix directory itself
+    /// ([`AllowedRoots::prefix_dir`]), not merely inside it: Wine would
+    /// create a fresh prefix at any other path.
+    PrefixDir,
     /// Colon-separated absolute paths, each inside one of the row's roots.
     PathList,
 }
@@ -90,8 +97,9 @@ pub struct Entry {
     pub kind: Kind,
     /// Who may set it.
     pub owner: Owner,
-    /// Roots a [`Kind::Path`] or [`Kind::PathList`] value may point into;
-    /// [`RootSet::NONE`] for [`Kind::Plain`].
+    /// Roots a [`Kind::Path`], [`Kind::PrefixDir`], or [`Kind::PathList`]
+    /// value may point into; [`RootSet::NONE`] for [`Kind::Plain`] and
+    /// [`Kind::NonEmpty`].
     pub roots: RootSet,
     /// The variable must be present after every launch's tiers are applied;
     /// [`assemble`] fails when it is not. Only engine-owned rows are
@@ -110,13 +118,31 @@ const fn plain(name: &'static str, owner: Owner) -> Entry {
 }
 
 /// The variables a launched process may receive, in output order.
+///
+/// | Variable | Owner | Check | Roots | Required |
+/// | --- | --- | --- | --- | --- |
+/// | `PATH`, `HOME`, `TMPDIR` | host | any value | | |
+/// | `WINEPREFIX` | engine | one absolute path resolving to the prefix directory itself | prefix | yes |
+/// | `WINEDEBUG` | game | any value | | |
+/// | `WINEDLLOVERRIDES`, `WINEMSYNC`, `WINEESYNC` | engine | any value | | |
+/// | `DXMT_CONFIG` | game | any value (inline `key=value;` options) | | |
+/// | `DXMT_CONFIG_FILE` | game | one absolute path | engine, overlay, prefix | |
+/// | `DXMT_LOG_LEVEL`, `MTL_HUD_ENABLED`, `ROSETTA_ADVERTISE_AVX` | game | any value | | |
+/// | `GST_PLUGIN_PATH` | game | colon-separated absolute paths | engine, overlay, prefix | |
+/// | `APPLEJACK_SESSION` | engine | any non-empty value | | yes |
+/// | `VK_ICD_FILENAMES` | game | colon-separated absolute paths | engine, overlay, prefix | |
+///
+/// `WINEARCH` is not a row: the prefix architecture is fixed by the loader
+/// (a 64-bit `wine` creates a `win64` prefix, and the variable only forces
+/// a 32-bit one, which no engine creates), so prefix creation runs
+/// `wineboot` through [`assemble`] like any launch.
 pub const ALLOWLIST: &[Entry] = &[
     plain("PATH", Owner::Host),
     plain("HOME", Owner::Host),
     plain("TMPDIR", Owner::Host),
     Entry {
         name: "WINEPREFIX",
-        kind: Kind::Path,
+        kind: Kind::PrefixDir,
         owner: Owner::Engine,
         roots: RootSet::PREFIX,
         required: true,
@@ -147,7 +173,7 @@ pub const ALLOWLIST: &[Entry] = &[
     },
     Entry {
         name: "APPLEJACK_SESSION",
-        kind: Kind::Plain,
+        kind: Kind::NonEmpty,
         owner: Owner::Engine,
         roots: RootSet::NONE,
         required: true,
@@ -288,14 +314,36 @@ pub enum DropReason {
     /// The tier that supplied the value is not allowed to set this variable
     /// (see [`Owner`]).
     NotOwner,
-    /// A path-valued variable is not absolute, contains `..`, or resolves
-    /// outside every root its row accepts.
+    /// A path-valued variable is not absolute, contains `..`, resolves
+    /// outside every root its row accepts, or (for [`Kind::PrefixDir`]) is
+    /// not the prefix directory.
     OutsideRoots {
         /// The rejected value.
         value: OsString,
     },
     /// An earlier value of the same name was overridden by a later one.
     Superseded,
+    /// A [`Kind::NonEmpty`] variable is empty.
+    Empty,
+}
+
+impl fmt::Display for DropReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAllowlisted => f.write_str("not in the allowlist"),
+            Self::Dyld => f.write_str("DYLD_ variables are never passed"),
+            Self::NotOwner => f.write_str("set by a tier that does not own the variable"),
+            Self::OutsideRoots { value } => {
+                write!(
+                    f,
+                    "`{}` fails the row's path check",
+                    Path::new(value).display()
+                )
+            }
+            Self::Superseded => f.write_str("superseded by a later tier"),
+            Self::Empty => f.write_str("empty"),
+        }
+    }
 }
 
 /// A variable that did not make it into the child environment.
@@ -328,8 +376,10 @@ pub struct Dropped {
 /// Returns [`Error::MissingEngineVariable`] when a required row
 /// (`WINEPREFIX`, `APPLEJACK_SESSION`) has no accepted value after the
 /// tiers are applied: the engine did not set it, or set a value that failed
-/// its check. Without `WINEPREFIX` Wine would use `~/.wine`; without the
-/// session id process discovery finds nothing.
+/// its check, in which case the error carries the [`DropReason`] of the
+/// engine's last value. Without `WINEPREFIX` Wine would use `~/.wine`, and
+/// with one other than the prefix directory it would create a prefix there;
+/// without the session id process discovery finds nothing.
 pub fn assemble(
     base: &[EnvPair],
     extras: &[EnvPair],
@@ -371,7 +421,15 @@ pub fn assemble(
         .find(|(entry, value)| entry.required && value.is_none())
         .map(|(entry, _)| entry)
     {
-        return Err(Error::MissingEngineVariable { name: entry.name });
+        let rejected = dropped
+            .iter()
+            .rev()
+            .find(|drop| drop.from == Owner::Engine && drop.name == entry.name)
+            .map(|drop| drop.reason.clone());
+        return Err(Error::MissingEngineVariable {
+            name: entry.name,
+            rejected,
+        });
     }
 
     let accepted = ALLOWLIST
@@ -402,9 +460,17 @@ fn classify(
     if !entry.owner.accepts(from) {
         return Err(DropReason::NotOwner);
     }
+    if entry.kind == Kind::NonEmpty && value.is_empty() {
+        return Err(DropReason::Empty);
+    }
     let inside = match entry.kind {
-        Kind::Plain => true,
+        Kind::Plain | Kind::NonEmpty => true,
         Kind::Path => is_inside(Path::new(value), roots, entry.roots),
+        Kind::PrefixDir => {
+            let path = Path::new(value);
+            is_inside(path, roots, entry.roots)
+                && resolve(path).as_deref() == Some(roots.prefix_dir())
+        }
         Kind::PathList => {
             let paths: Vec<&Path> = value
                 .to_str()

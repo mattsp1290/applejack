@@ -26,13 +26,19 @@ pub struct LaunchSpec {
 }
 
 /// A running launch. `processes()` and cancellation arrive with the
-/// `rosetta-wine` unit.
+/// `rosetta-wine` unit; cancellation runs `<server> -k` against
+/// `prefix_dir`, so the session carries both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     /// Value of `APPLEJACK_SESSION` in every process of the launch.
     pub id: String,
     /// Pid of the loader process.
     pub pid: u32,
+    /// Absolute path of the bundle's `wineserver` (`InstalledEngine::root`
+    /// joined with `wine.server`), for `<server> -k`.
+    pub server: PathBuf,
+    /// The `WINEPREFIX` the launch used; `<server> -k` must target it.
+    pub prefix_dir: PathBuf,
     /// `<log_dir>/wine.log` for this session.
     pub log_path: PathBuf,
 }
