@@ -168,11 +168,52 @@ APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example auth_spike
 APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example auth_spike -- --credentials
 ```
 
-QR mode prints the challenge URL; render it with any QR tool and scan it with
-the Steam mobile app. Credentials mode reads the account name from stdin and
-the password from the terminal without echo (`rpassword`). The spike stores the
-refresh token in an `InMemoryStore`, logs on again with it, decodes the license
-list, prints the license count and crate versions, and never prints the token.
+Use `--credentials` as the primary G2 mode. QR mode prints the challenge URL
+to render with any QR tool and scan with the Steam mobile app, but
+`steamroom` 0.3.0 ignores the `new_client_id` and `new_challenge_url` fields
+of `CAuthentication_PollAuthSessionStatus_Response`
+(`steamroom-0.3.0/src/client/mod.rs:470-496`), so when the QR challenge
+rotates the printed URL goes stale and the poll keeps running with the old
+id; scan within about 30 s or fall back to `--credentials`. Credentials mode
+reads the account name from stdin and the password from the terminal without
+echo (`rpassword`). The spike stores the refresh token in an `InMemoryStore`,
+logs on again with it, prints the heartbeat interval from the logon response,
+decodes the license list, prints the license count and crate versions, and
+never prints the token.
+
+### Reading the result
+
+- `login ok`, `refresh logon ok`, `licenses on account: N` with `N >= 1`, and
+  `gate G2: green`: green. A logged-on account always holds package 0, so the
+  spike prints a warning instead of the green line when the list is empty;
+  that is a decode problem to fix, not a red result.
+- A failure before `refresh logon ok` (auth, Steam Guard, rate limit,
+  `CMsgClientLogonResponse` eresult): the real red case. Rate limits and
+  Steam Guard surface as typed errors; retry after the floor or complete the
+  factor rather than counting them as red.
+- `refresh logon ok` followed by `timed out waiting for CLIENT_LICENSE_LIST`:
+  **not red**. This is the known MULTI-drain behaviour of
+  `SteamClient<Ready>::login` (`steamroom-0.3.0/src/client/mod.rs:286-350`):
+  it returns on the first `CLIENT_LOG_ON_RESPONSE`, discards every other
+  message in the same `MULTI`, and the `Receiver` from `SteamClient::connect`
+  is dead on arrival (`mod.rs:97-118`). The CM normally sends the logon
+  response as its own packet and the license list in a later `MULTI`, which
+  `license_list` unpacks, but that is server behaviour, not a contract.
+  Fallback order:
+  1. For the spike: a hand-rolled logon on `SteamClient<Ready>` with
+     `send_msg(ClientMsg::with_body(EMsg::CLIENT_LOGON, ..))` and a
+     `recv_msg` loop that unpacks `MULTI` and captures both
+     `CLIENT_LOG_ON_RESPONSE` (check `CMsgClientLogonResponse.eresult`, read
+     `steamid`/`client_sessionid` from the header) and `CLIENT_LICENSE_LIST`.
+     That proves the decode and keeps the Rust path green. Its limit: it never
+     yields `SteamClient<LoggedIn>`, so `pics_get_*` (all on `LoggedIn`,
+     `mod.rs:578-731`) are unavailable on that connection.
+  2. The durable fix is upstream: a `login` variant that returns the drained
+     sibling messages (or a receive buffer in `ClientInner`), applied through
+     `[patch.crates-io]` on a fork. A second connection per run is the only
+     alternative and doubles Steam Guard and rate-limit exposure.
+  3. `steam-vent` becomes relevant only if the hand-rolled loop also never
+     sees `CLIENT_LICENSE_LIST`.
 
 Record the outcome here:
 
@@ -199,9 +240,11 @@ real ones are listed in the unit report's DEVIATIONS.
 | (wrapper used) | `poll_until_tokens` (via `wait_for_scan`, `wait_for_confirmation`, `submit_code`) | `steamroom-client-0.3.0/src/login/credentials.rs:226` |
 | Steam Guard submit | `SteamClient<Ready>::submit_steam_guard_code` | `steamroom-0.3.0/src/client/mod.rs:499` |
 | (wrapper used) | `GuardChallenge::submit_code`, `MobileChallenge::wait_for_confirmation` | `steamroom-client-0.3.0/src/login/credentials.rs:167,207` |
-| tokens after approval | `ApprovedAuth::tokens` → `steamroom::auth::AuthTokens { access_token, refresh_token, account_name }` | `steamroom-client-0.3.0/src/login/terminal.rs:83`, `steamroom-0.3.0/src/auth/mod.rs:22` |
+| tokens after approval | `ApprovedAuth::tokens` → `steamroom::auth::AuthTokens { access_token, refresh_token, account_name }` | `steamroom-client-0.3.0/src/login/terminal.rs:83`, `steamroom-0.3.0/src/auth/mod.rs:23` (line 22 is its `#[non_exhaustive]`) |
 | refresh-token logon | `SteamClient<Ready>::login(ClientMsg)` with `CMsgClientLogon { account_name, access_token, obfuscated_private_ip, .. }` | `steamroom-0.3.0/src/client/mod.rs:286`; proto `steammessages_clientserver_login.proto` (`account_name`=50, `access_token`=108, `obfuscated_private_ip`=11) |
-| (reference) | `TokenLogin::login` builds the same message without a logon id | `steamroom-client-0.3.0/src/login/terminal.rs:55` |
+| (reference) | `TokenLogin::login` builds the same message without a logon id and without `supports_rate_limit_response`, both of which applejack adds | `steamroom-client-0.3.0/src/login/terminal.rs:55` |
+| logon response | `CMsgClientLogonResponse { eresult, heartbeat_seconds, .. }` from the `IncomingMsg` that `login` returns; `SteamClient<LoggedIn>::send_heartbeat` | proto `steammessages_clientserver_login.proto:97`; `steamroom-0.3.0/src/client/mod.rs:289,537` |
+| license-list result | `CMsgClientLicenseList.eresult` (`optional int32`, default 2) checked through `steamroom::enums::eresult` | `steamroom-0.3.0/proto/steam/steammessages_clientserver.proto:188`; `src/enums/mod.rs:79` |
 | PICS access tokens | `SteamClient<LoggedIn>::pics_get_access_tokens` | `steamroom-0.3.0/src/client/mod.rs:578` |
 | PICS product info | `SteamClient<LoggedIn>::pics_get_product_info` | `steamroom-0.3.0/src/client/mod.rs:625` |
 | PICS package access tokens | `SteamClient<LoggedIn>::pics_get_package_access_tokens` | `steamroom-0.3.0/src/client/mod.rs:681` |

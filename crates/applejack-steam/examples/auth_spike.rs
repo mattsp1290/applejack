@@ -95,7 +95,15 @@ async fn run(mode: AuthMode) -> Result<(), Box<dyn std::error::Error>> {
     }
     let licenses = connection.license_list().await?;
     println!("licenses on account: {}", licenses.len());
-    println!("gate G2: green (record this in docs/steam-layer.md)");
+    if licenses.is_empty() {
+        // A logged-on account always holds package 0, so an empty list means
+        // the decode went wrong even though the eresult passed.
+        println!(
+            "warning: the license list is empty; a logged-on account always holds package 0, so this is not green (raw count 0)"
+        );
+    } else {
+        println!("gate G2: green (record this in docs/steam-layer.md)");
+    }
     Ok(())
 }
 

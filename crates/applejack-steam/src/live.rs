@@ -320,6 +320,8 @@ impl SteamConnection for SteamroomConnection {
 fn decode_license_list(body: &[u8]) -> Result<Vec<License>, AuthError> {
     let list = CMsgClientLicenseList::decode(body)
         .map_err(|error| AuthError::Connection(format!("CMsgClientLicenseList: {error}")))?;
+    // The proto default for a missing eresult is 2 (Fail).
+    steamroom::enums::eresult(list.eresult.unwrap_or(2)).map_err(map_eresult)?;
     Ok(list
         .licenses
         .iter()
