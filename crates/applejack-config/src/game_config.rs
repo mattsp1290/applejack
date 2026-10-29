@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -134,9 +135,11 @@ named_enum!(SyncMode);
 named_enum!(LaunchMode);
 
 /// One `game_config` row. Every column is optional because a row only
-/// records what the user or a preset set; `resolve` fills the rest.
+/// records what the user or a preset set; `resolve` fills the rest. A key
+/// that is not a column fails to parse, so a preset typo is reported rather
+/// than silently dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GameConfig {
     pub engine_id: Option<String>,
     pub engine_version: Option<String>,
@@ -187,7 +190,8 @@ struct FieldSpec {
 }
 
 /// The field table. `config set` can only write a column that has a row here,
-/// and the SQL column list is derived from it so the two cannot drift.
+/// and `SELECT_SQL` and `UPSERT_SQL` list its names in this order, which
+/// `RawRow` reads back positionally.
 const FIELDS: [FieldSpec; 16] = [
     FieldSpec {
         name: "engine_id",
@@ -440,20 +444,21 @@ impl GameConfig {
     }
 }
 
-/// Engine ids and versions become directory names under `engines/`, so they
-/// are limited to a charset that cannot traverse or hide.
+/// Engine ids and versions become directory names under `engines/` and argv
+/// tokens for tools, so they are limited to a charset that cannot traverse,
+/// hide, or read as a flag.
 fn identifier(value: &str) -> Result<Option<String>, String> {
     if value.is_empty() {
         return Ok(None);
     }
-    let safe = !value.starts_with('.')
+    let safe = !value.starts_with(['.', '-'])
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if safe {
         Ok(Some(value.to_owned()))
     } else {
-        Err("expected letters, digits, '.', '_' or '-', not starting with '.'".to_owned())
+        Err("expected letters, digits, '.', '_' or '-', not starting with '.' or '-'".to_owned())
     }
 }
 
@@ -515,27 +520,31 @@ pub(crate) fn check_env_name(name: &str) -> Result<(), String> {
     }
 }
 
-const UPSERT_SQL: &str = "INSERT INTO game_config (appid, \
-     engine_id, engine_version, graphics_backend, sync_mode, hidraw_enabled, steam_input, \
-     steam_overlay, rosetta_advertise_avx, extra_env, launch_mode, launch_exe_override, \
-     launch_args_override, direct_verified_at, isolated_prefix, dx12_expectation, notes) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
-     ON CONFLICT(appid) DO UPDATE SET \
-     engine_id = excluded.engine_id, engine_version = excluded.engine_version, \
-     graphics_backend = excluded.graphics_backend, sync_mode = excluded.sync_mode, \
-     hidraw_enabled = excluded.hidraw_enabled, steam_input = excluded.steam_input, \
-     steam_overlay = excluded.steam_overlay, rosetta_advertise_avx = excluded.rosetta_advertise_avx, \
-     extra_env = excluded.extra_env, launch_mode = excluded.launch_mode, \
-     launch_exe_override = excluded.launch_exe_override, \
-     launch_args_override = excluded.launch_args_override, \
-     direct_verified_at = excluded.direct_verified_at, isolated_prefix = excluded.isolated_prefix, \
-     dx12_expectation = excluded.dx12_expectation, notes = excluded.notes";
+/// Column lists derived from `FIELDS`, so the SQL cannot drift from the table.
+static UPSERT_SQL: LazyLock<String> = LazyLock::new(|| {
+    let names = Field::names();
+    let placeholders = (2..=names.len() + 1)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let updates = names
+        .iter()
+        .map(|name| format!("{name} = excluded.{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO game_config (appid, {}) VALUES (?1, {placeholders}) \
+         ON CONFLICT(appid) DO UPDATE SET {updates}",
+        names.join(", ")
+    )
+});
 
-const SELECT_SQL: &str = "SELECT \
-     engine_id, engine_version, graphics_backend, sync_mode, hidraw_enabled, steam_input, \
-     steam_overlay, rosetta_advertise_avx, extra_env, launch_mode, launch_exe_override, \
-     launch_args_override, direct_verified_at, isolated_prefix, dx12_expectation, notes \
-     FROM game_config WHERE appid = ?1";
+static SELECT_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {} FROM game_config WHERE appid = ?1",
+        Field::names().join(", ")
+    )
+});
 
 impl ConfigDb {
     /// The stored configuration for `appid`, or `None` when no row exists.
@@ -548,7 +557,7 @@ impl ConfigDb {
     pub fn game_config(&self, appid: u32) -> Result<Option<GameConfig>, Error> {
         let row: Option<RawRow> = self
             .conn
-            .query_row(SELECT_SQL, [appid], |row| {
+            .query_row(&SELECT_SQL, [appid], |row| {
                 Ok(RawRow {
                     engine_id: row.get(0)?,
                     engine_version: row.get(1)?,
@@ -580,33 +589,37 @@ impl ConfigDb {
     /// `extra_env` cannot be encoded.
     pub fn set_game_config(&self, appid: u32, config: &GameConfig) -> Result<(), Error> {
         let extra_env = serde_json::to_string(&config.extra_env)?;
-        self.conn.execute(
-            UPSERT_SQL,
-            params![
-                appid,
-                config.engine_id,
-                config.engine_version,
-                config.graphics_backend.map(GraphicsBackend::as_str),
-                config.sync_mode.map(SyncMode::as_str),
-                config.hidraw_enabled,
-                config.steam_input,
-                config.steam_overlay,
-                config.rosetta_advertise_avx,
-                extra_env,
-                config.launch_mode.map(LaunchMode::as_str),
-                config.launch_exe_override,
-                config.launch_args_override,
-                config.direct_verified_at,
-                config.isolated_prefix,
-                config.dx12_expectation,
-                config.notes,
-            ],
-        )?;
-        Ok(())
+        self.write_locked(|db| {
+            db.conn.execute(
+                &UPSERT_SQL,
+                params![
+                    appid,
+                    config.engine_id,
+                    config.engine_version,
+                    config.graphics_backend.map(GraphicsBackend::as_str),
+                    config.sync_mode.map(SyncMode::as_str),
+                    config.hidraw_enabled,
+                    config.steam_input,
+                    config.steam_overlay,
+                    config.rosetta_advertise_avx,
+                    extra_env,
+                    config.launch_mode.map(LaunchMode::as_str),
+                    config.launch_exe_override,
+                    config.launch_args_override,
+                    config.direct_verified_at,
+                    config.isolated_prefix,
+                    config.dx12_expectation,
+                    config.notes,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Parses `value` for the column named `key` and writes it, creating the
-    /// row when needed. Unknown keys and unparseable values write nothing.
+    /// row when needed, inside one write transaction so a concurrent writer
+    /// cannot interleave between the read and the write. Unknown keys and
+    /// unparseable values write nothing.
     ///
     /// # Errors
     ///
@@ -616,9 +629,11 @@ impl ConfigDb {
     /// [`ConfigDb::set_game_config`].
     pub fn set_field(&self, appid: u32, key: &str, value: &str) -> Result<(), Error> {
         let field = Field::parse(key).ok_or_else(|| Error::UnknownField(key.to_owned()))?;
-        let mut config = self.game_config(appid)?.unwrap_or_default();
-        config.set(field, value)?;
-        self.set_game_config(appid, &config)
+        self.write_locked(|db| {
+            let mut config = db.game_config(appid)?.unwrap_or_default();
+            config.set(field, value)?;
+            db.set_game_config(appid, &config)
+        })
     }
 }
 
@@ -759,7 +774,9 @@ pub(crate) mod tests {
         for (key, value) in [
             ("hidraw_enabled", "maybe"),
             ("engine_id", "../../tmp/x"),
+            ("engine_id", "-rf"),
             ("engine_version", ".hidden"),
+            ("engine_version", "-1"),
             ("engine_version", "1.0/evil"),
             ("graphics_backend", "dxvk"),
             ("sync_mode", "ntsync"),
@@ -798,6 +815,39 @@ pub(crate) mod tests {
         assert_eq!(
             db.game_config(10).unwrap().unwrap().extra_env,
             BTreeMap::from([("A".to_owned(), "1".to_owned())])
+        );
+    }
+
+    #[test]
+    fn sql_column_lists_follow_the_field_table() {
+        let names = Field::names().join(", ");
+        assert!(
+            SELECT_SQL.starts_with(&format!("SELECT {names} FROM")),
+            "{}",
+            *SELECT_SQL
+        );
+        assert!(
+            UPSERT_SQL.contains(&format!("(appid, {names})")),
+            "{}",
+            *UPSERT_SQL
+        );
+        assert!(
+            UPSERT_SQL.ends_with("notes = excluded.notes"),
+            "{}",
+            *UPSERT_SQL
+        );
+        assert!(UPSERT_SQL.contains("?17)"), "{}", *UPSERT_SQL);
+    }
+
+    #[test]
+    fn unknown_config_keys_fail_to_parse() {
+        let error = serde_json::from_str::<GameConfig>(r#"{"launch_exe_overide": "/bin/sh"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("launch_exe_overide"), "{error}");
+        assert_eq!(
+            serde_json::from_str::<GameConfig>("{}").unwrap(),
+            GameConfig::default()
         );
     }
 

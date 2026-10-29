@@ -13,7 +13,7 @@ pub mod resolve;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, ErrorCode};
+use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior};
 
 pub use apps::{AppRow, Drm};
 pub use error::Error;
@@ -94,6 +94,40 @@ impl ConfigDb {
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(names)
+    }
+
+    /// Whether a `D3DMetal` overlay has been accepted for `engine_version`,
+    /// per the `d3dmetal` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlite`] when the query fails.
+    pub fn d3dmetal_accepted(&self, engine_version: &str) -> Result<bool, Error> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM d3dmetal WHERE engine_version = ?1",
+            [engine_version],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Runs `f` inside a `BEGIN IMMEDIATE` transaction, so a read-modify-write
+    /// of one row cannot interleave with another connection's write: the
+    /// write lock is taken before the read, and a second writer waits on the
+    /// busy timeout instead of overwriting with a stale copy. An error from
+    /// `f` rolls the transaction back. Called with a transaction already
+    /// open on this connection, it runs `f` inside that transaction.
+    pub(crate) fn write_locked<T>(
+        &self,
+        f: impl FnOnce(&Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let value = f(self)?;
+        tx.commit()?;
+        Ok(value)
     }
 }
 
@@ -276,6 +310,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn concurrent_set_field_on_two_connections_keeps_every_entry() {
+        const WRITES_PER_THREAD: usize = 20;
+        let temp = TempDb::new("race");
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|thread| {
+                    let barrier = &barrier;
+                    let path = &temp.path;
+                    scope.spawn(move || {
+                        let db = ConfigDb::open(path)?;
+                        barrier.wait();
+                        for i in 0..WRITES_PER_THREAD {
+                            db.set_field(40, "extra_env", &format!("WINEDEBUG_{thread}_{i}=x"))?;
+                        }
+                        Ok::<(), Error>(())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        let db = ConfigDb::open(&temp.path).unwrap();
+        let config = db.game_config(40).unwrap().unwrap();
+        assert_eq!(
+            config.extra_env.len(),
+            2 * WRITES_PER_THREAD,
+            "lost updates: {:?}",
+            config.extra_env.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn d3dmetal_accepted_reads_the_table() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        assert!(!db.d3dmetal_accepted("1.0.0").unwrap());
+        db.conn
+            .execute(
+                "INSERT INTO d3dmetal (engine_version, accepted_at) VALUES ('1.0.0', 'now')",
+                [],
+            )
+            .unwrap();
+        assert!(db.d3dmetal_accepted("1.0.0").unwrap());
+        assert!(!db.d3dmetal_accepted("1.0.1").unwrap());
+    }
+
+    #[test]
+    fn write_locked_rolls_back_on_error_and_nests_inside_an_open_transaction() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        let error = db
+            .write_locked(|db| {
+                db.meta_set("k", "v")?;
+                Err::<(), _>(Error::InvalidSchemaVersion("x".to_owned()))
+            })
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidSchemaVersion(_)), "{error}");
+        assert_eq!(db.meta_get("k").unwrap(), None, "rolled back");
+        db.write_locked(|db| {
+            db.meta_set("k", "outer")?;
+            db.write_locked(|db| db.meta_set("k2", "inner"))
+        })
+        .unwrap();
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("outer"));
+        assert_eq!(db.meta_get("k2").unwrap().as_deref(), Some("inner"));
+        assert!(db.conn.is_autocommit(), "transaction closed");
     }
 
     #[test]

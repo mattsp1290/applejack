@@ -95,27 +95,30 @@ impl ConfigDb {
                 value: row.last_installed_buildid.unwrap_or_default().to_string(),
                 reason: "exceeds the INTEGER column range".to_owned(),
             })?;
-        self.conn.execute(
-            &format!(
-                "INSERT INTO apps ({APP_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(appid) DO UPDATE SET name = excluded.name, \
-                 installdir = excluded.installdir, drm = excluded.drm, \
-                 library_dir = excluded.library_dir, \
-                 last_installed_buildid = excluded.last_installed_buildid, \
-                 last_manifest_ids = excluded.last_manifest_ids, fetched_at = excluded.fetched_at"
-            ),
-            params![
-                row.appid,
-                row.name,
-                row.installdir,
-                row.drm.as_str(),
-                row.library_dir,
-                buildid,
-                manifest_ids,
-                row.fetched_at,
-            ],
-        )?;
-        Ok(())
+        self.write_locked(|db| {
+            db.conn.execute(
+                &format!(
+                    "INSERT INTO apps ({APP_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(appid) DO UPDATE SET name = excluded.name, \
+                     installdir = excluded.installdir, drm = excluded.drm, \
+                     library_dir = excluded.library_dir, \
+                     last_installed_buildid = excluded.last_installed_buildid, \
+                     last_manifest_ids = excluded.last_manifest_ids, \
+                     fetched_at = excluded.fetched_at"
+                ),
+                params![
+                    row.appid,
+                    row.name,
+                    row.installdir,
+                    row.drm.as_str(),
+                    row.library_dir,
+                    buildid,
+                    manifest_ids,
+                    row.fetched_at,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// The row for `appid`, or `None`.
@@ -171,12 +174,14 @@ impl ConfigDb {
     ///
     /// Returns [`Error::Sqlite`] when the write fails.
     pub fn meta_set(&self, key: &str, value: &str) -> Result<(), Error> {
-        self.conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [key, value],
-        )?;
-        Ok(())
+        self.write_locked(|db| {
+            db.conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [key, value],
+            )?;
+            Ok(())
+        })
     }
 }
 
