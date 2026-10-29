@@ -143,7 +143,7 @@ public enum RpcErrorCode: Int, Codable, Sendable, CaseIterable {
     case protocolMismatch = 1000
     case helloRequired = 1001
     case notImplemented = 1002
-    case internalFailure = 1003
+    case `internal` = 1003
     case jobFailed = 1004
 }
 

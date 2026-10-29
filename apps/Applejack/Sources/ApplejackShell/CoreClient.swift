@@ -18,10 +18,17 @@ public enum CoreClientError: Error, Equatable, Sendable {
 }
 
 /// Drives `applejack serve --stdio`: newline-delimited JSON-RPC 2.0, requests
-/// matched to responses by id, `hello` on every spawn, and at most
+/// matched to responses by id, one shared `hello` per spawn, and at most
 /// `maxRestarts` respawns after an unexpected exit.
 public actor CoreClient {
     public static let protocolVersion: UInt32 = 1
+
+    /// How long stdout is still read after the core exits, so an answer the
+    /// core wrote on its way out is not lost.
+    static let exitDrainGrace: Duration = .milliseconds(250)
+    /// How long a torn-down core may keep running after its stdin closed
+    /// before it is terminated.
+    static let terminateGrace: Duration = .seconds(2)
 
     public let executable: URL
     public let arguments: [String]
@@ -33,10 +40,15 @@ public actor CoreClient {
     private let maxRestarts: Int
     private var process: Process?
     private var input: FileHandle?
+    /// Serializes stdin writes off the actor so a full pipe stalls only the
+    /// writer, never every caller.
+    private let writerQueue = DispatchQueue(label: "applejack.core-client.stdin")
     private var buffer: [UInt8] = []
     private var generation = 0
     private var nextId: Int64 = 1
     private var pending: [Int64: CheckedContinuation<Data, any Error>] = [:]
+    /// The `hello` of the current process; every caller awaits the same one.
+    private var handshake: Task<HelloResult, any Error>?
     private var launched = false
     private var shuttingDown = false
     private var fatal: CoreClientError?
@@ -59,8 +71,6 @@ public actor CoreClient {
     /// Spawns the core if needed and returns its `hello` answer.
     public func hello() async throws -> HelloResult {
         try await ensureRunning()
-        guard let helloResult else { throw CoreClientError.malformedResponse("hello result missing") }
-        return helloResult
     }
 
     public func hostDoctor() async throws -> HostFacts {
@@ -69,15 +79,17 @@ public actor CoreClient {
 
     /// Sends one request and waits for its response. Cancelling the task
     /// abandons the request: nothing is sent to the core and a late
-    /// response is dropped.
+    /// response is dropped. A cancelled caller still waits for an in-flight
+    /// `hello`, which it cannot cancel.
     public func call<Params: Encodable & Sendable, Result: Decodable & Sendable>(
         _ method: String, params: Params
     ) async throws -> Result {
-        try await ensureRunning()
+        _ = try await ensureRunning()
         return try await send(method, params: params)
     }
 
-    /// Closes the core's stdin, which ends its loop with exit 0.
+    /// Closes the core's stdin, which ends its loop with exit 0, and
+    /// terminates it if it is still running after `terminateGrace`.
     public func shutdown() {
         shuttingDown = true
         tearDown(failing: .shutDown)
@@ -89,25 +101,48 @@ public actor CoreClient {
 
     // MARK: - Lifecycle
 
-    private func ensureRunning() async throws {
+    @discardableResult
+    private func ensureRunning() async throws -> HelloResult {
         if let fatal { throw fatal }
         if shuttingDown { throw CoreClientError.shutDown }
-        if process != nil { return }
-        if launched {
-            guard restarts < maxRestarts else {
-                fatal = .restartLimit
-                throw CoreClientError.restartLimit
+        if process == nil {
+            if launched {
+                guard restarts < maxRestarts else {
+                    fatal = .restartLimit
+                    throw CoreClientError.restartLimit
+                }
             }
-            restarts += 1
+            helloResult = nil
+            try spawn()
+            // Counted after the spawn: a launch failure is not a restart.
+            if launched {
+                restarts += 1
+            }
+            launched = true
+            let generation = self.generation
+            handshake = Task { try await self.performHello(generation: generation) }
         }
-        launched = true
-        try spawn()
+        guard let handshake else { throw CoreClientError.coreExited(-1) }
+        return try await handshake.value
+    }
+
+    private func performHello(generation: Int) async throws -> HelloResult {
         do {
-            helloResult = try await send("hello", params: HelloParams(protocolVersion: protocolVersion))
+            let result: HelloResult = try await send("hello", params: HelloParams(protocolVersion: protocolVersion))
+            if generation == self.generation {
+                helloResult = result
+            }
+            return result
         } catch CoreClientError.rpc(let error) where error.errorCode == .protocolMismatch {
             fatal = .protocolMismatch(error)
             tearDown(failing: .protocolMismatch(error))
             throw CoreClientError.protocolMismatch(error)
+        } catch {
+            // A core that cannot be greeted serves nothing; the next call respawns it.
+            if generation == self.generation {
+                tearDown(failing: error as? CoreClientError ?? .coreExited(-1))
+            }
+            throw error
         }
     }
 
@@ -145,6 +180,13 @@ public actor CoreClient {
         process.terminationHandler = { finished in
             exitContinuation.yield(finished.terminationStatus)
             exitContinuation.finish()
+            // stdout reaches EOF only when every process holding it exits. A
+            // grandchild that inherited it must not keep callers waiting.
+            Task.detached {
+                try? await Task.sleep(for: CoreClient.exitDrainGrace)
+                reader.readabilityHandler = nil
+                continuation.finish()
+            }
         }
         do {
             try process.run()
@@ -184,15 +226,24 @@ public actor CoreClient {
     private func deliver(_ line: Data) {
         struct Envelope: Decodable {
             var id: RpcId?
+            var method: String?
+            var error: RpcError?
         }
-        guard let envelope = try? RpcCoding.decoder().decode(Envelope.self, from: line),
-            case .number(let id)? = envelope.id,
-            let continuation = pending.removeValue(forKey: id)
-        else {
-            // A notification (no id), a cancelled request's late answer, or
-            // a line that is not JSON: nothing is waiting for it.
+        guard let envelope = try? RpcCoding.decoder().decode(Envelope.self, from: line) else {
+            CoreClient.log("dropped \(line.count) bytes that are not a JSON message")
             return
         }
+        // A notification; no caller routes them until a job method lands.
+        if envelope.method != nil { return }
+        guard case .number(let id)? = envelope.id else {
+            // The core could not read the id of some request line. The call
+            // that sent it keeps waiting, because nothing says which one.
+            let detail = envelope.error.map { "\($0.code) \($0.message)" } ?? "no error member"
+            CoreClient.log("response with id \(String(describing: envelope.id)) matches no request: \(detail)")
+            return
+        }
+        // A cancelled request's late answer has nothing waiting for it.
+        guard let continuation = pending.removeValue(forKey: id) else { return }
         continuation.resume(returning: line)
     }
 
@@ -205,19 +256,31 @@ public actor CoreClient {
         guard generation == self.generation else { return }
         process = nil
         input = nil
+        handshake = nil
         buffer = []
         failPending(with: shuttingDown ? .shutDown : .coreExited(status))
     }
 
     /// Drops the current process and fails every in-flight request. Closing
-    /// stdin ends a healthy core's loop with exit 0; nothing waits for it.
+    /// stdin ends a healthy core's loop with exit 0; one that lingers past
+    /// `terminateGrace` is terminated.
     private func tearDown(failing error: CoreClientError) {
-        if process != nil {
+        if let process {
             generation += 1
-            try? input?.close()
+            if let input {
+                // Queued after any request still being written.
+                writerQueue.async { try? input.close() }
+            }
             input = nil
-            process = nil
+            self.process = nil
+            handshake = nil
             buffer = []
+            Task.detached {
+                try? await Task.sleep(for: CoreClient.terminateGrace)
+                if process.isRunning {
+                    process.terminate()
+                }
+            }
         }
         failPending(with: error)
     }
@@ -242,26 +305,31 @@ public actor CoreClient {
     private func send<Params: Encodable & Sendable, Result: Decodable & Sendable>(
         _ method: String, params: Params
     ) async throws -> Result {
-        guard let input, let process else { throw CoreClientError.coreExited(-1) }
+        try Task.checkCancellation()
+        guard let input, process != nil else { throw CoreClientError.coreExited(-1) }
         let id = nextId
         nextId += 1
-        var data = try RpcCoding.encoder().encode(OutgoingRequest(id: .number(id), method: method, params: params))
-        data.append(UInt8(ascii: "\n"))
-        do {
-            try input.write(contentsOf: data)
-        } catch {
-            // EPIPE: the core is gone and the request never reached it.
-            let status = process.isRunning ? -1 : process.terminationStatus
-            tearDown(failing: .coreExited(status))
-            throw CoreClientError.coreExited(status)
-        }
+        var encoded = try RpcCoding.encoder().encode(OutgoingRequest(id: .number(id), method: method, params: params))
+        encoded.append(UInt8(ascii: "\n"))
+        let data = encoded
+        let generation = self.generation
 
         let line: Data = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                pending[id] = continuation
                 if Task.isCancelled {
-                    pending.removeValue(forKey: id)
                     continuation.resume(throwing: CancellationError())
+                    return
+                }
+                // Registered before the write so a fast answer finds its caller.
+                pending[id] = continuation
+                writerQueue.async { [weak self] in
+                    do {
+                        try input.write(contentsOf: data)
+                    } catch {
+                        // EPIPE: the core is gone and the request never reached it.
+                        guard let self else { return }
+                        Task { await self.writeFailed(generation: generation) }
+                    }
                 }
             }
         } onCancel: {
@@ -283,8 +351,18 @@ public actor CoreClient {
         return result
     }
 
+    private func writeFailed(generation: Int) {
+        guard generation == self.generation, let process else { return }
+        let status = process.isRunning ? -1 : process.terminationStatus
+        tearDown(failing: .coreExited(status))
+    }
+
     private func cancel(id: Int64) {
         pending.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+
+    private static func log(_ message: String) {
+        FileHandle.standardError.write(Data("applejack core client: \(message)\n".utf8))
     }
 
     /// A write to a core that already exited must surface as an error on the
