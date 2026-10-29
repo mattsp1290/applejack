@@ -15,11 +15,8 @@ const ATTACKER_D3DMETAL_UNINSTALLED: &str =
 const ATTACKER_FLAG_IDENTIFIERS: &str = include_str!("fixtures/attacker-flag-identifiers.json");
 
 /// The game tier of the plan's allowlist: every pass-through name minus the
-/// ones the engine sets itself.
-const ALLOWED: [&str; 12] = [
-    "PATH",
-    "HOME",
-    "TMPDIR",
+/// ones the launcher or the engine sets itself.
+const ALLOWED: [&str; 8] = [
     "WINEDEBUG",
     "DXMT_CONFIG",
     "DXMT_CONFIG_FILE",
@@ -27,7 +24,6 @@ const ALLOWED: [&str; 12] = [
     "MTL_HUD_ENABLED",
     "ROSETTA_ADVERTISE_AVX",
     "GST_PLUGIN_PATH",
-    "APPLEJACK_SESSION",
     "VK_ICD_FILENAMES",
 ];
 
@@ -77,7 +73,8 @@ fn memory_db() -> ConfigDb {
 fn db_with_overlays(versions: &[&str]) -> ConfigDb {
     let db = memory_db();
     for version in versions {
-        db.d3dmetal_accept(version, ACCEPTED_AT).unwrap();
+        db.d3dmetal_accept(version, "/tmp/gptk.dmg", "2.1", ACCEPTED_AT)
+            .unwrap();
     }
     db
 }
@@ -170,7 +167,6 @@ fn malicious_preset_is_rejected_or_held_for_confirmation() {
         ]
     );
     assert!(plan.needs_confirmation());
-    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     assert_eq!(
         plan.config.extra_env.keys().collect::<Vec<_>>(),
         ["WINEDEBUG"]
@@ -405,7 +401,7 @@ fn empty_and_separator_only_path_values_are_rejected() {
     let plan =
         presets::import(&listed, &policy, &db, &data, None, ImportOptions::default()).unwrap();
     let item = rejected(&plan.rejected, "extra_env.DXMT_CONFIG_FILE");
-    assert!(item.reason.contains("single-path"), "{item:?}");
+    assert!(item.reason.contains("one path"), "{item:?}");
     assert!(plan.config.extra_env.is_empty());
 }
 

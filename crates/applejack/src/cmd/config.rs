@@ -1,4 +1,8 @@
 //! `applejack config <appid> show|set|export|import`.
+//!
+//! Only a write creates `db.sqlite`: `show`, `export`, and the import plan
+//! read a missing database as empty, and a `set` or `import` that has nothing
+//! valid to write leaves the data directory as it found it.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -96,7 +100,7 @@ fn execute(args: ConfigArgs) -> Result<String, Failure> {
     // consults the process environment.
     let home = config::home_dir_from(|name| std::env::var_os(name));
     match args.action {
-        Action::Show { json } => show(&config::open_db(&data_dir)?, args.appid, json),
+        Action::Show { json } => show(&open_existing_or_memory(&data_dir)?, args.appid, json),
         Action::Set { key, value } => {
             // Validate before opening, so a bad key or value never creates the database.
             let field = Field::parse(&key).ok_or_else(|| Error::UnknownField(key.clone()))?;
@@ -105,7 +109,7 @@ fn execute(args: ConfigArgs) -> Result<String, Failure> {
             Ok(format!("{key} = {value:?}"))
         }
         Action::Export { file } => export(
-            &config::open_db(&data_dir)?,
+            &open_existing_or_memory(&data_dir)?,
             args.appid,
             &data_dir,
             home.as_deref(),
@@ -124,6 +128,21 @@ fn execute(args: ConfigArgs) -> Result<String, Failure> {
     }
 }
 
+/// The database when it exists. A missing one holds no rows, so a reader
+/// gets the same answer from an empty in-memory one without creating
+/// `db.sqlite`.
+fn open_existing(data_dir: &Path) -> Result<Option<ConfigDb>, Error> {
+    data_dir
+        .join(config::DB_FILE)
+        .exists()
+        .then(|| config::open_db(data_dir))
+        .transpose()
+}
+
+fn open_existing_or_memory(data_dir: &Path) -> Result<ConfigDb, Error> {
+    open_existing(data_dir)?.map_or_else(ConfigDb::open_in_memory, Ok)
+}
+
 fn show(db: &ConfigDb, appid: u32, json: bool) -> Result<String, Failure> {
     let config = db.game_config(appid)?.unwrap_or_default();
     if json {
@@ -133,10 +152,11 @@ fn show(db: &ConfigDb, appid: u32, json: bool) -> Result<String, Failure> {
     Ok(render(&config))
 }
 
-/// One line per field. Set values are Debug-quoted, the form `set` echoes
-/// and the import report uses: control and bidirectional formatting
-/// characters come out escaped, so a stored value cannot move the cursor,
-/// reverse a line, or forge a `show` line. `--json` gives the exact form.
+/// One `field = "value"` line per field, the form `set` echoes and the
+/// import report uses, so a `show` line pastes into `set`. Values are
+/// Debug-quoted: control and bidirectional formatting characters come out
+/// escaped, so a stored value cannot move the cursor, reverse a line, or
+/// forge a `show` line. `--json` gives the exact form.
 fn render(config: &GameConfig) -> String {
     let width = Field::names()
         .iter()
@@ -149,7 +169,7 @@ fn render(config: &GameConfig) -> String {
             let value = config
                 .get(*field)
                 .map_or_else(|| "(unset)".to_owned(), |value| format!("{value:?}"));
-            format!("{:<width$}  {value}", field.name())
+            format!("{:<width$} = {value}", field.name())
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -180,18 +200,21 @@ fn import(
         Failure::Message(format!("cannot read {}: {error}", file.display()))
     };
     // Bound the read itself: a FIFO or character device reports no size, and
-    // a regular file can grow between a size check and the read.
-    let mut text = String::new();
+    // a regular file can grow between a size check and the read. The size is
+    // checked before decoding, so a cut inside a multibyte character still
+    // reports the size, not a UTF-8 error.
+    let mut bytes = Vec::new();
     std::fs::File::open(file)
         .map_err(|error| cannot_read(&error))?
         .take(MAX_PRESET_BYTES + 1)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|error| cannot_read(&error))?;
-    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_PRESET_BYTES {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PRESET_BYTES {
         return Err(cannot_read(&format!(
             "larger than the {MAX_PRESET_BYTES} byte preset limit"
         )));
     }
+    let text = String::from_utf8(bytes).map_err(|error| cannot_read(&error))?;
     let mut preset = Preset::from_json(&text)?;
     // The CLI's appid wins: a preset exported for one title may be applied to
     // another entry (a different depot of the same game, for instance). Say
@@ -208,13 +231,9 @@ fn import(
     let options = ImportOptions {
         accept_launch_overrides,
     };
-    // A missing database holds no rows, so the plan reads an empty in-memory
-    // one: a refused or unconfirmed import never creates `db.sqlite`.
-    let existing = data_dir
-        .join(config::DB_FILE)
-        .exists()
-        .then(|| config::open_db(data_dir))
-        .transpose()?;
+    // The plan only reads; `db.sqlite` is created below, once there is
+    // something to write.
+    let existing = open_existing(data_dir)?;
     let scratch;
     let plan_db = if let Some(db) = &existing {
         db
@@ -232,6 +251,10 @@ fn import(
         // Print the report before signalling, so the user sees what needs confirming.
         super::emit("config", &lines.join("\n"));
         return Err(Failure::ConfirmationRequired);
+    }
+    if plan.accepted.is_empty() {
+        lines.push(format!("nothing to apply to appid {appid}"));
+        return Ok(lines.join("\n"));
     }
     let db = if let Some(db) = existing {
         db
@@ -261,12 +284,6 @@ fn render_plan(plan: &ImportPlan) -> Vec<String> {
             continue;
         }
         out.push(format!("accept   {} = {:?}", item.field, item.value));
-    }
-    for item in &plan.warnings {
-        out.push(format!(
-            "warning  {} = {:?}: {}",
-            item.field, item.value, item.reason
-        ));
     }
     for item in &plan.rejected {
         out.push(format!(
@@ -306,6 +323,10 @@ mod tests {
         );
         assert!(line("extra_env").ends_with("\"{\\\"A\\\":\\\"1\\\"}\""));
         assert!(line("engine_id").ends_with("(unset)"));
+        assert!(
+            line("notes").contains(" = \""),
+            "the `field = value` form set echoes: {text}"
+        );
         assert_eq!(
             text.lines()
                 .filter(|line| line.starts_with("launch_exe_override"))

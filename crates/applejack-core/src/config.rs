@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 pub use applejack_config::presets::{
     self, Accepted, Confirmation, DATA_DIR_PLACEHOLDER, ENGINE_OWNED_NAMES, HOME_PLACEHOLDER,
-    META_HOST_CHIP, META_MACOS_VERSION, Rejected, SCHEMA_VERSION, ValueCheck, Warning,
+    HOST_OWNED_NAMES, LOADER_PREFIXES, META_HOST_CHIP, META_MACOS_VERSION, Rejected,
+    SCHEMA_VERSION, SECRET_NAME_FRAGMENTS, ValueCheck,
 };
 pub use applejack_config::{
     AppRow, ConfigDb, Drm, EnvPolicy, Error, Field, GameConfig, GraphicsBackend, ImportOptions,
@@ -108,8 +109,9 @@ pub struct DefaultEnvPolicy {
     engines: Vec<PathBuf>,
 }
 
-/// Every name the engine passes through, whoever sets it. A preset may set
-/// those that are not engine-owned or host-owned.
+/// Every name the engine passes through, whoever sets it. The game tier,
+/// which `allows` answers for, is this list minus the engine-owned and
+/// host-owned names.
 const ALLOWED_NAMES: [&str; 16] = [
     "PATH",
     "HOME",
@@ -141,7 +143,9 @@ impl DefaultEnvPolicy {
 
 impl EnvPolicy for DefaultEnvPolicy {
     fn allows(&self, name: &str) -> bool {
-        ALLOWED_NAMES.contains(&name) && !ENGINE_OWNED_NAMES.contains(&name)
+        ALLOWED_NAMES.contains(&name)
+            && !ENGINE_OWNED_NAMES.contains(&name)
+            && !HOST_OWNED_NAMES.contains(&name)
     }
 
     fn value_check(&self, name: &str) -> ValueCheck<'_> {
@@ -276,6 +280,10 @@ mod tests {
             "WINEDLLOVERRIDES",
             "WINEMSYNC",
             "WINEESYNC",
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "APPLEJACK_SESSION",
         ] {
             assert!(!policy.allows(name), "{name}");
         }
@@ -350,7 +358,6 @@ mod tests {
             plan.config.extra_env.keys().collect::<Vec<_>>(),
             ["DXMT_CONFIG", "WINEDEBUG"]
         );
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]
@@ -382,7 +389,7 @@ mod tests {
             presets::import(&listed, &policy, &db, data, None, ImportOptions::default()).unwrap();
         assert_eq!(rejected_names(&plan), ["DXMT_CONFIG_FILE"]);
         assert!(
-            plan.rejected[0].reason.contains("single-path"),
+            plan.rejected[0].reason.contains("one path"),
             "{:?}",
             plan.rejected
         );
@@ -427,7 +434,8 @@ mod tests {
         );
         assert_eq!(plan.config.graphics_backend, None);
 
-        db.d3dmetal_accept("1.0.0", "2026-10-29T00:00:00Z").unwrap();
+        db.d3dmetal_accept("1.0.0", "/tmp/gptk.dmg", "2.1", "2026-10-29T00:00:00Z")
+            .unwrap();
         let plan =
             presets::import(&preset, &policy, &db, data, None, ImportOptions::default()).unwrap();
         assert!(plan.rejected.is_empty(), "{:?}", plan.rejected);

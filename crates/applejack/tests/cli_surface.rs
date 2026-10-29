@@ -108,7 +108,7 @@ fn config_show_on_empty_data_dir_prints_empty_config() {
     let text = String::from_utf8(output.stdout).expect("utf-8");
     assert!(text.contains("hidraw_enabled"), "{text}");
     assert!(
-        !text.lines().any(|line| !line.ends_with("(unset)")),
+        !text.lines().any(|line| !line.ends_with(" = (unset)")),
         "{text}"
     );
 
@@ -121,6 +121,48 @@ fn config_show_on_empty_data_dir_prints_empty_config() {
     let config: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     assert!(config["hidraw_enabled"].is_null(), "{config}");
     assert_eq!(config["extra_env"], serde_json::json!({}));
+    assert!(
+        !data_dir.path.join("db.sqlite").exists(),
+        "a read created the database"
+    );
+}
+
+#[test]
+fn config_import_that_accepts_nothing_creates_no_database() {
+    let data_dir = TempDataDir::new("config-import-nothing");
+    std::fs::create_dir_all(&data_dir.path).expect("creates temp dir");
+    let preset = data_dir.path.join("preset.json");
+    std::fs::write(
+        &preset,
+        r#"{"schema": 1, "appid": 11,
+            "config": {"extra_env": {"WINEPREFIX": "$APPLEJACK_DATA_DIR/prefixes/g"},
+                       "direct_verified_at": "2026-10-29T00:00:00Z"}}"#,
+    )
+    .expect("writes preset");
+    let output = config(
+        &data_dir.path,
+        &["11", "import", preset.to_str().expect("utf-8")],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).expect("utf-8");
+    assert_eq!(
+        report
+            .lines()
+            .filter(|line| line.starts_with("reject"))
+            .count(),
+        2,
+        "{report}"
+    );
+    assert!(report.contains("nothing to apply to appid 11"), "{report}");
+    assert!(
+        !data_dir.path.join("db.sqlite").exists(),
+        "an import that accepted nothing created the database"
+    );
 }
 
 #[test]
@@ -284,17 +326,23 @@ fn config_import_rejects_forged_report_lines_and_oversized_files() {
             .any(|line| line.starts_with("reject   launch_exe_override = forged")),
         "a preset value forged a report line:\n{report}"
     );
-    assert!(report.contains("applied 0 item(s)"), "{report}");
+    assert!(report.contains("nothing to apply"), "{report}");
 
-    let huge = data_dir.path.join("huge.json");
-    std::fs::write(&huge, vec![b' '; (1 << 20) + 1]).expect("writes preset");
-    let output = config(
-        &data_dir.path,
-        &["11", "import", huge.to_str().expect("utf-8")],
-    );
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8(output.stderr).expect("utf-8");
-    assert!(stderr.contains("preset limit"), "{stderr}");
+    // One byte over the cap, and over the cap with the cut inside a
+    // multibyte character: the size message wins over a UTF-8 error.
+    let mut cut = vec![b' '; 1 << 20];
+    cut.extend_from_slice("\u{e9}".as_bytes());
+    for body in [vec![b' '; (1 << 20) + 1], cut] {
+        let huge = data_dir.path.join("huge.json");
+        std::fs::write(&huge, body).expect("writes preset");
+        let output = config(
+            &data_dir.path,
+            &["11", "import", huge.to_str().expect("utf-8")],
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr).expect("utf-8");
+        assert!(stderr.contains("preset limit"), "{stderr}");
+    }
     let shown = config(&data_dir.path, &["11", "show", "--json"]);
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("valid JSON");
     assert!(shown["launch_exe_override"].is_null(), "{shown}");

@@ -113,17 +113,44 @@ impl ConfigDb {
 
     /// Records that the user accepted a `D3DMetal` overlay for
     /// `engine_version`, so `graphics_backend = d3dmetal` imports for it.
+    /// `imported_from` is where the overlay came from and `gptk_version` the
+    /// Game Porting Toolkit release it was taken from; both are recorded with
+    /// the row so an accepted overlay always has its provenance.
     /// `accepted_at` is the caller's timestamp text; this crate never reads
-    /// the clock. Accepting again keeps the row and updates the stamp.
+    /// the clock. Accepting again replaces the row.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Sqlite`] when the write fails.
-    pub fn d3dmetal_accept(&self, engine_version: &str, accepted_at: &str) -> Result<(), Error> {
+    /// Returns [`Error::InvalidValue`] when any argument is empty and
+    /// [`Error::Sqlite`] when the write fails.
+    pub fn d3dmetal_accept(
+        &self,
+        engine_version: &str,
+        imported_from: &str,
+        gptk_version: &str,
+        accepted_at: &str,
+    ) -> Result<(), Error> {
+        let columns = [
+            ("d3dmetal.engine_version", engine_version),
+            ("d3dmetal.imported_from", imported_from),
+            ("d3dmetal.gptk_version", gptk_version),
+            ("d3dmetal.accepted_at", accepted_at),
+        ];
+        if let Some(&(field, _)) = columns.iter().find(|(_, value)| value.is_empty()) {
+            return Err(Error::InvalidValue {
+                field,
+                value: String::new(),
+                reason: "must not be empty".to_owned(),
+            });
+        }
         self.conn.execute(
-            "INSERT INTO d3dmetal (engine_version, accepted_at) VALUES (?1, ?2) \
-             ON CONFLICT(engine_version) DO UPDATE SET accepted_at = excluded.accepted_at",
-            [engine_version, accepted_at],
+            "INSERT INTO d3dmetal (engine_version, imported_from, gptk_version, accepted_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(engine_version) DO UPDATE SET \
+             imported_from = excluded.imported_from, \
+             gptk_version = excluded.gptk_version, \
+             accepted_at = excluded.accepted_at",
+            columns.map(|(_, value)| value),
         )?;
         Ok(())
     }
@@ -393,18 +420,38 @@ mod tests {
             .unwrap();
         assert!(db.d3dmetal_accepted("1.0.0").unwrap());
         assert!(!db.d3dmetal_accepted("1.0.1").unwrap());
-        db.d3dmetal_accept("1.0.1", "2026-10-29T00:00:00Z").unwrap();
-        db.d3dmetal_accept("1.0.1", "2026-10-30T00:00:00Z").unwrap();
+        db.d3dmetal_accept("1.0.1", "/tmp/gptk-1.dmg", "1.0", "2026-10-29T00:00:00Z")
+            .unwrap();
+        db.d3dmetal_accept("1.0.1", "/tmp/gptk-2.dmg", "2.1", "2026-10-30T00:00:00Z")
+            .unwrap();
         assert!(db.d3dmetal_accepted("1.0.1").unwrap());
-        let stamp: String = db
+        let row: (String, String, String) = db
             .conn
             .query_row(
-                "SELECT accepted_at FROM d3dmetal WHERE engine_version = '1.0.1'",
+                "SELECT imported_from, gptk_version, accepted_at FROM d3dmetal \
+                 WHERE engine_version = '1.0.1'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(stamp, "2026-10-30T00:00:00Z");
+        assert_eq!(
+            row,
+            (
+                "/tmp/gptk-2.dmg".to_owned(),
+                "2.1".to_owned(),
+                "2026-10-30T00:00:00Z".to_owned()
+            )
+        );
+        for (version, from, gptk, at) in [
+            ("", "/tmp/g.dmg", "1.0", "now"),
+            ("1.0.2", "", "1.0", "now"),
+            ("1.0.2", "/tmp/g.dmg", "", "now"),
+            ("1.0.2", "/tmp/g.dmg", "1.0", ""),
+        ] {
+            let error = db.d3dmetal_accept(version, from, gptk, at).unwrap_err();
+            assert!(matches!(error, Error::InvalidValue { .. }), "{error}");
+        }
+        assert!(!db.d3dmetal_accepted("1.0.2").unwrap());
     }
 
     #[test]

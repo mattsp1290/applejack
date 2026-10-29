@@ -2,6 +2,21 @@
 //! material; import filters every item through an [`EnvPolicy`] and reports
 //! what it accepted, rejected, or needs the user to confirm before anything
 //! is written.
+//!
+//! # Tiers
+//!
+//! Every environment variable the engine passes through belongs to one of
+//! three tiers:
+//!
+//! - **host-owned** ([`HOST_OWNED_NAMES`], [`LOADER_PREFIXES`]): the launcher
+//!   sets them from the host; a preset never does.
+//! - **engine-owned** ([`ENGINE_OWNED_NAMES`]): the engine sets them from the
+//!   chosen backend and sync mode; a preset value would be dropped at launch.
+//! - **game tier**: what a preset or `config set` may set. This is the tier
+//!   [`EnvPolicy::allows`] answers for.
+//!
+//! [`import`] refuses the first two tiers before it consults the policy, so
+//! a policy that forgets them is still safe; it should still agree.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -33,7 +48,7 @@ pub const META_MACOS_VERSION: &str = "macos_version";
 /// `extra_env` names containing any of these never leave the host and are
 /// never imported. Names are compared upper-cased with `_` removed, so
 /// `Pass_word` and `api_key` match.
-const SECRET_NAME_FRAGMENTS: [&str; 7] = [
+pub const SECRET_NAME_FRAGMENTS: [&str; 7] = [
     "TOKEN",
     "SECRET",
     "PASSWORD",
@@ -47,7 +62,7 @@ const SECRET_NAME_FRAGMENTS: [&str; 7] = [
 /// environment the launcher supplies, and variables that choose which
 /// binaries, loaders, or shell startup files run. This is the hard stop behind
 /// a policy that the engine crate will replace.
-const HOST_OWNED_NAMES: [&str; 15] = [
+pub const HOST_OWNED_NAMES: [&str; 15] = [
     "PATH",
     "HOME",
     "TMPDIR",
@@ -66,7 +81,7 @@ const HOST_OWNED_NAMES: [&str; 15] = [
 ];
 
 /// Dynamic-loader variable prefixes; any name starting with one is rejected.
-const LOADER_PREFIXES: [&str; 2] = ["DYLD_", "LD_"];
+pub const LOADER_PREFIXES: [&str; 2] = ["DYLD_", "LD_"];
 
 /// Names the engine sets itself from the chosen backend and sync mode. A
 /// preset value would be dropped at launch, so import refuses it, whatever
@@ -89,9 +104,10 @@ pub enum ValueCheck<'a> {
 /// The engine's environment allowlist, reached through a trait so this crate
 /// never depends on `applejack-engine`.
 pub trait EnvPolicy {
-    /// Whether a game-tier preset may set a variable with this name: the
-    /// game tier of the engine's allowlist. A name the engine passes through
-    /// but sets itself (`WINEPREFIX`, `APPLEJACK_SESSION`) answers `false`.
+    /// Whether a preset may set a variable with this name: `true` only for
+    /// the game tier (see the [module doc](self)). A host-owned name
+    /// (`PATH`, `APPLEJACK_SESSION`) or an engine-owned one (`WINEPREFIX`)
+    /// answers `false`.
     fn allows(&self, name: &str) -> bool;
     /// How the variable's value is checked. Each path-valued name has its
     /// own roots: an ICD or plugin path may not point into a Windows-writable
@@ -293,14 +309,6 @@ pub struct Confirmation {
     pub value: String,
 }
 
-/// An accepted item the user should still know about.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Warning {
-    pub field: String,
-    pub value: String,
-    pub reason: String,
-}
-
 /// The outcome of filtering a preset. Nothing reaches the database until
 /// [`ImportPlan::apply`] runs with every confirmation covered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,7 +318,6 @@ pub struct ImportPlan {
     pub accepted: Vec<Accepted>,
     pub rejected: Vec<Rejected>,
     pub confirmations: Vec<Confirmation>,
-    pub warnings: Vec<Warning>,
     /// The filtered configuration, confirmation items included.
     pub config: GameConfig,
     options: ImportOptions,
@@ -326,7 +333,8 @@ impl ImportPlan {
     /// Merges the filtered configuration into the stored row for the preset's
     /// appid, inside one write transaction so a concurrent writer cannot
     /// interleave between the read and the write. Fields the preset does not
-    /// set keep their stored values.
+    /// set keep their stored values. A plan that accepted nothing writes
+    /// nothing, so a refused import leaves no row behind.
     ///
     /// The plan is written as computed: the overlay and path gates are not
     /// re-run against the database or the file system at apply time. The
@@ -341,6 +349,9 @@ impl ImportPlan {
         if self.needs_confirmation() {
             return Err(Error::ConfirmationRequired(self.confirmations.clone()));
         }
+        if self.accepted.is_empty() {
+            return Ok(());
+        }
         db.write_locked(|db| {
             let mut stored = db.game_config(self.appid)?.unwrap_or_default();
             stored.merge_from(&self.config);
@@ -354,6 +365,43 @@ impl ImportPlan {
 /// `home` unset, `$HOME` stays literal: a path-valued variable then fails the
 /// absolute-path check and a `launch_exe_override` is rejected outright. The
 /// `d3dmetal` gate reads `db`'s `d3dmetal` table; nothing is written.
+///
+/// # Import rules
+///
+/// Checks run in this order; the first one an item fails gives the
+/// [`Rejected::reason`] the report shows.
+///
+/// 1. A value holding a control or bidirectional formatting character:
+///    "control and bidirectional formatting characters are not allowed in
+///    preset values".
+/// 2. An `extra_env` entry, by name: not a valid environment variable name
+///    (ASCII letters, digits, `_`); a [`LOADER_PREFIXES`] prefix ("`DYLD_*`
+///    loader variables are never passed to the engine"); a
+///    [`HOST_OWNED_NAMES`] name ("set by the launcher from the host, never by
+///    a preset"); an [`ENGINE_OWNED_NAMES`] name ("set by the engine from the
+///    chosen backend and sync mode"); a [`SECRET_NAME_FRAGMENTS`] match
+///    ("secret-looking names are never imported"); a name
+///    [`EnvPolicy::allows`] refuses ("not in the engine environment
+///    allowlist"). Name checks ignore case. Then, for a path-valued name per
+///    [`EnvPolicy::value_check`], the expanded value needs at least one path;
+///    a [`ValueCheck::Path`] variable takes one path, not a `:`-separated
+///    list; every path must be absolute, free of `.` and `..`, and inside one
+///    of the roots, lexically and after resolving the symlinks of its existing
+///    ancestors.
+/// 3. `engine_id` and `engine_version`: letters, digits, `.`, `_`, `-`, not
+///    starting with `.` or `-`, because they become directory names and argv
+///    tokens.
+/// 4. `launch_exe_override`: placeholders expanded and `.`/`..` folded; a path
+///    that starts with a placeholder must stay under that directory ("escapes
+///    the directory its placeholder names"); a literal `$HOME` with no host
+///    home is refused. It and `launch_args_override` are written only once
+///    confirmed ([`ImportOptions::accept_launch_overrides`]).
+/// 5. `graphics_backend = d3dmetal`: the preset must name an importable
+///    `engine_version` with an accepted overlay in the `d3dmetal` table.
+/// 6. `direct_verified_at`: always refused ("host-local verification stamp;
+///    run the direct probe here instead").
+/// 7. Every other field goes through the parser `config set` uses, so a
+///    typed column refuses what `set` would refuse.
 ///
 /// # Errors
 ///
@@ -380,7 +428,6 @@ pub fn import(
         accepted: Vec::new(),
         rejected: Vec::new(),
         confirmations: Vec::new(),
-        warnings: Vec::new(),
         config: GameConfig::default(),
         options,
     };
@@ -652,7 +699,7 @@ fn paths_inside_roots(value: &str, roots: &[PathBuf], list: bool) -> Result<(), 
         return Err("a path-valued variable needs at least one path".to_owned());
     }
     if !list && value.contains(':') {
-        return Err("a single-path variable may not hold a ':'-separated list".to_owned());
+        return Err("this variable takes one path, not a ':'-separated list".to_owned());
     }
     for part in parts {
         let path = Path::new(part);
