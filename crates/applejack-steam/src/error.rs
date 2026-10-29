@@ -2,6 +2,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::auth::AuthError;
+use crate::lock::Holder;
 
 /// Every failure this crate reports.
 #[derive(Debug, thiserror::Error)]
@@ -13,13 +14,14 @@ pub enum Error {
     /// An `appmanifest` is missing a field or holds a value of the wrong shape.
     #[error("acf: field `{path}`: {reason}")]
     AcfField { path: String, reason: String },
-    /// Another process holds the lock. `pid` and `command` come from the lock
-    /// file and are absent when the holder has not written them yet.
-    #[error("lock `{name}` is held by pid {} ({})", pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()), command.as_deref().unwrap_or("unknown command"))]
+    /// Another process holds the lock. `holder` is the line that process
+    /// wrote into the lock file; it is `None` while the new holder has not
+    /// written its line yet, when the line does not parse, or when the
+    /// recorded pid is no longer alive (a stale line left by a crash).
+    #[error("lock `{name}` is held{}", holder.as_ref().map_or_else(|| " (holder unknown)".to_owned(), |holder| format!(" by pid {} ({})", holder.pid, holder.command)))]
     LockHeld {
         name: String,
-        pid: Option<u32>,
-        command: Option<String>,
+        holder: Option<Holder>,
     },
     /// The lock file could not be created, locked, or written.
     #[error("lock `{name}` at {}: {source}", path.display())]

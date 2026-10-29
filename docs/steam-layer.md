@@ -61,15 +61,47 @@ them. The CM does not report a retry-after, so the value is a fixed 60 s floor.
 
 ## Locks
 
-`lock::Lock` takes an exclusive `flock` on `<data>/locks/<name>.lock` and
-writes one JSON line `{"pid", "command", "acquired_at"}` into it. A
-`NonBlocking` acquire on a held lock fails with `Error::LockHeld { pid,
-command }` read from that line; a `Blocking` acquire waits.
+`lock::Lock` takes an exclusive `flock` on `<data>/locks/<name>.lock`
+(created with mode `0600`) and writes one JSON line `{"pid", "command",
+"acquired_at"}` into it. `command` is the fixed subcommand label given to
+`LockDir::new` (`install`, `run`, ...), never argv or user input. After
+`flock` succeeds the lock re-checks that the path still names the locked
+inode and relocks otherwise, so unlinking a held lock file does not admit a
+second holder. On release the holder line is truncated before the unlock.
 
-Lock order is per-appid first, then the library, and the types enforce it:
-`LockDir::app(appid, mode)` yields an `AppLock`, and only
-`AppLock::library(mode)` yields a `LibraryLock`, which borrows the `AppLock`
-and so cannot outlive it. There is no other constructor.
+Modes: `NonBlocking` fails at once with `Error::LockHeld { name, holder }`;
+`Wait(duration)` polls and fails the same way on timeout; `Blocking` waits
+without bound. `holder` is `None` when the file is empty (the new holder has
+not written its line yet), when the line does not parse, or when the recorded
+pid is dead (`kill(pid, 0)` reports `ESRCH`, so a line left by a crash is not
+reported and a reused pid is only reported while that process exists).
+`Lock::holder` reads the same record without locking and applies the same
+filter.
+
+Lock order is per-appid first, then the library. What the types guarantee,
+within one process:
+
+- `LockDir::app(&mut self, appid, mode)` yields an `AppLock` that borrows the
+  `LockDir` mutably, so one `LockDir` holds at most one app lock, and the
+  sequence app-1, library, app-2 on one `LockDir` does not compile (the
+  `compile_fail` doc test on `LockDir::app` pins it).
+- Only `AppLock::library(mode)` yields a `LibraryLock`, which borrows the
+  `AppLock` and so cannot outlive it. `Lock::acquire` and the library lock's
+  name are crate-private; there is no other constructor.
+- `LockDir` is not `Clone`.
+
+What they do not guarantee: a process can construct two `LockDir`s and take
+app-1 then library on one and app-2 on the other, and two processes can take
+the locks in different orders. Across `LockDir`s and across processes the
+order is a convention: one `LockDir` per subcommand, app lock before library
+lock, and `Wait` rather than `Blocking` wherever a hung holder must not wedge
+the caller.
+
+Every applejack process sends the same `LOGIN_ID` in `CMsgClientLogon`, so two
+concurrent logged-in applejack connections on one account displace each
+other. The CLI/RPC unit that owns the connection lifetime must hold a
+`steam-session` lock (a `LockDir` name) for as long as a `SteamroomConnection`
+is in the logged-in stage; this crate only documents that rule.
 
 These locks serialize applejack processes only. They say nothing about the
 Windows Steam client.

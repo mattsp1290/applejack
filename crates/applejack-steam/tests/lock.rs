@@ -1,15 +1,19 @@
-use std::fs;
+use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use applejack_steam::Error;
 use applejack_steam::lock::{Holder, Lock, LockDir, Mode};
 
+/// Above every platform's pid range, so `kill(pid, 0)` reports `ESRCH`.
+const DEAD_PID: u32 = i32::MAX as u32;
+
 #[test]
 fn non_blocking_acquire_fails_with_the_holders_pid_and_command() {
     let dir = tempfile::tempdir().unwrap();
-    let locks = LockDir::new(dir.path(), "install 0");
+    let mut locks = LockDir::new(dir.path(), "install 0");
     let app = locks.app(0, Mode::NonBlocking).unwrap();
     let library = app.library(Mode::NonBlocking).unwrap();
 
@@ -20,38 +24,52 @@ fn non_blocking_acquire_fails_with_the_holders_pid_and_command() {
     assert!(holder.acquired_at > 0);
 
     let (tx, rx) = mpsc::channel();
-    let root = locks.root().to_path_buf();
+    let data_dir = dir.path().to_path_buf();
     thread::spawn(move || {
-        let other = LockDir::new(root.parent().unwrap(), "run 0");
-        tx.send(other.app(0, Mode::NonBlocking).map(|_| ()))
-            .unwrap();
+        let mut other = LockDir::new(&data_dir, "run 0");
+        let app = other.app(0, Mode::NonBlocking).map(|_| ());
+        let mut other = LockDir::new(&data_dir, "run 9");
+        let library = other
+            .app(9, Mode::NonBlocking)
+            .and_then(|app| app.library(Mode::NonBlocking).map(|_| ()));
+        tx.send((app, library)).unwrap();
     });
-    match rx.recv().unwrap() {
-        Err(Error::LockHeld { name, pid, command }) => {
+    let (app_result, library_result) = rx.recv().unwrap();
+    match app_result {
+        Err(Error::LockHeld { name, holder }) => {
             assert_eq!(name, "app-0");
-            assert_eq!(pid, Some(std::process::id()));
-            assert_eq!(command.as_deref(), Some("install 0"));
+            let holder = holder.expect("holder is recorded and alive");
+            assert_eq!(holder.pid, std::process::id());
+            assert_eq!(holder.command, "install 0");
         }
         other => panic!("expected LockHeld, got {other:?}"),
     }
-    assert!(matches!(
-        Lock::acquire(locks.root(), "library", Mode::NonBlocking, "x"),
-        Err(Error::LockHeld { .. })
-    ));
+    match library_result {
+        Err(Error::LockHeld { name, holder }) => {
+            assert_eq!(name, "library");
+            assert_eq!(
+                holder.map(|holder| holder.command).as_deref(),
+                Some("install 0")
+            );
+        }
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
 }
 
 #[test]
 fn blocking_acquire_succeeds_after_release() {
     let dir = tempfile::tempdir().unwrap();
-    let locks = LockDir::new(dir.path(), "first");
+    let mut locks = LockDir::new(dir.path(), "first");
     let first = locks.app(7, Mode::NonBlocking).unwrap();
 
     let (started, wait_started) = mpsc::channel();
     let (done, wait_done) = mpsc::channel();
-    let root = locks.root().to_path_buf();
+    let data_dir = dir.path().to_path_buf();
     let waiter = thread::spawn(move || {
         started.send(()).unwrap();
-        let lock = Lock::acquire(&root, "app-7", Mode::Blocking, "second").unwrap();
+        let mut other = LockDir::new(&data_dir, "second");
+        let root = other.root().to_path_buf();
+        let lock = other.app(7, Mode::Blocking).unwrap();
         done.send(Lock::holder(&root, "app-7").unwrap()).unwrap();
         drop(lock);
     });
@@ -69,13 +87,110 @@ fn blocking_acquire_succeeds_after_release() {
 }
 
 #[test]
-fn lock_files_live_under_data_locks() {
+fn wait_mode_times_out_with_the_holder_then_succeeds_once_released() {
     let dir = tempfile::tempdir().unwrap();
-    let locks = LockDir::new(dir.path(), "x");
+    let mut locks = LockDir::new(dir.path(), "holder");
+    let held = locks.app(3, Mode::NonBlocking).unwrap();
+
+    let mut other = LockDir::new(dir.path(), "waiter");
+    let started = Instant::now();
+    match other.app(3, Mode::Wait(Duration::from_millis(150))) {
+        Err(Error::LockHeld { name, holder }) => {
+            assert_eq!(name, "app-3");
+            assert_eq!(
+                holder.map(|holder| holder.command).as_deref(),
+                Some("holder")
+            );
+        }
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+    assert!(started.elapsed() >= Duration::from_millis(150));
+
+    let data_dir = dir.path().to_path_buf();
+    let waiter = thread::spawn(move || {
+        let mut other = LockDir::new(&data_dir, "waiter");
+        other
+            .app(3, Mode::Wait(Duration::from_secs(5)))
+            .map(|lock| lock.lock().name().to_owned())
+    });
+    thread::sleep(Duration::from_millis(50));
+    drop(held);
+    assert_eq!(waiter.join().unwrap().unwrap(), "app-3");
+}
+
+#[test]
+fn stale_holder_line_is_not_reported_after_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut locks = LockDir::new(dir.path(), "old-dead-command");
+    let app = locks.app(5, Mode::NonBlocking).unwrap();
+    let path = app.lock().path().to_path_buf();
+    assert_ne!(fs::read_to_string(&path).unwrap(), "");
+    drop(app);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "",
+        "release must clear the holder line"
+    );
+
+    // A holder that has `flock`ed but not yet written its line, with a stale
+    // line from a crashed process still in the file.
+    let stale = Holder {
+        pid: DEAD_PID,
+        command: "old-dead-command".to_owned(),
+        acquired_at: 1,
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&stale).unwrap()),
+    )
+    .unwrap();
+    let raw = File::options().read(true).write(true).open(&path).unwrap();
+    raw.try_lock().unwrap();
+
+    let mut other = LockDir::new(dir.path(), "new");
+    match other.app(5, Mode::NonBlocking) {
+        Err(Error::LockHeld { name, holder }) => {
+            assert_eq!(name, "app-5");
+            assert_eq!(
+                holder, None,
+                "a dead pid must not be reported as the holder"
+            );
+        }
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+    assert_eq!(Lock::holder(other.root(), "app-5"), None);
+    assert!(
+        !other
+            .app(5, Mode::NonBlocking)
+            .unwrap_err()
+            .to_string()
+            .contains("old-dead-command")
+    );
+
+    // An unparsable line is reported as unknown too.
+    fs::write(&path, "not json\n").unwrap();
+    assert!(matches!(
+        other.app(5, Mode::NonBlocking),
+        Err(Error::LockHeld { holder: None, .. })
+    ));
+    drop(raw);
+    assert!(other.app(5, Mode::NonBlocking).is_ok());
+}
+
+#[test]
+fn lock_files_are_private_and_live_under_data_locks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut locks = LockDir::new(dir.path(), "x");
     let app = locks.app(42, Mode::NonBlocking).unwrap();
     assert_eq!(app.appid(), 42);
     assert_eq!(app.lock().name(), "app-42");
     assert_eq!(app.lock().path(), dir.path().join("locks/app-42.lock"));
     let library = app.library(Mode::Blocking).unwrap();
     assert_eq!(library.lock().path(), dir.path().join("locks/library.lock"));
+    for path in [app.lock().path(), library.lock().path()] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
