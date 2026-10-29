@@ -90,6 +90,9 @@ async fn run(mode: AuthMode) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("refresh logon ok");
 
+    if let Some(interval) = connection.heartbeat_interval() {
+        println!("heartbeat interval: {}s", interval.as_secs());
+    }
     let licenses = connection.license_list().await?;
     println!("licenses on account: {}", licenses.len());
     println!("gate G2: green (record this in docs/steam-layer.md)");

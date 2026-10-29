@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use applejack_steam::acf::{AcfWriter, AppManifest, InstalledDepot, STATE_FLAGS_FULLY_INSTALLED};
+use applejack_steam::acf::{
+    AcfWriter, AppManifest, InstalledDepot, STATE_FLAGS_FULLY_INSTALLED, app_state,
+};
 
 fn fixture() -> String {
     let path =
@@ -49,10 +51,36 @@ fn parse_reads_every_field() {
 
 #[test]
 fn state_flags_other_than_four_are_not_fully_installed() {
-    let text = fixture().replace("\"StateFlags\"\t\t\"4\"", "\"StateFlags\"\t\t\"1026\"");
-    let manifest = AppManifest::parse(&text).unwrap();
-    assert_eq!(manifest.state_flags, 1026);
-    assert!(!manifest.is_fully_installed());
+    assert_eq!(STATE_FLAGS_FULLY_INSTALLED, app_state::FULLY_INSTALLED);
+    for flags in [
+        app_state::UPDATE_REQUIRED | app_state::UPDATE_STARTED,
+        app_state::FULLY_INSTALLED | app_state::UPDATE_REQUIRED,
+        app_state::FULLY_INSTALLED | app_state::APP_RUNNING,
+        app_state::UNINSTALLED,
+    ] {
+        let text = fixture().replace(
+            "\"StateFlags\"\t\t\"4\"",
+            &format!("\"StateFlags\"\t\t\"{flags}\""),
+        );
+        let manifest = AppManifest::parse(&text).unwrap();
+        assert_eq!(manifest.state_flags, flags);
+        assert!(!manifest.is_fully_installed(), "{flags}");
+    }
+}
+
+#[test]
+fn writer_emits_universe_1_between_appid_and_name() {
+    let manifest = AppManifest::parse(&fixture()).unwrap();
+    let text = AcfWriter::new(&manifest).write();
+    assert!(text.starts_with(
+        "\"AppState\"\n{\n\t\"appid\"\t\t\"0\"\n\t\"Universe\"\t\t\"1\"\n\t\"name\"\t\t\"Redacted Title\"\n"
+    ));
+    // A manifest without `Universe` still parses; the writer adds it.
+    let without = fixture().replace("\t\"Universe\"\t\t\"1\"\n", "");
+    assert_eq!(
+        AcfWriter::new(&AppManifest::parse(&without).unwrap()).write(),
+        fixture()
+    );
 }
 
 #[test]

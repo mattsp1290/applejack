@@ -1,6 +1,7 @@
 "AppState"
 {
 	"appid"		"0"
+	"Universe"		"1"
 	"name"		"Redacted Title"
 	"StateFlags"		"4"
 	"installdir"		"Redacted Title"

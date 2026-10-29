@@ -16,7 +16,8 @@ use steamroom::connection::{CmServer, Protocol};
 use steamroom::enums::EResultError;
 use steamroom::error::ConnectionError;
 use steamroom::generated::{
-    CMsgClientLicenseList, CMsgClientLogon, CMsgIpAddress, c_msg_ip_address,
+    CMsgClientLicenseList, CMsgClientLogon, CMsgClientLogonResponse, CMsgIpAddress,
+    c_msg_ip_address,
 };
 use steamroom::messages::EMsg;
 use steamroom::messages::header::PacketHeader;
@@ -61,7 +62,15 @@ enum Stage {
     GuardCode(GuardChallenge),
     MobileConfirm(MobileChallenge),
     Approved(ApprovedAuth),
-    LoggedIn(SteamClient<LoggedIn>),
+    LoggedIn(Session),
+}
+
+/// A logged-on client plus what the logon response said about keeping it.
+struct Session {
+    client: SteamClient<LoggedIn>,
+    /// `CMsgClientLogonResponse.heartbeat_seconds`: how often the CM expects
+    /// `SteamClient::send_heartbeat`. `None` when the CM did not say.
+    heartbeat: Option<Duration>,
 }
 
 /// One Steam connection at a time, as decision 5 in the plan requires.
@@ -83,6 +92,17 @@ impl SteamroomConnection {
 
     fn take_stage(&mut self) -> Stage {
         std::mem::replace(&mut self.stage, Stage::Idle)
+    }
+
+    /// The heartbeat interval the CM asked for in the logon response, once
+    /// `logon` has succeeded. The unit that keeps a session open drives
+    /// `SteamClient<LoggedIn>::send_heartbeat` at this interval.
+    #[must_use]
+    pub fn heartbeat_interval(&self) -> Option<Duration> {
+        match &self.stage {
+            Stage::LoggedIn(session) => session.heartbeat,
+            _ => None,
+        }
     }
 }
 
@@ -246,13 +266,22 @@ impl SteamConnection for SteamroomConnection {
         let mut msg = ClientMsg::with_body(EMsg::CLIENT_LOGON, &body);
         msg.header.steamid = Some(SteamId::from_parts(1, 1, 1, 0).raw());
         msg.header.client_sessionid = Some(0);
-        let (client, _response) = client.login(msg).await.map_err(map_steamroom_error)?;
-        self.stage = Stage::LoggedIn(client);
+        // `login` has already checked the response's eresult; its body is
+        // the `CMsgClientLogonResponse` whether it arrived alone or in a MULTI.
+        let (client, response) = client.login(msg).await.map_err(map_steamroom_error)?;
+        let response = CMsgClientLogonResponse::decode(&*response.body)
+            .map_err(|error| AuthError::Connection(format!("CMsgClientLogonResponse: {error}")))?;
+        let heartbeat = response
+            .heartbeat_seconds
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs);
+        self.stage = Stage::LoggedIn(Session { client, heartbeat });
         Ok(())
     }
 
     async fn license_list(&mut self) -> Result<Vec<License>, AuthError> {
-        let Stage::LoggedIn(client) = &self.stage else {
+        let Stage::LoggedIn(Session { client, .. }) = &self.stage else {
             return Err(AuthError::OutOfOrder(
                 "license_list needs a logged-in session",
             ));

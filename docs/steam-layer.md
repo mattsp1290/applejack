@@ -137,12 +137,20 @@ a key whose value is a `{` block; a `[` anywhere else is part of a bare token
 emits Valve's layout with LF line ends, so a client-written LF file
 round-trips byte for byte and a CRLF file is normalised to LF.
 `acf::AppManifest` reads and `acf::AcfWriter`
-writes `appmanifest_<appid>.acf` with `appid`, `name`, `StateFlags`,
-`installdir`, `LastUpdated`, `SizeOnDisk`, `buildid`, and `InstalledDepots`
-(`manifest`, `size` per depot). The field names follow the public format as
-documented by SteamKit and SteamDB. `tests/fixtures/appmanifest_000000.acf` is
-hand-written and redacted (appid 0); work package 5 replaces it with a captured
-client file and extends the writer with whatever keys the client needs.
+writes `appmanifest_<appid>.acf` with `appid`, `Universe` (always `1`, the
+public universe; some client versions treat its absence as a foreign
+manifest), `name`, `StateFlags`, `installdir`, `LastUpdated`, `SizeOnDisk`,
+`buildid`, and `InstalledDepots` (`manifest`, `size` per depot). The field
+names and order follow the public format as documented by SteamKit and
+SteamDB. `StateFlags` is the `EAppState` bitfield (`acf::app_state` exposes
+the bits: 1 Uninstalled, 2 UpdateRequired, 4 FullyInstalled, 64 AppRunning,
+256 UpdateRunning, 1048576 Downloading, ...); `is_fully_installed` compares
+the whole value with `4`, so `6`, `68`, and `1030` all refuse. Keys the
+writer does not model are dropped on rewrite; the depot unit, which rewrites
+client-written files for `install --update`, retains them.
+`tests/fixtures/appmanifest_000000.acf` is hand-written and redacted (appid
+0); work package 5 replaces it with a captured client file and extends the
+writer with whatever keys the client needs.
 
 ## Legal note
 
