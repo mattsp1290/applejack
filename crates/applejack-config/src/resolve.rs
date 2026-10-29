@@ -37,6 +37,11 @@ pub struct Resolved {
 /// engine leaves a defaulted field unset, the conservative value applies:
 /// DXMT, no fast sync, every toggle off, the client launch path, a shared
 /// prefix.
+///
+/// The union cannot unset an inherited variable: removing a name from the
+/// user layer (`config set extra_env NAME`) only drops the user's own value,
+/// and the preset's or engine's value for that name still applies. Unsetting
+/// would need a tombstone representation in `extra_env`; none exists yet.
 #[must_use]
 pub fn resolve(
     engine_defaults: &GameConfig,

@@ -53,7 +53,9 @@ pub enum Error {
 fn render_confirmations(items: &[Confirmation]) -> String {
     items
         .iter()
-        .map(|item| format!("{}={}", item.field, item.value))
+        // Preset values are untrusted; Debug formatting escapes control
+        // characters before the text reaches a log or the RPC layer.
+        .map(|item| format!("{}={:?}", item.field, item.value))
         .collect::<Vec<_>>()
         .join(", ")
 }
