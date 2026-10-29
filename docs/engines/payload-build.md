@@ -69,8 +69,50 @@ Environment knobs:
    Metal support is detected automatically (`configure.ac` checks
    `MTLDevice.registryID` and defines `HAVE_MTLDEVICE_REGISTRYID`), so there
    is no option to pass.
-4. `sh build/wine/build.sh` (after step 5's `sh build/gstreamer/fetch.sh`,
-   which it needs) — tool checks, the bison conftest, the pkg-config report,
+4. `sh build/dxmt/fetch.sh`, `sh build/vkd3d/fetch.sh`, `sh build/vulkan/fetch.sh`,
+   `sh build/gstreamer/fetch.sh` — extract each component under `build/work/`
+   after a denylist scan of its listing. `vulkan/fetch.sh` thins the universal
+   `libMoltenVK.dylib` to x86-64. `gstreamer/fetch.sh` expands the upstream
+   `.pkg` without installing it (and the devel `.pkg` of the same release
+   into `build/work/gstreamer/devel/`, a build input for step 5 that is
+   never staged; the devel counterparts of the same allowlist), stages only
+   the allowlisted sub-packages
+   (`base-system`, `base-crypto`, `osx-framework`, `core`, `system`,
+   `playback`, `codecs`, `effects`, `net`, `encoding`; the script comments
+   justify each), drops the GPL and patent-restricted ones (`codecs-gpl`,
+   `codecs-gpl-restricted`, `codecs-restricted`, `net-restricted`,
+   `dvd-gpl`, `libav`) and the tooling ones, removes the umbrella
+   `GStreamer` binary and its links (it re-exports libraries of the dropped
+   sub-packages, `libgstvalidate` among them, so it could never load;
+   winegstreamer links `libgstreamer-1.0` and friends, never the umbrella),
+   removes the command-line tools and helpers (`Versions/1.0/bin`,
+   `Versions/1.0/libexec`, and the `Commands` links: nothing in
+   winegstreamer runs them, `libgstreamer` scans plugins in-process when
+   `gst-plugin-scanner` is absent, and an executable the bundle does not
+   declare is dead weight step 9 never follows) and fails if any `LC_MAIN`
+   executable remains under the framework,
+   thins every universal Mach-O to x86-64 with `lipo` (a failure names the
+   file), prunes the symlinks that point into unstaged sub-packages
+   (`Headers`, into the devel package) and fails if any link still dangles,
+   and scans the staged listing against the denylist, whose
+   `scope = "payload"` rules name the excluded plugin dylibs. The
+   `LGPL-2.1-or-later` recorded for the component describes that allowlist,
+   not the whole upstream package. Once `configure` has found GStreamer
+   (step 5 asserts it), winegstreamer decodes
+   H.264/HEVC and AAC through VideoToolbox/AudioToolbox, VP8/VP9/AV1, Theora,
+   Vorbis, Opus, FLAC, MP3, and PCM in MP4, Matroska, WebM, Ogg, AVI, and
+   WAV. It does not decode WMV/VC-1, WMA, MPEG-1/2 video, MPEG-PS/TS, or
+   MPEG-4 Part 2 (DivX/Xvid/MS-MPEG4), nor Cinepak, Indeo, or ADPCM in AVI:
+   `codecs-restricted` holds the ASF, MPEG-PS/TS, and RealMedia demuxers,
+   and `libav` is the only decoder in the package for those formats (it has
+   no `mpeg2dec` or `faad`). Games with such cutscenes show a black or
+   skipped video until a codec decision (an ADR) adds `libav`. Bink and
+   Smacker are decoded by the games themselves and are unaffected. The
+   staged `codecs` set also carries `libgstopenh264`, built from source
+   (BSD-2-Clause); Cisco's H.264 patent coverage applies to Cisco's own
+   binaries only, so that plugin carries H.264 patent exposure of its own,
+   while VideoToolbox in `system` already decodes H.264.
+5. `sh build/wine/build.sh` — tool checks, the bison conftest, the pkg-config report,
    gate G4b (below), project patches from `build/wine/patches/`, then
    `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests`
    with `CC=clang`, `BISON=`, `FLEX=`, `GSTREAMER_CFLAGS=`,
@@ -123,49 +165,6 @@ Environment knobs:
    Homebrew, the msync patch set, the GStreamer stage or devel tree, a
    project patch that does not apply), so CI can run it before bootstrap and
    still catch a recipe defect.
-5. `sh build/dxmt/fetch.sh`, `sh build/vkd3d/fetch.sh`, `sh build/vulkan/fetch.sh`,
-   `sh build/gstreamer/fetch.sh` — extract each component under `build/work/`
-   after a denylist scan of its listing. `vulkan/fetch.sh` thins the universal
-   `libMoltenVK.dylib` to x86-64. `gstreamer/fetch.sh` expands the upstream
-   `.pkg` without installing it (and the devel `.pkg` of the same release
-   into `build/work/gstreamer/devel/`, a build input for step 4 that is
-   never staged; the devel counterparts of the same allowlist), stages only
-   the allowlisted sub-packages
-   (`base-system`, `base-crypto`, `osx-framework`, `core`, `system`,
-   `playback`, `codecs`, `effects`, `net`, `encoding`; the script comments
-   justify each), drops the GPL and patent-restricted ones (`codecs-gpl`,
-   `codecs-gpl-restricted`, `codecs-restricted`, `net-restricted`,
-   `dvd-gpl`, `libav`) and the tooling ones, removes the umbrella
-   `GStreamer` binary and its links (it re-exports libraries of the dropped
-   sub-packages, `libgstvalidate` among them, so it could never load;
-   winegstreamer links `libgstreamer-1.0` and friends, never the umbrella),
-   removes the command-line tools and helpers (`Versions/1.0/bin`,
-   `Versions/1.0/libexec`, and the `Commands` links: nothing in
-   winegstreamer runs them, `libgstreamer` scans plugins in-process when
-   `gst-plugin-scanner` is absent, and an executable the bundle does not
-   declare is dead weight step 9 never follows) and fails if any `LC_MAIN`
-   executable remains under the framework,
-   thins every universal Mach-O to x86-64 with `lipo` (a failure names the
-   file), prunes the symlinks that point into unstaged sub-packages
-   (`Headers`, into the devel package) and fails if any link still dangles,
-   and scans the staged listing against the denylist, whose
-   `scope = "payload"` rules name the excluded plugin dylibs. The
-   `LGPL-2.1-or-later` recorded for the component describes that allowlist,
-   not the whole upstream package. Once `configure` has found GStreamer
-   (step 4 asserts it), winegstreamer decodes
-   H.264/HEVC and AAC through VideoToolbox/AudioToolbox, VP8/VP9/AV1, Theora,
-   Vorbis, Opus, FLAC, MP3, and PCM in MP4, Matroska, WebM, Ogg, AVI, and
-   WAV. It does not decode WMV/VC-1, WMA, MPEG-1/2 video, MPEG-PS/TS, or
-   MPEG-4 Part 2 (DivX/Xvid/MS-MPEG4), nor Cinepak, Indeo, or ADPCM in AVI:
-   `codecs-restricted` holds the ASF, MPEG-PS/TS, and RealMedia demuxers,
-   and `libav` is the only decoder in the package for those formats (it has
-   no `mpeg2dec` or `faad`). Games with such cutscenes show a black or
-   skipped video until a codec decision (an ADR) adds `libav`. Bink and
-   Smacker are decoded by the games themselves and are unaffected. The
-   staged `codecs` set also carries `libgstopenh264`, built from source
-   (BSD-2-Clause); Cisco's H.264 patent coverage applies to Cisco's own
-   binaries only, so that plugin carries H.264 patent exposure of its own,
-   while VideoToolbox in `system` already decodes H.264.
 6. `sh build/osslsigncode/build.sh` — the host-arch Authenticode tool for
    `probes/`, built with `-DOPENSSL_USE_STATIC_LIBS=ON` so Homebrew's
    `libcrypto`/`libssl` are linked in rather than referenced from

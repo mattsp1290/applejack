@@ -32,13 +32,15 @@ const PINS_FILE: &str = "build/pins.toml";
 const DENYLIST_FILE: &str = "build/denylist.toml";
 const WORK_DIR: &str = "build/work";
 
+// The component fetches precede the Wine build, which needs the GStreamer
+// devel tree and stage from `build/gstreamer/fetch.sh`.
 const BUILD_SCRIPTS: &[&str] = &[
     "build/wine/fetch.sh",
-    "build/wine/build.sh",
     "build/dxmt/fetch.sh",
     "build/vkd3d/fetch.sh",
     "build/vulkan/fetch.sh",
     "build/gstreamer/fetch.sh",
+    "build/wine/build.sh",
     "build/osslsigncode/build.sh",
     "crates/applejack-engine/probes/hello32/build.sh",
     "crates/applejack-engine/probes/dx11-sample/build.sh",

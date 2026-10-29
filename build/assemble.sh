@@ -19,6 +19,9 @@ set -eu
 
 P=$(payload_dir)
 T="$P.tmp"
+# A run that died between the two mv's of the swap below left the last good
+# tree as $P.old only; put it back before anything here can fail.
+[ -e "$P" ] || [ ! -e "$P.old" ] || mv "$P.old" "$P"
 dxmt="$WORK/dxmt/src/v$(pin_field dxmt version)"
 vkd3d="$WORK/vkd3d/src/vkd3d-proton-$(pin_field vkd3d-proton version)"
 vulkan="$WORK/vulkan/stage"
@@ -81,9 +84,6 @@ copy_probe "$WORK/osslsigncode/osslsigncode" osslsigncode "sh build/osslsigncode
 
 xtask engine-payload --write-bundle-toml "$ROOT/build/bundle-spec.toml" "$T/BUNDLE.toml"
 
-# A run that died between the two mv's below left the last good tree as
-# $P.old only; put it back before it is discarded.
-[ -e "$P" ] || [ ! -e "$P.old" ] || mv "$P.old" "$P"
 rm -rf "$P.old"
 [ ! -e "$P" ] || mv "$P" "$P.old"
 mv "$T" "$P"

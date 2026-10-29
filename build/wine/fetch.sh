@@ -1,6 +1,5 @@
 #!/bin/sh
 # Fetches the pinned Wine source and the msync patch set into build/work/wine/.
-# build/wine/build.sh adds --with-metal to configure when configure.ac offers it.
 set -eu
 . "$(dirname "$0")/../lib.sh"
 
