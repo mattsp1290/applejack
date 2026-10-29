@@ -176,8 +176,11 @@ impl Wow64 {
 /// <data_dir>/engines/<id>/<version>/          installed bundle
 /// <data_dir>/engines/<id>/<version>.partial/  extraction in progress
 /// <data_dir>/engines/<id>/<version>.user/     per-user overlay (D3DMetal)
-/// <data_dir>/engines/<id>/ACTIVE              selected version
+/// <data_dir>/engines/<id>/<version>.download  archive being downloaded
 /// ```
+///
+/// The active version is not recorded here; the core owns it and passes it
+/// to [`versions::prune`] and [`versions::remove`] as a protected version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineLayout {
     data_dir: PathBuf,
@@ -188,8 +191,8 @@ impl EngineLayout {
     pub const PARTIAL_SUFFIX: &'static str = ".partial";
     /// Directory name suffix of a per-user overlay.
     pub const OVERLAY_SUFFIX: &'static str = ".user";
-    /// File that records the active version of an engine.
-    pub const ACTIVE_FILE: &'static str = "ACTIVE";
+    /// File name suffix of an archive being downloaded.
+    pub const DOWNLOAD_SUFFIX: &'static str = ".download";
 
     #[must_use]
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
@@ -229,10 +232,14 @@ impl EngineLayout {
             .join(format!("{version}{}", Self::OVERLAY_SUFFIX))
     }
 
-    /// `<data_dir>/engines/<id>/ACTIVE`.
+    /// `<data_dir>/engines/<id>/<version>.download`: where a downloaded
+    /// archive lands. It sits outside `<version>.partial/`, so a download
+    /// whose digest does not match is kept for inspection while the
+    /// extraction directory is discarded.
     #[must_use]
-    pub fn active_file(&self, id: EngineId) -> PathBuf {
-        self.engine_root(id).join(Self::ACTIVE_FILE)
+    pub fn download_path(&self, id: EngineId, version: &Version) -> PathBuf {
+        self.engine_root(id)
+            .join(format!("{version}{}", Self::DOWNLOAD_SUFFIX))
     }
 }
 

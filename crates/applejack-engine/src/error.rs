@@ -16,13 +16,22 @@ pub enum Error {
     #[error("archive SHA-256 mismatch: expected {expected}, actual {actual}")]
     Sha256Mismatch { expected: Sha256, actual: Sha256 },
 
-    /// `BUNDLE.toml` parsed but breaks an invariant.
+    /// `BUNDLE.toml` parsed but breaks an invariant, or the archive breaks a
+    /// layout rule.
     #[error("invalid BUNDLE.toml: {0}")]
     InvalidBundle(String),
 
     /// `BUNDLE.toml` names a loader that is not a file in the bundle.
     #[error("BUNDLE.toml names loader `{}` but the bundle has no such file", path.display())]
     MissingLoader { path: PathBuf },
+
+    /// `BUNDLE.toml` disagrees with the manifest entry the install came from.
+    #[error("BUNDLE.toml `{field}` is `{bundle}` but the manifest pins `{manifest}`")]
+    ManifestMismatch {
+        field: &'static str,
+        manifest: String,
+        bundle: String,
+    },
 
     /// A sync mode name outside `msync`, `esync`, and `none`.
     #[error("unknown sync mode `{0}` (expected msync, esync, or none)")]
@@ -32,6 +41,15 @@ pub enum Error {
     #[error("unknown engine id `{0}` (expected rosetta-wine or native-arm64)")]
     UnknownEngineId(String),
 
+    /// A graphics backend name outside `dxmt`, `wined3d`, `vkd3d-proton`, and
+    /// `d3dmetal`.
+    #[error("unknown graphics backend `{0}` (expected dxmt, wined3d, vkd3d-proton, or d3dmetal)")]
+    UnknownGraphicsBackend(String),
+
+    /// A HID mode name outside `enabled` and `disabled`.
+    #[error("unknown hidraw mode `{0}` (expected enabled or disabled)")]
+    UnknownHidrawMode(String),
+
     /// A version string that cannot name a directory under `engines/<id>/`.
     #[error("invalid engine version `{version}`: {reason}")]
     InvalidVersion {
@@ -39,15 +57,13 @@ pub enum Error {
         reason: &'static str,
     },
 
-    /// Removal refused because the version is the active one.
+    /// Removal refused because the caller listed the version as protected:
+    /// it is active, pinned by a game configuration, or in use by a running
+    /// session.
     #[error(
-        "version {version} of engine {id} is active; select another with `applejack engine use` first"
+        "version {version} of engine {id} is protected (active, pinned by a game configuration, or in use)"
     )]
-    ActiveVersion { id: EngineId, version: Version },
-
-    /// Removal refused because a game configuration pins the version.
-    #[error("version {version} of engine {id} is referenced by a game configuration")]
-    ReferencedVersion { id: EngineId, version: Version },
+    ProtectedVersion { id: EngineId, version: Version },
 
     /// The requested version has no `engines/<id>/<version>/` directory.
     #[error("engine {id} version {version} is not installed")]
@@ -68,6 +84,10 @@ pub enum Error {
         found: EngineId,
         found_version: Version,
     },
+
+    /// An allowed root for path-valued environment variables is unusable.
+    #[error("allowed root `{}` {reason}", path.display())]
+    InvalidRoot { path: PathBuf, reason: &'static str },
 
     /// Rosetta 2 is required and not installed.
     #[error(

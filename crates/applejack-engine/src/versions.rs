@@ -1,8 +1,8 @@
-//! Installed engine versions: listing, the active selection, and pruning.
+//! Installed engine versions: listing, removal, and pruning.
 //!
-//! The active version is recorded in `engines/<id>/ACTIVE` rather than the
-//! config database because the database belongs to `applejack-config`, which
-//! this crate never depends on. The core keeps the two in step.
+//! The active version is not recorded here. The core owns that fact (in
+//! `engine_versions.active`) and passes every version it must keep, including
+//! the active one, to [`remove`] and [`prune`] as `protected`.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -17,16 +17,21 @@ use crate::{EngineId, EngineLayout, Error, Result};
 /// An engine version string that doubles as a directory name under
 /// `engines/<id>/`.
 ///
-/// Ordering compares dot- and dash-separated segments left to right, numeric
-/// segments by value and other segments lexically, so `10.0.0 < 10.0.1 <
-/// 10.1.0` and `10.0.0-rc1 < 10.0.0`. The newest version is the greatest.
+/// The alphabet is lowercase ASCII `[0-9a-z._+-]`, starting with a digit and
+/// not ending with `.`, so that byte equality is filesystem identity on a
+/// case-insensitive volume and no version collides with a layout file.
+///
+/// Ordering compares dot- and dash-separated segments left to right, each
+/// split into alternating digit and letter runs: numbers by value, letters
+/// lexically. So `10.0.0 < 10.0.1 < 10.1.0`, `10.0.0-rc1 < 10.0.0`, and
+/// `10.0.0-rc9 < 10.0.0-rc10`. The newest version is the greatest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Version(String);
 
 impl Version {
-    /// Validates `value` as a version: non-empty, no path separators, not a
-    /// dot-file, and not carrying a layout suffix.
+    /// Validates `value` as a version: lowercase ASCII `[0-9a-z._+-]`, a
+    /// leading digit, no trailing `.`, and no layout suffix.
     ///
     /// # Errors
     ///
@@ -35,16 +40,20 @@ impl Version {
         let value = value.into();
         let reason = if value.is_empty() {
             Some("empty")
-        } else if value.starts_with('.') {
-            Some("starts with `.`")
-        } else if value.contains(['/', '\\']) || value.contains('\0') {
-            Some("contains a path separator or NUL")
+        } else if !value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'.' | b'_' | b'+' | b'-'))
+        {
+            Some("must use only lowercase ASCII letters, digits, `.`, `_`, `+`, `-`")
+        } else if !value.as_bytes()[0].is_ascii_digit() {
+            Some("must start with a digit")
+        } else if value.ends_with('.') {
+            Some("ends with `.`")
         } else if value.ends_with(EngineLayout::PARTIAL_SUFFIX)
             || value.ends_with(EngineLayout::OVERLAY_SUFFIX)
+            || value.ends_with(EngineLayout::DOWNLOAD_SUFFIX)
         {
-            Some("ends with a reserved directory suffix")
-        } else if value.chars().any(char::is_whitespace) {
-            Some("contains whitespace")
+            Some("ends with a reserved layout suffix")
         } else {
             None
         };
@@ -62,8 +71,25 @@ impl Version {
         &self.0
     }
 
-    fn segments(&self) -> impl Iterator<Item = Segment<'_>> {
-        self.0.split(['.', '-']).map(Segment::parse)
+    fn segments(&self) -> Vec<Segment<'_>> {
+        let mut out = Vec::new();
+        for part in self.0.split(['.', '-']) {
+            if part.is_empty() {
+                out.push(Segment::Text(""));
+                continue;
+            }
+            // `rc10` -> Text("rc"), Number(10): a digit run and a letter run
+            // never compare lexically against each other.
+            let bytes = part.as_bytes();
+            let mut start = 0;
+            for i in 1..=bytes.len() {
+                if i == bytes.len() || bytes[i].is_ascii_digit() != bytes[start].is_ascii_digit() {
+                    out.push(Segment::parse(&part[start..i]));
+                    start = i;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -100,8 +126,8 @@ impl PartialOrd for Segment<'_> {
 
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
-        let mut a = self.segments();
-        let mut b = other.segments();
+        let mut a = self.segments().into_iter();
+        let mut b = other.segments().into_iter();
         loop {
             match (a.next(), b.next()) {
                 (None, None) => return self.0.cmp(&other.0),
@@ -156,8 +182,9 @@ impl From<Version> for String {
     }
 }
 
-/// Installed versions of `id`, oldest first. Extraction-in-progress and
-/// overlay directories are not versions.
+/// Installed versions of `id`, oldest first. Only a directory whose name is a
+/// version and that holds a regular `BUNDLE.toml` counts; extraction,
+/// overlay, download, and stray directories are not versions.
 ///
 /// # Errors
 ///
@@ -176,7 +203,7 @@ pub fn list(layout: &EngineLayout, id: EngineId) -> Result<Vec<Version>> {
             .file_type()
             .map_err(|error| Error::io(entry.path(), error))?
             .is_dir();
-        if !is_dir {
+        if !is_dir || !has_descriptor(&entry.path()) {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -190,85 +217,42 @@ pub fn list(layout: &EngineLayout, id: EngineId) -> Result<Vec<Version>> {
     Ok(versions)
 }
 
-/// The version recorded in `engines/<id>/ACTIVE`, or `None` when no version
-/// is selected or the selected one is no longer installed.
-///
-/// # Errors
-///
-/// Returns [`Error::Io`] when the file exists but cannot be read, or
-/// [`Error::InvalidVersion`] when its content is not a version.
-pub fn active(layout: &EngineLayout, id: EngineId) -> Result<Option<Version>> {
-    let path = layout.active_file(id);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::io(path, error)),
-    };
-    let version = Version::new(text.trim())?;
-    if layout.engine_dir(id, &version).is_dir() {
-        Ok(Some(version))
-    } else {
-        Ok(None)
-    }
+fn has_descriptor(dir: &std::path::Path) -> bool {
+    fs::symlink_metadata(dir.join(crate::bundle::BUNDLE_FILE)).is_ok_and(|meta| meta.is_file())
 }
 
-/// Records `version` as the active one for `id`.
+/// Removes one installed version. `protected` lists every version the caller
+/// must keep: the active one, those pinned by a game configuration, and those
+/// in use by a running session. Comparison is exact.
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotInstalled`] when `engines/<id>/<version>/` does not
-/// exist, or [`Error::Io`] when the record cannot be written.
-pub fn set_active(layout: &EngineLayout, id: EngineId, version: &Version) -> Result<()> {
-    if !layout.engine_dir(id, version).is_dir() {
-        return Err(Error::NotInstalled {
-            id,
-            version: version.clone(),
-        });
-    }
-    let path = layout.active_file(id);
-    // Write then rename so a crash never leaves a half-written record.
-    let staged = path.with_extension("tmp");
-    fs::write(&staged, format!("{version}\n")).map_err(|error| Error::io(&staged, error))?;
-    fs::rename(&staged, &path).map_err(|error| Error::io(&path, error))
-}
-
-/// Removes one installed version.
-///
-/// # Errors
-///
-/// Returns [`Error::ActiveVersion`] when `version` is active,
-/// [`Error::ReferencedVersion`] when it is in `referenced`,
+/// Returns [`Error::ProtectedVersion`] when `version` is in `protected`,
 /// [`Error::NotInstalled`] when it is not installed, or [`Error::Io`].
 pub fn remove(
     layout: &EngineLayout,
     id: EngineId,
     version: &Version,
-    referenced: &[Version],
+    protected: &[Version],
 ) -> Result<()> {
-    if active(layout, id)?.as_ref() == Some(version) {
-        return Err(Error::ActiveVersion {
+    if protected.contains(version) {
+        return Err(Error::ProtectedVersion {
             id,
             version: version.clone(),
         });
     }
-    if referenced.contains(version) {
-        return Err(Error::ReferencedVersion {
-            id,
-            version: version.clone(),
-        });
-    }
-    let dir = layout.engine_dir(id, version);
-    if !dir.is_dir() {
+    if !list(layout, id)?.contains(version) {
         return Err(Error::NotInstalled {
             id,
             version: version.clone(),
         });
     }
+    let dir = layout.engine_dir(id, version);
     fs::remove_dir_all(&dir).map_err(|error| Error::io(dir, error))
 }
 
-/// Removes installed versions beyond the newest `keep`, never the active
-/// version or one in `referenced`. Per-user overlays (`<version>.user/`) are
+/// Removes installed versions beyond the newest `keep`, never one in
+/// `protected` (see [`remove`]). Per-user overlays (`<version>.user/`) are
 /// left alone because they hold user-supplied files. Returns what it removed,
 /// oldest first.
 ///
@@ -280,12 +264,11 @@ pub fn prune(
     layout: &EngineLayout,
     id: EngineId,
     keep: usize,
-    referenced: &[Version],
+    protected: &[Version],
 ) -> Result<Vec<Version>> {
-    let active = active(layout, id)?;
     let mut candidates: Vec<Version> = list(layout, id)?
         .into_iter()
-        .filter(|version| Some(version) != active.as_ref() && !referenced.contains(version))
+        .filter(|version| !protected.contains(version))
         .collect();
     // `list` is oldest first; the newest `keep` sit at the end.
     let remove_count = candidates.len().saturating_sub(keep);
@@ -310,10 +293,35 @@ mod tests {
         assert!(v("10.0.0") < v("10.0.1"));
         assert!(v("10.0.9") < v("10.0.10"));
         assert!(v("9.9.9") < v("10.0.0"));
+        assert!(v("0.1.0") < v("0.10.0"));
         assert!(v("10.0.0-rc1") < v("10.0.0"));
         assert!(v("10.0.0-rc1") < v("10.0.0-rc2"));
         assert!(v("10.0") < v("10.0.0"));
+        assert!(
+            v("10.0.0") < v("10.0.0-1"),
+            "a numeric tag is a post-release"
+        );
         assert_eq!(v("10.0.0").cmp(&v("10.0.0")), Ordering::Equal);
+    }
+
+    #[test]
+    fn version_orders_rc9_before_rc10() {
+        assert!(v("0.1.0-rc9") < v("0.1.0-rc10"));
+        assert!(v("10.0.0-rc9") < v("10.0.0-rc10"));
+        assert!(v("10.0.0-rc10") < v("10.0.0"));
+        assert!(v("10.0.0-beta2") < v("10.0.0-rc1"));
+    }
+
+    #[test]
+    fn version_rejects_uppercase() {
+        for bad in ["ACTIVE", "ACTIVE.tmp", "10.0.0-RC1", "10.0.0-Rc1"] {
+            let error = Version::new(bad).unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidVersion { .. }),
+                "{bad:?}: {error}"
+            );
+        }
+        assert!(Version::new("10.0.0-rc1").is_ok());
     }
 
     #[test]
@@ -325,10 +333,18 @@ mod tests {
             "a\\b",
             "1.0.partial",
             "1.0.user",
+            "1.0.download",
             "1 0",
+            "10.0.0.",
+            "10:0",
+            "x10",
+            "-1",
+            "1\u{e9}",
         ] {
             assert!(Version::new(bad).is_err(), "{bad:?} should be rejected");
         }
-        assert!(Version::new("10.0.0").is_ok());
+        for good in ["10.0.0", "0.1.0-rc9", "1.0+build_3", "7"] {
+            assert!(Version::new(good).is_ok(), "{good:?} should be accepted");
+        }
     }
 }
