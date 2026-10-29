@@ -6,7 +6,7 @@
 //! Every call below is named in `docs/steam-layer.md` under "API grounding"
 //! with the registry file and line it was confirmed against.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use prost::Message;
 use steamroom::client::msg::ClientMsg;
@@ -158,8 +158,13 @@ impl SteamConnection for SteamroomConnection {
     }
 
     async fn submit_guard_code(&mut self, code: &str) -> Result<(), AuthError> {
-        let Stage::GuardCode(challenge) = self.take_stage() else {
+        // Check before taking: a wrong-stage call must leave the stage (and
+        // any logged-in session) untouched, as `OutOfOrder` promises.
+        if !matches!(self.stage, Stage::GuardCode(_)) {
             return Err(AuthError::OutOfOrder("no Steam Guard code is pending"));
+        }
+        let Stage::GuardCode(challenge) = self.take_stage() else {
+            unreachable!("stage checked above")
         };
         let kind = if challenge.allowed_kinds().contains(&GuardType::DeviceCode) {
             GuardType::DeviceCode
@@ -175,11 +180,30 @@ impl SteamConnection for SteamroomConnection {
                 self.stage = Stage::GuardCode(challenge);
                 Err(AuthError::InvalidGuardCode)
             }
-            Err((_, error)) => Err(map_login_error(error)),
+            // The challenge is gone with the flow. A code mismatch reported
+            // from the token poll rather than the submit itself would read
+            // as "try another code", which nothing can accept any more.
+            Err((_, error)) => Err(match map_login_error(error) {
+                AuthError::InvalidGuardCode => AuthError::OutOfOrder(
+                    "the Steam Guard challenge was consumed; begin the login again",
+                ),
+                other => other,
+            }),
         }
     }
 
     async fn wait_for_tokens(&mut self) -> Result<Tokens, AuthError> {
+        match &self.stage {
+            Stage::GuardCode(challenge) => {
+                return Err(AuthError::GuardRequired {
+                    factor: guard_factor(challenge.allowed_kinds()),
+                });
+            }
+            Stage::Idle | Stage::LoggedIn(_) => {
+                return Err(AuthError::OutOfOrder("no auth session is pending"));
+            }
+            Stage::Qr(_) | Stage::MobileConfirm(_) | Stage::Approved(_) => {}
+        }
         let approved = match self.take_stage() {
             Stage::Qr(flow) => flow.wait_for_scan().await.map_err(map_login_error)?,
             Stage::MobileConfirm(challenge) => challenge
@@ -187,13 +211,8 @@ impl SteamConnection for SteamroomConnection {
                 .await
                 .map_err(map_login_error)?,
             Stage::Approved(approved) => approved,
-            Stage::GuardCode(challenge) => {
-                let factor = guard_factor(challenge.allowed_kinds());
-                self.stage = Stage::GuardCode(challenge);
-                return Err(AuthError::GuardRequired { factor });
-            }
-            Stage::Idle | Stage::LoggedIn(_) => {
-                return Err(AuthError::OutOfOrder("no auth session is pending"));
+            Stage::Idle | Stage::GuardCode(_) | Stage::LoggedIn(_) => {
+                unreachable!("stage checked above")
             }
         };
         let tokens = approved.tokens();
@@ -275,32 +294,17 @@ impl SteamConnection for SteamroomConnection {
                 "license_list needs a logged-in session",
             ));
         };
-        let deadline = Instant::now() + LICENSE_LIST_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(AuthError::Connection(
-                    "timed out waiting for CLIENT_LICENSE_LIST".to_owned(),
-                ));
-            }
-            let incoming = tokio::time::timeout(remaining, client.recv_msg())
-                .await
-                .map_err(|_| {
-                    AuthError::Connection("timed out waiting for CLIENT_LICENSE_LIST".to_owned())
-                })?
-                .map_err(map_steamroom_error)?;
-            if incoming.emsg == EMsg::CLIENT_LICENSE_LIST {
-                return decode_license_list(&incoming.body);
-            }
-            if incoming.emsg == EMsg::MULTI {
-                for sub in unpack_multi(&incoming.body).map_err(map_steamroom_error)? {
-                    if let PacketHeader::Protobuf { header, body } = PacketHeader::parse(&sub)
-                        .map_err(|error| map_steamroom_error(error.into()))?
-                        && header.emsg == EMsg::CLIENT_LICENSE_LIST
-                    {
-                        return decode_license_list(&body);
-                    }
-                }
+        match tokio::time::timeout(LICENSE_LIST_TIMEOUT, receive_license_list(client)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // `TcpTransport::recv` reads the header and body in separate
+                // `read_exact` calls with no partial-frame buffer, so the
+                // cancelled read may have consumed part of a frame. The
+                // stream cannot be trusted after this; the session ends here.
+                self.stage = Stage::Idle;
+                Err(AuthError::Connection(
+                    "timed out waiting for CLIENT_LICENSE_LIST; session closed".to_owned(),
+                ))
             }
         }
     }
@@ -319,6 +323,25 @@ impl SteamConnection for SteamroomConnection {
             ));
         };
         client.send_heartbeat().await.map_err(map_steamroom_error)
+    }
+}
+
+async fn receive_license_list(client: &SteamClient<LoggedIn>) -> Result<Vec<License>, AuthError> {
+    loop {
+        let incoming = client.recv_msg().await.map_err(map_steamroom_error)?;
+        if incoming.emsg == EMsg::CLIENT_LICENSE_LIST {
+            return decode_license_list(&incoming.body);
+        }
+        if incoming.emsg == EMsg::MULTI {
+            for sub in unpack_multi(&incoming.body).map_err(map_steamroom_error)? {
+                if let PacketHeader::Protobuf { header, body } =
+                    PacketHeader::parse(&sub).map_err(|error| map_steamroom_error(error.into()))?
+                    && header.emsg == EMsg::CLIENT_LICENSE_LIST
+                {
+                    return decode_license_list(&body);
+                }
+            }
+        }
     }
 }
 

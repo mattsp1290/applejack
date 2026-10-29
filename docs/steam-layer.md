@@ -31,7 +31,14 @@ and a `RefreshTokenStore`. Unit tests use a scripted fake connection;
   connection has consumed its auth session, the driver returns to idle, and
   the next call must be `begin` again; `finish` or `submit_guard_code` before
   that is `OutOfOrder`, never `GuardRequired`, so a shell that re-prompts on
-  `GuardRequired` cannot loop.
+  `GuardRequired` cannot loop. The same holds for a `GuardRequired` that the
+  connection itself reports from `finish`: it ends the login, since the
+  driver's own `GuardRequired` is only ever returned before the flow is
+  consumed. A call in the wrong state is `OutOfOrder` and leaves the
+  connection's state unchanged; a live connection never answers
+  `InvalidGuardCode` once its challenge is gone (a mismatch reported by the
+  token poll rather than the submit is `OutOfOrder`), so "try another code"
+  is only ever said while another code can be accepted.
 - **Refresh.** `refresh(account_name)` reads the stored refresh token and sends
   `CMsgClientLogon` with it on a fresh connection. The account name is not a
   secret; `steamroom-client`'s token logon requires it alongside the token, so
@@ -42,8 +49,11 @@ and a `RefreshTokenStore`. Unit tests use a scripted fake connection;
   rows is the host's job.
 - **License list.** After `refresh`, `SteamConnection::license_list` reads
   `EMsg::CLIENT_LICENSE_LIST` from the same connection (also inside `MULTI`
-  batches) and decodes `CMsgClientLicenseList`. It times out after 30 s.
-  Call it exactly once, directly after `logon` and before any PICS or
+  batches) and decodes `CMsgClientLicenseList`. It times out after 30 s,
+  and a timeout ends the session: the cancelled read may have consumed part
+  of a frame, so the connection returns to idle (`heartbeat_interval` is
+  `None`, `send_heartbeat` is `OutOfOrder`) and the caller must `logon`
+  again. Call it exactly once, directly after `logon` and before any PICS or
   heartbeat call: the live implementation drops every other message it
   receives while waiting, and Steam re-sends the list unprompted whenever
   the account's licenses change, so once PICS calls and heartbeats share

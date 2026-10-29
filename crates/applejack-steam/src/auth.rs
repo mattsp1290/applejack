@@ -157,7 +157,8 @@ impl fmt::Debug for License {
 /// the order is `begin_qr` or `begin_credentials`, optionally
 /// `submit_guard_code`, then `wait_for_tokens`; `logon` opens a session from a
 /// refresh token, `license_list` reads from that session, and
-/// `send_heartbeat` keeps it open at `heartbeat_interval`.
+/// `send_heartbeat` keeps it open at `heartbeat_interval`. A call made in the
+/// wrong state is [`AuthError::OutOfOrder`] and leaves the state unchanged.
 pub trait SteamConnection {
     /// Starts a QR session and returns the challenge payload to render.
     fn begin_qr(&mut self) -> impl Future<Output = Result<String, AuthError>> + Send;
@@ -190,7 +191,10 @@ pub trait SteamConnection {
     /// the live implementation drops every other message that arrives while
     /// it waits, and Steam sends the list unprompted after logon (and again
     /// whenever the account's licenses change), so a later call can eat
-    /// another reply or wait out its timeout.
+    /// another reply or wait out its timeout. A timeout ends the session,
+    /// because the cancelled read may have consumed part of a frame:
+    /// `heartbeat_interval` returns `None` afterwards, `send_heartbeat` is
+    /// [`AuthError::OutOfOrder`], and the caller must `logon` again.
     fn license_list(&mut self) -> impl Future<Output = Result<Vec<License>, AuthError>> + Send;
 
     /// The interval the CM asked for in the logon response; `None` before
@@ -300,11 +304,12 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
     ///
     /// # Errors
     ///
-    /// [`AuthError::GuardRequired`] when a code is still pending and
-    /// [`AuthError::OutOfOrder`] when no login is in progress; both leave the
-    /// login where it was. Any other error, from the connection or from
-    /// storing the token, ends the login: the auth flow is consumed on
-    /// failure, so the next call must be [`Authenticator::begin`].
+    /// [`AuthError::GuardRequired`] from the driver's own state (a code is
+    /// still pending) and [`AuthError::OutOfOrder`] when no login is in
+    /// progress; both leave the login where it was. Any other error, from
+    /// the connection (including a `GuardRequired` the connection itself
+    /// reports) or from storing the token, ends the login: the auth flow is
+    /// consumed on failure, so the next call must be [`Authenticator::begin`].
     pub async fn finish(&mut self) -> Result<LoginStep, Error> {
         match self.pending {
             Pending::AwaitingTokens => {}
