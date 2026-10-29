@@ -1,0 +1,14 @@
+target/
+.agents/plans/
+.agents/reviews/
+.agents/orchestrate/
+reviews/
+*.dmg
+fixtures/engines/
+fixtures/payloads/
+apps/Applejack/.build/
+# build/ holds committed scripts and pins; only generated output is ignored.
+/build/*.app/
+/build/work/
+*.xcuserstate
+.worktrees/

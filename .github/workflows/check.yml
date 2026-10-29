@@ -1,0 +1,51 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require Apple Silicon
+        run: test "$(uname -m)" = arm64
+      - name: Select the newest release Xcode 26
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)
+          if [ -z "$xcode" ]; then
+            echo "no release Xcode 26 bundle found under /Applications" >&2
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+      - name: Require Xcode 26.2 or newer
+        run: |
+          version=$(xcodebuild -version | awk '/^Xcode / { print $2 }')
+          echo "found Xcode ${version:-unknown}"
+          if [ -z "$version" ]; then
+            echo "could not read the Xcode version from xcodebuild -version" >&2
+            exit 1
+          fi
+          if [ "$(printf '%s\n' 26.2 "$version" | sort -V | head -1)" != 26.2 ]; then
+            echo "Xcode $version is older than the required 26.2" >&2
+            exit 1
+          fi
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - run: cargo xtask check

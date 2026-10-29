@@ -1,0 +1,11 @@
+[package]
+name = "applejack-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+applejack-manifest = { workspace = true }
+
+[lints]
+workspace = true

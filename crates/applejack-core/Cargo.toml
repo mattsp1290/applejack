@@ -1,0 +1,17 @@
+[package]
+name = "applejack-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+applejack-config = { workspace = true }
+applejack-engine = { workspace = true }
+applejack-steam = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
