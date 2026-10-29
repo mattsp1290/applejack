@@ -256,9 +256,7 @@ fn config_import_rejects_forged_report_lines_and_oversized_files() {
         .collect();
     assert_eq!(rejects.len(), 2, "{report}");
     assert!(
-        rejects
-            .iter()
-            .all(|line| line.contains("control characters")),
+        rejects.iter().all(|line| line.contains("control")),
         "{report}"
     );
     assert!(

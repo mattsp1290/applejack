@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ConfigDb, Error, Field, GameConfig, GraphicsBackend};
 
-/// The preset payload version this build writes and reads.
+/// The preset payload version this build writes and reads. Bump it when
+/// `config` gains a column: `GameConfig` denies unknown keys, so an older
+/// build refuses a preset that sets the new column, and the version check is
+/// where it should learn why. Unset columns are not written, so a preset that
+/// never set the column stays readable.
 pub const SCHEMA_VERSION: u64 = 1;
 
 /// Placeholder that replaces the data directory in exported paths.
@@ -63,20 +67,35 @@ const HOST_OWNED_NAMES: [&str; 15] = [
 /// Dynamic-loader variable prefixes; any name starting with one is rejected.
 const LOADER_PREFIXES: [&str; 2] = ["DYLD_", "LD_"];
 
+/// Names the engine sets itself from the chosen backend and sync mode. A
+/// preset value would be dropped at launch, so import refuses it, whatever
+/// the policy allows; a policy's [`EnvPolicy::allows`] answers `false` for
+/// them too.
+pub const ENGINE_OWNED_NAMES: [&str; 4] =
+    ["WINEPREFIX", "WINEDLLOVERRIDES", "WINEMSYNC", "WINEESYNC"];
+
+/// How a policy checks a variable's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueCheck<'a> {
+    /// Plain text; not checked as a path.
+    Plain,
+    /// Exactly one absolute path, which must resolve inside one of the roots.
+    Path(&'a [PathBuf]),
+    /// A `:`-separated list of absolute paths, each inside one of the roots.
+    PathList(&'a [PathBuf]),
+}
+
 /// The engine's environment allowlist, reached through a trait so this crate
 /// never depends on `applejack-engine`.
 pub trait EnvPolicy {
-    /// Whether the engine passes a variable with this name to the process.
+    /// Whether a game-tier preset may set a variable with this name: the
+    /// game tier of the engine's allowlist. A name the engine passes through
+    /// but sets itself (`WINEPREFIX`, `APPLEJACK_SESSION`) answers `false`.
     fn allows(&self, name: &str) -> bool;
-    /// Directories the variable's value (one path, or `:`-separated paths)
-    /// must resolve inside. Empty means the value is plain text and is not
-    /// checked as a path. Each path-valued name has its own roots: a prefix
-    /// path may not point into an engine payload and an ICD or plugin path
-    /// may not point into a Windows-writable prefix.
-    fn roots_for(&self, name: &str) -> &[PathBuf];
-    /// Whether a `D3DMetal` overlay has been accepted for `engine_version`,
-    /// which `graphics_backend = d3dmetal` requires. `None` is never present.
-    fn d3dmetal_overlay_present(&self, engine_version: Option<&str>) -> bool;
+    /// How the variable's value is checked. Each path-valued name has its
+    /// own roots: an ICD or plugin path may not point into a Windows-writable
+    /// prefix.
+    fn value_check(&self, name: &str) -> ValueCheck<'_>;
 }
 
 /// A preset file: one title's configuration plus the facts about the host
@@ -103,30 +122,42 @@ impl Preset {
         Ok(serde_json::from_str(text)?)
     }
 
-    /// Renders the preset as indented JSON.
+    /// Renders the preset as indented JSON. Unset `config` columns are left
+    /// out, so a build that predates a column still reads a preset that never
+    /// set it.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Json`] when encoding fails.
     pub fn to_json_pretty(&self) -> Result<String, Error> {
-        Ok(serde_json::to_string_pretty(self)?)
+        let mut value = serde_json::to_value(self)?;
+        if let Some(config) = value
+            .get_mut("config")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            config.retain(|_, field| !field.is_null());
+        }
+        Ok(serde_json::to_string_pretty(&value)?)
     }
 }
 
 /// Builds the shareable preset for `appid`. Absolute paths under `data_dir`
-/// become `$APPLEJACK_DATA_DIR/...`, then paths under `home` become
-/// `$HOME/...` (in that order, because the data dir usually sits under the
-/// home directory); secret-looking `extra_env` names are dropped; the
-/// host-local `direct_verified_at` stamp is cleared; host facts come from
-/// `meta` when recorded.
+/// become `$APPLEJACK_DATA_DIR/...` and paths under `home` become
+/// `$HOME/...`, the longer directory first; secret-looking `extra_env` names
+/// are dropped; the host-local `direct_verified_at` stamp is cleared; host
+/// facts come from `meta` when recorded. The export is refused when the
+/// account name (the last component of `home`) survives the rewrite as a
+/// path component in any text field, such as the Wine user directory
+/// `drive_c/users/<name>` or a `Z:\Users\<name>` path.
 ///
-/// `home` is the importing host's `HOME`, read by the caller: this crate
+/// `home` is the exporting host's `HOME`, read by the caller: this crate
 /// never consults the process environment.
 ///
 /// # Errors
 ///
-/// Returns the read errors of [`ConfigDb::game_config`] and
-/// [`ConfigDb::meta_get`].
+/// Returns [`Error::AccountNameInExport`] naming the first field that still
+/// holds the account name, and the read errors of [`ConfigDb::game_config`]
+/// and [`ConfigDb::meta_get`].
 pub fn export(
     db: &ConfigDb,
     appid: u32,
@@ -134,14 +165,17 @@ pub fn export(
     home: Option<&Path>,
 ) -> Result<Preset, Error> {
     let mut config = db.game_config(appid)?.unwrap_or_default();
-    let data_dir = data_dir_text(data_dir);
-    let home = home.map(data_dir_text);
+    let mut rewrites = vec![(path_text(data_dir), DATA_DIR_PLACEHOLDER)];
+    if let Some(home) = home {
+        rewrites.push((path_text(home), HOME_PLACEHOLDER));
+    }
+    // Longest first, so whichever directory lies inside the other is
+    // rewritten as a whole before its ancestor is.
+    rewrites.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
     let scrub = |text: &str| {
-        let text = replace_bounded(text, &data_dir, DATA_DIR_PLACEHOLDER);
-        match &home {
-            Some(home) => replace_bounded(&text, home, HOME_PLACEHOLDER),
-            None => text,
-        }
+        rewrites.iter().fold(text.to_owned(), |text, (from, to)| {
+            replace_bounded(&text, from, to)
+        })
     };
     config.extra_env = config
         .extra_env
@@ -160,6 +194,12 @@ pub fn export(
         *text = scrub(text);
     }
     config.direct_verified_at = None;
+    if let Some(account) = home.and_then(account_name)
+        && let Some((field, _)) =
+            exported_texts(&config).find(|(_, text)| contains_account(text, &account))
+    {
+        return Err(Error::AccountNameInExport { field });
+    }
     Ok(Preset {
         schema: SCHEMA_VERSION,
         appid,
@@ -169,6 +209,41 @@ pub fn export(
         macos_version: db.meta_get(META_MACOS_VERSION)?,
         config,
     })
+}
+
+/// The account short name: the last component of the home directory.
+fn account_name(home: &Path) -> Option<String> {
+    home.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// Whether `text` holds `account` as a whole path component under either
+/// separator: `/Users/x`, `drive_c/users/x`, `Z:\Users\x`, `file:///Users/x`.
+/// Case does not matter, because the macOS file system ignores it.
+fn contains_account(text: &str, account: &str) -> bool {
+    text.split(['/', '\\'])
+        .any(|part| part.eq_ignore_ascii_case(account))
+}
+
+/// Every text field an export carries, with its report name.
+fn exported_texts(config: &GameConfig) -> impl Iterator<Item = (String, &str)> {
+    let env = config
+        .extra_env
+        .iter()
+        .map(|(name, value)| (format!("extra_env.{name}"), value.as_str()));
+    let fields = [
+        (Field::LaunchExeOverride, &config.launch_exe_override),
+        (Field::LaunchArgsOverride, &config.launch_args_override),
+        (Field::Notes, &config.notes),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| {
+        value
+            .as_deref()
+            .map(|value| (field.name().to_owned(), value))
+    });
+    env.chain(fields)
 }
 
 /// What the user has agreed to before an import writes.
@@ -235,6 +310,10 @@ impl ImportPlan {
     /// interleave between the read and the write. Fields the preset does not
     /// set keep their stored values.
     ///
+    /// The plan is written as computed: the overlay and path gates are not
+    /// re-run against the database or the file system at apply time. The
+    /// launch step re-validates the overlay and every path before use.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::ConfirmationRequired`] without writing when a
@@ -254,15 +333,19 @@ impl ImportPlan {
 
 /// Filters `preset` through `policy` into a plan. `$APPLEJACK_DATA_DIR` and
 /// `$HOME` are expanded to `data_dir` and `home` before path checks; with
-/// `home` unset, `$HOME` stays literal and fails the absolute-path check.
+/// `home` unset, `$HOME` stays literal: a path-valued variable then fails the
+/// absolute-path check and a `launch_exe_override` is rejected outright. The
+/// `d3dmetal` gate reads `db`'s `d3dmetal` table; nothing is written.
 ///
 /// # Errors
 ///
 /// Returns [`Error::UnsupportedPresetSchema`] when the file's schema version
-/// is not [`SCHEMA_VERSION`].
+/// is not [`SCHEMA_VERSION`], and [`Error::Sqlite`] when the overlay table
+/// cannot be read.
 pub fn import(
     preset: &Preset,
     policy: &dyn EnvPolicy,
+    db: &ConfigDb,
     data_dir: &Path,
     home: Option<&Path>,
     options: ImportOptions,
@@ -271,8 +354,8 @@ pub fn import(
         return Err(Error::UnsupportedPresetSchema(preset.schema));
     }
     let placeholders = Placeholders {
-        data_dir: data_dir_text(data_dir),
-        home: home.map(data_dir_text),
+        data_dir: path_text(data_dir),
+        home: home.map(path_text),
     };
     let mut plan = ImportPlan {
         appid: preset.appid,
@@ -287,11 +370,11 @@ pub fn import(
         let Some(value) = preset.config.get(field) else {
             continue;
         };
-        if field != Field::ExtraEnv && value.chars().any(char::is_control) {
+        if field != Field::ExtraEnv && value.chars().any(is_unsafe_char) {
             plan.rejected.push(Rejected {
                 field: field.name().to_owned(),
                 value,
-                reason: CONTROL_CHARS.to_owned(),
+                reason: UNSAFE_CHARS.to_owned(),
             });
             continue;
         }
@@ -316,14 +399,16 @@ pub fn import(
             Field::GraphicsBackend
                 if preset.config.graphics_backend == Some(GraphicsBackend::D3dmetal) =>
             {
-                // The engine version is a lower column, so the plan already
-                // holds it when it passed the identifier check.
-                let reason = match plan.config.engine_version.as_deref() {
+                // An engine version that fails the identifier check is not
+                // imported, so it cannot vouch for an overlay either.
+                let gated_version = preset.config.engine_version.as_deref().filter(|version| {
+                    matches!(crate::game_config::identifier(version), Ok(Some(_)))
+                });
+                let reason = match gated_version {
                     None => Some("d3dmetal needs the preset to name an engine version".to_owned()),
-                    Some(version) if !policy.d3dmetal_overlay_present(Some(version)) => Some(
-                        format!("no D3DMetal overlay is accepted for engine version {version}"),
-                    ),
-                    Some(_) => None,
+                    Some(version) => (!db.d3dmetal_accepted(version)?).then(|| {
+                        format!("no D3DMetal overlay is accepted for engine version {version}")
+                    }),
                 };
                 match reason {
                     Some(reason) => plan.rejected.push(Rejected {
@@ -346,7 +431,20 @@ pub fn import(
     Ok(plan)
 }
 
-const CONTROL_CHARS: &str = "control characters are not allowed in preset values";
+const UNSAFE_CHARS: &str =
+    "control and bidirectional formatting characters are not allowed in preset values";
+
+/// Whether `c` is a control character or a bidirectional formatting
+/// character (`U+200E`, `U+200F`, `U+202A` to `U+202E`, `U+2066` to
+/// `U+2069`). Either can move the cursor, reverse a line, or forge a report
+/// line, so import refuses them; `Debug` formatting escapes them all.
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
 
 /// The host paths a preset's placeholders expand to.
 struct Placeholders {
@@ -370,7 +468,12 @@ impl Placeholders {
         let root = if starts_with_placeholder(value, DATA_DIR_PLACEHOLDER) {
             Some(&self.data_dir)
         } else if starts_with_placeholder(value, HOME_PLACEHOLDER) {
-            self.home.as_ref()
+            match &self.home {
+                Some(home) => Some(home),
+                // A literal `$HOME` would normalize to a relative path that
+                // does not resemble the file the user is asked to confirm.
+                None => return Err(format!("{HOME_PLACEHOLDER} is not set on this host")),
+            }
         } else {
             None
         };
@@ -464,8 +567,8 @@ fn import_env_entry(
     if let Err(reason) = crate::game_config::check_env_name(name) {
         return reject(value, reason);
     }
-    if value.chars().any(char::is_control) {
-        return reject(value, CONTROL_CHARS.to_owned());
+    if value.chars().any(is_unsafe_char) {
+        return reject(value, UNSAFE_CHARS.to_owned());
     }
     if let Some(prefix) = LOADER_PREFIXES.iter().find(|prefix| {
         name.get(..prefix.len())
@@ -485,6 +588,15 @@ fn import_env_entry(
             "set by the launcher from the host, never by a preset".to_owned(),
         );
     }
+    if ENGINE_OWNED_NAMES
+        .iter()
+        .any(|owned| owned.eq_ignore_ascii_case(name))
+    {
+        return reject(
+            value,
+            "set by the engine from the chosen backend and sync mode".to_owned(),
+        );
+    }
     if is_secret_name(name) {
         return reject(value, "secret-looking names are never imported".to_owned());
     }
@@ -492,31 +604,37 @@ fn import_env_entry(
         return reject(value, "not in the engine environment allowlist".to_owned());
     }
     let value = placeholders.expand(value);
-    let roots = policy.roots_for(name);
-    if !roots.is_empty()
-        && let Err(reason) = paths_inside_roots(&value, roots)
+    let check = match policy.value_check(name) {
+        ValueCheck::Plain => None,
+        ValueCheck::Path(roots) => Some((roots, false)),
+        ValueCheck::PathList(roots) => Some((roots, true)),
+    };
+    if let Some((roots, list)) = check
+        && let Err(reason) = paths_inside_roots(&value, roots, list)
     {
         return reject(&value, reason);
-    }
-    if name == "WINEDLLOVERRIDES" {
-        plan.warnings.push(Warning {
-            field: field.clone(),
-            value: value.clone(),
-            reason: "DLL overrides are applied as given; the engine refuses overrides of \
-                     ntdll and other core DLLs at launch"
-                .to_owned(),
-        });
     }
     plan.config.extra_env.insert(name.to_owned(), value.clone());
     plan.accepted.push(Accepted { field, value });
 }
 
-/// Every `:`-separated element must be an absolute, `.`- and `..`-free path
-/// under one of `roots`, lexically and after resolving symlinks in whatever
-/// part of it already exists. Roots need not exist yet; their existing
-/// ancestors are resolved the same way.
-fn paths_inside_roots(value: &str, roots: &[PathBuf]) -> Result<(), String> {
-    for part in value.split(':').filter(|part| !part.is_empty()) {
+/// Every path in `value` (one path, or a `:`-separated list when `list`)
+/// must be absolute, `.`- and `..`-free, and under one of `roots`, lexically
+/// and after resolving symlinks in whatever part of it already exists. Roots
+/// need not exist yet; their existing ancestors are resolved the same way.
+///
+/// This is an import-time check of the text: a symlink that appears later
+/// under a component that does not exist yet is not seen here. The launch
+/// step re-validates every path before it reaches the process.
+fn paths_inside_roots(value: &str, roots: &[PathBuf], list: bool) -> Result<(), String> {
+    let mut parts = value.split(':').filter(|part| !part.is_empty()).peekable();
+    if parts.peek().is_none() {
+        return Err("a path-valued variable needs at least one path".to_owned());
+    }
+    if !list && value.contains(':') {
+        return Err("a single-path variable may not hold a ':'-separated list".to_owned());
+    }
+    for part in parts {
         let path = Path::new(part);
         if !path.is_absolute() {
             return Err(format!("{part:?} is not an absolute path"));
@@ -591,10 +709,10 @@ fn is_secret_name(name: &str) -> bool {
         .any(|fragment| folded.contains(fragment))
 }
 
-/// The data directory as text without a trailing separator, so a match must
-/// end at a path boundary.
-fn data_dir_text(data_dir: &Path) -> String {
-    let text = data_dir.to_string_lossy();
+/// A directory as text without a trailing separator, so a match must end at
+/// a path boundary.
+fn path_text(path: &Path) -> String {
+    let text = path.to_string_lossy();
     let trimmed = text.trim_end_matches('/');
     if trimmed.is_empty() {
         text.into_owned()
@@ -611,9 +729,9 @@ fn is_delimiter(c: char) -> bool {
 
 /// Whether a path may start at `start`: at the text start, after a
 /// delimiter, or glued to a flag such as `-I/dir` or `-L/dir`. The flag rule
-/// looks at the whole token, because the character right before the path is
-/// the flag letter, not the `-`. A `-` after a path is part of a sibling name
-/// (`/data-other`), so it never ends a match.
+/// accepts only a token of dashes and flag letters before the path, so the
+/// `/dir` inside `-x/opt/dir` is not rewritten. A `-` after a path is part of
+/// a sibling name (`/data-other`), so it never ends a match.
 fn path_may_start_at(text: &str, start: usize) -> bool {
     let before = &text[..start];
     if before.chars().next_back().is_none_or(is_delimiter) {
@@ -622,7 +740,9 @@ fn path_may_start_at(text: &str, start: usize) -> bool {
     let token_start = before.rfind(is_delimiter).map_or(0, |i| {
         i + before[i..].chars().next().map_or(1, char::len_utf8)
     });
-    before[token_start..].starts_with('-')
+    let token = &before[token_start..];
+    let flag = token.trim_start_matches('-');
+    token.starts_with('-') && flag.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Replaces `from` with `to` only where `from` is a whole path prefix: it
@@ -756,8 +876,8 @@ mod tests {
                 ("Pass_word".to_owned(), "pw".to_owned()),
                 ("API_KEY".to_owned(), "k3y".to_owned()),
                 (
-                    "WINEPREFIX".to_owned(),
-                    format!("{}/Games/prefix", home.display()),
+                    "DXMT_CONFIG_FILE".to_owned(),
+                    format!("{}/Games/dxmt.conf", home.display()),
                 ),
                 (
                     "GST_PLUGIN_PATH".to_owned(),
@@ -780,9 +900,13 @@ mod tests {
         let preset = export(&db, 30, &data, Some(&home)).unwrap();
         let json = preset.to_json_pretty().unwrap();
         assert!(!json.contains("/Users/"), "home directory leaked: {json}");
+        assert!(!json.contains("example"), "account name leaked: {json}");
         assert!(!json.contains("Pass_word"), "{json}");
         assert!(!json.contains("API_KEY"), "{json}");
-        assert_eq!(preset.config.extra_env["WINEPREFIX"], "$HOME/Games/prefix");
+        assert_eq!(
+            preset.config.extra_env["DXMT_CONFIG_FILE"],
+            "$HOME/Games/dxmt.conf"
+        );
         assert_eq!(
             preset.config.extra_env["GST_PLUGIN_PATH"], "-I$APPLEJACK_DATA_DIR/engines",
             "the data dir is rewritten before the home directory"
@@ -802,11 +926,111 @@ mod tests {
     }
 
     #[test]
+    fn export_rewrites_the_longer_directory_first() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        let data = PathBuf::from("/tmp/hp");
+        let home = data.join("acct");
+        let config = GameConfig {
+            notes: Some(format!(
+                "save in {}/Saves; engines in {}/engines",
+                home.display(),
+                data.display()
+            )),
+            ..GameConfig::default()
+        };
+        db.set_game_config(31, &config).unwrap();
+        let preset = export(&db, 31, &data, Some(&home)).unwrap();
+        assert_eq!(
+            preset.config.notes.as_deref(),
+            Some("save in $HOME/Saves; engines in $APPLEJACK_DATA_DIR/engines"),
+            "a home directory below the data dir is still rewritten as a whole"
+        );
+    }
+
+    #[test]
+    fn export_refuses_an_account_name_it_cannot_rewrite() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        let data = data_dir();
+        let home = home();
+        let cases = [
+            (
+                "extra_env.DXMT_CONFIG_FILE",
+                GameConfig {
+                    extra_env: BTreeMap::from([(
+                        "DXMT_CONFIG_FILE".to_owned(),
+                        format!(
+                            "{}/prefixes/g/drive_c/users/example/dxmt.conf",
+                            data.display()
+                        ),
+                    )]),
+                    ..GameConfig::default()
+                },
+            ),
+            (
+                "launch_args_override",
+                GameConfig {
+                    launch_args_override: Some("-savedir Z:\\Users\\EXAMPLE\\Saves".to_owned()),
+                    ..GameConfig::default()
+                },
+            ),
+            (
+                "notes",
+                GameConfig {
+                    notes: Some("see file:///Users/example/x".to_owned()),
+                    ..GameConfig::default()
+                },
+            ),
+            // The override rewrites; the home path glued to `foo-` in the
+            // notes does not, and the guard names the field that kept it.
+            (
+                "notes",
+                GameConfig {
+                    launch_exe_override: Some(format!("{}/y", home.display())),
+                    notes: Some(format!("foo-{}/z", home.display())),
+                    ..GameConfig::default()
+                },
+            ),
+        ];
+        for (expected, config) in cases {
+            db.set_game_config(32, &config).unwrap();
+            let error = export(&db, 32, &data, Some(&home)).unwrap_err();
+            assert!(
+                matches!(&error, Error::AccountNameInExport { field } if field == expected),
+                "{expected}: {error}"
+            );
+            assert!(!error.to_string().contains("example"), "{error}");
+        }
+
+        // A word that is not a whole path component never trips the guard,
+        // and without a home directory there is no account name to guard.
+        let config = GameConfig {
+            notes: Some("an example of examples/x, not the account".to_owned()),
+            ..GameConfig::default()
+        };
+        db.set_game_config(33, &config).unwrap();
+        export(&db, 33, &data, Some(&home)).unwrap();
+        let config = GameConfig {
+            notes: Some("see file:///Users/example/x".to_owned()),
+            ..GameConfig::default()
+        };
+        db.set_game_config(34, &config).unwrap();
+        export(&db, 34, &data, None).unwrap();
+    }
+
+    #[test]
     fn export_of_missing_row_is_an_empty_preset() {
         let db = ConfigDb::open_in_memory().unwrap();
         let preset = export(&db, 7, &data_dir(), None).unwrap();
         assert_eq!(preset.config, GameConfig::default());
         assert_eq!(preset.appid, 7);
+        let json: serde_json::Value =
+            serde_json::from_str(&preset.to_json_pretty().unwrap()).unwrap();
+        assert_eq!(
+            json["config"],
+            serde_json::json!({ "extra_env": {} }),
+            "unset columns are not written"
+        );
+        assert_eq!(Preset::from_json(&json.to_string()).unwrap(), preset);
     }
 
     #[test]
@@ -854,6 +1078,12 @@ mod tests {
             "-I$D/x -L$D/y"
         );
         assert_eq!(replace_bounded("-I/dx/y", "/d", "$D"), "-I/dx/y");
+        assert_eq!(
+            replace_bounded("-x/opt/d/y", "/d", "$D"),
+            "-x/opt/d/y",
+            "the flag rule covers the flag letters only, not the rest of the token"
+        );
+        assert_eq!(replace_bounded("--p/d", "/d", "$D"), "--p$D");
         assert_eq!(replace_bounded("/opt-/d/x", "/d", "$D"), "/opt-/d/x");
         assert_eq!(replace_bounded("a=-I/d", "/d", "$D"), "a=-I$D");
         assert_eq!(replace_bounded("--prefix=/d", "/d", "$D"), "--prefix=$D");
@@ -883,11 +1113,8 @@ mod tests {
             fn allows(&self, _: &str) -> bool {
                 false
             }
-            fn roots_for(&self, _: &str) -> &[PathBuf] {
-                &[]
-            }
-            fn d3dmetal_overlay_present(&self, _: Option<&str>) -> bool {
-                false
+            fn value_check(&self, _: &str) -> ValueCheck<'_> {
+                ValueCheck::Plain
             }
         }
         let preset = Preset {
@@ -899,8 +1126,16 @@ mod tests {
             macos_version: None,
             config: GameConfig::default(),
         };
-        let error =
-            import(&preset, &Deny, &data_dir(), None, ImportOptions::default()).unwrap_err();
+        let db = ConfigDb::open_in_memory().unwrap();
+        let error = import(
+            &preset,
+            &Deny,
+            &db,
+            &data_dir(),
+            None,
+            ImportOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, Error::UnsupportedPresetSchema(2)),
             "{error}"

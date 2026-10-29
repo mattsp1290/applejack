@@ -10,12 +10,20 @@ use crate::{GameConfig, GraphicsBackend, LaunchMode, SyncMode};
 /// Launch settings with every engine-defaulted field filled in. Fields that
 /// have no engine default (engine identity, launch overrides, the DX12
 /// expectation) stay optional.
+///
+/// Values are the stored text as imported or set; nothing here is re-checked
+/// against the database or the file system. The launch step validates the
+/// overlay for `graphics_backend = d3dmetal` and every path in `extra_env`
+/// and the overrides against the engine's roots before use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "one field per game_config toggle column; the columns are independent"
 )]
 pub struct Resolved {
+    /// The title these settings are for: the key for its log directory,
+    /// session row, and prefix name.
+    pub appid: u32,
     pub engine_id: Option<String>,
     pub engine_version: Option<String>,
     pub graphics_backend: GraphicsBackend,
@@ -44,6 +52,7 @@ pub struct Resolved {
 /// would need a tombstone representation in `extra_env`; none exists yet.
 #[must_use]
 pub fn resolve(
+    appid: u32,
     engine_defaults: &GameConfig,
     preset: Option<&GameConfig>,
     user: &GameConfig,
@@ -62,6 +71,7 @@ pub fn resolve(
     extra_env.extend(preset.extra_env.clone());
     extra_env.extend(user.extra_env.clone());
     Resolved {
+        appid,
         engine_id: pick!(engine_id),
         engine_version: pick!(engine_version),
         graphics_backend: pick!(graphics_backend).unwrap_or(GraphicsBackend::Dxmt),
@@ -146,7 +156,8 @@ mod tests {
 
     #[test]
     fn user_beats_preset_beats_default_for_every_field() {
-        let resolved = resolve(&defaults(), Some(&preset()), &user());
+        let resolved = resolve(10, &defaults(), Some(&preset()), &user());
+        assert_eq!(resolved.appid, 10);
         assert_eq!(resolved.engine_id.as_deref(), Some("engine-user"));
         assert_eq!(resolved.engine_version.as_deref(), Some("version-user"));
         assert_eq!(resolved.graphics_backend, GraphicsBackend::Vkd3dProton);
@@ -168,7 +179,7 @@ mod tests {
 
     #[test]
     fn preset_beats_default_when_user_is_unset() {
-        let resolved = resolve(&defaults(), Some(&preset()), &GameConfig::default());
+        let resolved = resolve(10, &defaults(), Some(&preset()), &GameConfig::default());
         assert_eq!(resolved.engine_id.as_deref(), Some("engine-preset"));
         assert_eq!(resolved.graphics_backend, GraphicsBackend::Wined3d);
         assert_eq!(resolved.sync_mode, SyncMode::Esync);
@@ -184,7 +195,7 @@ mod tests {
 
     #[test]
     fn default_applies_when_preset_and_user_are_unset() {
-        let resolved = resolve(&defaults(), None, &GameConfig::default());
+        let resolved = resolve(10, &defaults(), None, &GameConfig::default());
         assert_eq!(resolved.engine_id.as_deref(), Some("engine-default"));
         assert_eq!(resolved.graphics_backend, GraphicsBackend::Dxmt);
         assert_eq!(resolved.sync_mode, SyncMode::Msync);
@@ -204,7 +215,7 @@ mod tests {
             }
             let mut user_only = GameConfig::default();
             user_only.set(field, &user().get(field).unwrap()).unwrap();
-            let resolved = resolve(&defaults(), Some(&preset()), &user_only);
+            let resolved = resolve(10, &defaults(), Some(&preset()), &user_only);
             let json = serde_json::to_value(&resolved).unwrap();
             let expected = serde_json::to_value(&user_only).unwrap()[field.name()].clone();
             assert_eq!(json[field.name()], expected, "{field}");
@@ -213,7 +224,7 @@ mod tests {
 
     #[test]
     fn empty_engine_defaults_fall_back_to_conservative_values() {
-        let resolved = resolve(&GameConfig::default(), None, &GameConfig::default());
+        let resolved = resolve(10, &GameConfig::default(), None, &GameConfig::default());
         assert_eq!(resolved.graphics_backend, GraphicsBackend::Dxmt);
         assert_eq!(resolved.sync_mode, SyncMode::Disabled);
         assert_eq!(resolved.launch_mode, LaunchMode::Client);

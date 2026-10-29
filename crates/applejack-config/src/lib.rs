@@ -18,7 +18,7 @@ use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior};
 pub use apps::{AppRow, Drm};
 pub use error::Error;
 pub use game_config::{Field, GameConfig, GraphicsBackend, LaunchMode, SyncMode};
-pub use presets::{EnvPolicy, ImportOptions, ImportPlan, Preset};
+pub use presets::{EnvPolicy, ImportOptions, ImportPlan, Preset, ValueCheck};
 pub use resolve::{Resolved, resolve};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -111,18 +111,53 @@ impl ConfigDb {
         Ok(count > 0)
     }
 
+    /// Records that the user accepted a `D3DMetal` overlay for
+    /// `engine_version`, so `graphics_backend = d3dmetal` imports for it.
+    /// `accepted_at` is the caller's timestamp text; this crate never reads
+    /// the clock. Accepting again keeps the row and updates the stamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlite`] when the write fails.
+    pub fn d3dmetal_accept(&self, engine_version: &str, accepted_at: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "INSERT INTO d3dmetal (engine_version, accepted_at) VALUES (?1, ?2) \
+             ON CONFLICT(engine_version) DO UPDATE SET accepted_at = excluded.accepted_at",
+            [engine_version, accepted_at],
+        )?;
+        Ok(())
+    }
+
     /// Runs `f` inside a `BEGIN IMMEDIATE` transaction, so a read-modify-write
     /// of one row cannot interleave with another connection's write: the
     /// write lock is taken before the read, and a second writer waits on the
     /// busy timeout instead of overwriting with a stale copy. An error from
     /// `f` rolls the transaction back. Called with a transaction already
-    /// open on this connection, it runs `f` inside that transaction.
+    /// open on this connection, it runs `f` inside a savepoint of that
+    /// transaction, so an inner error the outer closure swallows still undoes
+    /// the inner writes.
+    ///
+    /// Every transaction opened on this connection must be IMMEDIATE: nesting
+    /// is detected with `is_autocommit`, and a DEFERRED transaction that has
+    /// already read would lose the write-before-read guarantee (in WAL mode
+    /// the inner write then fails with `SQLITE_BUSY_SNAPSHOT`).
     pub(crate) fn write_locked<T>(
         &self,
         f: impl FnOnce(&Self) -> Result<T, Error>,
     ) -> Result<T, Error> {
         if !self.conn.is_autocommit() {
-            return f(self);
+            self.conn.execute_batch("SAVEPOINT write_locked")?;
+            return match f(self) {
+                Ok(value) => {
+                    self.conn.execute_batch("RELEASE write_locked")?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    self.conn
+                        .execute_batch("ROLLBACK TO write_locked; RELEASE write_locked")?;
+                    Err(error)
+                }
+            };
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let value = f(self)?;
@@ -358,6 +393,18 @@ mod tests {
             .unwrap();
         assert!(db.d3dmetal_accepted("1.0.0").unwrap());
         assert!(!db.d3dmetal_accepted("1.0.1").unwrap());
+        db.d3dmetal_accept("1.0.1", "2026-10-29T00:00:00Z").unwrap();
+        db.d3dmetal_accept("1.0.1", "2026-10-30T00:00:00Z").unwrap();
+        assert!(db.d3dmetal_accepted("1.0.1").unwrap());
+        let stamp: String = db
+            .conn
+            .query_row(
+                "SELECT accepted_at FROM d3dmetal WHERE engine_version = '1.0.1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, "2026-10-30T00:00:00Z");
     }
 
     #[test]
@@ -378,6 +425,24 @@ mod tests {
         .unwrap();
         assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("outer"));
         assert_eq!(db.meta_get("k2").unwrap().as_deref(), Some("inner"));
+        assert!(db.conn.is_autocommit(), "transaction closed");
+    }
+
+    #[test]
+    fn nested_write_locked_undoes_an_inner_error_the_outer_closure_swallows() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        db.write_locked(|db| {
+            db.meta_set("k", "outer")?;
+            let inner = db.write_locked(|db| {
+                db.meta_set("k2", "inner")?;
+                Err::<(), _>(Error::InvalidSchemaVersion("x".to_owned()))
+            });
+            assert!(inner.is_err());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("outer"));
+        assert_eq!(db.meta_get("k2").unwrap(), None, "inner write rolled back");
         assert!(db.conn.is_autocommit(), "transaction closed");
     }
 

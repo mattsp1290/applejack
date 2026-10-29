@@ -209,11 +209,11 @@ fn import(
         preset.appid = appid;
     }
     let db = config::open_db(data_dir)?;
-    let policy = DefaultEnvPolicy::new(data_dir, &db);
+    let policy = DefaultEnvPolicy::new(data_dir);
     let options = ImportOptions {
         accept_launch_overrides,
     };
-    let plan = config::presets::import(&preset, &policy, data_dir, home, options)?;
+    let plan = config::presets::import(&preset, &policy, &db, data_dir, home, options)?;
     let mut lines = render_plan(&plan);
     if plan.needs_confirmation() {
         lines.push(

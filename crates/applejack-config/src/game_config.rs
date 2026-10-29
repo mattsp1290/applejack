@@ -447,7 +447,7 @@ impl GameConfig {
 /// Engine ids and versions become directory names under `engines/` and argv
 /// tokens for tools, so they are limited to a charset that cannot traverse,
 /// hide, or read as a flag.
-fn identifier(value: &str) -> Result<Option<String>, String> {
+pub(crate) fn identifier(value: &str) -> Result<Option<String>, String> {
     if value.is_empty() {
         return Ok(None);
     }
@@ -910,5 +910,15 @@ pub(crate) mod tests {
         assert_eq!(base.extra_env["WINEDEBUG"], "+all");
         assert_eq!(base.extra_env["DXMT_LOG_LEVEL"], "info");
         assert_eq!(base.extra_env["NEW"], "1");
+    }
+
+    #[test]
+    fn merge_from_carries_every_field() {
+        let mut target = GameConfig::default();
+        target.merge_from(&full_config());
+        for field in Field::ALL {
+            assert_eq!(target.get(field), full_config().get(field), "{field}");
+        }
+        assert_eq!(target, full_config());
     }
 }

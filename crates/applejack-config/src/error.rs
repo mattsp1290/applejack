@@ -45,6 +45,13 @@ pub enum Error {
     /// The preset file declares a schema version this build does not read.
     #[error("unsupported preset schema version {0}; this build reads version {supported}", supported = crate::presets::SCHEMA_VERSION)]
     UnsupportedPresetSchema(u64),
+    /// An exported text field still names the account after host paths were
+    /// rewritten to placeholders.
+    #[error("{field} names the account in a form export cannot rewrite; clear or edit it first")]
+    AccountNameInExport {
+        /// The field, as `show` and the import report name it.
+        field: String,
+    },
     /// `ImportPlan::apply` ran without the confirmation its items require.
     #[error("import needs confirmation for: {items}", items = render_confirmations(.0))]
     ConfirmationRequired(Vec<Confirmation>),
