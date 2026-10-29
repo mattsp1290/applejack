@@ -1,13 +1,25 @@
 //! Valve's text `KeyValues` format, as used by `appmanifest_<appid>.acf`,
 //! `libraryfolders.vdf`, and `config.vdf`.
 //!
-//! The reader accepts quoted and bare tokens, nested braces, `//` comments,
-//! `[$CONDITION]` suffixes (ignored), and the escapes `\"`, `\\`, `\n`, `\t`,
-//! and `\r`. Duplicate keys are kept in order. The writer emits Valve's layout
-//! (tab indentation, `"key"<tab><tab>"value"`, braces on their own lines), so a
-//! file written by the Steam client round-trips byte for byte.
+//! The reader accepts quoted and bare tokens, nested braces up to
+//! [`MAX_DEPTH`] levels, `//` comments, a leading UTF-8 BOM, and the escapes
+//! `\"`, `\\`, `\n`, `\t`, and `\r`; any other escape is an error. A
+//! `[$CONDITION]` suffix is skipped (never evaluated) when it follows a value
+//! on the same line, or a key whose value is a `{` block; a `[` anywhere else
+//! is part of a bare token, so `a[b]` is one token while `v [b]` is a value
+//! and a conditional. Top-level `#base` and `#include` directives are
+//! rejected. Duplicate keys are kept in order.
+//!
+//! The writer emits Valve's layout (tab indentation, `"key"<tab><tab>"value"`,
+//! braces on their own lines, LF line ends), so a client-written LF file
+//! round-trips byte for byte; a CRLF file parses and is written back with LF.
 
 use crate::Error;
+
+/// Deepest `{` nesting the reader accepts. Valve's own files nest a handful
+/// of levels; anything deeper is not a client file, and bounding the
+/// recursion keeps a malformed file from overflowing the stack.
+pub const MAX_DEPTH: usize = 64;
 
 /// One `"key" value` pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +108,7 @@ impl Document {
     ///
     /// Returns [`Error::VdfParse`] with the line of the first malformed token.
     pub fn parse(text: &str) -> Result<Self, Error> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut parser = Parser {
             chars: text.char_indices().peekable(),
             text,
@@ -226,6 +239,9 @@ impl Parser<'_> {
     }
 
     fn nodes(&mut self, depth: usize) -> Result<Vec<Node>, Error> {
+        if depth > MAX_DEPTH {
+            return Err(self.error(format!("nesting deeper than {MAX_DEPTH} levels")));
+        }
         let mut nodes = Vec::new();
         loop {
             let key = match self.token()? {
@@ -236,8 +252,24 @@ impl Parser<'_> {
                 Token::End => return Err(self.error("unexpected end of input inside `{`")),
                 Token::Open => return Err(self.error("expected a key before `{`")),
             };
+            if depth == 0
+                && (key.eq_ignore_ascii_case("#base") || key.eq_ignore_ascii_case("#include"))
+            {
+                return Err(self.error(format!("`{key}` directives are not supported")));
+            }
+            let key_line = self.line;
+            let key_conditional = self.conditional_on_line()?;
             let value = match self.token()? {
-                Token::Text(text) => Value::Str(text),
+                Token::Text(_) if key_conditional => {
+                    return Err(Error::VdfParse {
+                        line: key_line,
+                        message: format!("conditional after key `{key}` must be followed by `{{`"),
+                    });
+                }
+                Token::Text(text) => {
+                    self.conditional_on_line()?;
+                    Value::Str(text)
+                }
                 Token::Open => Value::Map(self.nodes(depth + 1)?),
                 Token::Close => return Err(self.error(format!("key `{key}` has no value"))),
                 Token::End => {
@@ -262,7 +294,6 @@ impl Parser<'_> {
                     self.chars.next();
                 }
                 '/' if self.text[index..].starts_with("//") => self.skip_line(),
-                '[' => self.skip_conditional()?,
                 '{' => {
                     self.chars.next();
                     return Ok(Token::Open);
@@ -289,16 +320,29 @@ impl Parser<'_> {
         }
     }
 
+    /// Skips a `[...]` conditional that follows the previous token on the
+    /// same line. Returns whether one was present.
+    fn conditional_on_line(&mut self) -> Result<bool, Error> {
+        while let Some(&(_, ch)) = self.chars.peek() {
+            match ch {
+                ' ' | '\t' | '\r' => {
+                    self.chars.next();
+                }
+                '[' => {
+                    self.skip_conditional()?;
+                    return Ok(true);
+                }
+                _ => break,
+            }
+        }
+        Ok(false)
+    }
+
     fn skip_conditional(&mut self) -> Result<(), Error> {
         for (_, ch) in self.chars.by_ref() {
             match ch {
                 ']' => return Ok(()),
-                '\n' => {
-                    return Err(Error::VdfParse {
-                        line: self.line,
-                        message: "unterminated `[` conditional".to_owned(),
-                    });
-                }
+                '\n' => break,
                 _ => {}
             }
         }
@@ -316,10 +360,10 @@ impl Parser<'_> {
                     Some((_, 'r')) => out.push('\r'),
                     Some((_, '"')) => out.push('"'),
                     Some((_, '\\')) => out.push('\\'),
-                    // Valve keeps unknown sequences verbatim.
+                    // Rejected rather than kept verbatim: the writer would
+                    // double the backslash and change the bytes on rewrite.
                     Some((_, other)) => {
-                        out.push('\\');
-                        out.push(other);
+                        return Err(self.error(format!("unknown escape `\\{other}`")));
                     }
                     None => return Err(self.error("unterminated string")),
                 },

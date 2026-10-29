@@ -4,7 +4,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use applejack_steam::vdf::{Document, Node, Value};
+use applejack_steam::Error;
+use applejack_steam::vdf::{Document, MAX_DEPTH, Node, Value};
 
 fn fixture(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -77,4 +78,94 @@ fn malformed_text_reports_the_line() {
     assert!(Document::parse("}").is_err());
     assert!(Document::parse("\"k\" \"unterminated").is_err());
     assert!(Document::parse("{ \"k\" \"v\" }").is_err());
+}
+
+#[test]
+fn nesting_depth_64_parses_and_65_is_rejected() {
+    let nested = |levels: usize| format!("{}{}", "\"a\"{".repeat(levels), "}".repeat(levels));
+    assert_eq!(MAX_DEPTH, 64);
+    assert!(Document::parse(&nested(64)).is_ok());
+    let error = Document::parse(&nested(65)).unwrap_err();
+    assert!(matches!(error, Error::VdfParse { .. }), "{error}");
+    assert_eq!(
+        error.to_string(),
+        "vdf: line 1: nesting deeper than 64 levels"
+    );
+}
+
+#[test]
+fn conditional_brackets_follow_a_value_or_a_block_key_only() {
+    // `a[b]` is one bare token; ` [b]` after a value is a conditional. That
+    // asymmetry is Valve's, pinned here so a tokenizer change cannot regress it.
+    let text = "\"r\"\n{\n\ta[b] v\n\tk v [b]\n\t\"q\" \"w\"[$WIN32]\n\t\"blk\" [!$OSX]\n\t{\n\t\t\"x\" \"y\"\n\t}\n}\n";
+    let document = Document::parse(text).unwrap();
+    assert_eq!(document.get_str("r/a[b]"), Some("v"));
+    assert_eq!(document.get_str("r/k"), Some("v"));
+    assert_eq!(document.get_str("r/q"), Some("w"));
+    assert_eq!(document.get_str("r/blk/x"), Some("y"));
+    assert_eq!(
+        document.to_text(),
+        "\"r\"\n{\n\t\"a[b]\"\t\t\"v\"\n\t\"k\"\t\t\"v\"\n\t\"q\"\t\t\"w\"\n\t\"blk\"\n\t{\n\t\t\"x\"\t\t\"y\"\n\t}\n}\n"
+    );
+
+    // A `[` that starts a token is a bare key, not a conditional, even on the
+    // line after a value.
+    let document = Document::parse("\"k\" \"v\"\n[abc] w\n").unwrap();
+    assert_eq!(document.get_str("k"), Some("v"));
+    assert_eq!(document.get_str("[abc]"), Some("w"));
+
+    // A conditional after a key must be followed by `{`, and the error names
+    // the key's line rather than one further down.
+    for text in [
+        "\"r\"\n{\n\t\"k\" [abc] \"v\"\n}\n",
+        "\"r\"\n{\n\t\"k\" [abc]\n\t\"v2\" \"x\"\n}\n",
+    ] {
+        let error = Document::parse(text).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "vdf: line 3: conditional after key `k` must be followed by `{`"
+        );
+    }
+    assert!(Document::parse("\"k\" \"v\" [unterminated\n").is_err());
+}
+
+#[test]
+fn top_level_base_and_include_directives_are_rejected() {
+    for text in [
+        "#base \"other.vdf\"\n\"r\"\n{\n}\n",
+        "#include \"other.vdf\"\n",
+        "\"#Base\" \"other.vdf\"\n",
+    ] {
+        let error = Document::parse(text).unwrap_err();
+        assert!(matches!(error, Error::VdfParse { line: 1, .. }), "{error}");
+        assert!(error.to_string().contains("not supported"), "{error}");
+    }
+    // Below the top level the same text is an ordinary key.
+    let document = Document::parse("\"r\"\n{\n\t\"#base\"\t\t\"x\"\n}\n").unwrap();
+    assert_eq!(document.get_str("r/#base"), Some("x"));
+}
+
+#[test]
+fn leading_bom_is_stripped() {
+    let document = Document::parse("\u{feff}\"root\"\n{\n\t\"k\"\t\t\"v\"\n}\n").unwrap();
+    assert_eq!(document.get_str("root/k"), Some("v"));
+    assert_eq!(document.to_text(), "\"root\"\n{\n\t\"k\"\t\t\"v\"\n}\n");
+}
+
+#[test]
+fn unknown_escapes_are_rejected() {
+    let error = Document::parse("\"k\" \"a\\qb\"\n").unwrap_err();
+    assert_eq!(error.to_string(), "vdf: line 1: unknown escape `\\q`");
+    let document = Document::parse("\"k\" \"a\\\\qb\"\n").unwrap();
+    assert_eq!(document.get_str("k"), Some("a\\qb"));
+    assert_eq!(document.to_text(), "\"k\"\t\t\"a\\\\qb\"\n");
+}
+
+#[test]
+fn crlf_input_parses_and_is_written_back_with_lf() {
+    let lf = fixture("libraryfolders.vdf");
+    let crlf = lf.replace('\n', "\r\n");
+    let document = Document::parse(&crlf).unwrap();
+    assert_eq!(document, Document::parse(&lf).unwrap());
+    assert_eq!(document.to_text(), lf);
 }

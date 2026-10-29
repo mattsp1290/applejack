@@ -125,10 +125,18 @@ is false) belongs to the client; `install --update` refuses and names
 
 ## `.acf` and `.vdf`
 
-`vdf::Document` reads Valve's text KeyValues (quoted and bare tokens, nested
-braces, `//` comments, `[$CONDITION]` suffixes, escaped quotes, duplicate keys
-preserved in order) and writes Valve's layout, so a client-written file
-round-trips byte for byte. `acf::AppManifest` reads and `acf::AcfWriter`
+`vdf::Document` reads Valve's text KeyValues: quoted and bare tokens, nested
+braces up to `vdf::MAX_DEPTH` (64; deeper input is `Error::VdfParse`, not a
+stack overflow), `//` comments, a leading UTF-8 BOM, the escapes `\" \\ \n
+\t \r` (any other escape is `VdfParse`, since the writer would change its
+bytes), and duplicate keys preserved in order. A `[$CONDITION]` suffix is
+skipped, never evaluated, only where it follows a value on the same line or
+a key whose value is a `{` block; a `[` anywhere else is part of a bare token
+(`a[b]` is one token, `v [b]` is a value and a conditional). Top-level
+`#base` and `#include` directives are rejected with `VdfParse`. The writer
+emits Valve's layout with LF line ends, so a client-written LF file
+round-trips byte for byte and a CRLF file is normalised to LF.
+`acf::AppManifest` reads and `acf::AcfWriter`
 writes `appmanifest_<appid>.acf` with `appid`, `name`, `StateFlags`,
 `installdir`, `LastUpdated`, `SizeOnDisk`, `buildid`, and `InstalledDepots`
 (`manifest`, `size` per depot). The field names follow the public format as
