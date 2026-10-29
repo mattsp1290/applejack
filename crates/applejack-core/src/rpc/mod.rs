@@ -10,7 +10,7 @@ pub mod wire;
 use crate::host::HostFacts;
 use methods::{HelloResult, Method, MethodStatus};
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use wire::{ErrorCode, Id, Request, Response, RpcError};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -86,11 +86,17 @@ pub fn not_implemented(method: &Method) -> RpcError {
     RpcError::new(ErrorCode::NotImplemented, message).with_data(json!({"method": name}))
 }
 
+/// Whether a method's params, results, and error details stay out of logs.
+#[must_use]
+pub fn is_redacted(method: &str) -> bool {
+    method.starts_with("steam.login.")
+}
+
 /// Replaces `steam.login.*` params and results with [`REDACTED`] before they
 /// reach a log. Objects keep their keys so a log still shows the shape.
 #[must_use]
 pub fn redact(method: &str, value: &Value) -> Value {
-    if !method.starts_with("steam.login.") {
+    if !is_redacted(method) {
         return value.clone();
     }
     match value {
@@ -128,16 +134,29 @@ impl<H: Handler, W: Write> Handler for Logged<H, W> {
         let outcome = self.inner.handle(method);
         let _ = match &outcome {
             Ok(result) => writeln!(self.sink, "<- {name} ok {}", redact(name, result)),
+            // A login error's message or data may echo the account; only the
+            // code is safe to log.
+            Err(error) if is_redacted(name) => writeln!(
+                self.sink,
+                "<- {name} error {} ({})",
+                error.code.name(),
+                error.code.code()
+            ),
             Err(error) => writeln!(self.sink, "<- {name} error {error}"),
         };
         outcome
     }
 }
 
+/// The longest request line the loop reads into memory. Longer lines are
+/// answered with `InvalidRequest` and skipped.
+pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Serves newline-delimited JSON-RPC until EOF or a protocol mismatch.
 ///
 /// A line that is not UTF-8 or not JSON answers `ParseError` with a null id;
-/// valid JSON that is not a request answers `InvalidRequest`; both continue
+/// valid JSON that is not a request (including a non-object or a line
+/// longer than [`MAX_LINE_BYTES`]) answers `InvalidRequest`; both continue
 /// the loop. Empty lines are skipped. Every response is flushed before the
 /// next line is read.
 ///
@@ -154,8 +173,21 @@ pub fn serve<H: Handler + ?Sized>(
     let mut line = Vec::new();
     loop {
         line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        // One byte past the cap tells a line that is too long from one that
+        // is exactly at it.
+        let limit = u64::try_from(MAX_LINE_BYTES + 1).unwrap_or(u64::MAX);
+        if reader.by_ref().take(limit).read_until(b'\n', &mut line)? == 0 {
             return Ok(ExitStatus::Eof);
+        }
+        if line.len() > MAX_LINE_BYTES && !line.ends_with(b"\n") {
+            line.clear();
+            skip_line(&mut reader)?;
+            let error = RpcError::new(
+                ErrorCode::InvalidRequest,
+                format!("request line exceeds {MAX_LINE_BYTES} bytes"),
+            );
+            respond(&mut writer, &Response::error(None, error))?;
+            continue;
         }
         let Ok(text) = std::str::from_utf8(&line) else {
             let error = RpcError::new(ErrorCode::ParseError, "line is not UTF-8");
@@ -181,25 +213,48 @@ pub fn serve<H: Handler + ?Sized>(
     }
 }
 
-fn parse_request(text: &str) -> Result<Request, Response> {
-    match serde_json::from_str::<Request>(text) {
-        Ok(request) => Ok(request),
-        Err(error) if error.is_data() => {
-            // Valid JSON but not a request: echo the id when one is readable.
-            let id = serde_json::from_str::<Value>(text)
-                .ok()
-                .and_then(|value| value.get("id").cloned())
-                .and_then(|id| serde_json::from_value::<Id>(id).ok());
-            Err(Response::error(
-                id,
-                RpcError::new(ErrorCode::InvalidRequest, error.to_string()),
-            ))
+/// Consumes the reader up to and including the next newline (or EOF) without
+/// buffering the skipped bytes.
+fn skip_line(reader: &mut impl BufRead) -> io::Result<()> {
+    loop {
+        let (used, done) = {
+            let available = reader.fill_buf()?;
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(index) => (index + 1, true),
+                None => (available.len(), available.is_empty()),
+            }
+        };
+        reader.consume(used);
+        if done {
+            return Ok(());
         }
-        Err(error) => Err(Response::error(
+    }
+}
+
+fn parse_request(text: &str) -> Result<Request, Response> {
+    let value = serde_json::from_str::<Value>(text).map_err(|error| {
+        Response::error(
             None,
             RpcError::new(ErrorCode::ParseError, error.to_string()),
-        )),
-    }
+        )
+    })?;
+    // Serde would also read a request out of an array; JSON-RPC does not.
+    let Value::Object(object) = value else {
+        return Err(Response::error(
+            None,
+            RpcError::new(ErrorCode::InvalidRequest, "request must be a JSON object"),
+        ));
+    };
+    // Valid JSON but not a request: echo the id when one is readable.
+    let id = object
+        .get("id")
+        .and_then(|id| serde_json::from_value::<Id>(id.clone()).ok());
+    serde_json::from_value::<Request>(Value::Object(object)).map_err(|error| {
+        Response::error(
+            id,
+            RpcError::new(ErrorCode::InvalidRequest, error.to_string()),
+        )
+    })
 }
 
 fn dispatch<H: Handler + ?Sized>(

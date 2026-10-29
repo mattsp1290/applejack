@@ -1,22 +1,44 @@
 //! The serve loop over in-memory pipes.
 
-use applejack_core::rpc::methods::Method;
+use applejack_core::rpc::methods::{LoginMode, Method, MethodStatus};
 use applejack_core::rpc::wire::{Body, ErrorCode, Id, Response, RpcError};
 use applejack_core::rpc::{self, CoreHandler, ExitStatus, Handler, Logged, PROTOCOL_VERSION};
 use serde_json::{Value, json};
 
 const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":1}}"#;
 const DOCTOR: &str = r#"{"jsonrpc":"2.0","id":2,"method":"host.doctor","params":{}}"#;
+const MISMATCH: &str =
+    r#"{"jsonrpc":"2.0","id":9,"method":"hello","params":{"protocol_version":99}}"#;
 
 /// Answers every method with its name so tests can see what was dispatched.
+/// `steam.login.complete` fails the way a real login handler might: with the
+/// account and the guard code in the error.
 #[derive(Default)]
 struct Echo {
     seen: Vec<String>,
+    account: Option<String>,
 }
 
 impl Handler for Echo {
     fn handle(&mut self, method: &Method) -> Result<Value, RpcError> {
         self.seen.push(method.name().to_owned());
+        match method {
+            Method::SteamLoginStart(params) => {
+                if let LoginMode::Credentials { account_name, .. } = &params.mode {
+                    self.account = Some(account_name.clone());
+                }
+            }
+            Method::SteamLoginComplete(params) => {
+                let account = self.account.as_deref().unwrap_or("anonymous");
+                let code = params.steam_guard_code.as_deref().unwrap_or("");
+                return Err(RpcError::new(
+                    ErrorCode::Internal,
+                    format!("Steam Guard code {code} rejected for account {account}"),
+                )
+                .with_data(method.params()));
+            }
+            _ => {}
+        }
         Ok(json!({"method": method.name(), "params": method.params()}))
     }
 }
@@ -82,10 +104,7 @@ fn request_before_hello_is_refused_and_hello_still_works() {
 
 #[test]
 fn protocol_mismatch_answers_and_ends_the_loop_non_zero() {
-    let input = format!(
-        "{}\n{DOCTOR}\n",
-        r#"{"jsonrpc":"2.0","id":9,"method":"hello","params":{"protocol_version":99}}"#
-    );
+    let input = format!("{MISMATCH}\n{DOCTOR}\n");
     let mut handler = Echo::default();
     let (responses, status) = run(&input, &mut handler);
     assert_eq!(status, ExitStatus::ProtocolMismatch);
@@ -146,6 +165,75 @@ fn valid_json_that_is_not_a_request_gets_invalid_request_with_its_id() {
 }
 
 #[test]
+fn non_object_json_gets_invalid_request_with_null_id() {
+    // Serde would read a request out of the array form; JSON-RPC does not.
+    let input = format!(
+        "{}\n42\n\"hello\"\n{HELLO}\n",
+        r#"["2.0",7,"host.doctor",{}]"#
+    );
+    let mut handler = Echo::default();
+    let (responses, _) = run(&input, &mut handler);
+    assert_eq!(responses.len(), 4);
+    for response in &responses[..3] {
+        assert_eq!(error_of(response).code, ErrorCode::InvalidRequest);
+        assert_eq!(response.id, None);
+    }
+    assert!(responses[3].is_ok());
+    assert_eq!(handler.seen, ["hello"], "the array form was not dispatched");
+}
+
+#[test]
+fn request_without_id_gets_invalid_request_with_null_id() {
+    let input = format!(
+        "{HELLO}\n{}\n{DOCTOR}\n",
+        r#"{"jsonrpc":"2.0","method":"host.doctor","params":{}}"#
+    );
+    let (responses, _) = run(&input, &mut Echo::default());
+    assert_eq!(responses.len(), 3, "a shell-sent notification is answered");
+    assert_eq!(error_of(&responses[1]).code, ErrorCode::InvalidRequest);
+    assert_eq!(responses[1].id, None);
+    assert!(responses[2].is_ok());
+}
+
+fn junk_line(length: usize) -> String {
+    "x".repeat(length)
+}
+
+#[test]
+fn overlong_line_gets_invalid_request_and_the_loop_continues() {
+    let input = format!("{}\n{HELLO}\n", junk_line(rpc::MAX_LINE_BYTES + 1));
+    let (responses, status) = run(&input, &mut Echo::default());
+    assert_eq!(status, ExitStatus::Eof);
+    assert_eq!(responses.len(), 2);
+    let error = error_of(&responses[0]);
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert!(error.message.contains("exceeds"), "{}", error.message);
+    assert_eq!(responses[0].id, None);
+    assert!(
+        responses[1].is_ok(),
+        "the rest of the long line was skipped"
+    );
+}
+
+#[test]
+fn line_at_the_cap_is_parsed_rather_than_refused() {
+    let input = format!("{}\n{HELLO}\n", junk_line(rpc::MAX_LINE_BYTES));
+    let (responses, _) = run(&input, &mut Echo::default());
+    assert_eq!(responses.len(), 2);
+    assert_eq!(error_of(&responses[0]).code, ErrorCode::ParseError);
+    assert!(responses[1].is_ok());
+}
+
+#[test]
+fn overlong_line_without_newline_at_eof_is_refused_then_eof() {
+    let input = junk_line(rpc::MAX_LINE_BYTES + 1);
+    let (responses, status) = run(&input, &mut Echo::default());
+    assert_eq!(status, ExitStatus::Eof);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(error_of(&responses[0]).code, ErrorCode::InvalidRequest);
+}
+
+#[test]
 fn empty_lines_are_skipped() {
     let input = format!("\n{HELLO}\n   \n{DOCTOR}\n");
     let (responses, _) = run(&input, &mut Echo::default());
@@ -179,8 +267,9 @@ fn pending_methods_answer_not_implemented_naming_the_work_package() {
     let mut input = format!("{HELLO}\n");
     let pending: Vec<Method> = Method::examples()
         .into_iter()
-        .filter(|method| !matches!(method, Method::Hello(_) | Method::HostDoctor(_)))
+        .filter(|method| matches!(method.status(), MethodStatus::Pending { .. }))
         .collect();
+    assert!(pending.len() > 1, "the table has pending methods");
     for (index, method) in pending.iter().enumerate() {
         let request = json!({
             "jsonrpc": "2.0",
@@ -215,12 +304,51 @@ fn string_ids_are_echoed() {
     assert_eq!(responses[0].id, Some(Id::String("req-1".into())));
 }
 
+/// `status()` and `CoreHandler` must agree on which methods are served, so
+/// a work package that lands a method flips exactly one row in the table.
+#[test]
+fn core_handler_answers_not_implemented_exactly_for_pending_methods() {
+    for method in Method::examples() {
+        let outcome = CoreHandler.handle(&method);
+        let pending = matches!(method.status(), MethodStatus::Pending { .. });
+        assert_eq!(
+            matches!(&outcome, Err(error) if error.code == ErrorCode::NotImplemented),
+            pending,
+            "{}: status and handler disagree",
+            method.name()
+        );
+    }
+}
+
 #[test]
 fn hello_may_be_repeated() {
     let input = format!("{HELLO}\n{HELLO}\n{DOCTOR}\n");
     let (responses, _) = run(&input, &mut Echo::default());
     assert_eq!(responses.len(), 3);
     assert!(responses.iter().all(Response::is_ok));
+}
+
+#[test]
+fn mismatched_hello_after_a_good_one_still_exits_65() {
+    let input = format!("{HELLO}\n{MISMATCH}\n{DOCTOR}\n");
+    let (responses, status) = run(&input, &mut Echo::default());
+    assert_eq!(status, ExitStatus::ProtocolMismatch);
+    assert_eq!(status.code(), 65);
+    assert_eq!(responses.len(), 2, "nothing after the mismatch is answered");
+    assert!(responses[0].is_ok());
+    assert_eq!(error_of(&responses[1]).code, ErrorCode::ProtocolMismatch);
+}
+
+#[test]
+fn eof_without_a_good_hello_exits_0() {
+    let (responses, status) = run(&format!("{DOCTOR}\n"), &mut Echo::default());
+    assert_eq!(status, ExitStatus::Eof);
+    assert_eq!(status.code(), 0);
+    assert_eq!(error_of(&responses[0]).code, ErrorCode::HelloRequired);
+
+    let (responses, status) = run("", &mut Echo::default());
+    assert_eq!(status, ExitStatus::Eof);
+    assert_eq!(responses, Vec::<Response>::new());
 }
 
 #[test]
@@ -246,19 +374,35 @@ fn logged_handler_writes_redacted_lines_to_the_sink_only() {
         "jsonrpc": "2.0",
         "id": 2,
         "method": "steam.login.start",
-        "params": {"mode": {"kind": "credentials", "account_name": "me", "password": "hunter2"}},
+        "params": {"mode": {"kind": "credentials", "account_name": "swordfish", "password": "hunter2"}},
     });
-    let input = format!("{HELLO}\n{login}\n{DOCTOR}\n");
+    let complete = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "steam.login.complete",
+        "params": {"session_id": "sess-1", "steam_guard_code": "ABCDE"},
+    });
+    let input = format!("{HELLO}\n{login}\n{complete}\n{DOCTOR}\n");
     let mut handler = Logged::new(Echo::default(), Vec::new());
     let mut output = Vec::new();
     rpc::serve(input.as_bytes(), &mut output, &mut handler).unwrap();
     let (echo, sink) = handler.into_parts();
     let log = String::from_utf8(sink).unwrap();
-    assert_eq!(echo.seen, ["hello", "steam.login.start", "host.doctor"]);
-    assert!(
-        !log.contains("hunter2"),
-        "password leaked into the log:\n{log}"
+    assert_eq!(
+        echo.seen,
+        [
+            "hello",
+            "steam.login.start",
+            "steam.login.complete",
+            "host.doctor"
+        ]
     );
+    for secret in ["hunter2", "swordfish", "ABCDE", "sess-1"] {
+        assert!(
+            !log.contains(secret),
+            "`{secret}` leaked into the log:\n{log}"
+        );
+    }
     assert!(
         log.contains("-> steam.login.start {\"mode\":\"<redacted>\"}"),
         "{log}"
@@ -269,14 +413,21 @@ fn logged_handler_writes_redacted_lines_to_the_sink_only() {
         ),
         "{log}"
     );
+    // A login error logs its code only: the message and data may echo the
+    // account.
+    assert!(
+        log.contains("<- steam.login.complete error Internal (1003)\n"),
+        "{log}"
+    );
     assert!(log.contains("-> host.doctor {}"), "{log}");
     assert!(log.contains("-> hello {\"protocol_version\":1}"), "{log}");
 
-    // The echo handler returned the password in its result; the wire carries
-    // it (the shell asked), the log does not.
+    // The echo handler returned the password in its result and the account in
+    // its error; the wire carries them (the shell asked), the log does not.
     let wire = String::from_utf8(output).unwrap();
     assert!(wire.contains("hunter2"));
-    assert_eq!(wire.lines().count(), 3);
+    assert!(wire.contains("rejected for account swordfish"));
+    assert_eq!(wire.lines().count(), 4);
 }
 
 #[test]

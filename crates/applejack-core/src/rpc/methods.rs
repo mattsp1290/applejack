@@ -421,16 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn hello_and_host_doctor_are_the_only_implemented_methods() {
-        let implemented: Vec<&str> = Method::examples()
-            .iter()
-            .filter(|method| method.status() == MethodStatus::Implemented)
-            .map(Method::name)
-            .collect();
-        assert_eq!(implemented, ["hello", "host.doctor"]);
-    }
-
-    #[test]
     fn from_request_distinguishes_unknown_method_from_bad_params() {
         let unknown = Method::from_request("nope", json!({})).unwrap_err();
         assert_eq!(unknown.code, ErrorCode::MethodNotFound);

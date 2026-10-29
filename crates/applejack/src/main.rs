@@ -1,12 +1,12 @@
 //! Command-line entry point for applejack.
 
+mod cmd;
+
 use applejack_core::host::HostFacts;
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
-
-mod cmd;
 
 /// `EX_UNAVAILABLE` from sysexits(3): the subcommand exists but is not implemented yet.
 const EXIT_NOT_IMPLEMENTED: u8 = 69;
