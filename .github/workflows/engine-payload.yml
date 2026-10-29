@@ -1,7 +1,8 @@
-# Builds the Rosetta engine payload. Expected to fail at `bootstrap.sh --check`
-# or `engine-payload --build` until the Wine build lands (the toolchain install
-# and the multi-hour build are not yet exercised); `--fetch` and the data-file
-# checks are the parts that pass today.
+# Builds the Rosetta engine payload. `pins-verify` and `--fetch` (with the
+# denylist scan of every archive) pass on a stock runner; `bootstrap.sh --check`
+# fails there until the installing mode is exercised, and the multi-hour Wine
+# build has not run yet. Actions are pinned to commit SHAs; the tag each SHA
+# carried when it was looked up is recorded beside it.
 name: engine-payload
 
 on:
@@ -17,27 +18,27 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Require Apple Silicon
         run: test "$(uname -m)" = arm64
       - name: Install the pinned Rust toolchain
         run: |
           rustup toolchain install
           rustup show active-toolchain
-      - uses: actions/cache@v4
+      # Only the registry and git caches: `target/` feeds the binary that runs
+      # every gate below, so it is rebuilt from source on each run.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - name: Verify the pin and denylist files
         run: cargo xtask pins-verify
+      - name: Fetch and scan every pin
+        run: cargo xtask engine-payload --fetch
       - name: Check build prerequisites
         run: sh build/bootstrap.sh --check
-      - name: Fetch every pin
-        run: cargo xtask engine-payload --fetch
       - name: Build the payload
         run: cargo xtask engine-payload --build
       - name: Check the payload
