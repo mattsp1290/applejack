@@ -1,0 +1,28 @@
+# Well-formed sample with one entry per table. Every other fixture in this
+# directory is derived from this file by generate.sh.
+
+[[engine]]
+id = "rosetta-wine"
+version = "10.0.0"
+arch = "x86_64"
+min_macos = "14.0"
+url = "https://example.invalid/engines/rosetta-wine-10.0.0-x86_64.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+components = { wine = "10.0", dxmt = "0.60" }
+notarization_submission_id = ""
+
+[[tool]]
+version = "3.0.0"
+url = "https://example.invalid/tools/depotdownloader-3.0.0.zip"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+arch = "arm64"
+runs_on = "host"
+
+[[probe]]
+id = "cpuid"
+version = "0.1.0"
+url = "https://example.invalid/probes/cpuid-0.1.0.exe"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+arch = "x86_64"
+runs_in = "rosetta"
+ships_in_bundle = true
