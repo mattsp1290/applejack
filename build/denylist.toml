@@ -1,0 +1,21 @@
+# Paths that must never appear in an engine payload or in a fetched archive.
+# `cargo xtask engine-payload --check <payload>` scans the assembled tree and
+# `--check-listing` scans archive listings before extraction. A pattern without
+# `/` matches any single path component; one with `/` matches a component-aligned
+# suffix of the path. See ADR-0004.
+
+[[deny]]
+pattern = "D3DMetal*"
+reason = "Apple D3DMetal is user-supplied under the per-user overlay only (ADR-0004)"
+
+[[deny]]
+pattern = "libd3dshared*"
+reason = "Apple D3DMetal companion library (ADR-0004)"
+
+[[deny]]
+pattern = "libmetalirconverter*"
+reason = "Apple Metal shader converter ships with D3DMetal and is not redistributable"
+
+[[deny]]
+pattern = "lib/external/**"
+reason = "the GPTK external directory holds Apple-licensed binaries; the overlay owns it"
