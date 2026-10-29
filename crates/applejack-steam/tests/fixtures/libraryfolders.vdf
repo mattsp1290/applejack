@@ -1,0 +1,28 @@
+"libraryfolders"
+{
+	"0"
+	{
+		"path"		"C:\\Program Files (x86)\\Steam"
+		"label"		""
+		"contentid"		"0"
+		"totalsize"		"0"
+		"update_clean_bytes_tally"		"0"
+		"time_last_update_verified"		"0"
+		"apps"
+		{
+			"0"		"123456789"
+		}
+	}
+	"1"
+	{
+		"path"		"Z:\\Users\\redacted\\Library\\Application Support\\applejack\\library"
+		"label"		"applejack"
+		"contentid"		"0"
+		"totalsize"		"0"
+		"update_clean_bytes_tally"		"0"
+		"time_last_update_verified"		"0"
+		"apps"
+		{
+		}
+	}
+}

@@ -6,6 +6,19 @@ license.workspace = true
 
 [dependencies]
 applejack-manifest = { workspace = true }
+prost = { workspace = true }
+rustix = { workspace = true }
+security-framework = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+steamroom = { workspace = true }
+steamroom-client = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+rpassword = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
