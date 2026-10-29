@@ -187,15 +187,24 @@ All commands run from the repository root. Output goes under `build/work/`
    `build/work/`, the payload's own absolute path, any absolute path outside
    `/System` and `/usr/lib`, any `..` component, or `/System/Volumes/`
    (a firmlink back into the data volume); on any symlink that is absolute,
-   dangling, or whose real resolution (not only the lexical one) leaves the
-   payload; and on any `@rpath/`, `@loader_path/`, or `@executable_path/`
-   dependency that names no file in the payload. `@rpath/x` is looked up
-   through every relocated `LC_RPATH` in the payload, as dyld searches the
-   rpaths of the whole load chain, so a Unix module without its own rpath
-   resolves through the loader's; `@loader_path/x` and `@executable_path/x`
-   resolve against the binary's own directory (for a dylib the executable is
-   unknown, so an `@executable_path` dependency that is not next to the dylib
-   is reported). Absolute `LC_RPATH` entries contribute nothing to the lookup.
+   dangling, whose lexical walk from the link's directory climbs above the
+   payload root at any point (even one that comes back in through the root's
+   own name, which breaks once the installer renames the root), or whose real
+   resolution leaves the payload; and on any `@rpath/`, `@loader_path/`, or
+   `@executable_path/` dependency that names no file in the payload. The
+   lookup follows dyld. The payload's executables are the Mach-Os with
+   `LC_MAIN` (or `LC_UNIXTHREAD`); `@executable_path` relocates against each
+   executable's directory, in dependencies and `LC_RPATH` entries alike.
+   `@rpath/x` is searched through the binary's own relocated `LC_RPATH`
+   entries plus the executables', since dyld consults the rpaths of the image
+   and of the images that loaded it up to the main executable and never those
+   of unrelated images: a dlopen'd Unix module without an rpath resolves
+   through the loader's, and a library reachable only through another dylib's
+   rpath is reported. `@loader_path/x` resolves against the binary's own
+   directory. When the binary's `LC_RPATH` entries, or an executable's,
+   include a system root such as `/usr/lib/swift`, its unresolved `@rpath/`
+   references are left to dyld; other absolute `LC_RPATH` entries contribute
+   nothing to the lookup.
 
 ## Running the built Wine
 

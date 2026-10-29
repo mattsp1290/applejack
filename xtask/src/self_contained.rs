@@ -136,42 +136,77 @@ fn command_values<'a>(
         })
 }
 
+/// Whether `otool -l` output describes an executable (`LC_MAIN`, or
+/// `LC_UNIXTHREAD` before 10.8) rather than a dylib or bundle.
+pub fn is_executable(load_commands: &str) -> bool {
+    load_commands
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "cmd LC_MAIN" || line == "cmd LC_UNIXTHREAD")
+}
+
+/// Whether any `LC_RPATH` is a system root such as `/usr/lib/swift`. dyld
+/// searches it on its own, so nothing in the payload can show an `@rpath/`
+/// reference of that binary unresolved.
+pub fn has_system_rpath(load_commands: &str) -> bool {
+    rpath_entries(load_commands).any(is_system)
+}
+
 /// The payload-relative directories a binary's relocatable `LC_RPATH`
-/// entries name. `@loader_path` and `@executable_path` both relocate against
-/// the binary's own directory (for a dylib the executable is unknown, so
-/// this is the best static reading). An entry that climbs out of the payload
-/// or is absolute names nothing here; `check_rpaths` reports the absolute
-/// ones.
-pub fn relocated_rpaths(binary: &str, load_commands: &str) -> Vec<PathBuf> {
+/// entries name: `@loader_path` against the binary's own directory,
+/// `@executable_path` against each of `exe_dirs`, the directories of the
+/// payload's executables (a dylib's loader is only known at run time). An
+/// entry that climbs out of the payload or is absolute names nothing here;
+/// `check_rpaths` reports the absolute ones.
+pub fn relocated_rpaths(binary: &str, load_commands: &str, exe_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let bin_dir = binary_dir(binary);
     rpath_entries(load_commands)
-        .filter_map(|path| {
-            let rest = path
-                .strip_prefix("@loader_path")
-                .or_else(|| path.strip_prefix("@executable_path"))?;
+        .flat_map(|path| {
+            let (bases, rest): (Vec<&Path>, &str) =
+                if let Some(rest) = path.strip_prefix("@loader_path") {
+                    (vec![bin_dir.as_path()], rest)
+                } else if let Some(rest) = path.strip_prefix("@executable_path") {
+                    (exe_dirs.iter().map(PathBuf::as_path).collect(), rest)
+                } else {
+                    (Vec::new(), "")
+                };
             let rest = rest.strip_prefix('/').unwrap_or(rest);
-            normalize_relative(&bin_dir.join(rest))
+            bases
+                .into_iter()
+                .filter_map(|base| normalize_relative(&base.join(rest)))
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// What one binary's `@rpath/` and `@executable_path/` references resolve
+/// through. dyld consults the rpaths of the image itself and of the images
+/// that loaded it up to the main executable, never those of unrelated
+/// images, so the set is the binary's own rpaths plus the executables'
+/// (which also covers a dlopen'd Unix module or plugin).
+pub struct Search<'a> {
+    /// Relocated `LC_RPATH` directories of the binary and of the payload's
+    /// executables.
+    pub rpath_dirs: &'a BTreeSet<PathBuf>,
+    /// Directories of the payload's executables.
+    pub exe_dirs: &'a [PathBuf],
+    /// An `LC_RPATH` of the binary or of an executable is a system root, so
+    /// an `@rpath/` reference the payload does not satisfy is left to dyld.
+    pub system_rpath: bool,
 }
 
 /// Checks that every `@rpath/`, `@loader_path/`, and `@executable_path/`
 /// dependency of one Mach-O names a file in the payload.
 ///
-/// `@rpath/x` is tried through every directory in `rpath_dirs`, the
-/// relocated `LC_RPATH` entries of the whole payload: dyld searches the
-/// rpaths of the executable and of every dylib in the load chain, so a Unix
-/// module without `LC_RPATH` of its own still resolves through the loader's.
-/// An absolute `LC_RPATH` contributes nothing (a system one such as
-/// `/usr/lib/swift` is not expected in this payload). `@loader_path/x` and
-/// `@executable_path/x` resolve against the binary's own directory.
-/// `resolves` says whether a payload-relative candidate is a file inside the
-/// payload; it follows symlinks, so a framework's `Versions/Current` link
-/// works.
+/// `@rpath/x` is tried through `search.rpath_dirs`; `@loader_path/x`
+/// resolves against the binary's own directory and `@executable_path/x`
+/// against each executable's. `resolves` says whether a payload-relative
+/// candidate is a file inside the payload; it follows symlinks, so a
+/// framework's `Versions/Current` link works.
 pub fn check_references_resolve(
     binary: &str,
     load_commands: &str,
-    rpath_dirs: &BTreeSet<PathBuf>,
+    search: &Search<'_>,
     resolves: &dyn Fn(&Path) -> bool,
 ) -> Vec<Violation> {
     let bin_dir = binary_dir(binary);
@@ -181,13 +216,19 @@ pub fn check_references_resolve(
                 .iter()
                 .find_map(|prefix| reference.strip_prefix(prefix).map(|rest| (*prefix, rest)))?;
             let (candidates, reason): (Vec<PathBuf>, &str) = match prefix {
-                "@rpath/" => (
-                    rpath_dirs
-                        .iter()
-                        .filter_map(|dir| normalize_relative(&dir.join(rest)))
-                        .collect(),
-                    "@rpath reference resolves through no LC_RPATH in the payload",
-                ),
+                "@rpath/" => {
+                    if search.system_rpath {
+                        return None;
+                    }
+                    (
+                        search
+                            .rpath_dirs
+                            .iter()
+                            .filter_map(|dir| normalize_relative(&dir.join(rest)))
+                            .collect(),
+                        "@rpath reference resolves through no LC_RPATH of the binary or of an executable",
+                    )
+                }
                 "@loader_path/" => (
                     normalize_relative(&bin_dir.join(rest))
                         .into_iter()
@@ -195,10 +236,16 @@ pub fn check_references_resolve(
                     "@loader_path reference does not resolve to a file in the payload",
                 ),
                 _ => (
-                    normalize_relative(&bin_dir.join(rest))
-                        .into_iter()
+                    search
+                        .exe_dirs
+                        .iter()
+                        .filter_map(|dir| normalize_relative(&dir.join(rest)))
                         .collect(),
-                    "@executable_path reference does not resolve to a file next to the binary",
+                    if search.exe_dirs.is_empty() {
+                        "@executable_path reference, and the payload has no executable to resolve it against"
+                    } else {
+                        "@executable_path reference does not resolve against any executable's directory"
+                    },
                 ),
             };
             if candidates.iter().any(|candidate| resolves(candidate)) {
@@ -213,7 +260,8 @@ pub fn check_references_resolve(
         .collect()
 }
 
-fn binary_dir(binary: &str) -> PathBuf {
+/// The payload-relative directory of a payload-relative binary path.
+pub(crate) fn binary_dir(binary: &str) -> PathBuf {
     Path::new(binary)
         .parent()
         .map(Path::to_path_buf)
@@ -221,8 +269,8 @@ fn binary_dir(binary: &str) -> PathBuf {
 }
 
 /// Resolves `.` and `..` lexically; `None` when the path climbs above its
-/// root or is not relative.
-fn normalize_relative(path: &Path) -> Option<PathBuf> {
+/// root at any point (even if it comes back in) or is not relative.
+pub(crate) fn normalize_relative(path: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -254,7 +302,7 @@ fn classify(reference: &str, payload_root: &Path, build_dir: &Path) -> Option<&'
     if reference.starts_with("/System/Volumes/") {
         return Some("/System/Volumes/ is a firmlink into the data volume, not the system");
     }
-    if SYSTEM_ROOTS.iter().any(|root| reference.starts_with(root)) {
+    if is_system(reference) {
         return None;
     }
     if starts_with_dir(reference, "/usr/local") {
@@ -275,6 +323,12 @@ fn classify(reference: &str, payload_root: &Path, build_dir: &Path) -> Option<&'
     Some("not an absolute, @rpath, @loader_path, or @executable_path reference")
 }
 
+fn is_system(reference: &str) -> bool {
+    SYSTEM_ROOTS
+        .iter()
+        .any(|root| starts_with_dir(reference, root))
+}
+
 fn starts_with_dir(reference: &str, dir: &str) -> bool {
     let dir = dir.trim_end_matches('/');
     !dir.is_empty()
@@ -288,7 +342,21 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    use super::{check_otool_listing, check_references_resolve, check_rpaths, relocated_rpaths};
+    use super::{
+        Search, check_otool_listing, check_references_resolve, check_rpaths, has_system_rpath,
+        is_executable, relocated_rpaths,
+    };
+
+    fn files(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    fn references(violations: &[super::Violation]) -> Vec<&str> {
+        violations
+            .iter()
+            .map(|violation| violation.reference.as_str())
+            .collect()
+    }
 
     const LISTING: &str = "\
 wine/bin/wine64:
@@ -492,29 +560,40 @@ Load command 8
          path /usr/local/lib (offset 12)
 ";
 
+    // The loader: an executable whose own rpath reaches wine/lib.
+    const LOADER_LOAD_COMMANDS: &str = "\
+wine/bin/wine:
+Load command 8
+          cmd LC_MAIN
+      cmdsize 24
+Load command 9
+          cmd LC_RPATH
+         path @loader_path/../lib (offset 12)
+";
+
     #[test]
     fn relative_references_must_resolve_to_payload_files() {
         let binary = "wine/lib/wine/x86_64-unix/ntdll.so";
-        let own = relocated_rpaths(binary, MODULE_LOAD_COMMANDS);
+        assert!(!is_executable(MODULE_LOAD_COMMANDS));
+        assert!(is_executable(LOADER_LOAD_COMMANDS));
+        let exe_dirs = vec![PathBuf::from("wine/bin")];
+        let own = relocated_rpaths(binary, MODULE_LOAD_COMMANDS, &exe_dirs);
         assert_eq!(own, [PathBuf::from("wine/lib")]);
-        let files: BTreeSet<PathBuf> = [
+        let files = files(&[
             "wine/lib/libfreetype.6.dylib",
             "wine/lib/libgnutls.30.dylib",
             "wine/lib/wine/x86_64-unix/ntdll.so",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
+        ]);
         let resolves = |candidate: &Path| files.contains(candidate);
         let rpath_dirs: BTreeSet<PathBuf> = own.into_iter().collect();
-        let violations =
-            check_references_resolve(binary, MODULE_LOAD_COMMANDS, &rpath_dirs, &resolves);
-        let references: Vec<&str> = violations
-            .iter()
-            .map(|violation| violation.reference.as_str())
-            .collect();
+        let search = Search {
+            rpath_dirs: &rpath_dirs,
+            exe_dirs: &exe_dirs,
+            system_rpath: false,
+        };
+        let violations = check_references_resolve(binary, MODULE_LOAD_COMMANDS, &search, &resolves);
         assert_eq!(
-            references,
+            references(&violations),
             [
                 "@rpath/libmissing.dylib",
                 "@loader_path/../../../../../../escape.dylib",
@@ -536,20 +615,261 @@ Load command 8
         // A module with no LC_RPATH of its own resolves through the loader's.
         let bare = "wine/lib/wine/x86_64-unix/ntdll.so:\n\
 Load command 1\n          cmd LC_LOAD_DYLIB\n         name @rpath/libfreetype.6.dylib (offset 24)\n";
-        assert_eq!(relocated_rpaths(binary, bare), Vec::<PathBuf>::new());
         assert_eq!(
-            check_references_resolve(binary, bare, &BTreeSet::new(), &resolves).len(),
+            relocated_rpaths(binary, bare, &exe_dirs),
+            Vec::<PathBuf>::new()
+        );
+        let none = BTreeSet::new();
+        let search = Search {
+            rpath_dirs: &none,
+            exe_dirs: &exe_dirs,
+            system_rpath: false,
+        };
+        assert_eq!(
+            check_references_resolve(binary, bare, &search, &resolves).len(),
             1
         );
-        let loader_rpaths = relocated_rpaths(
-            "wine/bin/wine",
-            "wine/bin/wine:\nLoad command 9\n          cmd LC_RPATH\n         path @loader_path/../lib (offset 12)\n",
-        );
-        let rpath_dirs: BTreeSet<PathBuf> = loader_rpaths.into_iter().collect();
+        let rpath_dirs: BTreeSet<PathBuf> =
+            relocated_rpaths("wine/bin/wine", LOADER_LOAD_COMMANDS, &exe_dirs)
+                .into_iter()
+                .collect();
         assert_eq!(rpath_dirs, BTreeSet::from([PathBuf::from("wine/lib")]));
+        let search = Search {
+            rpath_dirs: &rpath_dirs,
+            exe_dirs: &exe_dirs,
+            system_rpath: false,
+        };
         assert_eq!(
-            check_references_resolve(binary, bare, &rpath_dirs, &resolves),
+            check_references_resolve(binary, bare, &search, &resolves),
             []
+        );
+    }
+
+    // The Fix Verifier's `union` fixture: `app` names `@rpath/libfoo.dylib`
+    // with no LC_RPATH, and an unrelated plugin's rpath is the only one that
+    // reaches `deps/`. dyld fails with "no LC_RPATH's found".
+    const UNION_APP: &str = "\
+wine/bin/app:
+Load command 10
+          cmd LC_MAIN
+Load command 11
+          cmd LC_LOAD_DYLIB
+         name @rpath/libfoo.dylib (offset 24)
+Load command 12
+          cmd LC_LOAD_DYLIB
+         name /usr/lib/libSystem.B.dylib (offset 24)
+";
+    const UNION_PLUGIN: &str = "\
+wine/lib/gst/libplug.dylib:
+Load command 0
+          cmd LC_ID_DYLIB
+         name @rpath/libplug.dylib (offset 24)
+Load command 1
+          cmd LC_LOAD_DYLIB
+         name /usr/lib/libSystem.B.dylib (offset 24)
+Load command 2
+          cmd LC_RPATH
+         path @loader_path/../deps (offset 12)
+";
+
+    #[test]
+    fn union_of_unrelated_rpaths_does_not_resolve_an_executable() {
+        let files = files(&[
+            "wine/bin/app",
+            "wine/lib/deps/libfoo.dylib",
+            "wine/lib/gst/libplug.dylib",
+        ]);
+        let resolves = |candidate: &Path| files.contains(candidate);
+        let exe_dirs = vec![PathBuf::from("wine/bin")];
+        let exe_rpaths: BTreeSet<PathBuf> = relocated_rpaths("wine/bin/app", UNION_APP, &exe_dirs)
+            .into_iter()
+            .collect();
+        assert!(exe_rpaths.is_empty());
+        let plugin_rpaths: BTreeSet<PathBuf> =
+            relocated_rpaths("wine/lib/gst/libplug.dylib", UNION_PLUGIN, &exe_dirs)
+                .into_iter()
+                .collect();
+        assert_eq!(
+            plugin_rpaths,
+            BTreeSet::from([PathBuf::from("wine/lib/deps")])
+        );
+
+        // The plugin's rpath would resolve the reference; it is not searched.
+        let search = Search {
+            rpath_dirs: &exe_rpaths,
+            exe_dirs: &exe_dirs,
+            system_rpath: false,
+        };
+        let violations = check_references_resolve("wine/bin/app", UNION_APP, &search, &resolves);
+        assert_eq!(references(&violations), ["@rpath/libfoo.dylib"]);
+        let search = Search {
+            rpath_dirs: &plugin_rpaths,
+            exe_dirs: &exe_dirs,
+            system_rpath: false,
+        };
+        assert_eq!(
+            check_references_resolve(
+                "wine/lib/gst/libplug.dylib",
+                UNION_PLUGIN,
+                &search,
+                &resolves
+            ),
+            []
+        );
+    }
+
+    // The Fix Verifier's `exe-good` and `exe-bad` fixtures: `app` loads a
+    // Unix module that depends on `@executable_path/../lib/libbar.dylib`.
+    // dyld resolves it against `wine/bin`, so `wine/lib/libbar.dylib` loads
+    // and `wine/lib/wine/lib/libbar.dylib` (next to the module) does not.
+    const EXE_APP: &str = "\
+wine/bin/app:
+Load command 10
+          cmd LC_MAIN
+Load command 11
+          cmd LC_LOAD_DYLIB
+         name @loader_path/../lib/wine/unix/libmod.dylib (offset 24)
+";
+    const EXE_MODULE: &str = "\
+wine/lib/wine/unix/libmod.dylib:
+Load command 0
+          cmd LC_ID_DYLIB
+         name @loader_path/../lib/wine/unix/libmod.dylib (offset 24)
+Load command 1
+          cmd LC_LOAD_DYLIB
+         name @executable_path/../lib/libbar.dylib (offset 24)
+";
+
+    fn module_violations(files: &BTreeSet<PathBuf>) -> Vec<super::Violation> {
+        let resolves = |candidate: &Path| files.contains(candidate);
+        let exe_dirs = vec![PathBuf::from("wine/bin")];
+        let none = BTreeSet::new();
+        let search = Search {
+            rpath_dirs: &none,
+            exe_dirs: &exe_dirs,
+            system_rpath: false,
+        };
+        let mut violations = check_references_resolve("wine/bin/app", EXE_APP, &search, &resolves);
+        violations.extend(check_references_resolve(
+            "wine/lib/wine/unix/libmod.dylib",
+            EXE_MODULE,
+            &search,
+            &resolves,
+        ));
+        violations
+    }
+
+    #[test]
+    fn exe_good_executable_path_resolves_against_the_executable() {
+        let files = files(&[
+            "wine/bin/app",
+            "wine/lib/libbar.dylib",
+            "wine/lib/wine/unix/libmod.dylib",
+        ]);
+        assert_eq!(module_violations(&files), []);
+    }
+
+    #[test]
+    fn exe_bad_executable_path_does_not_resolve_against_the_dylib() {
+        let files = files(&[
+            "wine/bin/app",
+            "wine/lib/wine/lib/libbar.dylib",
+            "wine/lib/wine/unix/libmod.dylib",
+        ]);
+        let violations = module_violations(&files);
+        assert_eq!(
+            references(&violations),
+            ["@executable_path/../lib/libbar.dylib"],
+            "{violations:?}"
+        );
+        assert_eq!(violations[0].binary, "wine/lib/wine/unix/libmod.dylib");
+        assert!(
+            violations[0].reason.contains("executable"),
+            "{}",
+            violations[0]
+        );
+
+        // Without any executable the reference has nothing to resolve against.
+        let resolves = |candidate: &Path| files.contains(candidate);
+        let none = BTreeSet::new();
+        let search = Search {
+            rpath_dirs: &none,
+            exe_dirs: &[],
+            system_rpath: false,
+        };
+        let violations = check_references_resolve(
+            "wine/lib/wine/unix/libmod.dylib",
+            EXE_MODULE,
+            &search,
+            &resolves,
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].reason.contains("no executable"),
+            "{}",
+            violations[0]
+        );
+    }
+
+    #[test]
+    fn executable_path_rpaths_relocate_against_the_executables() {
+        // GStreamer's shape: a plugin with `@executable_path/../lib` next to
+        // `@loader_path/..`, in a payload whose executables are elsewhere.
+        let plugin = "\
+wine/lib/GStreamer.framework/Versions/1.0/lib/gstreamer-1.0/libgstx.dylib:
+Load command 1
+          cmd LC_RPATH
+         path @executable_path/../lib (offset 12)
+Load command 2
+          cmd LC_RPATH
+         path @loader_path/.. (offset 12)
+Load command 3
+          cmd LC_RPATH
+         path @executable_path/../../../../../.. (offset 12)
+";
+        let exe_dirs = vec![PathBuf::from("wine/bin"), PathBuf::from("probes")];
+        let dirs = relocated_rpaths(
+            "wine/lib/GStreamer.framework/Versions/1.0/lib/gstreamer-1.0/libgstx.dylib",
+            plugin,
+            &exe_dirs,
+        );
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("wine/lib"),
+                PathBuf::from("lib"),
+                PathBuf::from("wine/lib/GStreamer.framework/Versions/1.0/lib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_system_rpath_leaves_rpath_references_to_dyld() {
+        // LOAD_COMMANDS carries `LC_RPATH /usr/lib/swift`, which dyld
+        // searches from the shared cache; the payload cannot prove the
+        // reference unresolved.
+        assert!(has_system_rpath(LOAD_COMMANDS));
+        assert!(!has_system_rpath(MODULE_LOAD_COMMANDS));
+        let resolves = |_: &Path| false;
+        let exe_dirs = vec![PathBuf::from("wine/bin")];
+        let none = BTreeSet::new();
+        let search = Search {
+            rpath_dirs: &none,
+            exe_dirs: &exe_dirs,
+            system_rpath: has_system_rpath(LOAD_COMMANDS),
+        };
+        assert_eq!(
+            check_references_resolve("wine/bin/rpath_exe", LOAD_COMMANDS, &search, &resolves),
+            []
+        );
+        let search = Search {
+            rpath_dirs: &none,
+            exe_dirs: &exe_dirs,
+            system_rpath: false,
+        };
+        assert_eq!(
+            check_references_resolve("wine/bin/rpath_exe", LOAD_COMMANDS, &search, &resolves).len(),
+            1
         );
     }
 

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use sha2::{Digest, Sha256};
@@ -15,7 +15,8 @@ use crate::bundle_toml::BundleSpec;
 use crate::denylist::{Denylist, Hit};
 use crate::pins::{Pin, Pins};
 use crate::self_contained::{
-    Violation, check_otool_listing, check_references_resolve, check_rpaths, relocated_rpaths,
+    Search, Violation, binary_dir, check_otool_listing, check_references_resolve, check_rpaths,
+    has_system_rpath, is_executable, normalize_relative, relocated_rpaths,
 };
 
 pub const USAGE: &str = "\
@@ -496,36 +497,7 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
             load_commands,
         });
     }
-    // Every relocated LC_RPATH in the payload: the search path dyld builds
-    // from the whole load chain, which a module without its own rpath uses.
-    let rpath_dirs: BTreeSet<PathBuf> = machos
-        .iter()
-        .flat_map(|macho| relocated_rpaths(&macho.relative, &macho.load_commands))
-        .collect();
-    let resolves = |candidate: &Path| {
-        fs::canonicalize(payload.join(candidate))
-            .is_ok_and(|real| real.starts_with(&payload) && real.is_file())
-    };
-    for macho in &machos {
-        violations.extend(check_otool_listing(
-            &macho.relative,
-            &macho.listing,
-            &payload,
-            &build_dir,
-        ));
-        violations.extend(check_rpaths(
-            &macho.relative,
-            &macho.load_commands,
-            &payload,
-            &build_dir,
-        ));
-        violations.extend(check_references_resolve(
-            &macho.relative,
-            &macho.load_commands,
-            &rpath_dirs,
-            &resolves,
-        ));
-    }
+    violations.extend(link_violations(&payload, &build_dir, &machos));
     Ok(Report {
         payload,
         paths: entries.len(),
@@ -535,8 +507,71 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
     })
 }
 
+/// The self-containment violations of every Mach-O: absolute references,
+/// absolute rpaths, and relative references that name no payload file.
+fn link_violations(payload: &Path, build_dir: &Path, machos: &[MachO]) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    // dyld resolves `@rpath/` through the rpaths of the image and of the
+    // executable that loaded (or dlopen'd) it, so each binary searches its
+    // own rpaths plus the executables'; a payload-wide union would accept a
+    // library the loader never looks for.
+    let executables: Vec<&MachO> = machos
+        .iter()
+        .filter(|macho| is_executable(&macho.load_commands))
+        .collect();
+    let exe_dirs: Vec<PathBuf> = executables
+        .iter()
+        .map(|macho| binary_dir(&macho.relative))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let exe_rpaths: BTreeSet<PathBuf> = executables
+        .iter()
+        .flat_map(|macho| relocated_rpaths(&macho.relative, &macho.load_commands, &exe_dirs))
+        .collect();
+    let exe_system_rpath = executables
+        .iter()
+        .any(|macho| has_system_rpath(&macho.load_commands));
+    let resolves = |candidate: &Path| {
+        fs::canonicalize(payload.join(candidate))
+            .is_ok_and(|real| real.starts_with(payload) && real.is_file())
+    };
+    for macho in machos {
+        violations.extend(check_otool_listing(
+            &macho.relative,
+            &macho.listing,
+            payload,
+            build_dir,
+        ));
+        violations.extend(check_rpaths(
+            &macho.relative,
+            &macho.load_commands,
+            payload,
+            build_dir,
+        ));
+        let mut rpath_dirs = exe_rpaths.clone();
+        rpath_dirs.extend(relocated_rpaths(
+            &macho.relative,
+            &macho.load_commands,
+            &exe_dirs,
+        ));
+        let search = Search {
+            rpath_dirs: &rpath_dirs,
+            exe_dirs: &exe_dirs,
+            system_rpath: exe_system_rpath || has_system_rpath(&macho.load_commands),
+        };
+        violations.extend(check_references_resolve(
+            &macho.relative,
+            &macho.load_commands,
+            &search,
+            &resolves,
+        ));
+    }
+    violations
+}
+
 /// One Mach-O of the payload with both `otool` outputs, kept so the
-/// payload-wide rpath set exists before any reference is resolved.
+/// executables' rpath set exists before any reference is resolved.
 struct MachO {
     relative: String,
     listing: String,
@@ -545,37 +580,28 @@ struct MachO {
 
 /// Why a symlink would not survive the payload moving to another machine.
 ///
-/// The lexical test is the fast path and names the obvious escape; the real
-/// resolution is the authority, since a `..` after a component that is itself
-/// a symlink is popped lexically as though it were a directory. `payload` is
+/// The lexical walk from the link's payload-relative directory must never
+/// climb above the root, even when the target comes back in through the
+/// root's own name: the installer renames the root. The real resolution is
+/// the second authority, since a `..` after a component that is itself a
+/// symlink is popped lexically as though it were a directory. `payload` is
 /// canonical, so `starts_with` on the canonical target is exact.
 fn symlink_reason(payload: &Path, link: &Path, target: &Path) -> Option<&'static str> {
     if target.is_absolute() {
         return Some("absolute symlink target");
     }
-    let resolved = lexical_normalize(&link.parent().unwrap_or(payload).join(target));
-    if !resolved.starts_with(payload) {
-        return Some("symlink target escapes the payload");
+    let link_dir = link
+        .parent()
+        .and_then(|dir| dir.strip_prefix(payload).ok())
+        .unwrap_or(Path::new(""));
+    if normalize_relative(&link_dir.join(target)).is_none() {
+        return Some("symlink target climbs out of the payload");
     }
     match fs::canonicalize(link) {
         Err(_) => Some("dangling symlink"),
         Ok(real) if !real.starts_with(payload) => Some("symlink resolves outside the payload"),
         Ok(_) => None,
     }
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 fn check_listing(root: &Path, listing: &str) -> Result<(), String> {
@@ -903,7 +929,10 @@ mod tests {
             violations,
             [
                 ("wine/lib/dangling", "dangling symlink"),
-                ("wine/lib/escape", "symlink target escapes the payload"),
+                (
+                    "wine/lib/escape",
+                    "symlink target climbs out of the payload"
+                ),
                 ("wine/lib/gpu", "absolute symlink target"),
                 ("wine/lib/libfreetype.6.dylib", "absolute symlink target"),
             ]
@@ -949,6 +978,37 @@ mod tests {
             [(
                 "wine/lib/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/libfreetype.6.dylib",
                 "symlink resolves outside the payload"
+            )]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The Fix Verifier's `reenter` fixture: the target climbs above the
+    /// root and comes back in through the root's name. On the build host it
+    /// resolves; after the installer renames the root it dangles.
+    #[test]
+    fn reenter_symlink_through_the_root_name_is_a_violation() {
+        let dir = scratch("symlink-reenter");
+        let payload = dir.join("payload");
+        fs::create_dir_all(payload.join("wine/lib")).expect("payload");
+        fs::write(payload.join("wine/lib/libfoo.real.dylib"), b"not a mach-o").expect("file");
+        symlink(
+            "../../../payload/wine/lib/libfoo.real.dylib",
+            payload.join("wine/lib/libfoo.dylib"),
+        )
+        .expect("re-entering link");
+        assert!(payload.join("wine/lib/libfoo.dylib").is_file());
+        let report = inspect(&root(), &payload).expect("report");
+        let violations: Vec<(&str, &str)> = report
+            .violations
+            .iter()
+            .map(|violation| (violation.binary.as_str(), violation.reason.as_str()))
+            .collect();
+        assert_eq!(
+            violations,
+            [(
+                "wine/lib/libfoo.dylib",
+                "symlink target climbs out of the payload"
             )]
         );
         let _ = fs::remove_dir_all(&dir);
