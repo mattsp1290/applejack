@@ -5,7 +5,7 @@ set -eu
 . "$(dirname "$0")/../lib.sh"
 
 archive=$(fetch_pin moltenvk)
-list_archive "$archive" | check_listing
+scan_archive "$archive"
 extract "$archive" "$WORK/vulkan/src"
 dylib="$WORK/vulkan/src/MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
 icd="$WORK/vulkan/src/MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json"

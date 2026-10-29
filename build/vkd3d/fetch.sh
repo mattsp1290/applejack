@@ -5,7 +5,7 @@ set -eu
 
 need zstd "brew install zstd; tar needs it for .tar.zst"
 archive=$(fetch_pin vkd3d-proton)
-list_archive "$archive" | check_listing
+scan_archive "$archive"
 extract "$archive" "$WORK/vkd3d/src"
 version=$(pin_field vkd3d-proton version)
 echo "vkd3d-proton $version DLLs:"

@@ -17,6 +17,20 @@ struct File {
 struct Entry {
     pattern: String,
     reason: String,
+    #[serde(default)]
+    scope: Scope,
+}
+
+/// Where a rule applies. A fetched archive may legitimately carry a file that
+/// must never ship when only a subset of it is staged (the `GStreamer` package
+/// bundles its GPL codecs next to the LGPL ones), so such rules are
+/// `payload`-scoped and skipped by the archive scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Scope {
+    #[default]
+    All,
+    Payload,
 }
 
 /// A compiled denylist.
@@ -30,6 +44,7 @@ struct Rule {
     pattern: Pattern,
     source: String,
     reason: String,
+    scope: Scope,
 }
 
 /// One path that matched a rule.
@@ -68,9 +83,11 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 // `*` never crosses a `/`, so `D3DMetal*` names one component and
-// `lib/external/**` needs the literal directory.
+// `lib/external/**` needs the literal directory. Matching ignores case because
+// the payload ships on case-insensitive APFS, where Wine's lookup of
+// `lib/external/D3DMetal.framework` finds `lib/External/d3dmetal.framework`.
 const OPTIONS: MatchOptions = MatchOptions {
-    case_sensitive: true,
+    case_sensitive: false,
     require_literal_separator: true,
     require_literal_leading_dot: false,
 };
@@ -95,6 +112,7 @@ impl Denylist {
                     pattern,
                     source: entry.pattern,
                     reason: entry.reason,
+                    scope: entry.scope,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -109,18 +127,35 @@ impl Denylist {
         self.rules.is_empty()
     }
 
-    /// Reports every path in `paths` that matches a rule.
+    /// Reports every path in `paths` that matches any rule: the scan for an
+    /// assembled payload tree or a staged listing.
     ///
     /// A pattern without `/` is tested against each path component, so
     /// `D3DMetal*` catches the framework directory and the binary inside it.
     /// A pattern with `/` is tested against the whole path and against every
     /// suffix that starts at a component boundary, so `lib/external/**` catches
-    /// `wine/lib/external/x`.
+    /// `wine/lib/external/x`. Backslashes count as separators so a listing
+    /// produced on Windows is matched the same way.
     pub fn scan<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Vec<Hit> {
+        self.scan_rules(paths, |_| true)
+    }
+
+    /// Reports every path in `paths` that matches a rule with [`Scope::All`]:
+    /// the scan for a fetched archive's listing.
+    pub fn scan_archive<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Vec<Hit> {
+        self.scan_rules(paths, |rule| rule.scope == Scope::All)
+    }
+
+    fn scan_rules<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+        applies: impl Fn(&Rule) -> bool,
+    ) -> Vec<Hit> {
         let mut hits = Vec::new();
         for path in paths {
-            let normalized = path.trim_start_matches("./").trim_end_matches('/');
-            for rule in &self.rules {
+            let normalized = path.replace('\\', "/");
+            let normalized = normalized.trim_start_matches("./").trim_end_matches('/');
+            for rule in self.rules.iter().filter(|rule| applies(rule)) {
                 if rule.matches(normalized) {
                     hits.push(Hit {
                         path: path.to_owned(),
@@ -216,6 +251,58 @@ reason = "GPTK external directory"
             2
         );
         assert_eq!(denylist.scan(["./wine/lib/external/"]).len(), 1);
+    }
+
+    #[test]
+    fn matches_case_variants_as_apfs_would() {
+        let denylist = Denylist::parse(FILE).expect("valid");
+        let hits = denylist.scan([
+            "wine/lib/External/d3dmetal.framework/d3dmetal",
+            "wine/lib/LIBD3DSHARED.dylib",
+        ]);
+        let paths: Vec<&str> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert!(
+            paths.contains(&"wine/lib/External/d3dmetal.framework/d3dmetal"),
+            "{paths:?}"
+        );
+        assert!(paths.contains(&"wine/lib/LIBD3DSHARED.dylib"), "{paths:?}");
+        let patterns: Vec<&str> = hits.iter().map(|hit| hit.pattern.as_str()).collect();
+        assert!(patterns.contains(&"lib/external/**"), "{patterns:?}");
+    }
+
+    #[test]
+    fn treats_backslashes_as_separators() {
+        let denylist = Denylist::parse(FILE).expect("valid");
+        let hits = denylist.scan([r"x\lib\external\D3DMetal.framework\D3DMetal"]);
+        let patterns: Vec<&str> = hits.iter().map(|hit| hit.pattern.as_str()).collect();
+        assert!(patterns.contains(&"D3DMetal*"), "{patterns:?}");
+        assert!(patterns.contains(&"lib/external/**"), "{patterns:?}");
+        assert_eq!(hits[0].path, r"x\lib\external\D3DMetal.framework\D3DMetal");
+    }
+
+    #[test]
+    fn payload_scoped_rules_skip_the_archive_scan() {
+        let text = format!(
+            "{FILE}\n[[deny]]\npattern = \"libgstx264*\"\nreason = \"GPL\"\nscope = \"payload\"\n"
+        );
+        let denylist = Denylist::parse(&text).expect("valid");
+        let listing = [
+            "pkg/lib/gstreamer-1.0/libgstx264.dylib",
+            "pkg/lib/external/D3DMetal.framework/D3DMetal",
+        ];
+        let archive_hits = denylist.scan_archive(listing);
+        let archive: Vec<&str> = archive_hits
+            .iter()
+            .map(|hit| hit.pattern.as_str())
+            .collect();
+        assert!(!archive.contains(&"libgstx264*"), "{archive:?}");
+        assert!(archive.contains(&"D3DMetal*"), "{archive:?}");
+        let payload = denylist.scan(listing);
+        assert!(payload.iter().any(|hit| hit.pattern == "libgstx264*"));
+        assert!(
+            Denylist::parse("[[deny]]\npattern = \"a\"\nreason = \"b\"\nscope = \"archive\"\n")
+                .is_err()
+        );
     }
 
     #[test]

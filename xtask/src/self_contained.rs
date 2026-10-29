@@ -52,12 +52,75 @@ pub fn check_otool_listing(
         .collect()
 }
 
+/// Checks the text of `otool -l <binary>` for run-path entries that would not
+/// resolve on a clean machine.
+///
+/// `@rpath/` references pass [`check_otool_listing`] whatever they resolve
+/// through, so an absolute `LC_RPATH` outside the system is the leftover
+/// this catches: an install name rewritten while the binary keeps
+/// `/usr/local/lib` as a search path.
+pub fn check_rpaths(
+    binary: &str,
+    load_commands: &str,
+    payload_root: &Path,
+    build_dir: &Path,
+) -> Vec<Violation> {
+    rpath_entries(load_commands)
+        .filter_map(|path| {
+            let reason = if path == "@loader_path"
+                || path.starts_with("@loader_path/")
+                || path == "@executable_path"
+                || path.starts_with("@executable_path/")
+            {
+                None
+            } else if path.starts_with('/') {
+                classify(path, payload_root, build_dir)
+            } else {
+                Some("rpath is neither @loader_path, @executable_path, nor absolute")
+            };
+            reason.map(|reason| Violation {
+                binary: binary.to_owned(),
+                reference: format!("LC_RPATH {path}"),
+                reason: reason.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The `path` of every `LC_RPATH` load command in `otool -l` output.
+fn rpath_entries(load_commands: &str) -> impl Iterator<Item = &str> {
+    let mut in_rpath = false;
+    load_commands
+        .lines()
+        .map(str::trim)
+        .filter_map(move |line| {
+            if let Some(command) = line.strip_prefix("cmd ") {
+                in_rpath = command.trim() == "LC_RPATH";
+                return None;
+            }
+            if !in_rpath {
+                return None;
+            }
+            let rest = line.strip_prefix("path ")?;
+            let path = rest.rsplit_once(" (offset ").map_or(rest, |(path, _)| path);
+            Some(path.trim())
+        })
+}
+
 fn classify(reference: &str, payload_root: &Path, build_dir: &Path) -> Option<&'static str> {
     if RELATIVE_PREFIXES
         .iter()
         .any(|prefix| reference.starts_with(prefix))
     {
         return None;
+    }
+    // `/usr/lib/../../usr/local/lib/x` is not a system path, and
+    // `/System/Volumes/Data/...` is a firmlink back into the data volume.
+    if reference.starts_with('/') && reference.split('/').any(|component| component == "..") {
+        return Some("absolute path with a `..` component");
+    }
+    if reference.starts_with("/System/Volumes/") {
+        return Some("/System/Volumes/ is a firmlink into the data volume, not the system");
     }
     if SYSTEM_ROOTS.iter().any(|root| reference.starts_with(root)) {
         return None;
@@ -92,7 +155,7 @@ fn starts_with_dir(reference: &str, dir: &str) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::check_otool_listing;
+    use super::{check_otool_listing, check_rpaths};
 
     const LISTING: &str = "\
 wine/bin/wine64:
@@ -171,6 +234,95 @@ x (architecture arm64):
         assert_eq!(
             check_otool_listing("x", listing, Path::new("/p"), Path::new("/b")),
             []
+        );
+    }
+
+    #[test]
+    fn rejects_spoofed_system_prefixes() {
+        let listing = "\
+x:
+\t/usr/lib/../../usr/local/lib/x.dylib (compatibility version 1.0.0, current version 1.0.0)
+\t/System/Volumes/Data/usr/local/lib/x.dylib (compatibility version 1.0.0, current version 1.0.0)
+\t@loader_path/../lib/libz.1.dylib (compatibility version 1.0.0, current version 1.3.1)
+";
+        let violations = check_otool_listing("x", listing, Path::new("/p"), Path::new("/b"));
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0].reason.contains(".."), "{}", violations[0]);
+        assert!(
+            violations[1].reason.contains("firmlink"),
+            "{}",
+            violations[1]
+        );
+    }
+
+    // The shape `otool -l` prints for the Pin Auditor's fixture
+    // (`clang main.c -lfoo -Wl,-rpath,/usr/local/lib`).
+    const LOAD_COMMANDS: &str = "\
+wine/bin/rpath_exe:
+Load command 12
+          cmd LC_LOAD_DYLIB
+      cmdsize 48
+         name @rpath/libfoo.dylib (offset 24)
+Load command 13
+          cmd LC_RPATH
+      cmdsize 32
+         path /usr/local/lib (offset 12)
+Load command 14
+          cmd LC_RPATH
+      cmdsize 40
+         path @loader_path/../lib (offset 12)
+Load command 15
+          cmd LC_RPATH
+      cmdsize 40
+         path @executable_path/../lib (offset 12)
+Load command 16
+          cmd LC_RPATH
+      cmdsize 48
+         path /Users/ci/build/work/wine/stage/lib (offset 12)
+Load command 17
+          cmd LC_RPATH
+      cmdsize 32
+         path /usr/lib/swift (offset 12)
+Load command 18
+          cmd LC_RPATH
+      cmdsize 32
+         path @rpath/lib (offset 12)
+";
+
+    #[test]
+    fn flags_absolute_rpaths_outside_the_system() {
+        let violations = check_rpaths(
+            "wine/bin/rpath_exe",
+            LOAD_COMMANDS,
+            Path::new("/Users/ci/payload"),
+            Path::new("/Users/ci/build/work"),
+        );
+        let references: Vec<&str> = violations
+            .iter()
+            .map(|violation| violation.reference.as_str())
+            .collect();
+        assert_eq!(
+            references,
+            [
+                "LC_RPATH /usr/local/lib",
+                "LC_RPATH /Users/ci/build/work/wine/stage/lib",
+                "LC_RPATH @rpath/lib",
+            ]
+        );
+        assert!(
+            violations[0].reason.contains("/usr/local"),
+            "{}",
+            violations[0]
+        );
+        assert!(
+            violations[1].reason.contains("build directory"),
+            "{}",
+            violations[1]
+        );
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.binary == "wine/bin/rpath_exe")
         );
     }
 
