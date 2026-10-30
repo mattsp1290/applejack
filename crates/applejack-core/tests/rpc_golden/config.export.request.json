@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 23,
+  "method": "config.export",
+  "params": {
+    "appid": 220,
+    "path": "/tmp/220.preset.json"
+  }
+}

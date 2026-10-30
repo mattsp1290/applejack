@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "method": "steam.login.start",
+  "params": {
+    "mode": {
+      "kind": "qr"
+    }
+  }
+}

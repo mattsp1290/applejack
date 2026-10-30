@@ -1,5 +1,7 @@
 //! Command-line entry point for applejack.
 
+mod cmd;
+
 use applejack_core::host::HostFacts;
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
@@ -39,13 +41,13 @@ enum Command {
     /// Launch an installed title
     Run(Pending),
     /// Read and write per-game configuration
-    Config(Pending),
+    Config(cmd::config::ConfigArgs),
     /// Create, snapshot, and reset Wine prefixes
     Prefix(Pending),
     /// Manage the shared Steam client prefix
     Runtime(Pending),
     /// Serve JSON-RPC over stdio for the app shell
-    Serve(Pending),
+    Serve(cmd::serve::ServeArgs),
     /// Report host readiness facts
     Doctor {
         /// Print the facts as JSON
@@ -74,6 +76,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Doctor { json } => doctor(json),
+        Command::Config(args) => cmd::config::run(args),
+        Command::Serve(args) => cmd::serve::run(args),
         stub => not_implemented(stub.name()),
     }
 }

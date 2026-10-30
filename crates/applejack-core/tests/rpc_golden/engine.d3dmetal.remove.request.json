@@ -1,0 +1,6 @@
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "engine.d3dmetal.remove",
+  "params": {}
+}
