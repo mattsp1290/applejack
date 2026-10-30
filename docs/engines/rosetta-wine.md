@@ -3,10 +3,12 @@
 `rosetta-wine` runs x86-64 Wine under Rosetta 2 with DXMT for DirectX 10 and
 11, vkd3d-proton over a Vulkan-on-Metal driver for DirectX 12, and optional
 user-supplied D3DMetal. The crate `applejack-engine` holds the engine domain
-model: the `Engine` trait, the bundle descriptor, installation, version
-management, and the launch environment allowlist. The engine implementation
-itself (prefix creation, launching, process discovery, D3DMetal import) is a
-separate unit; see "What comes next".
+model (the `Engine` trait, the bundle descriptor, installation, version
+management, the launch environment allowlist) and the implementation,
+`RosettaWine` in `src/rosetta_wine/`: the prefix builder, launching and
+sessions, process discovery, the D3DMetal overlay, snapshots, and the CPUID
+probe. Rosetta runs the x86-64 loader directly; nothing is wrapped in
+`arch -x86_64`.
 
 ## Bundle layout
 
@@ -284,30 +286,224 @@ variable is always dropped; the hardened runtime
 strips them anyway, so the bundle must be self-contained. Names outside the
 table are dropped.
 
-## What comes next
+## Prefix builder
 
-The `rosetta-wine` implementation of the `Engine` trait adds:
+`RosettaWine::create_prefix(installed, prefix_dir, spec)` requires an
+absolute `prefix_dir` that is absent or an empty directory, refuses a backend
+the bundle cannot serve (see "Backends"), and then runs the four steps of
+`rosetta_wine::prefix::PREFIX_STEPS`, in this order:
 
-- `doctor`: Rosetta presence, macOS version against `min_macos`, bundle state.
-- Prefix creation: `wineboot --init` through `assemble` (the loader fixes
-  the prefix architecture at `win64`; see the allowlist), backend DLL
-  overrides copied from the `InstalledEngine` per architecture, sync mode
-  variables,
-  registry seeds including the `hidraw_key`, the `S:` library drive,
-  snapshots before an engine version change. The `Prefix` records the engine
-  id and version that made it and the `backend`, `sync_mode`, and `hidraw`
-  last applied; `apply_overrides` returns the updated `Prefix`.
-- Launch: `Engine::launch(installed, prefix, spec)` spawns `installed`'s
-  loader with `WINEPREFIX` and `APPLEJACK_SESSION` in `engine_set` and
-  derives `WINEMSYNC`/`WINEESYNC`, `WINEDLLOVERRIDES`, and
-  `VK_ICD_FILENAMES` from `prefix.sync_mode` and `prefix.backend` (Wine
-  does not persist them, so the prefix is the one record). Log capture to
-  `~/Library/Logs/applejack/<session>/wine.log`, cancellation through
-  `<server> -k` against the prefix; the `Session` already carries `server`
-  and `prefix_dir` for it.
-- Process discovery: same-user processes carrying the session id, and the
-  `wineserver` liveness check for a prefix.
-- D3DMetal: import from a mounted Game Porting Toolkit image into
-  `installed.overlay_root` with license acknowledgement, and removal.
-- The CPUID probe that records whether `ROSETTA_ADVERTISE_AVX=1` changes the
-  advertised features.
+| Step | What happens |
+| --- | --- |
+| `wineboot` | `<loader> wineboot --init` with the environment below, cwd the prefix, stdout and stderr to `<spec.log_dir>/<session>/wineboot.log`; then `<server> -w`, bounded by `SERVER_WAIT` (180 s), after which the server is killed with `-k` and the step fails |
+| `dll-overrides` | the backend's DLLs from `[overrides.<backend>]` copied into `drive_c/windows/system32` (`x86_64` list) and `drive_c/windows/syswow64` (`i386` list); the files copied are recorded so the next apply removes them first |
+| `registry-seeds` | a `REGEDIT4` file imported with `<loader> regedit /S seeds.reg` from the directory holding it (a relative file name needs no path translation), then `<server> -w`: `HKCU\Software\Wine\WineDbg\ShowCrashDialog = 0`, `HKCU\Software\Wine\DllOverrides\<dll> = "native,builtin"` for the backend's DLLs and the value deleted (`=-`) for every other backend's, and the HID toggle at the bundle's `[registry] hidraw_key` (the last path component is the value name; `HKLM`/`HKCU` are expanded): `DisableHidraw = 1` for `hidraw = disabled`, `0` for `enabled` |
+| `library-drive` | `dosdevices/s:` symlinked to `spec.library_dir` when set |
+
+A failure in any step removes the prefix directory and returns the error with
+the log path (`Error::WineCommandFailed { command, status, log }`); the
+`wineboot.log` lives under the log root, not the prefix, so it survives.
+Prefix creation is a session like a launch: `APPLEJACK_SESSION=prefix-<id>`
+and `WINEPREFIX` are set through `assemble`, so the allowlist's required rows
+hold for it too.
+
+The engine's own state in a prefix lives under `<prefix>/applejack/`:
+`prefix.toml` (`PrefixRecord`: engine, engine version, backend, sync mode,
+hidraw, the copied DLL paths), the last `seeds.reg`, and the `regedit.log` of
+the last `apply_overrides`. `RosettaWine::open_prefix(dir)` reads the record
+back into a `Prefix`; a record naming another engine is refused.
+`apply_overrides(installed, prefix, backend, sync_mode, hidraw)` re-runs the
+`dll-overrides` and `registry-seeds` steps (removing the previously copied
+DLLs first, so a switch from DXMT to vkd3d-proton leaves no `winemetal.dll`
+behind) and rewrites the record; it never re-runs `wineboot`. Wine runs its
+own prefix update when a newer Wine opens an older prefix; taking a snapshot
+before that (the plan's "snapshot before an engine-version change") is the
+core's call, through the snapshot API below, since the engine does not know
+the snapshot root.
+
+### Backends
+
+- `wined3d`: no DLL overrides.
+- `dxmt`: available when `[overrides.dxmt]` lists a DLL.
+- `vkd3d-proton`: available when `[overrides.vkd3d]` lists a DLL; the
+  launch also sets `VK_ICD_FILENAMES` to `<bundle>/vulkan/MoltenVK_icd.json`
+  when that file exists (a conventional path until `BUNDLE.toml` names the
+  ICD; recorded as a follow-up).
+- `d3dmetal`: available only when `[d3dmetal]` names an overlay location
+  and the overlay holds both `D3DMetal.framework` and `libd3dshared.dylib`
+  ("verified" means imported through the command below; assumption A5, that
+  the payload loads in the project's Wine, is gate G4d and is not checked
+  here). Otherwise `create_prefix` and `apply_overrides` refuse with
+  `Error::BackendUnavailable` before touching anything.
+
+## The environment the children see
+
+Every Wine process the engine starts (wineboot, regedit, wineserver, a
+launch) gets its environment from `launch::env::assemble` with the engine
+tier built by `rosetta_wine::launch::engine_rows`:
+
+| Variable | Value |
+| --- | --- |
+| `PATH` | `<bundle>/<dir of wine.loader>:/usr/bin:/bin:/usr/sbin:/sbin` (`HOST_PATH`). Neither `/usr/local/bin` nor `/opt/homebrew/bin` is on it: `wineboot` runs `update-mime-database` when it finds one on `PATH`, and the payload must not pick up host tools. |
+| `WINEPREFIX` | the prefix directory |
+| `APPLEJACK_SESSION` | `launch-<nanos>-<pid>-<n>`, `prefix-...`, or `apply-...` |
+| `WINEDLLOVERRIDES` | `mscoree=;mshtml=` always (`MONO_GECKO_OVERRIDE`), then `;<dll>,<dll>=n,b` for the backend's DLLs |
+| `WINEESYNC=1` or `WINEMSYNC=1` | from the prefix's sync mode; nothing for `none` |
+| `VK_ICD_FILENAMES` | the MoltenVK ICD, vkd3d-proton backend only |
+| `ROSETTA_ADVERTISE_AVX=1` | only when `LaunchSpec::advertise_avx` and the recorded `CpuidProbe` says the variable changes the advertised bits |
+
+`HOME` and `TMPDIR` come from the host environment; `WINEDEBUG` and the other
+game-owned rows come from the host or `LaunchSpec::env_extras`. Variables
+dropped by the allowlist are written to the session log with their reason
+before the loader starts.
+
+Wine Mono and Gecko: `wineboot --init` on this payload blocks on the
+"install Wine Mono" dialog unless `mscoree` is disabled (the first run on
+this host sat for 2.5 hours in `control.exe appwiz.cpl install_mono`).
+applejack never ships Wine Mono or Gecko, so the override is permanent and
+present in every launch, not only during prefix creation; a title that needs
+.NET or the embedded browser fails the same way with or without the dialog.
+The unit test `engine_rows_carry_the_mono_gecko_override_and_backend_dlls`
+asserts it for every backend and sync mode.
+
+## Launch and sessions
+
+`RosettaWine::launch(installed, prefix, spec)` refuses a prefix of another
+engine and a 32-bit title on a `wow64 = "none"` bundle (it reads the PE
+machine type of `spec.exe`, resolving `X:\...` through
+`<prefix>/dosdevices/x:` and relative paths against `spec.cwd`; a file it
+cannot read passes, and Wine reports its own error), then spawns
+`<loader> <exe> <args>` with cwd `spec.cwd`, stdin closed, and stdout and
+stderr appended to `<spec.log_dir>/<session-id>/wine.log`. The launcher's
+log root is `~/Library/Logs/applejack`; tests pass a temporary directory.
+The `Session` owns the child handle and offers:
+
+- `wait()` / `try_wait()`: the loader's exit status (the loader `exec`s into
+  the Windows process, so its pid and status are the title's).
+- `cancel()`: `<server> -k` then `<server> -w` against the prefix, so it
+  returns once the server and every process of the prefix are gone.
+- `processes()`: same-uid processes carrying the session id (below).
+- `wineserver_alive()`: whether a server listens for the prefix.
+
+## Process discovery
+
+Wine passes the environment to every Windows process it starts, so
+`APPLEJACK_SESSION=<id>` survives its forks and reparenting. The kernel
+exposes a process's exec path, argv, and environment through
+`sysctl(KERN_PROCARGS2)`. The crate choice is `sysinfo` (0.38,
+`default-features = false, features = ["system"]`): it is the one safe
+wrapper over that `sysctl` in the local registry, the workspace forbids
+`unsafe` so `libc::sysctl` cannot be called directly, and a dedicated FFI
+crate would be out of scope. `rosetta_wine::process::find_session(id)`
+refreshes every process's user, exe, cmd, and environ through it, keeps the
+ones owned by the current uid (`rustix::process::getuid`) whose environment
+holds the exact `APPLEJACK_SESSION=<id>` entry, and reports
+`Process { pid, exe, session_id }`. `exe` is the last argv entry naming a
+`.exe`, reduced to its file name (`steam.exe`, `steamwebhelper.exe`, the
+game); Wine rewrites argv in place so argv[0] is the Windows executable, and
+`KERN_PROCARGS2` reads the live argument area, so `ps` and this agree. The
+matching is `match_record`, unit-tested over a captured record.
+`ps -E` remains the debugging fallback.
+
+`wineserver_alive(prefix_dir)` derives the server's socket as Wine does,
+`/tmp/.wine-<uid>/server-<dev>-<inode>/socket` with the prefix directory's
+device and inode in hex, and connects to it: a connect succeeds only while
+the server is alive, so a stale socket left by a killed server reads as not
+alive, and the server drops the unused connection.
+
+## D3DMetal overlay import
+
+`rosetta_wine::d3dmetal::import(installed, source, accept_apple_license)`
+is a function over a path: `source` is the root of a mounted Game Porting
+Toolkit volume (a fixture tree in tests; never the Gcenx cask, and never
+run in CI). It checks, in order:
+
+1. the bundle declares `[d3dmetal] overlay_dir` (else
+   `Error::D3DMetalUnsupported`);
+2. `<source>/README.md` is readable (else `Error::D3DMetalSource` naming
+   that path);
+3. `<source>/redist/lib/external/D3DMetal.framework` and
+   `libd3dshared.dylib` exist (assumption A1; else `Error::D3DMetalSource`
+   naming the missing entry and the README to consult);
+4. `accept_apple_license` is set (else `Error::LicenseNotAccepted` carrying
+   the acknowledgement text, which names `<source>/License.pdf` and the flag
+   `--accept-apple-license`).
+
+It then replaces `<overlay_root>/<overlay_dir>/` with a copy of the two
+entries (symlinks inside the framework kept as links) and returns
+`D3DMetalOverlay { overlay_dir, imported_from, gptk_version, accepted_at }`
+for the core to store in its `d3dmetal` table; `gptk_version` is the first
+numeric token after "Game Porting Toolkit" in the README, or `unknown`.
+`remove(installed)` deletes the overlay. Wiring the overlay into Wine's
+library search (the A5 mechanism) is the payload build's decision and is not
+done here. D3DMetal is never committed, downloaded, or published.
+
+## Snapshots and retention
+
+`rosetta_wine::snapshot` works on directories, independent of the engine:
+
+- `create(prefix_dir, snapshots_root, name)` copies the prefix to
+  `<snapshots_root>/<name>/<YYYYMMDDTHHMMSSZ>/` (with `-N` appended when
+  the second is already taken) using `/bin/cp -c -R` (an APFS clone;
+  `cp` itself falls back to a byte copy across volumes), and `cp -R` when
+  `-c` is refused. Symlinks are copied as links, so `dosdevices/z: -> /` is
+  not followed.
+- `list(snapshots_root, name)` returns them oldest first.
+- `restore(prefix_dir, snapshots_root, name, timestamp)` takes a safety
+  snapshot of the current prefix, copies the chosen one to
+  `<prefix_dir>.restoring`, and swaps it in with two renames; an interrupted
+  restore leaves the prefix as it was or fully restored. Returns the safety
+  snapshot.
+- `reset(prefix_dir, snapshots_root, name, keep_user_data, recreate)` takes
+  a safety snapshot, removes the prefix, calls `recreate` (the core wraps
+  `create_prefix`), and with `keep_user_data` copies `drive_c/users/` back
+  from the safety snapshot.
+- `prune(snapshots_root, name, keep)` removes all but the newest `keep`;
+  `DEFAULT_KEEP` is 3.
+
+## CPUID probe
+
+`RosettaWine::probe_cpuid(installed)` runs `[probes] cpuid` twice, without
+and with `ROSETTA_ADVERTISE_AVX=1`, with only `PATH` in the environment, and
+returns `CpuidProbe { plain, advertised }` of `CpuidFeatures { avx, avx2,
+osxsave, xcr0_ymm }`. `changes_bits()` is what a launch consults
+(`LaunchSpec::cpuid_probe`) before setting the variable. Storing the result
+in `meta` is the core's job.
+
+## Doctor and install
+
+`doctor(host, installed)` is read-only: Rosetta presence (error when the
+core says it is absent, warning when it could not tell, informational on an
+x86-64 host), macOS against `min_macos`, a warning below macOS 15 when the
+bundle carries DXMT, the loader and server present, the probes present, the
+backends and sync modes, and whether the D3DMetal overlay is imported.
+`install` refuses with `Error::RosettaMissing` on an arm64 host whose
+`rosetta_present` is `Some(false)` and otherwise delegates to
+`bundle::install`.
+
+## What the CLI unit will expose
+
+The commands in the plan map onto this crate as follows; none exist yet.
+
+| Command | Calls |
+| --- | --- |
+| `applejack engine doctor` | `RosettaWine::doctor` with the core's `Host` |
+| `applejack engine install rosetta-wine` | `RosettaWine::install` with an `InstallRequest` |
+| `applejack engine probe-cpuid` | `RosettaWine::probe_cpuid`, stored in `meta` |
+| `applejack engine d3dmetal import <path> [--accept-apple-license]` | `d3dmetal::import`, record stored in `d3dmetal` |
+| `applejack engine d3dmetal remove` | `d3dmetal::remove`, record cleared |
+| `applejack prefix create <name> --backend <b>` | `RosettaWine::create_prefix` with `log_dir = ~/Library/Logs/applejack` |
+| `applejack prefix snapshot <name>` / `restore` / `reset [--keep-user-data]` / `snapshot prune` | `snapshot::{create, restore, reset, prune}` under `prefixes/.snapshots/` |
+| `applejack run <appid>` | `RosettaWine::launch`, then `Session::{wait, cancel, processes, wineserver_alive}` |
+
+## Known limits
+
+- Wine Mono and Gecko are never installed; .NET titles and embedded
+  browsers that need them do not work in this engine.
+- msync is not in the payload (gate G4b deferred); `sync_modes` is
+  `["esync", "none"]`.
+- `VK_ICD_FILENAMES` is set from a conventional path until `BUNDLE.toml`
+  names the ICD.
+- The D3DMetal backend is listed as available as soon as the overlay is
+  imported; A5 (the payload loads in the project's Wine) is verified by gate
+  G4d, not by the engine.
