@@ -3,9 +3,9 @@
 //! allowlist. Accepts and returns plain structs and never depends on
 //! `applejack-config`.
 //!
-//! This crate holds the domain model. The first implementation of [`Engine`]
-//! (`rosetta-wine`: prefix creation, process spawning, process discovery,
-//! `D3DMetal` overlay, CPUID probe) lands in a later unit. See
+//! This crate holds the domain model and its first implementation,
+//! [`RosettaWine`] (prefix creation, process spawning, process discovery,
+//! `D3DMetal` overlay, CPUID probe, snapshots). See
 //! `docs/engines/rosetta-wine.md`.
 
 #![warn(missing_docs)]
@@ -21,6 +21,7 @@ pub mod bundle;
 mod error;
 pub mod launch;
 pub mod manifest;
+pub mod rosetta_wine;
 pub mod versions;
 
 pub use applejack_manifest::{Arch, Sha256};
@@ -28,6 +29,7 @@ pub use bundle::{ArchiveSource, BundleToml, Capabilities, InstallRequest, Instal
 pub use error::{Error, Result};
 pub use launch::{LaunchSpec, Session};
 pub use manifest::embedded_manifest;
+pub use rosetta_wine::RosettaWine;
 pub use versions::Version;
 
 /// Which engine a bundle, prefix, or configuration refers to.
@@ -378,6 +380,11 @@ pub struct PrefixSpec {
     /// Shared game library mounted as drive `S:`; `None` leaves the drive
     /// unmapped.
     pub library_dir: Option<PathBuf>,
+    /// Log root. Prefix creation is a session like any launch: its
+    /// `wineboot` and `regedit` output goes to `<log_dir>/<session-id>/`,
+    /// outside the prefix, so the log survives the prefix being removed on
+    /// failure.
+    pub log_dir: PathBuf,
 }
 
 /// A Wine prefix created by an engine, with the configuration last applied
@@ -422,8 +429,8 @@ pub enum Progress {
 }
 
 /// The operations the launcher programs against. Each engine bundle is
-/// described by its `BUNDLE.toml`; the first implementation, `rosetta-wine`,
-/// lands in the unit after this one.
+/// described by its `BUNDLE.toml`; [`RosettaWine`] is the first
+/// implementation.
 pub trait Engine {
     /// The engine's identity.
     fn id(&self) -> EngineId;
@@ -462,7 +469,8 @@ pub trait Engine {
         progress: &mut dyn FnMut(Progress),
     ) -> Result<InstalledEngine>;
 
-    /// Creates a prefix at `prefix_dir` and applies `spec`.
+    /// Creates a prefix at `prefix_dir` and applies `spec`. `prefix_dir`
+    /// must be absolute and either absent or an empty directory.
     ///
     /// # Errors
     ///

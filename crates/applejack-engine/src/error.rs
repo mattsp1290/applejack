@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use applejack_manifest::Sha256;
 
 use crate::launch::env::DropReason;
-use crate::{EngineId, Version};
+use crate::{EngineId, GraphicsBackend, Version};
 
 /// Errors from engine install, validation, version management, and launch.
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +154,128 @@ pub enum Error {
         "Rosetta 2 is not installed; run `softwareupdate --install-rosetta --agree-to-license`"
     )]
     RosettaMissing,
+
+    /// A prefix cannot be created at `path` because something is already
+    /// there, or the path is not absolute.
+    #[error("cannot create a prefix at `{}`: {reason}", path.display())]
+    PrefixUnusable {
+        /// The requested prefix directory.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+
+    /// `path` is not a prefix this engine made: it has no `applejack.toml`
+    /// record, the record is unreadable, or it names another engine.
+    #[error("`{}` is not a usable prefix: {reason}", path.display())]
+    InvalidPrefix {
+        /// The prefix directory.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+
+    /// A Wine process the engine ran (`wineboot`, `regedit`, `wineserver`)
+    /// did not exit 0. The prefix is removed when `wineboot` fails; the log
+    /// stays for inspection.
+    #[error("`{command}` failed ({status}); log at `{}`", log.display())]
+    WineCommandFailed {
+        /// The command as rendered for the log.
+        command: String,
+        /// The exit status.
+        status: String,
+        /// Where stdout and stderr went.
+        log: PathBuf,
+    },
+
+    /// The loader could not be spawned.
+    #[error("cannot spawn `{}`: {source}", program.display())]
+    Spawn {
+        /// The executable.
+        program: PathBuf,
+        /// The underlying failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The requested backend cannot be applied to this bundle: no override
+    /// table lists a DLL for it, or the `D3DMetal` overlay is not populated.
+    #[error("graphics backend {backend} is unavailable: {reason}")]
+    BackendUnavailable {
+        /// The requested backend.
+        backend: GraphicsBackend,
+        /// Why.
+        reason: String,
+    },
+
+    /// A 32-bit executable was handed to a bundle whose Wine runs 64-bit code
+    /// only (`wow64 = "none"`).
+    #[error(
+        "`{}` is a 32-bit (i386) executable and engine version {version} runs 64-bit code only (wow64 = \"none\")",
+        exe.display()
+    )]
+    ThirtyTwoBitUnsupported {
+        /// The executable.
+        exe: PathBuf,
+        /// The bundle version.
+        version: Version,
+    },
+
+    /// The directory handed to the `D3DMetal` import is not a Game Porting
+    /// Toolkit volume as the engine expects it.
+    #[error("D3DMetal import: `{}` {reason}", path.display())]
+    D3DMetalSource {
+        /// The file or directory that failed the check.
+        path: PathBuf,
+        /// What was expected.
+        reason: String,
+    },
+
+    /// The `D3DMetal` import was requested without accepting Apple's license.
+    #[error("{acknowledgement}")]
+    LicenseNotAccepted {
+        /// The acknowledgement text, naming the license file on the volume.
+        acknowledgement: String,
+    },
+
+    /// The bundle declares no `[d3dmetal]` overlay location, so `D3DMetal`
+    /// cannot be imported for it.
+    #[error(
+        "engine version {version} declares no [d3dmetal] overlay location; D3DMetal is unavailable for it"
+    )]
+    D3DMetalUnsupported {
+        /// The bundle version.
+        version: Version,
+    },
+
+    /// No snapshot `<name>/<timestamp>` exists.
+    #[error("snapshot {name}/{timestamp} does not exist")]
+    SnapshotNotFound {
+        /// The prefix name.
+        name: String,
+        /// The snapshot timestamp.
+        timestamp: String,
+    },
+
+    /// A snapshot or prefix name cannot be a directory name.
+    #[error("invalid snapshot name `{name}`: {reason}")]
+    InvalidSnapshotName {
+        /// The rejected name.
+        name: String,
+        /// The rule it broke.
+        reason: &'static str,
+    },
+
+    /// A probe printed output the engine cannot parse.
+    #[error("probe `{}` printed unparseable output: {reason}: {output:?}", probe.display())]
+    ProbeOutput {
+        /// The probe executable.
+        probe: PathBuf,
+        /// What was wrong.
+        reason: String,
+        /// The output as printed.
+        output: String,
+    },
 
     /// A filesystem operation failed; `path` is the file or directory involved.
     #[error("{}: {source}", path.display())]

@@ -1,0 +1,488 @@
+//! Spawning the loader: the environment rows the engine sets, log capture,
+//! the `Session` methods, and the 32-bit refusal.
+
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::launch::env::{self, AllowedRoots, Dropped};
+use crate::{
+    EnvPair, Error, GraphicsBackend, InstalledEngine, LaunchSpec, Prefix, Result, Session, SyncMode,
+};
+
+use super::cpuid::CpuidProbe;
+use super::process::{self, Process, SESSION_VARIABLE};
+
+/// `WINEDLLOVERRIDES` entries every Wine process of this engine carries:
+/// the Wine Mono (`mscoree`) and Gecko (`mshtml`) installers disabled.
+/// `wineboot --init` otherwise blocks on the install-Mono dialog, and
+/// applejack never ships either package.
+pub const MONO_GECKO_OVERRIDE: &str = "mscoree=;mshtml=";
+
+/// System directories appended to the bundle's `wine/bin` on the
+/// children's `PATH`. `/usr/local` and `/opt/homebrew` are not on it, so
+/// `wineboot` does not find a host `update-mime-database` and the payload
+/// cannot pick up host tools.
+pub const HOST_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The Rosetta variable the CPUID probe records.
+pub const ADVERTISE_AVX: &str = "ROSETTA_ADVERTISE_AVX";
+
+/// `MoltenVK_icd.json` relative to the bundle root, used for
+/// `VK_ICD_FILENAMES` with the vkd3d-proton backend when present.
+pub const VULKAN_ICD: &str = "vulkan/MoltenVK_icd.json";
+
+/// The `PATH` the children see: the loader's directory, then [`HOST_PATH`].
+#[must_use]
+pub fn child_path(installed: &InstalledEngine) -> OsString {
+    let loader = installed.root.join(&installed.bundle.wine.loader);
+    let mut path = loader
+        .parent()
+        .map_or_else(|| installed.root.as_os_str(), Path::as_os_str)
+        .to_owned();
+    path.push(":");
+    path.push(HOST_PATH);
+    path
+}
+
+/// `WINEDLLOVERRIDES` for `backend`: [`MONO_GECKO_OVERRIDE`] and then the
+/// backend's DLLs as `a,b,c=n,b`.
+#[must_use]
+pub fn dll_overrides_value(bundle: &crate::BundleToml, backend: GraphicsBackend) -> String {
+    let stems = super::prefix::override_stems(bundle, backend);
+    if stems.is_empty() {
+        MONO_GECKO_OVERRIDE.to_owned()
+    } else {
+        format!("{MONO_GECKO_OVERRIDE};{}=n,b", stems.join(","))
+    }
+}
+
+/// The ICD file for `VK_ICD_FILENAMES`, when the bundle carries one.
+#[must_use]
+pub fn vulkan_icd(installed: &InstalledEngine) -> Option<PathBuf> {
+    let icd = installed.root.join(VULKAN_ICD);
+    icd.is_file().then_some(icd)
+}
+
+/// The engine tier of the environment: `PATH`, `WINEPREFIX`,
+/// `APPLEJACK_SESSION`, `WINEDLLOVERRIDES`, the sync variable,
+/// `VK_ICD_FILENAMES` for vkd3d-proton, and `ROSETTA_ADVERTISE_AVX=1` when
+/// `advertise_avx`.
+#[must_use]
+pub fn engine_rows(
+    installed: &InstalledEngine,
+    prefix_dir: &Path,
+    session_id: &str,
+    backend: GraphicsBackend,
+    sync_mode: SyncMode,
+    advertise_avx: bool,
+) -> Vec<EnvPair> {
+    let pair = |name: &str, value: OsString| (OsString::from(name), value);
+    let mut rows = vec![
+        pair("PATH", child_path(installed)),
+        pair("WINEPREFIX", prefix_dir.as_os_str().to_owned()),
+        pair(SESSION_VARIABLE, OsString::from(session_id)),
+        pair(
+            "WINEDLLOVERRIDES",
+            OsString::from(dll_overrides_value(&installed.bundle, backend)),
+        ),
+    ];
+    match sync_mode {
+        SyncMode::Msync => rows.push(pair("WINEMSYNC", OsString::from("1"))),
+        SyncMode::Esync => rows.push(pair("WINEESYNC", OsString::from("1"))),
+        SyncMode::None => {}
+    }
+    if backend == GraphicsBackend::Vkd3dProton
+        && let Some(icd) = vulkan_icd(installed)
+    {
+        rows.push(pair("VK_ICD_FILENAMES", icd.into_os_string()));
+    }
+    if advertise_avx {
+        rows.push(pair(ADVERTISE_AVX, OsString::from("1")));
+    }
+    rows
+}
+
+/// Whether a launch sets `ROSETTA_ADVERTISE_AVX=1`: the spec asks and the
+/// recorded probe says the variable changes the bits.
+#[must_use]
+pub fn advertise_avx(spec: &LaunchSpec) -> bool {
+    spec.advertise_avx
+        && spec
+            .cpuid_probe
+            .as_ref()
+            .is_some_and(CpuidProbe::changes_bits)
+}
+
+/// Runs the host environment, `extras`, and `engine_rows` through the
+/// allowlist with the roots of `installed` and `prefix_dir`.
+pub(crate) fn assemble_env(
+    installed: &InstalledEngine,
+    prefix_dir: &Path,
+    extras: &[EnvPair],
+    engine_rows: &[EnvPair],
+) -> Result<(Vec<EnvPair>, Vec<Dropped>)> {
+    let roots = AllowedRoots::new(&installed.root, &installed.overlay_root, prefix_dir)?;
+    let base: Vec<EnvPair> = std::env::vars_os().collect();
+    env::assemble(&base, extras, engine_rows, &roots)
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `<kind>-<unix-nanos hex>-<pid hex>-<counter>`: unique on the host, so
+/// process discovery never matches a stale environment.
+pub(crate) fn new_session_id(kind: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!(
+        "{kind}-{nanos:x}-{:x}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn open_log(log: &Path) -> Result<File> {
+    if let Some(parent) = log.parent() {
+        fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+    }
+    File::options()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|error| Error::io(log, error))
+}
+
+fn render(program: &Path, args: &[&OsStr]) -> String {
+    let mut text = program.display().to_string();
+    for arg in args {
+        text.push(' ');
+        text.push_str(&arg.to_string_lossy());
+    }
+    text
+}
+
+fn spawn_logged(
+    program: &Path,
+    args: &[&OsStr],
+    env: &[EnvPair],
+    cwd: &Path,
+    log: &Path,
+    header: &[String],
+) -> Result<std::process::Child> {
+    let mut file = open_log(log)?;
+    let mut lines = vec![format!("[applejack] run: {}", render(program, args))];
+    lines.extend(header.iter().cloned());
+    for line in lines {
+        writeln!(file, "{line}").map_err(|error| Error::io(log, error))?;
+    }
+    let stderr = file.try_clone().map_err(|error| Error::io(log, error))?;
+    Command::new(program)
+        .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|error| Error::Spawn {
+            program: program.to_path_buf(),
+            source: error,
+        })
+}
+
+/// Runs `<root>/<program> args` to completion with `env`, stdout and
+/// stderr appended to `log`.
+pub(crate) fn run_logged(
+    installed: &InstalledEngine,
+    program: &Path,
+    args: &[&str],
+    env: &[EnvPair],
+    cwd: &Path,
+    log: &Path,
+) -> Result<()> {
+    let program = installed.root.join(program);
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let status = spawn_logged(&program, &args, env, cwd, log, &[])?
+        .wait()
+        .map_err(|error| Error::io(&program, error))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::WineCommandFailed {
+            command: render(&program, &args),
+            status: status.to_string(),
+            log: log.to_path_buf(),
+        })
+    }
+}
+
+/// `<server> -w` for `prefix_dir`, bounded by `timeout`: on expiry the
+/// server is killed with `-k` and the wait reported as failed.
+pub(crate) fn wait_for_server(
+    installed: &InstalledEngine,
+    prefix_dir: &Path,
+    log: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    let server = installed.root.join(&installed.bundle.wine.server);
+    let path = child_path(installed);
+    let mut child = server_command(&server, &path, prefix_dir, "-w", log)?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| Error::io(&server, error))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(Error::WineCommandFailed {
+                command: format!("{} -w", server.display()),
+                status: status.to_string(),
+                log: log.to_path_buf(),
+            });
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            kill_server(&server, &path, prefix_dir, log)?;
+            return Err(Error::WineCommandFailed {
+                command: format!("{} -w", server.display()),
+                status: format!("timed out after {}s", timeout.as_secs()),
+                log: log.to_path_buf(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn server_command(
+    server: &Path,
+    path: &OsStr,
+    prefix_dir: &Path,
+    flag: &str,
+    log: &Path,
+) -> Result<std::process::Child> {
+    let env = [
+        (OsString::from("PATH"), path.to_owned()),
+        (
+            OsString::from("WINEPREFIX"),
+            prefix_dir.as_os_str().to_owned(),
+        ),
+    ];
+    spawn_logged(server, &[OsStr::new(flag)], &env, prefix_dir, log, &[])
+}
+
+/// `<server> -k` then `<server> -w`, so the caller returns once the server
+/// and every process of the prefix are gone.
+fn kill_server(server: &Path, path: &OsStr, prefix_dir: &Path, log: &Path) -> Result<()> {
+    // `-k` exits non-zero when no server runs, which is the state wanted.
+    let _ = server_command(server, path, prefix_dir, "-k", log)?.wait();
+    server_command(server, path, prefix_dir, "-w", log)?
+        .wait()
+        .map_err(|error| Error::io(server, error))?;
+    Ok(())
+}
+
+/// Spawns the loader for `spec` inside `prefix`.
+pub(crate) fn spawn(
+    installed: &InstalledEngine,
+    prefix: &Prefix,
+    spec: &LaunchSpec,
+) -> Result<Session> {
+    if prefix.engine != installed.id {
+        return Err(Error::InvalidPrefix {
+            path: prefix.dir.clone(),
+            reason: format!(
+                "it belongs to engine {}, not {}",
+                prefix.engine, installed.id
+            ),
+        });
+    }
+    check_32bit(installed, &prefix.dir, &spec.cwd, &spec.exe)?;
+    let id = new_session_id("launch");
+    let log_path = spec.log_dir.join(&id).join("wine.log");
+    let rows = engine_rows(
+        installed,
+        &prefix.dir,
+        &id,
+        prefix.backend,
+        prefix.sync_mode,
+        advertise_avx(spec),
+    );
+    let (env, dropped) = assemble_env(installed, &prefix.dir, &spec.env_extras, &rows)?;
+    // Host variables outside the allowlist are the normal case and would
+    // put every name in the user's shell into the log; game extras and
+    // rejected values are worth a line.
+    let header: Vec<String> = dropped
+        .iter()
+        .filter(|drop| {
+            drop.from != env::Owner::Host || drop.reason != env::DropReason::NotAllowlisted
+        })
+        .map(|drop| {
+            format!(
+                "[applejack] dropped {} from {:?} tier: {}",
+                drop.name.to_string_lossy(),
+                drop.from,
+                drop.reason
+            )
+        })
+        .collect();
+    let loader = installed.root.join(&installed.bundle.wine.loader);
+    let mut args: Vec<&OsStr> = vec![spec.exe.as_os_str()];
+    args.extend(spec.args.iter().map(OsString::as_os_str));
+    let child = spawn_logged(&loader, &args, &env, &spec.cwd, &log_path, &header)?;
+    let path = env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map_or_else(|| child_path(installed), |(_, value)| value.clone());
+    Ok(Session {
+        id,
+        pid: child.id(),
+        server: installed.root.join(&installed.bundle.wine.server),
+        prefix_dir: prefix.dir.clone(),
+        log_path,
+        path,
+        child,
+    })
+}
+
+impl Session {
+    /// Waits for the loader process to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] from `waitpid`.
+    pub fn wait(&mut self) -> Result<ExitStatus> {
+        self.child
+            .wait()
+            .map_err(|error| Error::io(&self.log_path, error))
+    }
+
+    /// The loader's exit status if it has exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] from `waitpid`.
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        self.child
+            .try_wait()
+            .map_err(|error| Error::io(&self.log_path, error))
+    }
+
+    /// Kills everything in the prefix with `<server> -k` and waits for the
+    /// server to be gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the spawn or wait failure.
+    pub fn cancel(&mut self) -> Result<()> {
+        kill_server(&self.server, &self.path, &self.prefix_dir, &self.log_path)?;
+        let _ = self.child.try_wait();
+        Ok(())
+    }
+
+    /// Same-uid processes carrying this session's id, by pid.
+    #[must_use]
+    pub fn processes(&self) -> Vec<Process> {
+        process::find_session(&self.id)
+    }
+
+    /// Whether a `wineserver` is listening for this session's prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the prefix directory cannot be stat'ed.
+    pub fn wineserver_alive(&self) -> Result<bool> {
+        process::wineserver_alive(&self.prefix_dir)
+    }
+}
+
+/// The machine type in a PE header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeMachine {
+    /// `IMAGE_FILE_MACHINE_I386`.
+    I386,
+    /// `IMAGE_FILE_MACHINE_AMD64`.
+    Amd64,
+    /// Anything else, verbatim.
+    Other(u16),
+}
+
+/// Reads the PE machine type of `path`; `None` when the file is not a PE
+/// image.
+///
+/// # Errors
+///
+/// Returns the read failure.
+pub fn pe_machine(path: &Path) -> io::Result<Option<PeMachine>> {
+    let mut file = File::open(path)?;
+    let mut dos = [0u8; 64];
+    if file.read(&mut dos)? < 64 || &dos[..2] != b"MZ" {
+        return Ok(None);
+    }
+    let offset = u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]);
+    file.seek(SeekFrom::Start(u64::from(offset)))?;
+    let mut header = [0u8; 6];
+    if file.read(&mut header)? < 6 || &header[..4] != b"PE\0\0" {
+        return Ok(None);
+    }
+    Ok(Some(match u16::from_le_bytes([header[4], header[5]]) {
+        0x014c => PeMachine::I386,
+        0x8664 => PeMachine::Amd64,
+        other => PeMachine::Other(other),
+    }))
+}
+
+/// Where `exe` is on disk: an absolute Unix path as is, `X:\...` or
+/// `X:/...` through `<prefix>/dosdevices/x:`, anything else relative to
+/// `cwd`.
+#[must_use]
+pub fn resolve_exe(prefix_dir: &Path, cwd: &Path, exe: &Path) -> PathBuf {
+    if exe.is_absolute() {
+        return exe.to_path_buf();
+    }
+    let text = exe.to_string_lossy();
+    let bytes = text.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        let drive = format!("{}:", bytes[0].to_ascii_lowercase() as char);
+        let rest = text[3..].replace('\\', "/");
+        return prefix_dir.join("dosdevices").join(drive).join(rest);
+    }
+    cwd.join(text.replace('\\', "/"))
+}
+
+/// Refuses a 32-bit executable when the bundle runs 64-bit code only. A
+/// file that cannot be read or is not a PE image passes: Wine reports its
+/// own error.
+///
+/// # Errors
+///
+/// Returns [`Error::ThirtyTwoBitUnsupported`].
+pub fn check_32bit(
+    installed: &InstalledEngine,
+    prefix_dir: &Path,
+    cwd: &Path,
+    exe: &Path,
+) -> Result<()> {
+    if installed.bundle.wine.wow64.supports_32bit() {
+        return Ok(());
+    }
+    let path = resolve_exe(prefix_dir, cwd, exe);
+    if pe_machine(&path).ok().flatten() == Some(PeMachine::I386) {
+        return Err(Error::ThirtyTwoBitUnsupported {
+            exe: exe.to_path_buf(),
+            version: installed.version.clone(),
+        });
+    }
+    Ok(())
+}
