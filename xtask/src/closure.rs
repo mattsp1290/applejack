@@ -8,16 +8,28 @@
 //! tree: copy what is missing from the x86-64 Homebrew, rewrite install names
 //! and references to `@rpath/<leaf>`, add the `@loader_path/..` run paths
 //! that make each binary's own references resolve, re-sign, and look again,
-//! until a round plans nothing. The checker's `inspect` then has the last
-//! word, so `--close` cannot succeed on a tree `--check` rejects.
+//! until a round plans nothing. A round lands whole or not at all. The
+//! checker's `inspect` then has the last word, so `--close` cannot succeed
+//! on a tree `--check` rejects.
 //!
 //! Wine passes a bare SONAME to `dlopen` (`dlls/win32u/freetype.c`,
 //! `dlls/bcrypt/gnutls.c`, `dlls/winebus.sys/bus_sdl.c`, ...) and sets no
 //! search path for it; dyld resolves a leaf name as `@rpath/<leaf>` through
 //! the run paths of the calling image and of the main executable, then the
-//! working directory and `/usr/lib`, never `/usr/local/lib`. The executables
-//! Wine links have no header padding for a new load command, so the run path
-//! goes on the Unix modules whose bytes name the SONAME.
+//! working directory and `/usr/lib`, never `/usr/local/lib`. The run path
+//! goes on the Unix modules whose bytes name the SONAME: the caller's run
+//! paths are what dyld consults for a bare-leaf `dlopen`, so the module that
+//! calls `dlopen` is the right owner, and the two main executables
+//! (`wine/bin/wine` and `wine/lib/wine/x86_64-unix/wine`, in different
+//! directories) stay untouched.
+//!
+//! dyld keeps one image per install name per process: a second file with
+//! the same install name is never loaded, whichever run path a client has.
+//! The payload therefore holds exactly one regular file per install name. A
+//! library the payload already ships (the `GStreamer` framework's freetype
+//! and libintl, the pinned `MoltenVK`) is linked or reached by a run path, never
+//! copied again, and a duplicate the tree carries becomes a relative link to
+//! the file the SONAME policy names, or is refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -26,8 +38,9 @@ use std::io::Read as _;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::bundle_toml::BundleSpec;
+use crate::bundle_toml::{BundleSpec, is_formula_name};
 use crate::denylist::Denylist;
 use crate::engine_payload::{BUNDLE_FILE, check, is_macho, load_denylist, otool, walk};
 use crate::self_contained::{
@@ -49,9 +62,11 @@ const HOMEBREW_CELLAR: &str = "/usr/local/Cellar";
 /// Wine's `configure` records every library it `dlopen`s by name here.
 const CONFIG_H: &str = "build/work/wine/build/include/config.h";
 /// Each round copies at most one more level of dependencies, so a tree that
-/// has not settled by now is cycling.
+/// has not settled by now has a deeper chain than any Homebrew library
+/// needs, or is cycling.
 const MAX_ROUNDS: usize = 8;
 const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+const DUPLICATE_REASON: &str = "several regular files carry this install name; dyld keeps one image per install name per process, so load order would pick the library";
 
 /// How a SONAME from `config.h` is satisfied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +74,9 @@ pub enum SonamePolicy {
     /// Copied from `/usr/local/lib/<soname>`; the default for any SONAME
     /// without a row in [`SONAME_POLICY`].
     Homebrew,
-    /// A component the payload already ships at this bundle-relative path;
-    /// `wine/lib/<soname>` becomes a relative link to it.
+    /// A file the payload already ships at this bundle-relative path;
+    /// `wine/lib/<soname>` becomes a relative link to it, and any other
+    /// regular file carrying its install name becomes a link to it too.
     Payload(&'static str),
     /// A macOS library dyld finds in the shared cache on its own.
     System,
@@ -71,19 +87,37 @@ pub enum SonamePolicy {
 
 /// The SONAMEs that are not plain Homebrew copies. A new SONAME in
 /// `config.h` that is neither here nor in the x86-64 Homebrew fails the
-/// closure, which is the moment to classify it.
+/// closure, which is the moment to classify it; so does a SONAME the payload
+/// already ships somewhere without a row here.
 pub const SONAME_POLICY: &[(&str, SonamePolicy)] = &[
     // Wine's SONAME_LIBVULKAN and SONAME_LIBMOLTENVK: the pinned MoltenVK
-    // release (`components.moltenvk`), not Homebrew's molten-vk formula.
+    // release (`components.moltenvk`), not Homebrew's molten-vk formula. The
+    // framework ships a MoltenVK of its own (1.2.9, for its vulkan and
+    // applemedia plugins) under the same install name; it becomes a link to
+    // the pin, whose exports cover every symbol those plugins import.
     (
         "libMoltenVK.dylib",
         SonamePolicy::Payload("vulkan/libMoltenVK.dylib"),
+    ),
+    // The framework's freetype, which its fontconfig, harfbuzz, cairo, pango,
+    // and libass link, rather than a second copy from Homebrew; it exports
+    // every FT_* symbol win32u and dwrite look up.
+    (
+        "libfreetype.6.dylib",
+        SonamePolicy::Payload("wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib"),
     ),
     // No file under /usr/lib since macOS 11; dyld serves it from the cache.
     ("libcups.2.dylib", SonamePolicy::System),
     // unixODBC; odbc32 dlopens it lazily and reports no driver without it.
     ("libodbc.dylib", SonamePolicy::Optional),
 ];
+
+fn policy(soname: &str) -> SonamePolicy {
+    SONAME_POLICY
+        .iter()
+        .find(|(name, _)| *name == soname)
+        .map_or(SonamePolicy::Homebrew, |(_, policy)| *policy)
+}
 
 /// One Mach-O of the tree as the planner sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +138,7 @@ pub struct Image {
 /// The tree a round plans against.
 #[derive(Debug, Default)]
 pub struct Tree {
+    /// Every regular Mach-O file.
     pub images: Vec<Image>,
     /// Payload-relative paths of every regular file and of every symlink that
     /// resolves to a file inside the payload.
@@ -152,6 +187,9 @@ impl Edit {
 pub struct Plan {
     pub copies: Vec<Copy>,
     pub links: Vec<Link>,
+    /// Regular files that carry the install name of a file the SONAME
+    /// policy names; each becomes a relative link to that file.
+    pub replaced: Vec<Link>,
     /// By payload-relative binary.
     pub edits: BTreeMap<String, Edit>,
     /// References nothing here can close; the round applies nothing when
@@ -163,7 +201,10 @@ pub struct Plan {
 
 impl Plan {
     pub fn is_empty(&self) -> bool {
-        self.copies.is_empty() && self.links.is_empty() && self.edits.is_empty()
+        self.copies.is_empty()
+            && self.links.is_empty()
+            && self.replaced.is_empty()
+            && self.edits.is_empty()
     }
 }
 
@@ -171,20 +212,28 @@ impl Plan {
 /// under `/usr/local/lib`) to the canonical file to copy, or says why not.
 pub type Source<'a> = dyn Fn(&str) -> Result<PathBuf, String> + 'a;
 
+/// Runs one of the tools `apply` needs (`lipo`, `install_name_tool`,
+/// `codesign`); a test stands in a failing one.
+pub type Runner<'a> = dyn FnMut(&str, &[&OsStr]) -> Result<(), String> + 'a;
+
 /// Plans one round over `tree`.
 ///
-/// For every SONAME: present under `wine/lib/`, or supplied per
-/// [`SONAME_POLICY`], or copied from the x86-64 Homebrew. For every image: a
+/// First, every install name carried by more than one regular file: the
+/// others become links to the file the SONAME policy names, or the group is
+/// an error. For every SONAME: present under `wine/lib/`, or linked per
+/// [`SONAME_POLICY`], or copied from the x86-64 Homebrew (an error when the
+/// payload ships it elsewhere without a policy row). For every image: a
 /// foreign install name becomes `@rpath/<file name>`; a foreign absolute
 /// `LC_RPATH` is dropped; a Unix module naming a supplied SONAME gets the run
-/// path to `wine/lib/`; each `@rpath/<leaf>` dependency must be reachable
-/// through the image's own `@loader_path` run paths (existing or planned
-/// this round), else the run path to the one directory holding the leaf is
-/// added (the image's own directory wins a tie; any other tie is an error),
-/// else the leaf is copied from Homebrew; each foreign absolute dependency
-/// is copied to `wine/lib/` when absent and rewritten to `@rpath/<leaf>`.
-/// `@loader_path/` and `@executable_path/` references are left for the
-/// checker, whose chain rules decide them.
+/// path to `wine/lib/`; each foreign absolute dependency is rewritten to
+/// `@rpath/<leaf>` with the run path to the one payload directory already
+/// holding the leaf, else copied to `wine/lib/`; each `@rpath/<leaf>`
+/// dependency must be reachable through the image's own `@loader_path` run
+/// paths (existing or planned this round), else the run path to the one
+/// directory holding the leaf is added (the image's own directory wins a
+/// tie; any other tie is an error naming the directories), else the leaf is
+/// copied from Homebrew. `@loader_path/` and `@executable_path/` references
+/// are left for the checker, whose chain rules decide them.
 pub fn plan(tree: &Tree, sonames: &[String], source: &Source<'_>) -> Plan {
     let mut round = Round {
         tree,
@@ -193,6 +242,7 @@ pub fn plan(tree: &Tree, sonames: &[String], source: &Source<'_>) -> Plan {
         planned: BTreeSet::new(),
         supplied: BTreeSet::new(),
     };
+    round.duplicates();
     for soname in sonames {
         round.soname(soname);
     }
@@ -253,16 +303,43 @@ impl Round<'_> {
         });
     }
 
+    /// Two regular files with one install name: the ones that are not the
+    /// policy's file become links to it, or the group is refused.
+    fn duplicates(&mut self) {
+        let mut by_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for image in &self.tree.images {
+            if let Some(id) = &image.id {
+                by_id
+                    .entry(id.clone())
+                    .or_default()
+                    .push(image.relative.clone());
+            }
+        }
+        for (id, files) in by_id {
+            if files.len() < 2 {
+                continue;
+            }
+            match policy(file_name(&id)) {
+                SonamePolicy::Payload(canonical) if files.iter().any(|file| file == canonical) => {
+                    for file in files.iter().filter(|file| *file != canonical) {
+                        self.plan.replaced.push(Link {
+                            link: PathBuf::from(file),
+                            target: relative_path(&binary_dir(file), Path::new(canonical)),
+                        });
+                    }
+                }
+                _ => self.fail(&files.join(", "), &id, DUPLICATE_REASON),
+            }
+        }
+    }
+
     fn soname(&mut self, soname: &str) {
         let dest = Path::new(LIB_DIR).join(soname);
         if self.tree.files.contains(&dest) {
             self.supplied.insert(soname.to_owned());
             return;
         }
-        let policy = SONAME_POLICY
-            .iter()
-            .find(|(name, _)| *name == soname)
-            .map_or(SonamePolicy::Homebrew, |(_, policy)| *policy);
+        let policy = policy(soname);
         match policy {
             SonamePolicy::System => {}
             SonamePolicy::Payload(path) => {
@@ -281,22 +358,38 @@ impl Round<'_> {
                     );
                 }
             }
-            SonamePolicy::Homebrew | SonamePolicy::Optional => match (self.source)(soname) {
-                Ok(file) => {
-                    self.copy(file, dest);
-                    self.supplied.insert(soname.to_owned());
+            SonamePolicy::Homebrew | SonamePolicy::Optional => {
+                let elsewhere = dirs_providing(self.tree, &self.planned, Path::new(soname));
+                if !elsewhere.is_empty() {
+                    self.fail(
+                        CONFIG_H,
+                        soname,
+                        &format!(
+                            "{} already ships it; dyld keeps one image per install name per process, so the SONAME policy must name that file instead of a second copy",
+                            join(&elsewhere)
+                        ),
+                    );
+                    return;
                 }
-                Err(reason) if policy == SonamePolicy::Optional => self.plan.notes.push(format!(
-                    "{soname}: optional, not shipped ({HOMEBREW_LIB}/{soname}: {reason})"
-                )),
-                Err(reason) => self.fail(
-                    CONFIG_H,
-                    soname,
-                    &format!(
-                        "dlopen'd by name; {HOMEBREW_LIB}/{soname}: {reason}; no row in the SONAME policy"
+                match (self.source)(soname) {
+                    Ok(file) => {
+                        self.copy(file, dest);
+                        self.supplied.insert(soname.to_owned());
+                    }
+                    Err(reason) if policy == SonamePolicy::Optional => {
+                        self.plan.notes.push(format!(
+                            "{soname}: optional, not shipped ({HOMEBREW_LIB}/{soname}: {reason})"
+                        ));
+                    }
+                    Err(reason) => self.fail(
+                        CONFIG_H,
+                        soname,
+                        &format!(
+                            "dlopen'd by name; {HOMEBREW_LIB}/{soname}: {reason}; no row in the SONAME policy"
+                        ),
                     ),
-                ),
-            },
+                }
+            }
         }
     }
 
@@ -322,6 +415,7 @@ impl Round<'_> {
                 }
             }
         }
+        let mut rpath_references = Vec::new();
         for reference in &image.dependencies {
             if reference.starts_with("/System/Volumes/") {
                 self.fail(
@@ -334,7 +428,7 @@ impl Round<'_> {
                 || reference.starts_with("@executable_path/")
             {
             } else if let Some(rest) = reference.strip_prefix("@rpath/") {
-                self.rpath_dependency(image, &mut pending, reference, rest);
+                rpath_references.push((reference.as_str(), rest));
             } else if reference.starts_with('/') {
                 self.absolute_dependency(image, &mut pending, reference);
             } else {
@@ -344,6 +438,16 @@ impl Round<'_> {
                     "not an absolute, @rpath, @loader_path, or @executable_path reference",
                 );
             }
+        }
+        // The unambiguous references settle the image's run paths first, so
+        // a leaf the payload holds in two directories is judged against every
+        // run path the image will have, whatever the load-command order.
+        let (ambiguous, plain): (Vec<_>, Vec<_>) =
+            rpath_references.into_iter().partition(|(_, rest)| {
+                dirs_providing(self.tree, &self.planned, Path::new(rest)).len() > 1
+            });
+        for (reference, rest) in plain.into_iter().chain(ambiguous) {
+            self.rpath_dependency(image, &mut pending, reference, rest);
         }
         if !pending.edit.is_empty() {
             self.plan.edits.insert(image.relative.clone(), pending.edit);
@@ -385,42 +489,67 @@ impl Round<'_> {
                 ),
             },
             [only] => pending.reach(only),
-            several => {
-                let dirs = several
-                    .iter()
-                    .map(|dir| dir.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.fail(
-                    &image.relative,
-                    reference,
-                    &format!(
-                        "{rest} is in {} directories ({dirs}) and none is on the binary's run path",
-                        several.len()
-                    ),
-                );
-            }
+            several => self.fail(
+                &image.relative,
+                reference,
+                &format!(
+                    "{rest} is in {} directories ({}) and none is on the binary's run path",
+                    several.len(),
+                    join(several)
+                ),
+            ),
         }
     }
 
     fn absolute_dependency(&mut self, image: &Image, pending: &mut ImageEdit, reference: &str) {
         let leaf = file_name(reference);
         let dest = Path::new(LIB_DIR).join(leaf);
-        if !self.present(&dest) {
-            match (self.source)(reference) {
-                Ok(file) => self.copy(file, dest),
-                Err(reason) => {
-                    self.fail(&image.relative, reference, &reason);
+        let reach = if self.present(&dest) {
+            PathBuf::from(LIB_DIR)
+        } else {
+            let providers = dirs_providing(self.tree, &self.planned, Path::new(leaf));
+            match providers.as_slice() {
+                [] => match (self.source)(reference) {
+                    Ok(file) => {
+                        self.copy(file, dest);
+                        PathBuf::from(LIB_DIR)
+                    }
+                    Err(reason) => {
+                        self.fail(&image.relative, reference, &reason);
+                        return;
+                    }
+                },
+                // The payload ships the leaf already (the framework's
+                // libintl for gnutls): one file per install name, so the
+                // reference turns to that file instead of a second copy.
+                [only] => only.clone(),
+                several => {
+                    self.fail(
+                        &image.relative,
+                        reference,
+                        &format!(
+                            "{leaf} is in {} directories ({}); dyld keeps one image per install name per process",
+                            several.len(),
+                            join(several)
+                        ),
+                    );
                     return;
                 }
             }
-        }
+        };
         pending
             .edit
             .changes
             .push((reference.to_owned(), format!("@rpath/{leaf}")));
-        pending.reach(Path::new(LIB_DIR));
+        pending.reach(&reach);
     }
+}
+
+fn join(dirs: &[PathBuf]) -> String {
+    dirs.iter()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn is_system(reference: &str) -> bool {
@@ -508,12 +637,13 @@ pub fn sonames_from_config_h(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// `(formula, version)` of a file under the x86-64 Homebrew Cellar.
+/// `(formula, version)` of a file under the x86-64 Homebrew Cellar, whose
+/// first component is the formula name (`openssl@3` for a versioned one).
 pub fn homebrew_formula(source: &Path) -> Option<(String, String)> {
     let mut rest = source.strip_prefix(HOMEBREW_CELLAR).ok()?.components();
     let formula = rest.next()?.as_os_str().to_str()?.to_owned();
     let version = rest.next()?.as_os_str().to_str()?.to_owned();
-    Some((formula, version))
+    is_formula_name(&formula).then_some((formula, version))
 }
 
 /// What the first bytes of a file say.
@@ -599,20 +729,59 @@ pub fn close(root: &Path, payload: &Path) -> Result<(), String> {
         }
         Ok(file)
     };
+    let scan_tree = |payload: &Path| scan(payload, &sonames);
+    let gate = |plan: &Plan| gate_copies(&denylist, &spec, plan);
+    let mut runner = |program: &str, args: &[&OsStr]| run(program, args);
+    let outcome = settle(&payload, &sonames, &source, &scan_tree, &gate, &mut runner)?;
+    println!(
+        "[xtask] close {}: settled after {} round(s): {} librar{} copied, {} link(s) made, {} binar{} rewritten",
+        payload.display(),
+        outcome.rounds,
+        outcome.copied,
+        if outcome.copied == 1 { "y" } else { "ies" },
+        outcome.linked,
+        outcome.rewritten.len(),
+        if outcome.rewritten.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+    );
+    check(root, &payload)
+}
 
-    let mut copied = 0;
-    let mut rewritten: BTreeSet<String> = BTreeSet::new();
+/// What [`settle`] did to the tree.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// Rounds that changed the tree.
+    pub rounds: usize,
+    pub copied: usize,
+    /// Links created, the replaced duplicates included.
+    pub linked: usize,
+    pub rewritten: BTreeSet<String>,
+}
+
+/// The fixed-point loop: scan, plan, gate, apply, until a round plans
+/// nothing. A round with an unresolvable reference or a refused copy
+/// applies nothing; a round a tool fails in is rolled back by [`apply`].
+fn settle(
+    payload: &Path,
+    sonames: &[String],
+    source: &Source<'_>,
+    scan: &dyn Fn(&Path) -> Result<Tree, String>,
+    gate: &dyn Fn(&Plan) -> Result<(), String>,
+    run: &mut Runner<'_>,
+) -> Result<Outcome, String> {
+    let mut outcome = Outcome::default();
     let mut noted: BTreeSet<String> = BTreeSet::new();
-    let mut rounds = 0;
     loop {
-        rounds += 1;
-        if rounds > MAX_ROUNDS {
+        if outcome.rounds == MAX_ROUNDS {
             return Err(format!(
-                "no fixed point after {MAX_ROUNDS} rounds; the tree keeps changing"
+                "no fixed point after {MAX_ROUNDS} rounds: a dependency chain deeper than that, or a tree that keeps changing"
             ));
         }
-        let tree = scan(&payload, &sonames)?;
-        let plan = plan(&tree, &sonames, &source);
+        let tree = scan(payload)?;
+        let plan = plan(&tree, sonames, source);
         for note in &plan.notes {
             if noted.insert(note.clone()) {
                 println!("[xtask] close: {note}");
@@ -623,27 +792,21 @@ pub fn close(root: &Path, payload: &Path) -> Result<(), String> {
                 eprintln!("[xtask] close: {error}");
             }
             return Err(format!(
-                "{} reference(s) cannot be closed (round {rounds})",
-                plan.errors.len()
+                "{} reference(s) cannot be closed (round {}); nothing of the round was applied",
+                plan.errors.len(),
+                outcome.rounds + 1
             ));
         }
         if plan.is_empty() {
-            break;
+            return Ok(outcome);
         }
-        gate_copies(&denylist, &spec, &plan)?;
-        apply(&payload, &plan)?;
-        copied += plan.copies.len();
-        rewritten.extend(plan.edits.keys().cloned());
+        gate(&plan)?;
+        apply(payload, &plan, run)?;
+        outcome.rounds += 1;
+        outcome.copied += plan.copies.len();
+        outcome.linked += plan.links.len() + plan.replaced.len();
+        outcome.rewritten.extend(plan.edits.keys().cloned());
     }
-    println!(
-        "[xtask] close {}: settled after {} round(s): {copied} librar{} copied, {} binar{} rewritten",
-        payload.display(),
-        rounds - 1,
-        if copied == 1 { "y" } else { "ies" },
-        rewritten.len(),
-        if rewritten.len() == 1 { "y" } else { "ies" },
-    );
-    check(root, &payload)
 }
 
 /// Refuses a round whose copies are denylisted or whose Homebrew provenance
@@ -656,6 +819,7 @@ fn gate_copies(denylist: &Denylist, spec: &BundleSpec, plan: &Plan) -> Result<()
         .chain(
             plan.links
                 .iter()
+                .chain(&plan.replaced)
                 .map(|link| link.link.to_string_lossy().into_owned()),
         )
         .collect();
@@ -673,7 +837,7 @@ fn gate_copies(denylist: &Denylist, spec: &BundleSpec, plan: &Plan) -> Result<()
     for copy in &plan.copies {
         let Some((formula, version)) = homebrew_formula(&copy.source) else {
             return Err(format!(
-                "{}: not under {HOMEBREW_CELLAR}, so its formula and version are unknown",
+                "{}: not under {HOMEBREW_CELLAR}/<formula>/<version>/, so its formula and version are unknown",
                 copy.source.display()
             ));
         };
@@ -758,9 +922,35 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-fn apply(payload: &Path, plan: &Plan) -> Result<(), String> {
+/// Applies one round, whole or not at all: every file the round creates,
+/// replaces, or rewrites is journaled, and a failure puts each one back from
+/// its pre-image before the error (the file and the tool's stderr) returns.
+fn apply(payload: &Path, plan: &Plan, run: &mut Runner<'_>) -> Result<(), String> {
+    let mut journal = Journal::new()?;
+    match apply_journaled(payload, plan, run, &mut journal) {
+        Ok(()) => {
+            journal.discard();
+            Ok(())
+        }
+        Err(error) => Err(match journal.restore() {
+            Ok(restored) => {
+                format!("{error}; the round was rolled back ({restored} file(s) restored)")
+            }
+            Err(failure) => format!("{error}; rolling the round back failed too: {failure}"),
+        }),
+    }
+}
+
+fn apply_journaled(
+    payload: &Path,
+    plan: &Plan,
+    run: &mut Runner<'_>,
+    journal: &mut Journal,
+) -> Result<(), String> {
     for copy in &plan.copies {
-        copy_library(&copy.source, &payload.join(&copy.dest))?;
+        let dest = payload.join(&copy.dest);
+        journal.created(&dest);
+        copy_library(&copy.source, &dest, run)?;
         println!(
             "[xtask] close: copied {} <- {}",
             copy.dest.display(),
@@ -769,6 +959,7 @@ fn apply(payload: &Path, plan: &Plan) -> Result<(), String> {
     }
     for link in &plan.links {
         let path = payload.join(&link.link);
+        journal.created(&path);
         symlink(&link.target, &path).map_err(|error| format!("{}: {error}", path.display()))?;
         println!(
             "[xtask] close: linked {} -> {}",
@@ -776,13 +967,112 @@ fn apply(payload: &Path, plan: &Plan) -> Result<(), String> {
             link.target.display()
         );
     }
+    for link in &plan.replaced {
+        let path = payload.join(&link.link);
+        journal.save(&path)?;
+        fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        symlink(&link.target, &path).map_err(|error| format!("{}: {error}", path.display()))?;
+        println!(
+            "[xtask] close: replaced {} with a link to {}",
+            link.link.display(),
+            link.target.display()
+        );
+    }
     for (binary, edit) in &plan.edits {
         let path = payload.join(binary);
-        install_name_tool(&path, edit)?;
-        codesign(&path)?;
+        journal.save(&path)?;
+        install_name_tool(&path, edit, run)?;
+        codesign(&path, run)?;
         println!("[xtask] close: rewrote {binary}: {}", describe(edit));
     }
     Ok(())
+}
+
+static JOURNALS: AtomicUsize = AtomicUsize::new(0);
+
+/// The pre-images of one round: files it created (to remove) and copies of
+/// files it rewrote or replaced (to put back).
+struct Journal {
+    dir: PathBuf,
+    created: Vec<PathBuf>,
+    saved: Vec<(PathBuf, PathBuf)>,
+}
+
+impl Journal {
+    fn new() -> Result<Self, String> {
+        let dir = std::env::temp_dir().join(format!(
+            "applejack-closure-{}-{}",
+            std::process::id(),
+            JOURNALS.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        Ok(Self {
+            dir,
+            created: Vec::new(),
+            saved: Vec::new(),
+        })
+    }
+
+    /// Records a path the round is about to create.
+    fn created(&mut self, path: &Path) {
+        self.created.push(path.to_path_buf());
+    }
+
+    /// Copies a file aside before the round rewrites or replaces it.
+    fn save(&mut self, path: &Path) -> Result<(), String> {
+        let backup = self.dir.join(self.saved.len().to_string());
+        fs::copy(path, &backup).map_err(|error| {
+            format!(
+                "{}: cannot save a copy aside before rewriting it: {error}",
+                path.display()
+            )
+        })?;
+        self.saved.push((path.to_path_buf(), backup));
+        Ok(())
+    }
+
+    /// Removes what the round created and puts back what it changed, in
+    /// reverse order; the count of files touched, or every failure.
+    fn restore(self) -> Result<usize, String> {
+        let mut restored = 0;
+        let mut failures = Vec::new();
+        for path in self.created.iter().rev() {
+            match remove(path) {
+                Ok(()) => restored += 1,
+                Err(error) => failures.push(error),
+            }
+        }
+        for (path, backup) in self.saved.iter().rev() {
+            // A replaced file is a link now; the copy must not follow it.
+            if let Err(error) = remove(path) {
+                failures.push(error);
+                continue;
+            }
+            match fs::copy(backup, path) {
+                Ok(_) => restored += 1,
+                Err(error) => failures.push(format!("{}: {error}", path.display())),
+            }
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+        if failures.is_empty() {
+            Ok(restored)
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn discard(self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Removes a file or symlink; an absent path is fine.
+fn remove(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
 }
 
 fn describe(edit: &Edit) -> String {
@@ -804,7 +1094,7 @@ fn describe(edit: &Edit) -> String {
 
 /// Copies one library, thinning a universal file to x86-64, and refuses
 /// anything that is not an x86-64 Mach-O afterwards.
-fn copy_library(source: &Path, dest: &Path) -> Result<(), String> {
+fn copy_library(source: &Path, dest: &Path, run: &mut Runner<'_>) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
@@ -851,7 +1141,7 @@ fn copy_library(source: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
-fn install_name_tool(path: &Path, edit: &Edit) -> Result<(), String> {
+fn install_name_tool(path: &Path, edit: &Edit, run: &mut Runner<'_>) -> Result<(), String> {
     let mut args: Vec<&OsStr> = Vec::new();
     if let Some(id) = &edit.id {
         args.extend([OsStr::new("-id"), OsStr::new(id)]);
@@ -869,7 +1159,7 @@ fn install_name_tool(path: &Path, edit: &Edit) -> Result<(), String> {
     run("install_name_tool", &args)
 }
 
-fn codesign(path: &Path) -> Result<(), String> {
+fn codesign(path: &Path, run: &mut Runner<'_>) -> Result<(), String> {
     run(
         "codesign",
         &[
@@ -906,15 +1196,22 @@ fn run(program: &str, args: &[&OsStr]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::ffi::OsStr;
+    use std::fs;
     use std::path::{Path, PathBuf};
 
     use super::{
-        Copy, Edit, Header, Image, Link, Plan, Tree, header, homebrew_formula, plan, relative_path,
-        rpath_from, sonames_from_config_h,
+        Copy, Edit, Header, Image, Link, Outcome, Plan, Tree, apply, gate_copies, header,
+        homebrew_formula, plan, relative_path, rpath_from, settle, sonames_from_config_h,
     };
+    use crate::bundle_toml::BundleSpec;
+    use crate::denylist::Denylist;
 
     const MODULES: &str = "wine/lib/wine/x86_64-unix";
     const GST_LIB: &str = "wine/lib/GStreamer.framework/Versions/1.0/lib";
+    const GST_RPATH: &str = "@loader_path/../../GStreamer.framework/Versions/1.0/lib";
+    /// A thin x86-64 Mach-O header, enough for [`header`].
+    const X86_64_MAGIC: [u8; 8] = [0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01];
 
     fn image(relative: &str, id: Option<&str>, deps: &[&str], rpaths: &[&str]) -> Image {
         Image {
@@ -941,8 +1238,9 @@ mod tests {
         Tree { images, files }
     }
 
-    /// A Homebrew with freetype, libpng, gnutls, and gettext, none of them
-    /// universal; `libodbc.dylib` is absent and `libarm.dylib` is arm64.
+    /// A Homebrew with gnutls, p11-kit, libpng, freetype, and gettext, none
+    /// of them universal; `libodbc.dylib` is absent and `libarm.dylib` is
+    /// arm64.
     fn homebrew(reference: &str) -> Result<PathBuf, String> {
         let leaf = reference.rsplit('/').next().unwrap_or(reference);
         let cellar = |formula: &str, version: &str| {
@@ -951,9 +1249,10 @@ mod tests {
             )))
         };
         match leaf {
-            "libfreetype.6.dylib" => cellar("freetype", "2.13.3"),
-            "libpng16.16.dylib" => cellar("libpng", "1.6.50"),
             "libgnutls.30.dylib" => cellar("gnutls", "3.8.10"),
+            "libp11-kit.0.dylib" => cellar("p11-kit", "0.25.5"),
+            "libpng16.16.dylib" => cellar("libpng", "1.6.50"),
+            "libfreetype.6.dylib" => cellar("freetype", "2.13.3"),
             "libintl.8.dylib" => cellar("gettext", "0.26"),
             "libarm.dylib" => Err(
                 "resolves to /opt/homebrew/Cellar/arm/1/lib/libarm.dylib, outside the x86-64 Homebrew prefix /usr/local"
@@ -973,6 +1272,19 @@ mod tests {
             .unwrap_or_else(|| panic!("no edit for {binary} in {plan:?}"))
     }
 
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-closure-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Writes a stand-in x86-64 Mach-O with `tail` after the header.
+    fn fake_macho(path: &Path, tail: &[u8]) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("parent dir");
+        fs::write(path, [&X86_64_MAGIC[..], tail].concat()).expect("fake Mach-O");
+    }
+
     #[test]
     fn relative_paths_climb_then_descend() {
         let rel = |from: &str, to: &str| relative_path(Path::new(from), Path::new(to));
@@ -984,6 +1296,10 @@ mod tests {
         assert_eq!(
             rel("wine/lib", "vulkan/libMoltenVK.dylib"),
             PathBuf::from("../../vulkan/libMoltenVK.dylib")
+        );
+        assert_eq!(
+            rel(GST_LIB, "vulkan/libMoltenVK.dylib"),
+            PathBuf::from("../../../../../../vulkan/libMoltenVK.dylib")
         );
         assert_eq!(rel("wine/lib", "wine/lib"), PathBuf::new());
         assert_eq!(rel("", "wine/lib"), PathBuf::from("wine/lib"));
@@ -1027,6 +1343,12 @@ mod tests {
             Some(("nettle".to_owned(), "3.10.2".to_owned()))
         );
         assert_eq!(
+            homebrew_formula(Path::new(
+                "/usr/local/Cellar/openssl@3/3.5.1/lib/libssl.3.dylib"
+            )),
+            Some(("openssl@3".to_owned(), "3.5.1".to_owned()))
+        );
+        assert_eq!(
             homebrew_formula(Path::new("/usr/local/lib/libfoo.dylib")),
             None
         );
@@ -1034,13 +1356,16 @@ mod tests {
             homebrew_formula(Path::new("/opt/homebrew/Cellar/x/1/lib/a")),
             None
         );
+        assert_eq!(
+            homebrew_formula(Path::new("/usr/local/Cellar/not a formula/1/lib/a")),
+            None
+        );
     }
 
     #[test]
     fn headers_tell_thin_x86_64_from_fat_and_arm64() {
-        let x86_64 = [0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01];
         assert_eq!(
-            header(&x86_64),
+            header(&X86_64_MAGIC),
             Header::Thin {
                 cputype: super::CPU_TYPE_X86_64
             }
@@ -1065,6 +1390,31 @@ mod tests {
         assert_eq!(header(&[0xcf, 0xfa]), Header::NotMachO);
     }
 
+    /// The staged framework's shape: `libgst*` libraries and `libintl` with
+    /// the framework's own run paths.
+    fn framework_images() -> Vec<Image> {
+        vec![
+            image(
+                &format!("{GST_LIB}/libgstvideo-1.0.0.dylib"),
+                Some("@rpath/libgstvideo-1.0.0.dylib"),
+                &["@rpath/libgstreamer-1.0.0.dylib", "@rpath/libintl.8.dylib"],
+                &["@executable_path/../lib", "@loader_path/../lib"],
+            ),
+            image(
+                &format!("{GST_LIB}/libgstreamer-1.0.0.dylib"),
+                Some("@rpath/libgstreamer-1.0.0.dylib"),
+                &["@rpath/libintl.8.dylib"],
+                &["@executable_path/../lib", "@loader_path/../lib"],
+            ),
+            image(
+                &format!("{GST_LIB}/libintl.8.dylib"),
+                Some("@rpath/libintl.8.dylib"),
+                &[],
+                &["@loader_path/../lib"],
+            ),
+        ]
+    }
+
     /// The real payload's shape before the closure: winegstreamer's
     /// `@rpath/libgst*` references resolve only through a run path into the
     /// framework; the Wine modules' `@rpath/ntdll.so` already resolves
@@ -1072,47 +1422,28 @@ mod tests {
     #[test]
     fn a_module_gets_the_run_path_to_the_framework_library() {
         let winegstreamer = format!("{MODULES}/winegstreamer.so");
-        let t = tree(
-            vec![
-                image(
-                    &format!("{MODULES}/ntdll.so"),
-                    Some("@rpath/ntdll.so"),
-                    &["/usr/lib/libSystem.B.dylib"],
-                    &["@loader_path/"],
-                ),
-                image(
-                    &winegstreamer,
-                    Some("@rpath/winegstreamer.so"),
-                    &[
-                        "@rpath/ntdll.so",
-                        "@rpath/libgstvideo-1.0.0.dylib",
-                        "@rpath/libgstreamer-1.0.0.dylib",
-                        "@rpath/libintl.8.dylib",
-                        "/usr/lib/libSystem.B.dylib",
-                    ],
-                    &["@loader_path/"],
-                ),
-                image(
-                    &format!("{GST_LIB}/libgstvideo-1.0.0.dylib"),
-                    Some("@rpath/libgstvideo-1.0.0.dylib"),
-                    &["@rpath/libgstreamer-1.0.0.dylib", "@rpath/libintl.8.dylib"],
-                    &["@executable_path/../lib", "@loader_path/../lib"],
-                ),
-                image(
-                    &format!("{GST_LIB}/libgstreamer-1.0.0.dylib"),
-                    Some("@rpath/libgstreamer-1.0.0.dylib"),
-                    &["@rpath/libintl.8.dylib"],
-                    &["@executable_path/../lib", "@loader_path/../lib"],
-                ),
-                image(
-                    &format!("{GST_LIB}/libintl.8.dylib"),
-                    Some("@rpath/libintl.8.dylib"),
-                    &[],
-                    &["@loader_path/../lib"],
-                ),
-            ],
-            &[],
-        );
+        let mut images = vec![
+            image(
+                &format!("{MODULES}/ntdll.so"),
+                Some("@rpath/ntdll.so"),
+                &["/usr/lib/libSystem.B.dylib"],
+                &["@loader_path/"],
+            ),
+            image(
+                &winegstreamer,
+                Some("@rpath/winegstreamer.so"),
+                &[
+                    "@rpath/ntdll.so",
+                    "@rpath/libgstvideo-1.0.0.dylib",
+                    "@rpath/libgstreamer-1.0.0.dylib",
+                    "@rpath/libintl.8.dylib",
+                    "/usr/lib/libSystem.B.dylib",
+                ],
+                &["@loader_path/"],
+            ),
+        ];
+        images.extend(framework_images());
+        let t = tree(images, &[]);
         let p = plan(&t, &[], &homebrew);
         assert_eq!(p.errors, []);
         assert_eq!(p.copies, []);
@@ -1124,7 +1455,7 @@ mod tests {
         assert_eq!(
             edit(&p, &winegstreamer),
             &Edit {
-                add_rpaths: vec!["@loader_path/../../GStreamer.framework/Versions/1.0/lib".into()],
+                add_rpaths: vec![GST_RPATH.into()],
                 ..Edit::default()
             }
         );
@@ -1132,63 +1463,117 @@ mod tests {
         // After the rewrite the framework directory is on the run path and
         // the plan is empty: the closure is idempotent.
         let mut closed = t;
-        closed.images[1]
-            .rpaths
-            .push("@loader_path/../../GStreamer.framework/Versions/1.0/lib".into());
+        closed.images[1].rpaths.push(GST_RPATH.into());
         assert!(plan(&closed, &[], &homebrew).is_empty());
+    }
+
+    /// A leaf the payload holds in two directories, one of them a link: the
+    /// reference listed first is judged after the image's other references
+    /// have settled its run paths, so load-command order does not decide.
+    #[test]
+    fn an_ambiguous_reference_listed_first_resolves_like_one_listed_last() {
+        let winegstreamer = format!("{MODULES}/winegstreamer.so");
+        let mut images = vec![image(
+            &winegstreamer,
+            Some("@rpath/winegstreamer.so"),
+            &[
+                "@rpath/libintl.8.dylib",
+                "@rpath/libgstvideo-1.0.0.dylib",
+                "@rpath/libgstreamer-1.0.0.dylib",
+                "/usr/lib/libSystem.B.dylib",
+            ],
+            &["@loader_path/"],
+        )];
+        images.extend(framework_images());
+        let t = tree(images, &["wine/lib/libintl.8.dylib"]);
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(
+            edit(&p, &winegstreamer),
+            &Edit {
+                add_rpaths: vec![GST_RPATH.into()],
+                ..Edit::default()
+            }
+        );
+        assert_eq!(p.edits.len(), 1, "{p:?}");
     }
 
     fn win32u_tree() -> Tree {
         tree(
-            vec![naming(
-                image(
-                    &format!("{MODULES}/win32u.so"),
-                    Some("@rpath/win32u.so"),
-                    &["@rpath/ntdll.so"],
-                    &["@loader_path/"],
+            vec![
+                naming(
+                    image(
+                        &format!("{MODULES}/win32u.so"),
+                        Some("@rpath/win32u.so"),
+                        &["@rpath/ntdll.so"],
+                        &["@loader_path/"],
+                    ),
+                    &["libfreetype.6.dylib", "libMoltenVK.dylib"],
                 ),
-                &["libfreetype.6.dylib", "libMoltenVK.dylib"],
-            )],
-            &[&format!("{MODULES}/ntdll.so"), "vulkan/libMoltenVK.dylib"],
+                naming(
+                    image(
+                        &format!("{MODULES}/bcrypt.so"),
+                        Some("@rpath/bcrypt.so"),
+                        &["@rpath/ntdll.so"],
+                        &["@loader_path/"],
+                    ),
+                    &["libgnutls.30.dylib"],
+                ),
+            ],
+            &[
+                &format!("{MODULES}/ntdll.so"),
+                "vulkan/libMoltenVK.dylib",
+                &format!("{GST_LIB}/libfreetype.6.dylib"),
+                &format!("{GST_LIB}/libintl.8.dylib"),
+            ],
         )
     }
 
-    const WIN32U_SONAMES: [&str; 4] = [
+    const SONAMES: [&str; 5] = [
         "libfreetype.6.dylib",
         "libMoltenVK.dylib",
+        "libgnutls.30.dylib",
         "libcups.2.dylib",
         "libodbc.dylib",
     ];
 
-    /// The first round: freetype is copied, `MoltenVK` linked to the pinned
-    /// copy, cups is the system's, odbc is noted; win32u names two supplied
-    /// SONAMEs and gets the run path once.
+    /// The first round: freetype and `MoltenVK` are linked to the files the
+    /// payload ships, gnutls is copied, cups is the system's, odbc is noted;
+    /// each module naming a supplied SONAME gets the run path once.
     #[test]
     fn sonames_are_copied_linked_or_left_per_policy() {
-        let win32u = format!("{MODULES}/win32u.so");
-        let p = plan(&win32u_tree(), &sonames(&WIN32U_SONAMES), &homebrew);
+        let p = plan(&win32u_tree(), &sonames(&SONAMES), &homebrew);
         assert_eq!(p.errors, []);
         assert_eq!(
             p.copies,
             [Copy {
-                source: "/usr/local/Cellar/freetype/2.13.3/lib/libfreetype.6.dylib".into(),
-                dest: "wine/lib/libfreetype.6.dylib".into(),
+                source: "/usr/local/Cellar/gnutls/3.8.10/lib/libgnutls.30.dylib".into(),
+                dest: "wine/lib/libgnutls.30.dylib".into(),
             }]
         );
         assert_eq!(
             p.links,
-            [Link {
-                link: "wine/lib/libMoltenVK.dylib".into(),
-                target: "../../vulkan/libMoltenVK.dylib".into(),
-            }]
+            [
+                Link {
+                    link: "wine/lib/libfreetype.6.dylib".into(),
+                    target: "GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib".into(),
+                },
+                Link {
+                    link: "wine/lib/libMoltenVK.dylib".into(),
+                    target: "../../vulkan/libMoltenVK.dylib".into(),
+                }
+            ]
         );
-        assert_eq!(
-            edit(&p, &win32u),
-            &Edit {
-                add_rpaths: vec!["@loader_path/../..".into()],
-                ..Edit::default()
-            }
-        );
+        assert_eq!(p.replaced, []);
+        for module in ["win32u.so", "bcrypt.so"] {
+            assert_eq!(
+                edit(&p, &format!("{MODULES}/{module}")),
+                &Edit {
+                    add_rpaths: vec!["@loader_path/../..".into()],
+                    ..Edit::default()
+                }
+            );
+        }
         assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
         assert!(
             p.notes[0].starts_with("libodbc.dylib: optional"),
@@ -1197,23 +1582,30 @@ mod tests {
         );
     }
 
-    /// The rounds after the copy: the copied library's own install name,
-    /// foreign dependency, and run path; then the dependency's install name
+    /// The rounds after the copy: the copied library's own install name, a
+    /// dependency the framework already ships (reached by a run path, not
+    /// copied), a dependency copied beside it; then that one's install name
     /// and a stray absolute run path; then nothing.
     #[test]
     fn copied_libraries_are_closed_over_their_dependencies() {
-        let win32u = format!("{MODULES}/win32u.so");
-        let names = sonames(&WIN32U_SONAMES);
+        let names = sonames(&SONAMES);
         let mut t = win32u_tree();
-        t.files.insert("wine/lib/libfreetype.6.dylib".into());
-        t.files.insert("wine/lib/libMoltenVK.dylib".into());
-        t.images[0].rpaths.push("@loader_path/../..".into());
-        t.images.push(image(
+        for file in [
+            "wine/lib/libgnutls.30.dylib",
             "wine/lib/libfreetype.6.dylib",
-            Some("/usr/local/opt/freetype/lib/libfreetype.6.dylib"),
+            "wine/lib/libMoltenVK.dylib",
+        ] {
+            t.files.insert(file.into());
+        }
+        for module in &mut t.images {
+            module.rpaths.push("@loader_path/../..".into());
+        }
+        t.images.push(image(
+            "wine/lib/libgnutls.30.dylib",
+            Some("/usr/local/opt/gnutls/lib/libgnutls.30.dylib"),
             &[
-                "/usr/lib/libz.1.dylib",
-                "/usr/local/opt/libpng/lib/libpng16.16.dylib",
+                "/usr/local/opt/gettext/lib/libintl.8.dylib",
+                "/usr/local/opt/p11-kit/lib/libp11-kit.0.dylib",
                 "/usr/lib/libSystem.B.dylib",
             ],
             &[],
@@ -1224,34 +1616,46 @@ mod tests {
         assert_eq!(
             p.copies,
             [Copy {
-                source: "/usr/local/Cellar/libpng/1.6.50/lib/libpng16.16.dylib".into(),
-                dest: "wine/lib/libpng16.16.dylib".into(),
+                source: "/usr/local/Cellar/p11-kit/0.25.5/lib/libp11-kit.0.dylib".into(),
+                dest: "wine/lib/libp11-kit.0.dylib".into(),
             }]
         );
         assert_eq!(
-            edit(&p, "wine/lib/libfreetype.6.dylib"),
+            edit(&p, "wine/lib/libgnutls.30.dylib"),
             &Edit {
-                id: Some("@rpath/libfreetype.6.dylib".into()),
-                changes: vec![(
-                    "/usr/local/opt/libpng/lib/libpng16.16.dylib".into(),
-                    "@rpath/libpng16.16.dylib".into()
-                )],
-                add_rpaths: vec!["@loader_path".into()],
+                id: Some("@rpath/libgnutls.30.dylib".into()),
+                changes: vec![
+                    (
+                        "/usr/local/opt/gettext/lib/libintl.8.dylib".into(),
+                        "@rpath/libintl.8.dylib".into()
+                    ),
+                    (
+                        "/usr/local/opt/p11-kit/lib/libp11-kit.0.dylib".into(),
+                        "@rpath/libp11-kit.0.dylib".into()
+                    ),
+                ],
+                add_rpaths: vec![
+                    "@loader_path/GStreamer.framework/Versions/1.0/lib".into(),
+                    "@loader_path".into(),
+                ],
                 delete_rpaths: vec![],
             }
         );
-        assert!(!p.edits.contains_key(&win32u), "{p:?}");
+        assert_eq!(p.edits.len(), 1, "{p:?}");
 
-        t.files.insert("wine/lib/libpng16.16.dylib".into());
-        t.images[1] = image(
-            "wine/lib/libfreetype.6.dylib",
-            Some("@rpath/libfreetype.6.dylib"),
-            &["/usr/lib/libz.1.dylib", "@rpath/libpng16.16.dylib"],
-            &["@loader_path"],
+        t.files.insert("wine/lib/libp11-kit.0.dylib".into());
+        t.images[2] = image(
+            "wine/lib/libgnutls.30.dylib",
+            Some("@rpath/libgnutls.30.dylib"),
+            &["@rpath/libintl.8.dylib", "@rpath/libp11-kit.0.dylib"],
+            &[
+                "@loader_path/GStreamer.framework/Versions/1.0/lib",
+                "@loader_path",
+            ],
         );
         t.images.push(image(
-            "wine/lib/libpng16.16.dylib",
-            Some("/usr/local/opt/libpng/lib/libpng16.16.dylib"),
+            "wine/lib/libp11-kit.0.dylib",
+            Some("/usr/local/opt/p11-kit/lib/libp11-kit.0.dylib"),
             &["/usr/lib/libSystem.B.dylib"],
             &["/usr/local/lib", "/usr/lib/swift"],
         ));
@@ -1259,58 +1663,159 @@ mod tests {
         assert_eq!(p.errors, []);
         assert_eq!(p.copies, []);
         assert_eq!(
-            edit(&p, "wine/lib/libpng16.16.dylib"),
+            edit(&p, "wine/lib/libp11-kit.0.dylib"),
             &Edit {
-                id: Some("@rpath/libpng16.16.dylib".into()),
+                id: Some("@rpath/libp11-kit.0.dylib".into()),
                 delete_rpaths: vec!["/usr/local/lib".into()],
                 ..Edit::default()
             }
         );
         assert_eq!(p.edits.len(), 1, "{p:?}");
 
-        t.images[2] = image(
-            "wine/lib/libpng16.16.dylib",
-            Some("@rpath/libpng16.16.dylib"),
+        t.images[3] = image(
+            "wine/lib/libp11-kit.0.dylib",
+            Some("@rpath/libp11-kit.0.dylib"),
             &["/usr/lib/libSystem.B.dylib"],
             &["/usr/lib/swift"],
         );
         assert!(plan(&t, &names, &homebrew).is_empty());
     }
 
+    /// A leaf in two directories, one of them a link: the image whose run
+    /// path reaches either is fine; one reaching neither is ambiguous, and
+    /// the error names both directories.
     #[test]
-    fn a_leaf_present_in_two_directories_prefers_the_binarys_own() {
-        // gnutls in wine/lib names @rpath/libintl.8.dylib, which exists both
-        // beside it and in the framework: its own directory wins. A module
-        // elsewhere that reaches neither is ambiguous.
+    fn a_leaf_behind_a_link_is_no_tie_for_a_reaching_image_and_names_both_dirs_otherwise() {
+        let other = format!("{MODULES}/other.so");
         let t = tree(
             vec![
                 image(
-                    "wine/lib/libgnutls.30.dylib",
-                    Some("@rpath/libgnutls.30.dylib"),
-                    &["@rpath/libintl.8.dylib"],
-                    &[],
+                    &format!("{GST_LIB}/libharfbuzz.0.dylib"),
+                    Some("@rpath/libharfbuzz.0.dylib"),
+                    &["@rpath/libfreetype.6.dylib"],
+                    &["@loader_path/../lib"],
                 ),
                 image(
-                    &format!("{MODULES}/other.so"),
+                    &other,
                     Some("@rpath/other.so"),
-                    &["@rpath/libintl.8.dylib"],
+                    &["@rpath/libfreetype.6.dylib"],
                     &["@loader_path/"],
                 ),
             ],
             &[
-                "wine/lib/libintl.8.dylib",
-                &format!("{GST_LIB}/libintl.8.dylib"),
+                "wine/lib/libfreetype.6.dylib",
+                &format!("{GST_LIB}/libfreetype.6.dylib"),
             ],
         );
         let p = plan(&t, &[], &homebrew);
-        assert_eq!(
-            edit(&p, "wine/lib/libgnutls.30.dylib").add_rpaths,
-            ["@loader_path"]
-        );
+        assert_eq!(p.edits.len(), 0, "{p:?}");
         assert_eq!(p.errors.len(), 1, "{p:?}");
-        assert_eq!(p.errors[0].binary, format!("{MODULES}/other.so"));
+        assert_eq!(p.errors[0].binary, other);
+        assert_eq!(p.errors[0].reference, "@rpath/libfreetype.6.dylib");
         assert!(
-            p.errors[0].reason.contains("2 directories"),
+            p.errors[0]
+                .reason
+                .contains(&format!("2 directories (wine/lib, {GST_LIB})")),
+            "{}",
+            p.errors[0]
+        );
+    }
+
+    /// Two regular files with one install name: the framework's `MoltenVK`
+    /// becomes a link to the pinned one the policy names; two `libintl`s,
+    /// which no policy row decides, are refused with both files named.
+    #[test]
+    fn a_duplicate_install_name_is_linked_to_the_policys_file_or_refused() {
+        let framework_mvk = format!("{GST_LIB}/libMoltenVK.dylib");
+        let mut t = tree(
+            vec![
+                image(
+                    "vulkan/libMoltenVK.dylib",
+                    Some("@rpath/libMoltenVK.dylib"),
+                    &["/usr/lib/libc++.1.dylib"],
+                    &[],
+                ),
+                image(
+                    &framework_mvk,
+                    Some("@rpath/libMoltenVK.dylib"),
+                    &["/usr/lib/libc++.1.dylib"],
+                    &["@loader_path/../lib"],
+                ),
+                image(
+                    &format!("{GST_LIB}/gstreamer-1.0/libgstapplemedia.dylib"),
+                    Some("@rpath/libgstapplemedia.dylib"),
+                    &["@rpath/libMoltenVK.dylib"],
+                    &["@loader_path/../../lib"],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(
+            p.replaced,
+            [Link {
+                link: framework_mvk.clone().into(),
+                target: "../../../../../../vulkan/libMoltenVK.dylib".into(),
+            }]
+        );
+        assert!(
+            p.copies.is_empty() && p.links.is_empty() && p.edits.is_empty(),
+            "{p:?}"
+        );
+
+        // Once replaced, the link is a file of the tree and no image.
+        t.images.remove(1);
+        assert!(plan(&t, &[], &homebrew).is_empty());
+
+        let t = tree(
+            vec![
+                image(
+                    "wine/lib/libintl.8.dylib",
+                    Some("@rpath/libintl.8.dylib"),
+                    &[],
+                    &[],
+                ),
+                image(
+                    &format!("{GST_LIB}/libintl.8.dylib"),
+                    Some("@rpath/libintl.8.dylib"),
+                    &[],
+                    &["@loader_path/../lib"],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(
+            p.errors[0].binary,
+            format!("wine/lib/libintl.8.dylib, {GST_LIB}/libintl.8.dylib")
+        );
+        assert_eq!(p.errors[0].reference, "@rpath/libintl.8.dylib");
+        assert!(
+            p.errors[0]
+                .reason
+                .contains("one image per install name per process"),
+            "{}",
+            p.errors[0]
+        );
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    /// A SONAME without a policy row that the payload already ships somewhere
+    /// is not copied again: the policy has to name that file.
+    #[test]
+    fn a_soname_the_payload_ships_elsewhere_is_not_copied_again() {
+        let t = tree(vec![], &[&format!("{GST_LIB}/libgnutls.30.dylib")]);
+        let p = plan(&t, &sonames(&["libgnutls.30.dylib"]), &homebrew);
+        assert_eq!(p.copies, []);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(p.errors[0].binary, super::CONFIG_H);
+        assert_eq!(p.errors[0].reference, "libgnutls.30.dylib");
+        assert!(
+            p.errors[0]
+                .reason
+                .starts_with(&format!("{GST_LIB} already ships it")),
             "{}",
             p.errors[0]
         );
@@ -1328,6 +1833,7 @@ mod tests {
                     "@rpath/libnowhere.dylib",
                     "/System/Volumes/Data/usr/local/lib/libx.dylib",
                     "libbare.dylib",
+                    "/usr/local/opt/libpng/lib/libpng16.16.dylib",
                 ],
                 &["@loader_path/"],
             )],
@@ -1353,13 +1859,13 @@ mod tests {
                 ),
                 (
                     "wine/lib/wine/x86_64-unix/bad.so",
-                    "@rpath/libnowhere.dylib"
-                ),
-                (
-                    "wine/lib/wine/x86_64-unix/bad.so",
                     "/System/Volumes/Data/usr/local/lib/libx.dylib"
                 ),
                 ("wine/lib/wine/x86_64-unix/bad.so", "libbare.dylib"),
+                (
+                    "wine/lib/wine/x86_64-unix/bad.so",
+                    "@rpath/libnowhere.dylib"
+                ),
             ],
             "{p:?}"
         );
@@ -1378,8 +1884,9 @@ mod tests {
             "{:?}",
             p.notes
         );
-        // Nothing is planned beside the errors.
-        assert_eq!(p.copies, []);
+        // The plan keeps going past the errors (the resolvable libpng is
+        // planned); `settle` is what withholds the round.
+        assert_eq!(p.copies.len(), 1, "{p:?}");
     }
 
     #[test]
@@ -1427,5 +1934,296 @@ mod tests {
         let p = plan(&t, &sonames(&["libfreetype.6.dylib"]), &homebrew);
         assert_eq!(p.errors, []);
         assert!(p.is_empty(), "{p:?}");
+    }
+
+    fn fixture_spec() -> BundleSpec {
+        BundleSpec::parse(include_str!("../tests/fixtures/BUNDLE.toml")).expect("fixture")
+    }
+
+    fn denylist() -> Denylist {
+        Denylist::parse(include_str!("../../build/denylist.toml")).expect("denylist")
+    }
+
+    fn copy_plan(source: &str, dest: &str) -> Plan {
+        Plan {
+            copies: vec![Copy {
+                source: source.into(),
+                dest: dest.into(),
+            }],
+            ..Plan::default()
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_copy_without_a_row_or_with_another_version() {
+        let denylist = denylist();
+        let spec = fixture_spec();
+        let plan = copy_plan(
+            "/usr/local/Cellar/libffi/3.4.6/lib/libffi.8.dylib",
+            "wine/lib/libffi.8.dylib",
+        );
+        let error = gate_copies(&denylist, &spec, &plan).unwrap_err();
+        assert!(
+            error.contains("lack a matching [components] row"),
+            "{error}"
+        );
+        let plan = copy_plan(
+            "/usr/local/Cellar/gnutls/3.8.9/lib/libgnutls.30.dylib",
+            "wine/lib/libgnutls.30.dylib",
+        );
+        let error = gate_copies(&denylist, &spec, &plan).unwrap_err();
+        assert!(error.contains("lack a matching"), "{error}");
+        let plan = copy_plan(
+            "/usr/local/lib/libgnutls.30.dylib",
+            "wine/lib/libgnutls.30.dylib",
+        );
+        let error = gate_copies(&denylist, &spec, &plan).unwrap_err();
+        assert!(error.contains("formula and version are unknown"), "{error}");
+        let plan = copy_plan(
+            "/usr/local/Cellar/gnutls/3.8.10/lib/libgnutls.30.dylib",
+            "wine/lib/libgnutls.30.dylib",
+        );
+        gate_copies(&denylist, &spec, &plan).expect("a recorded copy passes");
+    }
+
+    #[test]
+    fn the_gate_refuses_a_denylisted_destination() {
+        let denylist = denylist();
+        let plan = copy_plan(
+            "/usr/local/Cellar/x264/1/lib/libgstx264.dylib",
+            "wine/lib/libgstx264.dylib",
+        );
+        let error = gate_copies(&denylist, &fixture_spec(), &plan).unwrap_err();
+        assert!(error.contains("denylisted"), "{error}");
+    }
+
+    /// Records every tool invocation; `install_name_tool` overwrites its
+    /// binary like the real one and fails on `failing`.
+    fn stub_runner<'a>(
+        calls: &'a mut Vec<String>,
+        failing: &'a str,
+    ) -> impl FnMut(&str, &[&OsStr]) -> Result<(), String> + 'a {
+        move |program: &str, args: &[&OsStr]| {
+            let line = format!(
+                "{program} {}",
+                args.iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            calls.push(line.clone());
+            let target = args.last().expect("a target");
+            if program == "install_name_tool" {
+                if target.to_string_lossy().ends_with(failing) {
+                    return Err(format!(
+                        "{line} failed (exit status: 1): larger updated load commands do not fit"
+                    ));
+                }
+                fs::write(target, b"rewritten").expect("rewrite");
+            }
+            Ok(())
+        }
+    }
+
+    /// A tool failure on the second binary rolls the whole round back: the
+    /// copy and the link are gone, the first binary and the replaced
+    /// duplicate are back to their bytes, and the error names the binary and
+    /// the tool's stderr.
+    #[test]
+    fn a_tool_failure_rolls_the_round_back() {
+        let dir = scratch("rollback");
+        let payload = dir.join("payload");
+        fake_macho(&payload.join("wine/lib/a.so"), b"a");
+        fake_macho(&payload.join("wine/lib/b.so"), b"b");
+        fake_macho(&payload.join("vulkan/libMoltenVK.dylib"), b"pin");
+        fake_macho(&payload.join("fw/libMoltenVK.dylib"), b"dup");
+        fake_macho(&dir.join("src/libA.1.dylib"), b"A");
+        let before = |name: &str| fs::read(payload.join(name)).expect(name);
+        let plan = Plan {
+            copies: vec![Copy {
+                source: dir.join("src/libA.1.dylib"),
+                dest: "wine/lib/libA.1.dylib".into(),
+            }],
+            links: vec![Link {
+                link: "wine/lib/libMoltenVK.dylib".into(),
+                target: "../../vulkan/libMoltenVK.dylib".into(),
+            }],
+            replaced: vec![Link {
+                link: "fw/libMoltenVK.dylib".into(),
+                target: "../vulkan/libMoltenVK.dylib".into(),
+            }],
+            edits: [
+                ("wine/lib/a.so", "@loader_path"),
+                ("wine/lib/b.so", "@loader_path/.."),
+            ]
+            .into_iter()
+            .map(|(binary, rpath)| {
+                (
+                    binary.to_owned(),
+                    Edit {
+                        add_rpaths: vec![rpath.to_owned()],
+                        ..Edit::default()
+                    },
+                )
+            })
+            .collect(),
+            ..Plan::default()
+        };
+        let mut calls = Vec::new();
+        let error = apply(&payload, &plan, &mut stub_runner(&mut calls, "b.so")).unwrap_err();
+        // The copy, the link, the replaced file, a.so, and b.so (saved
+        // before its tool failed) are all put back.
+        assert!(
+            error.contains("wine/lib/b.so")
+                && error.contains("do not fit")
+                && error.contains("rolled back (5 file(s) restored)"),
+            "{error}"
+        );
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(calls[0].ends_with("a.so") && calls[1].starts_with("codesign"));
+        assert!(!payload.join("wine/lib/libA.1.dylib").exists());
+        assert!(fs::symlink_metadata(payload.join("wine/lib/libMoltenVK.dylib")).is_err());
+        assert_eq!(before("wine/lib/a.so"), [&X86_64_MAGIC[..], b"a"].concat());
+        assert_eq!(before("wine/lib/b.so"), [&X86_64_MAGIC[..], b"b"].concat());
+        let dup = fs::symlink_metadata(payload.join("fw/libMoltenVK.dylib")).expect("dup");
+        assert!(dup.file_type().is_file());
+        assert_eq!(
+            before("fw/libMoltenVK.dylib"),
+            [&X86_64_MAGIC[..], b"dup"].concat()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    type Scan = Box<dyn Fn(&Path) -> Result<Tree, String>>;
+
+    /// A scratch payload with `ok.so` naming a copyable `libpng` and, when
+    /// `with_bad`, `bad.so` naming a leaf nowhere; `scan` hands the planner
+    /// that shape as long as `libpng` is not in `wine/lib/`.
+    fn settle_fixture(name: &str, with_bad: bool) -> (PathBuf, PathBuf, Scan) {
+        let dir = scratch(name);
+        let payload = dir.join("payload");
+        fake_macho(&payload.join(format!("{MODULES}/ok.so")), b"ok");
+        fake_macho(&dir.join("src/libpng16.16.dylib"), b"png");
+        if with_bad {
+            fake_macho(&payload.join(format!("{MODULES}/bad.so")), b"bad");
+        }
+        let scan = move |payload: &Path| {
+            let copied = payload.join("wine/lib/libpng16.16.dylib").exists();
+            let mut images = vec![image(
+                &format!("{MODULES}/ok.so"),
+                Some("@rpath/ok.so"),
+                &[if copied {
+                    "@rpath/libpng16.16.dylib"
+                } else {
+                    "/usr/local/opt/libpng/lib/libpng16.16.dylib"
+                }],
+                if copied {
+                    &["@loader_path/", "@loader_path/../.."]
+                } else {
+                    &["@loader_path/"]
+                },
+            )];
+            if with_bad {
+                images.push(image(
+                    &format!("{MODULES}/bad.so"),
+                    Some("@rpath/bad.so"),
+                    &["@rpath/libnowhere.dylib"],
+                    &["@loader_path/"],
+                ));
+            }
+            let extra = if copied {
+                vec!["wine/lib/libpng16.16.dylib"]
+            } else {
+                vec![]
+            };
+            Ok(tree(images, &extra))
+        };
+        (dir.clone(), payload, Box::new(scan))
+    }
+
+    /// A round with an unresolvable reference applies nothing, asserted on
+    /// the tree: the resolvable copy beside it never lands and no tool runs.
+    #[test]
+    fn a_round_with_an_unresolvable_reference_leaves_the_tree_untouched() {
+        let (dir, payload, scan) = settle_fixture("withhold", true);
+        let src = dir.join("src/libpng16.16.dylib");
+        let source = |reference: &str| -> Result<PathBuf, String> {
+            if reference.ends_with("libpng16.16.dylib") {
+                Ok(src.clone())
+            } else {
+                Err("No such file or directory (os error 2)".into())
+            }
+        };
+        let mut calls = Vec::new();
+        let error = settle(
+            &payload,
+            &[],
+            &source,
+            scan.as_ref(),
+            &|_| Ok(()),
+            &mut stub_runner(&mut calls, "<nothing fails>"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("1 reference(s) cannot be closed (round 1)"),
+            "{error}"
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+        assert!(!payload.join("wine/lib/libpng16.16.dylib").exists());
+        let mut entries: Vec<String> = fs::read_dir(payload.join("wine/lib"))
+            .expect("wine/lib")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["wine"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Without the bad module the same tree settles in one round: the copy
+    /// lands, the module is rewritten through the tools, and the next scan
+    /// plans nothing.
+    #[test]
+    fn a_resolvable_round_lands_and_the_next_scan_settles() {
+        let (dir, payload, scan) = settle_fixture("settle", false);
+        let src = dir.join("src/libpng16.16.dylib");
+        let source = |_: &str| -> Result<PathBuf, String> { Ok(src.clone()) };
+        let mut calls = Vec::new();
+        let outcome = settle(
+            &payload,
+            &[],
+            &source,
+            scan.as_ref(),
+            &|_| Ok(()),
+            &mut stub_runner(&mut calls, "<nothing fails>"),
+        )
+        .expect("settles");
+        assert_eq!(
+            outcome,
+            Outcome {
+                rounds: 1,
+                copied: 1,
+                linked: 0,
+                rewritten: [format!("{MODULES}/ok.so")].into_iter().collect(),
+            }
+        );
+        assert!(payload.join("wine/lib/libpng16.16.dylib").is_file());
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls[0].starts_with("install_name_tool -change /usr/local/opt/libpng/lib/libpng16.16.dylib @rpath/libpng16.16.dylib -add_rpath @loader_path/../.. "),
+            "{}",
+            calls[0]
+        );
+        assert!(
+            calls[1].starts_with("codesign --force --sign - "),
+            "{}",
+            calls[1]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

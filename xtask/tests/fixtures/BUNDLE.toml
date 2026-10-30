@@ -32,14 +32,6 @@ license = "LGPL-2.1-or-later"
 version = "2.14"
 license = "GPL-3.0-or-later"
 
-[components.freetype]
-version = "2.13.3"
-license = "FTL"
-
-[components.gettext]
-version = "0.26"
-license = "LGPL-2.1-or-later"
-
 [components.gmp]
 version = "6.3.0"
 license = "LGPL-3.0-or-later OR GPL-2.0-or-later"
@@ -51,10 +43,6 @@ license = "LGPL-2.1-or-later"
 [components.libidn2]
 version = "2.3.8"
 license = "(GPL-2.0-or-later OR LGPL-3.0-or-later) AND Unicode-DFS-2016"
-
-[components.libpng]
-version = "1.6.50"
-license = "libpng-2.0"
 
 [components.libtasn1]
 version = "4.20.0"

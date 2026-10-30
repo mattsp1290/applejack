@@ -3,7 +3,7 @@
 //! references (`closure.rs`), and writes `BUNDLE.toml`. The Wine build itself
 //! runs through the scripts under `build/`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
@@ -18,7 +18,8 @@ use crate::denylist::{Denylist, Hit};
 use crate::pins::{Pin, Pins};
 use crate::self_contained::{
     Search, Violation, binary_dir, check_otool_listing, check_references_resolve, check_rpaths,
-    has_system_rpath, is_executable, normalize_relative, references_left_to_dyld, relocated_rpaths,
+    has_system_rpath, id_entry, is_executable, normalize_relative, references_left_to_dyld,
+    relocated_rpaths,
 };
 
 pub const USAGE: &str = "\
@@ -547,6 +548,7 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
             &build_dir,
         ));
     }
+    violations.extend(duplicate_install_names(&machos));
     let resolves = |candidate: &Path| {
         fs::canonicalize(payload.join(candidate))
             .is_ok_and(|real| real.starts_with(&payload) && real.is_file())
@@ -565,6 +567,28 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
         violations,
         left_to_dyld: chained.left_to_dyld,
     })
+}
+
+/// dyld keeps one image per install name per process, so two regular files
+/// carrying the same `LC_ID_DYLIB` let load order pick the library every
+/// client gets; the closure links such duplicates to one file (symlinks are
+/// not inspected here, so they pass).
+fn duplicate_install_names(machos: &[MachO]) -> Vec<Violation> {
+    let mut by_id: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for macho in machos {
+        if let Some(id) = id_entry(&macho.load_commands) {
+            by_id.entry(id).or_default().push(&macho.relative);
+        }
+    }
+    by_id
+        .into_iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(id, files)| Violation {
+            binary: files.join(", "),
+            reference: id.to_owned(),
+            reason: "several regular files carry this install name; dyld keeps one image per install name per process, so load order would pick the library".to_owned(),
+        })
+        .collect()
 }
 
 pub(crate) const BUNDLE_FILE: &str = "BUNDLE.toml";
@@ -1802,6 +1826,40 @@ Load command 9
             outcome.left_to_dyld,
             [(module.to_owned(), "@rpath/libfreetype.6.dylib".to_owned())]
         );
+    }
+
+    /// The closed payload's own trap: Homebrew's `libfreetype.6.dylib` beside
+    /// the framework's, both `@rpath/libfreetype.6.dylib`; the framework's
+    /// `libpng16.16.56.0.dylib` and a `libpng16.16.dylib` differ and pass.
+    #[test]
+    fn two_regular_files_with_one_install_name_are_a_violation() {
+        let id = |name: &str| {
+            format!(
+                "Load command 0\n          cmd LC_ID_DYLIB\n         name @rpath/{name} (offset 24)\n"
+            )
+        };
+        let machos = [
+            macho("wine/bin/wine", "Load command 0\n          cmd LC_MAIN\n"),
+            macho("wine/lib/libfreetype.6.dylib", &id("libfreetype.6.dylib")),
+            macho(
+                "wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib",
+                &id("libfreetype.6.dylib"),
+            ),
+            macho("wine/lib/libpng16.16.dylib", &id("libpng16.16.dylib")),
+            macho(
+                "wine/lib/GStreamer.framework/Versions/1.0/lib/libpng16.16.56.0.dylib",
+                &id("libpng16.16.56.0.dylib"),
+            ),
+        ];
+        assert_eq!(
+            describe(&super::duplicate_install_names(&machos)),
+            [(
+                "wine/lib/libfreetype.6.dylib, wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib".to_owned(),
+                "@rpath/libfreetype.6.dylib".to_owned(),
+                "several regular files carry this install name; dyld keeps one image per install name per process, so load order would pick the library".to_owned(),
+            )]
+        );
+        assert_eq!(super::duplicate_install_names(&machos[..2]), []);
     }
 
     #[test]
