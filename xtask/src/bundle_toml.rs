@@ -61,10 +61,12 @@ pub enum Wow64 {
 
 /// The named rows are the pinned components; every other row is an x86-64
 /// Homebrew library family the dylib closure copies into `wine/lib/`, keyed
-/// by formula name. serde cannot combine `deny_unknown_fields` with the
-/// flattened map, so [`Components::validate`] is the strictness instead: a
-/// key that spells a named row (`kosmic_krisp`, `MoltenVK`) or is no
-/// Homebrew formula name fails the parse.
+/// by formula name, or one of the [`SHIPPED_ELSEWHERE`] libraries Wine
+/// binds to inside another component's tree. serde rejects
+/// `deny_unknown_fields` together with `flatten` on the same struct, so
+/// [`Components::validate`] is the strictness instead: a key that spells a
+/// named row (`kosmic_krisp`, `MoltenVK`) or is no Homebrew formula name
+/// fails the parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Components {
     pub dxmt: Component,
@@ -242,17 +244,27 @@ impl BundleSpec {
              The `wine/lib/` rows are the x86-64 Homebrew libraries Wine links or loads by\n\
              name, copied in by `cargo xtask engine-payload --close` with the formula version\n\
              the build host had installed; each license is the shipped library's own, not\n\
-             that of the formula's command-line tools. Libraries the GStreamer framework\n\
-             already ships (freetype, libintl) are not copied again: Wine reaches the\n\
-             framework's files, and the GStreamer row covers them."
+             that of the formula's command-line tools. A row whose location is a file inside\n\
+             `wine/lib/GStreamer.framework` is a library the framework ships that Wine or a\n\
+             copied library binds to directly: dyld keeps one image per install name per\n\
+             process, so it is not copied again, and its license is its own, as listed, not\n\
+             GStreamer's."
         );
+        for elsewhere in SHIPPED_ELSEWHERE {
+            if let Some(credit) = elsewhere.credit
+                && self.components.libraries.contains_key(elsewhere.key)
+            {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "{credit}");
+            }
+        }
         let choices = self.components.choices();
         if !choices.is_empty() {
             let _ = writeln!(out);
             let _ = writeln!(
                 out,
                 "Where a license above is an `OR` expression ({}), this bundle exercises\n\
-                 the {EXERCISED_OPTION} option.",
+                 the {EXERCISED_OPTION} option of that choice; any `AND` terms apply as written.",
                 choices.join(", ")
             );
         }
@@ -380,13 +392,13 @@ impl Components {
             .map(|(name, component, location)| (name.to_owned(), component, location.to_owned()))
             .collect();
         rows.extend(self.libraries.iter().map(|(formula, component)| {
-            (
-                formula.clone(),
-                component,
-                format!(
+            let location = match shipped_elsewhere(formula) {
+                Some(elsewhere) => format!("`{}` ({})", elsewhere.file, elsewhere.why),
+                None => format!(
                     "`wine/lib/` (x86-64 Homebrew formula `{formula}`, copied by the dylib closure)"
                 ),
-            )
+            };
+            (formula.clone(), component, location)
         }));
         rows
     }
@@ -395,17 +407,20 @@ impl Components {
     fn choices(&self) -> Vec<String> {
         self.rows()
             .into_iter()
-            .filter(|(_, component, _)| component.license.contains(" OR "))
+            .filter(|(_, component, _)| {
+                Spdx::parse(&component.license).is_ok_and(|expression| expression.has_choice())
+            })
             .map(|(name, _, _)| name)
             .collect()
     }
 
     /// Library rows are keyed by Homebrew formula name; a key that spells a
-    /// named row is a typo of a pinned component. Every `OR` license must
-    /// offer [`EXERCISED_OPTION`], the one the notices say the bundle takes.
+    /// named row is a typo of a pinned component. Every license parses as an
+    /// SPDX expression, and every `OR` in it must list [`EXERCISED_OPTION`],
+    /// the one the notices say the bundle takes, as one of its operands.
     fn validate(&self) -> Result<(), Error> {
         for (formula, component) in &self.libraries {
-            if let Some(row) = NAMED_ROWS.iter().find(|row| fold(row) == fold(formula)) {
+            if let Some(row) = named_row(formula) {
                 return Err(Error::Invalid(format!(
                     "`components.{formula}` spells the pinned component row `{row}`; use that row"
                 )));
@@ -427,7 +442,13 @@ impl Components {
             }
         }
         for (name, component, _) in self.rows() {
-            if component.license.contains(" OR ") && !component.license.contains(EXERCISED_OPTION) {
+            let expression = Spdx::parse(&component.license).map_err(|reason| {
+                Error::Invalid(format!(
+                    "the `{name}` license `{}` is not an SPDX expression: {reason}",
+                    component.license
+                ))
+            })?;
+            if !expression.every_choice_offers(EXERCISED_OPTION) {
                 return Err(Error::Invalid(format!(
                     "the `{name}` license `{}` offers a choice without {EXERCISED_OPTION}, the option the notices state",
                     component.license
@@ -457,9 +478,185 @@ fn fold(name: &str) -> String {
         .collect()
 }
 
+/// The named row `formula` spells, if any: such a formula (`molten-vk`) can
+/// never have a library row.
+pub(crate) fn named_row(formula: &str) -> Option<&'static str> {
+    NAMED_ROWS
+        .iter()
+        .copied()
+        .find(|row| fold(row) == fold(formula))
+}
+
+/// A library Wine, or a library the closure copied, binds to inside another
+/// component's tree rather than under `wine/lib/`: it has a `[components]`
+/// row like a copied library (the engine reader accepts nothing richer), and
+/// the notices render its real location, provenance, and any credit its
+/// license requires. The closure's `SONAME_POLICY` names the same files.
+pub(crate) struct Elsewhere {
+    /// The `[components]` key.
+    pub(crate) key: &'static str,
+    /// The payload-relative file.
+    pub(crate) file: &'static str,
+    /// What the file is and who binds to it.
+    pub(crate) why: &'static str,
+    /// Text the license requires in the distribution's documentation.
+    pub(crate) credit: Option<&'static str>,
+}
+
+pub(crate) const SHIPPED_ELSEWHERE: &[Elsewhere] = &[
+    Elsewhere {
+        key: "freetype",
+        file: "wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib",
+        why: "FreeType as the GStreamer framework ships it (`LC_ID_DYLIB` current version 26.2.20); Wine's font engine, which `win32u` and `dwrite` load by name through the link `wine/lib/libfreetype.6.dylib`",
+        // The FTL's redistribution clause asks for a statement that the
+        // software is based in part on the FreeType Team's work, and its
+        // suggested wording names the year of the release used (2.13.3 is
+        // the 2024 release).
+        credit: Some(
+            "FreeType is used under the FreeType License (`FTL`); FreeType's GPL-2.0-or-later\n\
+             alternative is not elected. This software is based in part on the work of the\n\
+             FreeType Team. Portions of this software are copyright © 2024 The FreeType\n\
+             Project (www.freetype.org). All rights reserved.",
+        ),
+    },
+    Elsewhere {
+        key: "proxy-libintl",
+        file: "wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib",
+        why: "proxy-libintl as the GStreamer framework ships it (`LC_ID_DYLIB` current version 10.5.0), a stub gettext runtime whose `dgettext` returns the message untranslated; the copied gnutls and libidn2 bind to it, so their messages are English",
+        credit: None,
+    },
+];
+
+/// The [`SHIPPED_ELSEWHERE`] entry for a `[components]` key.
+pub(crate) fn shipped_elsewhere(key: &str) -> Option<&'static Elsewhere> {
+    SHIPPED_ELSEWHERE
+        .iter()
+        .find(|elsewhere| elsewhere.key == key)
+}
+
 /// The option this bundle exercises where a component's license is an `OR`
 /// expression: the LGPL beside Wine's own LGPL-2.1-or-later.
 pub const EXERCISED_OPTION: &str = "LGPL-3.0-or-later";
+
+/// An SPDX license expression, as far as the notices need it: `AND` binds
+/// tighter than `OR`, parentheses group, and `WITH` qualifies one license.
+#[derive(Debug, PartialEq, Eq)]
+enum Spdx {
+    License(String),
+    And(Vec<Spdx>),
+    Or(Vec<Spdx>),
+}
+
+impl Spdx {
+    fn parse(text: &str) -> Result<Self, String> {
+        let mut tokens: Vec<&str> = Vec::new();
+        for word in text.split_whitespace() {
+            let mut rest = word;
+            while let Some(after) = rest.strip_prefix('(') {
+                tokens.push("(");
+                rest = after;
+            }
+            let mut closing = 0;
+            while let Some(before) = rest.strip_suffix(')') {
+                closing += 1;
+                rest = before;
+            }
+            if !rest.is_empty() {
+                tokens.push(rest);
+            }
+            tokens.extend(std::iter::repeat_n(")", closing));
+        }
+        let mut cursor = 0;
+        let expression = Self::disjunction(&tokens, &mut cursor)?;
+        match tokens.get(cursor) {
+            None => Ok(expression),
+            Some(token) => Err(format!("unexpected `{token}`")),
+        }
+    }
+
+    fn disjunction(tokens: &[&str], cursor: &mut usize) -> Result<Self, String> {
+        let mut operands = vec![Self::conjunction(tokens, cursor)?];
+        while tokens.get(*cursor) == Some(&"OR") {
+            *cursor += 1;
+            operands.push(Self::conjunction(tokens, cursor)?);
+        }
+        Ok(Self::group(operands, Self::Or))
+    }
+
+    fn conjunction(tokens: &[&str], cursor: &mut usize) -> Result<Self, String> {
+        let mut operands = vec![Self::primary(tokens, cursor)?];
+        while tokens.get(*cursor) == Some(&"AND") {
+            *cursor += 1;
+            operands.push(Self::primary(tokens, cursor)?);
+        }
+        Ok(Self::group(operands, Self::And))
+    }
+
+    fn group(mut operands: Vec<Self>, make: fn(Vec<Self>) -> Self) -> Self {
+        if operands.len() == 1 {
+            operands.remove(0)
+        } else {
+            make(operands)
+        }
+    }
+
+    fn primary(tokens: &[&str], cursor: &mut usize) -> Result<Self, String> {
+        let is_word = |token: &str| !matches!(token, "(" | ")" | "AND" | "OR" | "WITH");
+        match tokens.get(*cursor).copied() {
+            None => Err("the expression ends where a license was expected".into()),
+            Some("(") => {
+                *cursor += 1;
+                let inner = Self::disjunction(tokens, cursor)?;
+                if tokens.get(*cursor) != Some(&")") {
+                    return Err("a `(` without its `)`".into());
+                }
+                *cursor += 1;
+                Ok(inner)
+            }
+            Some(token) if !is_word(token) => Err(format!("unexpected `{token}`")),
+            Some(license) => {
+                *cursor += 1;
+                if tokens.get(*cursor) == Some(&"WITH") {
+                    let exception = tokens
+                        .get(*cursor + 1)
+                        .copied()
+                        .filter(|token| is_word(token))
+                        .ok_or_else(|| "`WITH` without an exception".to_owned())?;
+                    *cursor += 2;
+                    return Ok(Self::License(format!("{license} WITH {exception}")));
+                }
+                Ok(Self::License(license.to_owned()))
+            }
+        }
+    }
+
+    fn has_choice(&self) -> bool {
+        match self {
+            Self::License(_) => false,
+            Self::And(operands) => operands.iter().any(Self::has_choice),
+            Self::Or(_) => true,
+        }
+    }
+
+    /// Every `OR` in the expression lists `option` as one of its own
+    /// operands, so electing it is always possible.
+    fn every_choice_offers(&self, option: &str) -> bool {
+        match self {
+            Self::License(_) => true,
+            Self::And(operands) => operands
+                .iter()
+                .all(|operand| operand.every_choice_offers(option)),
+            Self::Or(operands) => {
+                operands
+                    .iter()
+                    .any(|operand| *operand == Self::License(option.to_owned()))
+                    && operands
+                        .iter()
+                        .all(|operand| operand.every_choice_offers(option))
+            }
+        }
+    }
+}
 
 /// Homebrew's formula-name grammar, `[A-Za-z0-9_+.-]+` with an optional
 /// `@[A-Za-z0-9.]+` version suffix (`openssl@3`, `icu4c@77`). TOML quotes a
@@ -775,7 +972,7 @@ mod tests {
         let notices = dual.to_notices().expect("renders");
         assert!(
             notices.contains(
-                "Where a license above is an `OR` expression (gmp, libidn2), this bundle exercises\nthe LGPL-3.0-or-later option."
+                "Where a license above is an `OR` expression (gmp, libidn2), this bundle exercises\nthe LGPL-3.0-or-later option of that choice; any `AND` terms apply as written."
             ),
             "{notices}"
         );
@@ -785,6 +982,103 @@ mod tests {
             .insert("x".into(), component("1", "MIT OR GPL-2.0-only"));
         let error = bad.to_notices().unwrap_err();
         assert!(error.to_string().contains("offers a choice"), "{error}");
+    }
+
+    /// The option must be an operand of every `OR` in the parsed expression,
+    /// not a substring of it; a malformed expression is refused too.
+    #[test]
+    fn the_exercised_option_must_be_an_operand_of_every_or() {
+        let with = |license: &str| {
+            let mut spec = spec();
+            spec.components
+                .libraries
+                .insert("x".into(), component("1", license));
+            spec.to_notices()
+        };
+        for real in [
+            "LGPL-3.0-or-later OR GPL-2.0-or-later",
+            "GPL-2.0-or-later OR LGPL-3.0-or-later",
+            "(GPL-2.0-or-later OR LGPL-3.0-or-later) AND Unicode-DFS-2016",
+            "LGPL-2.1-or-later",
+            "FTL",
+            "GPL-2.0-or-later WITH Classpath-exception-2.0 OR LGPL-3.0-or-later",
+        ] {
+            with(real).unwrap_or_else(|error| panic!("{real}: {error}"));
+        }
+        for bad in [
+            "LGPL-3.0-or-later AND (MIT OR Apache-2.0)",
+            "GPL-2.0-only OR (MIT AND LGPL-3.0-or-later)",
+            "MIT OR GPL-2.0-only",
+            "LGPL-3.0-or-later-ish OR MIT",
+        ] {
+            let error = with(bad).unwrap_err();
+            assert!(
+                error.to_string().contains("offers a choice without"),
+                "{bad}: {error}"
+            );
+        }
+        for malformed in [
+            "(MIT",
+            "MIT OR",
+            "MIT AND OR GPL-2.0-only",
+            "MIT WITH",
+            "MIT) OR LGPL-3.0-or-later",
+        ] {
+            let error = with(malformed).unwrap_err();
+            assert!(
+                error.to_string().contains("not an SPDX expression"),
+                "{malformed}: {error}"
+            );
+        }
+        let mut nested = spec();
+        nested.components.libraries.insert(
+            "a".into(),
+            component("1", "(GPL-2.0-or-later OR LGPL-3.0-or-later) AND MIT"),
+        );
+        nested
+            .components
+            .libraries
+            .insert("b".into(), component("1", "MIT"));
+        assert!(
+            nested
+                .to_notices()
+                .expect("renders")
+                .contains("`OR` expression (a), this bundle"),
+        );
+    }
+
+    /// A library Wine binds to inside another component's tree renders its
+    /// real location and, where its license asks for one, the credit.
+    #[test]
+    fn a_library_shipped_elsewhere_renders_its_location_and_credit() {
+        let mut elsewhere = spec();
+        elsewhere
+            .components
+            .libraries
+            .insert("freetype".into(), component("2.13.3", "FTL"));
+        elsewhere
+            .components
+            .libraries
+            .insert("proxy-libintl".into(), component("1", "LGPL-2.0-or-later"));
+        let notices = elsewhere.to_notices().expect("renders");
+        assert!(
+            notices.contains(
+                "| freetype | 2.13.3 | FTL | `wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib` (FreeType as the GStreamer framework ships it"
+            ),
+            "{notices}"
+        );
+        assert!(
+            notices.contains(
+                "| proxy-libintl | 1 | LGPL-2.0-or-later | `wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib` (proxy-libintl as the GStreamer framework ships it"
+            ),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("Portions of this software are copyright © 2024 The FreeType"),
+            "{notices}"
+        );
+        assert!(!notices.contains("copied by the dylib closure)\n| freetype"));
+        assert!(!spec().to_notices().expect("renders").contains("FreeType"));
     }
 
     #[test]
@@ -893,6 +1187,14 @@ mod tests {
         let spec_path = xtask.join("../build/bundle-spec.toml");
         let spec_text = fs::read_to_string(&spec_path).expect("build/bundle-spec.toml");
         let spec = BundleSpec::parse(&spec_text).expect("the committed spec validates");
+        for elsewhere in super::SHIPPED_ELSEWHERE {
+            assert!(
+                spec.components.libraries.contains_key(elsewhere.key),
+                "build/bundle-spec.toml has no [components.{}] row for {}",
+                elsewhere.key,
+                elsewhere.file
+            );
+        }
         let fixture = xtask.join("tests/fixtures/BUNDLE.toml");
         let expected = fs::read_to_string(&fixture).expect("tests/fixtures/BUNDLE.toml");
         assert_eq!(

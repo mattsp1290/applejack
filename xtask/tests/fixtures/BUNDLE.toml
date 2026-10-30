@@ -32,6 +32,10 @@ license = "LGPL-2.1-or-later"
 version = "2.14"
 license = "GPL-3.0-or-later"
 
+[components.freetype]
+version = "2.13.3"
+license = "FTL"
+
 [components.gmp]
 version = "6.3.0"
 license = "LGPL-3.0-or-later OR GPL-2.0-or-later"
@@ -59,6 +63,10 @@ license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
 [components.p11-kit]
 version = "0.25.5"
 license = "BSD-3-Clause"
+
+[components.proxy-libintl]
+version = "1"
+license = "LGPL-2.0-or-later"
 
 [components.sdl2]
 version = "2.32.8"

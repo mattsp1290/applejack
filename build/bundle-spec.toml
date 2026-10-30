@@ -54,13 +54,29 @@ osslsigncode = { version = "2.14", license = "GPL-3.0-or-later" }
 #   nettle:       libnettle.8.dylib, libhogweed.6.dylib (gnutls)
 #   gmp:          libgmp.10.dylib (gnutls, hogweed)
 #   sdl2:         libSDL2-2.0.0.dylib (Wine dlopens it: winebus)
-# Not rows, because the payload already ships them and dyld keeps one image
-# per install name: freetype (Wine dlopens libfreetype.6.dylib; wine/lib/
-# holds a link to the GStreamer framework's copy, under the `gstreamer` row),
-# gettext's libintl.8.dylib (gnutls and libidn2 reach the framework's copy
-# through a run path), and molten-vk (Wine's libMoltenVK.dylib is a link to
-# the pinned MoltenVK under vulkan/, the `moltenvk` row above, and so is the
-# framework's copy).
+# Not copied, because the payload already ships them and dyld keeps one image
+# per install name, but rows all the same, since each is a library under its
+# own license that Wine or a copied library binds to (SHIPPED_ELSEWHERE in
+# xtask/src/bundle_toml.rs renders their real location and credit, and the
+# closure's SONAME_POLICY names the same files):
+#   freetype:      the GStreamer framework's libfreetype.6.dylib is FreeType
+#                  2.13.3 (LC_ID_DYLIB current version 26.2.20), under the
+#                  FTL, whose binary redistribution requires the FreeType
+#                  credit the notices carry; FreeType's GPL-2.0-or-later
+#                  alternative is not elected. Wine dlopens it (win32u,
+#                  dwrite) through the link wine/lib/libfreetype.6.dylib.
+#   proxy-libintl: the framework's libintl.8.dylib is not gettext's; it is
+#                  proxy-libintl (frida/proxy-libintl, meson version 1,
+#                  darwin_versions 10/10.5, copyright 2008 Tor Lillqvist),
+#                  a stub whose dgettext returns the message untranslated,
+#                  under the GNU Library GPL 2 or later. gnutls and libidn2
+#                  bind to it through a run path and an allow_older_compat
+#                  policy row (they record compatibility version 13.0.0).
+# molten-vk is neither: Wine's libMoltenVK.dylib is a link to the pinned
+# MoltenVK under vulkan/, the `moltenvk` row above, and so is the framework's
+# copy.
+freetype = { version = "2.13.3", license = "FTL" }
+proxy-libintl = { version = "1", license = "LGPL-2.0-or-later" }
 gnutls = { version = "3.8.10", license = "LGPL-2.1-or-later" }
 p11-kit = { version = "0.25.5", license = "BSD-3-Clause" }
 libidn2 = { version = "2.3.8", license = "(GPL-2.0-or-later OR LGPL-3.0-or-later) AND Unicode-DFS-2016" }
