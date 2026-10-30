@@ -3,4 +3,6 @@
 //! the JSON-RPC method table served by `applejack serve --stdio`. This is the
 //! only crate that depends on `applejack-config`.
 
+pub mod config;
 pub mod host;
+pub mod rpc;

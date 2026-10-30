@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "engine.d3dmetal.import",
+  "params": {
+    "license_acknowledged": true,
+    "path": "/Volumes/Game Porting Toolkit"
+  }
+}

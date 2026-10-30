@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": 19,
+  "method": "runtime.steam.repair",
+  "params": {
+    "reinstall": false
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 26,
+  "method": "prefix.restore",
+  "params": {
+    "prefix": "220",
+    "timestamp": "20261028T120000Z"
+  }
+}

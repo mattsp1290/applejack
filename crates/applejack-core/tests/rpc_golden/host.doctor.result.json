@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "arch": "arm64",
+    "developer_id_identities": 1,
+    "free_disk_bytes": 1168608788480,
+    "macos_version": "26.0.1",
+    "rosetta_present": true,
+    "screen_recording": "unknown"
+  }
+}
