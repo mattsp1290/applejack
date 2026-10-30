@@ -90,12 +90,9 @@ final class ViewModelTests: XCTestCase {
         XCTAssertTrue(try requests(for: "steam.library")[0].contains("\"params\":{\"refresh\":true}"))
 
         await library.install(440)
-        guard case .ready(let snapshot) = library.installs[440] else {
-            return XCTFail("expected a finished install, got \(String(describing: library.installs[440]))")
-        }
-        XCTAssertTrue(snapshot.finished)
-        XCTAssertEqual(snapshot.jobId, JobId(rawValue: 8))
+        XCTAssertNil(library.installs[440], "a finished install hands the row back to the library's install state")
         XCTAssertTrue(try requests(for: "app.install")[0].contains("\"params\":{\"appid\":440,\"update\":false,\"verify\":false}"))
+        XCTAssertEqual(try requests(for: "steam.library").count, 2, "a finished install reloads the library")
         await app.shutdown()
     }
 
@@ -377,9 +374,42 @@ final class ViewModelTests: XCTestCase {
         try handle.close()
         try await waitUntil { logs.lines.count == 3 }
         XCTAssertEqual(logs.lines, ["first", "second", "third"])
+
+        // Leaving the view suspends the poll; coming back re-reads the file.
+        logs.suspend()
+        XCTAssertEqual(logs.tailedPath, log.path)
+        logs.resume()
+        try await waitUntil { logs.lines.count == 3 }
+        XCTAssertEqual(logs.lines, ["first", "second", "third"])
         logs.stop()
         XCTAssertTrue(logs.lines.isEmpty)
+        XCTAssertNil(logs.tailedPath)
         await app.shutdown()
+    }
+
+    func testLogTailerStartsOverAfterRotation() async throws {
+        // Lifted from the review of 747fac1 (probe P4), which read
+        // ["one", "two", "three", "", "new4"] from this sequence.
+        let log = FileManager.default.temporaryDirectory.appendingPathComponent("rotated-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        try Data("one\ntwo\nthree\n".utf8).write(to: log)
+        let stream = LogTailer.lines(at: log.path, interval: .milliseconds(20))
+        let collector = Task {
+            var lines: [String] = []
+            for await line in stream {
+                lines.append(line)
+            }
+            return lines
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        try FileManager.default.removeItem(at: log)
+        try Data("new1\n".utf8).write(to: log)
+        try await Task.sleep(for: .milliseconds(150))
+        try Data("new1\nnew2\nnew3\nnew4\n".utf8).write(to: log)
+        try await Task.sleep(for: .milliseconds(150))
+        collector.cancel()
+        let lines = await collector.value
+        XCTAssertEqual(lines, ["one", "two", "three", "new1", "new2", "new3", "new4"])
     }
 
     // MARK: - Controllers

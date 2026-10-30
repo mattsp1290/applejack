@@ -46,6 +46,10 @@ public struct LogsView: View {
                 model.follow(url.path)
             }
         }
-        .task { await model.load() }
+        .task {
+            model.resume()
+            await model.load()
+        }
+        .onDisappear { model.suspend() }
     }
 }

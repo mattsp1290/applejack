@@ -19,7 +19,13 @@ public final class LibraryViewModel {
         }
     }
 
+    /// `app.install` as a job; a finished one gives the row back to the
+    /// library's install state, reloaded.
     public func install(_ appid: UInt32) async {
         await app.runJob("app.install", params: AppInstallParams(appid: appid)) { installs[appid] = $0 }
+        if case .ready(let snapshot) = installs[appid], snapshot.finished {
+            installs[appid] = nil
+            await load()
+        }
     }
 }

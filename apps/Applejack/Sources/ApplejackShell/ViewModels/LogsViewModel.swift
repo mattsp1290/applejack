@@ -54,4 +54,17 @@ public final class LogsViewModel {
         tailedPath = nil
         lines = []
     }
+
+    /// Stops polling while the view is hidden; `tailedPath` stays so
+    /// `resume()` can pick the file up again.
+    public func suspend() {
+        tail?.cancel()
+        tail = nil
+    }
+
+    /// Follows `tailedPath` again, from the start, after `suspend()`.
+    public func resume() {
+        guard tail == nil, let path = tailedPath else { return }
+        follow(path)
+    }
 }

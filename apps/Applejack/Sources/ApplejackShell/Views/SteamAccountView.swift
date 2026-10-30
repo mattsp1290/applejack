@@ -9,7 +9,7 @@ public struct SteamAccountView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            FlowStateView(model.login, idle: "Not signed in.", retry: { Task { await model.startQrLogin() } }) { session in
+            FlowStateView(model.login, idle: "Sign-in state unknown. Sign in with QR to continue.", retry: { Task { await model.startQrLogin() } }) { session in
                 switch session.step {
                 case .qrReady(let payload):
                     Text("Scan with the Steam mobile app, then press Done.")

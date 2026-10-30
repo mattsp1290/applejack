@@ -14,6 +14,12 @@ public enum LogTailer {
             while !Task.isCancelled {
                 if let handle = FileHandle(forReadingAtPath: path) {
                     defer { try? handle.close() }
+                    // A file shorter than what was read was truncated or
+                    // replaced: start over instead of resuming mid-file.
+                    if let size = try? handle.seekToEnd(), size < offset {
+                        offset = 0
+                        partial.removeAll()
+                    }
                     if (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.readToEnd(), !data.isEmpty {
                         offset += UInt64(data.count)
                         partial.append(data)
