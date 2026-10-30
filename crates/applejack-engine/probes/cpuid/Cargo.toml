@@ -1,0 +1,21 @@
+# Standalone x86-64 probe, excluded from the workspace: it is built for
+# x86_64-apple-darwin by `cargo xtask engine-payload` and runs under Rosetta.
+[package]
+name = "cpuid-probe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "cpuid"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

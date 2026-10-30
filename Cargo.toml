@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*", "xtask"]
+# Probe crates build for other targets and are driven by `cargo xtask engine-payload`.
+exclude = ["crates/applejack-engine/probes/cpuid"]
 resolver = "3"
 
 [workspace.package]
@@ -25,6 +27,7 @@ tar = "0.4.46"
 security-framework = "3.7.0"
 tracing = "0.1.44"
 thiserror = "2.0.21"
+glob = "0.3.4"
 steamroom = "0.3.0"
 steamroom-client = "0.3.0"
 prost = "0.14"

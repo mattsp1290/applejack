@@ -1,0 +1,132 @@
+# Every input of the Rosetta engine payload build, pinned by HTTPS URL and
+# SHA-256. `cargo xtask engine-payload --fetch` downloads each `dest` under
+# build/work/, verifies it, and scans its listing against build/denylist.toml
+# before any script extracts it; `cargo xtask pins-verify` parses this file
+# offline. Hashes were computed from the downloaded files on the date in each
+# pin's `# verified:` line, which says what cross-checked that hash: an
+# upstream digest, or TOFU (trust on first use, no published digest to compare
+# with). `kind` is "source", "release-asset", or "toolchain" (a build input
+# that is never staged or shipped). Each `dest` is unique.
+#
+# GitHub `/archive/` tarballs (wine-msync, osslsigncode) are generated on
+# demand and their bytes are not guaranteed stable (the 2023 gzip change
+# altered them once). A change breaks `--fetch` with a hash mismatch and ships
+# nothing; `--fetch` re-verifies every present archive on each run. If it
+# happens, mirror the verified archive as a release asset under our control
+# and repoint the pin.
+
+# WineHQ stable 11.0 (ADR-0010, gate G4a Option A). The sha256 here matches the
+# tarball whose sha512 is listed in https://dl.winehq.org/wine/source/11.0/sha512sums.asc.
+# verified: upstream sha512sums.asc (the sha512 of the same bytes), 2026-10-28
+[[pin]]
+id = "wine"
+kind = "source"
+url = "https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz"
+sha256 = "c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701"
+version = "11.0"
+license = "LGPL-2.1-or-later"
+dest = "wine/wine-11.0.tar.xz"
+
+# marzent/wine-msync, newest commit on main (2024-08-13, "Add staging patch for
+# 9.15"). Gate G4b decides whether any of its patches applies to Wine 11.0.
+# verified: TOFU 2026-10-28 (GitHub /archive/ tarball, no published digest)
+[[pin]]
+id = "wine-msync"
+kind = "source"
+url = "https://github.com/marzent/wine-msync/archive/be7f3e2ff40670018cd7aa9042bad487fa7a83ec.tar.gz"
+sha256 = "ff0db97698b182a9a7dff1f03744097d47371f9d377e49b4847cbeeafcef8160"
+version = "be7f3e2ff40670018cd7aa9042bad487fa7a83ec"
+license = "LGPL-2.1-or-later"
+dest = "wine/wine-msync-be7f3e2.tar.gz"
+
+# DXMT v0.80, the last MIT release (later releases are LGPL-2.1). Archive layout:
+# v0.80/{x86_64-windows,i386-windows}/{d3d10core,d3d11,dxgi,winemetal}.dll,
+# v0.80/x86_64-windows/{nvapi64,nvngx}.dll, v0.80/x86_64-unix/winemetal.so.
+# verified: TOFU 2026-10-28 (release asset, no published digest)
+[[pin]]
+id = "dxmt"
+kind = "release-asset"
+url = "https://github.com/3Shain/dxmt/releases/download/v0.80/dxmt-v0.80-builtin.tar.gz"
+sha256 = "8f260e36b5739e68f3bad613381441385c4dc7b85b78ba8de653d5a6a264529d"
+version = "0.80"
+license = "MIT"
+dest = "dxmt/dxmt-v0.80-builtin.tar.gz"
+
+# vkd3d-proton v3.1 release build. Archive layout: vkd3d-proton-3.1/{x64,x86}/{d3d12,d3d12core}.dll.
+# verified: TOFU 2026-10-28 (release asset, no published digest)
+[[pin]]
+id = "vkd3d-proton"
+kind = "release-asset"
+url = "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v3.1/vkd3d-proton-3.1.tar.zst"
+sha256 = "b85ea8219b71093a3924913dd7aae6172333dc0c069983ed510816d67f02120b"
+version = "3.1"
+license = "LGPL-2.1-or-later"
+dest = "vkd3d/vkd3d-proton-3.1.tar.zst"
+
+# MoltenVK v1.4.2 macOS release (universal arm64+x86_64 dylib and xcframework).
+# verified: TOFU 2026-10-28 (release asset, no published digest)
+[[pin]]
+id = "moltenvk"
+kind = "release-asset"
+url = "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar"
+sha256 = "f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e"
+version = "1.4.2"
+license = "Apache-2.0"
+dest = "vulkan/MoltenVK-1.4.2-macos.tar"
+
+# Upstream GStreamer runtime package for macOS. Since 1.22 upstream ships one
+# universal (arm64 + x86_64) package; the x86_64 slices are what the payload uses.
+# The product archive also carries GPL and patent-restricted sub-packages
+# (codecs-gpl, codecs-gpl-restricted, codecs-restricted, net-restricted,
+# dvd-gpl, libav). build/gstreamer/fetch.sh stages only the allowlisted
+# LGPL/MIT/BSD/Apache sub-packages, which is what `license` describes; the
+# payload-scoped rules in build/denylist.toml reject the rest.
+# verified: TOFU 2026-10-28 (upstream publishes no digest for the macOS package)
+[[pin]]
+id = "gstreamer"
+kind = "release-asset"
+url = "https://gstreamer.freedesktop.org/data/pkg/osx/1.28.8/gstreamer-1.0-1.28.8-universal.pkg"
+sha256 = "d371ab04a7632713626836c2fc234e863cc98484c74c473eba99b0fbd9b3a3fe"
+version = "1.28.8"
+license = "LGPL-2.1-or-later"
+dest = "gstreamer/gstreamer-1.0-1.28.8-universal.pkg"
+
+# The matching devel package: headers and pkg-config files of the same
+# release. A build input only (kind "toolchain", like llvm-mingw): never
+# staged, never shipped. build/gstreamer/fetch.sh expands the devel
+# counterparts of the staged sub-packages under build/work/gstreamer/devel/,
+# where build/wine/build.sh points Wine's configure; without it configure
+# finds no GStreamer and builds a Wine without winegstreamer.
+# verified: TOFU 2026-10-29 (upstream publishes no digest for the macOS package)
+[[pin]]
+id = "gstreamer-devel"
+kind = "toolchain"
+url = "https://gstreamer.freedesktop.org/data/pkg/osx/1.28.8/gstreamer-1.0-devel-1.28.8-universal.pkg"
+sha256 = "e6d380bc17be7eccf13e0154567d4718fc9321da822408c7ca0cd808b3d4a3f7"
+version = "1.28.8"
+license = "LGPL-2.1-or-later"
+dest = "gstreamer/gstreamer-1.0-devel-1.28.8-universal.pkg"
+
+# osslsigncode 2.14 source (GitHub tag archive; the release has no separate
+# source tarball). Built as a host-arch tool for Authenticode verification.
+# verified: TOFU 2026-10-28 (GitHub /archive/ tarball, no published digest)
+[[pin]]
+id = "osslsigncode"
+kind = "source"
+url = "https://github.com/mtrojnar/osslsigncode/archive/refs/tags/2.14.tar.gz"
+sha256 = "0f033fd6069387d2e489fbd2187e62f624764eb8c2758ee94e3e793e5150b5c5"
+version = "2.14"
+license = "GPL-3.0-or-later"
+dest = "osslsigncode/osslsigncode-2.14.tar.gz"
+
+# llvm-mingw 20261020, macOS universal, UCRT. Provides i686- and
+# x86_64-w64-mingw32-clang for Wine's PE side and the probes.
+# verified: TOFU 2026-10-28 (release asset, no published digest)
+[[pin]]
+id = "llvm-mingw"
+kind = "toolchain"
+url = "https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-macos-universal.tar.xz"
+sha256 = "e9c13e4ede38e715003ffc674d4d00a1088df8235439d1f0c16188ff0704c17e"
+version = "20261020"
+license = "Apache-2.0 WITH LLVM-exception"
+dest = "toolchain/llvm-mingw-20261020-ucrt-macos-universal.tar.xz"

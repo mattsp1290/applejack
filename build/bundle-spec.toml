@@ -1,0 +1,71 @@
+# The typed spec `cargo xtask engine-payload --write-bundle-toml` renders into
+# the payload's BUNDLE.toml and THIRD_PARTY_NOTICES.md (build/assemble.sh runs
+# it). Same shape as BUNDLE.toml; the engine crate's reader parses the result.
+# Versions and licenses follow build/pins.toml; paths follow the layout
+# build/assemble.sh produces. The gate results (`wow64`, `sync_modes`,
+# `[d3dmetal]`) are hand-entered from docs/engines/payload-build.md.
+
+id = "rosetta-wine"
+# Bundle version: Wine version, then the bundle revision. Directory name under
+# engines/rosetta-wine/, so lowercase [0-9a-z._+-] starting with a digit.
+version = "11.0-1"
+arch = "x86_64"
+# MACOSX_DEPLOYMENT_TARGET in build/wine/build.sh.
+min_macos = "14.0"
+# Gate G4b: neither msync patch applies to wine-11.0, so esync is the default.
+sync_modes = ["esync", "none"]
+
+[wine]
+version = "11.0"
+source_url = "https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz"
+source_rev = "wine-11.0"
+loader = "wine/bin/wine"
+server = "wine/bin/wineserver"
+# Wine 10+ on Xcode 15.3+ needs no preloader; `preloader` stays absent.
+# configure --enable-archs=i386,x86_64 builds upstream's new WoW64. Gate G4e
+# confirms 32-bit code runs before this value is trusted.
+wow64 = "new"
+
+[components]
+dxmt = { version = "0.80", license = "MIT" }
+vkd3d_proton = { version = "3.1", license = "LGPL-2.1-or-later" }
+moltenvk = { version = "1.4.2", license = "Apache-2.0" }
+# kosmickrisp: no x86-64 build is pinned (plan 03 step 4); omitted.
+gstreamer = { version = "1.28.8", license = "LGPL-2.1-or-later" }
+osslsigncode = { version = "2.14", license = "GPL-3.0-or-later" }
+
+# Bundle-relative DLL paths per Windows architecture; the installer copies
+# each into the prefix and overrides its stem. winemetal.dll is DXMT's bridge
+# to wine/lib/wine/x86_64-unix/winemetal.so; nvapi64.dll and nvngx.dll are
+# optional and not shipped.
+[overrides.dxmt]
+x86_64 = [
+  "dxmt/x86_64-windows/d3d11.dll",
+  "dxmt/x86_64-windows/dxgi.dll",
+  "dxmt/x86_64-windows/d3d10core.dll",
+  "dxmt/x86_64-windows/winemetal.dll",
+]
+i386 = [
+  "dxmt/i386-windows/d3d11.dll",
+  "dxmt/i386-windows/dxgi.dll",
+  "dxmt/i386-windows/d3d10core.dll",
+  "dxmt/i386-windows/winemetal.dll",
+]
+
+[overrides.vkd3d]
+x86_64 = ["vkd3d/x64/d3d12.dll", "vkd3d/x64/d3d12core.dll"]
+i386 = ["vkd3d/x86/d3d12.dll", "vkd3d/x86/d3d12core.dll"]
+
+# Gate G4d (D3DMetal loads in this Wine build) has not run. Its presence
+# advertises the D3DMetal backend, so the table stays out until G4d passes:
+# [d3dmetal]
+# overlay_dir = "wine/lib/external"
+
+[probes]
+cpuid = "probes/cpuid"
+dx11_sample = "probes/dx11-sample.exe"
+xinput_check = "probes/xinput-check.exe"
+
+[registry]
+# dlls/winebus.sys/main.c, check_bus_option, at wine-11.0.
+hidraw_key = 'HKLM\System\CurrentControlSet\Services\WineBus\DisableHidraw'

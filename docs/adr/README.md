@@ -11,3 +11,4 @@ One record per key decision in the macOS Windows Steam runner plan.
 - [ADR-0007](ADR-0007.md) Synchronization mode comes from the bundle.
 - [ADR-0008](ADR-0008.md) Native ARM64 engine is a gated track, not a blocker.
 - [ADR-0009](ADR-0009.md) Rollback is a first-class engine and prefix operation.
+- [ADR-0010](ADR-0010.md) The Rosetta engine builds Wine from the WineHQ 11.0 stable release.

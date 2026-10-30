@@ -1,0 +1,178 @@
+# Paths that must never appear in an engine payload or in a fetched archive.
+# `cargo xtask engine-payload --fetch` scans every archive's listing before it
+# lands, `--check <payload>` scans the assembled tree, and `--check-listing`
+# scans a staged tree (the GStreamer stage). Rules with `scope = "payload"`
+# are skipped by the archive scan only. A pattern without `/` matches any
+# single path component; one with `/` matches a component-aligned suffix of
+# the path. See ADR-0004.
+
+[[deny]]
+pattern = "D3DMetal*"
+reason = "Apple D3DMetal is user-supplied under the per-user overlay only (ADR-0004)"
+
+[[deny]]
+pattern = "libd3dshared*"
+reason = "Apple D3DMetal companion library (ADR-0004)"
+
+[[deny]]
+pattern = "libmetalirconverter*"
+reason = "Apple Metal shader converter ships with D3DMetal and is not redistributable"
+
+[[deny]]
+pattern = "lib/external/**"
+reason = "the GPTK external directory holds Apple-licensed binaries; the overlay owns it"
+
+# GStreamer sub-packages that build/gstreamer/fetch.sh leaves out. The pinned
+# product archive legitimately contains them next to the LGPL set, so these
+# rules carry `scope = "payload"`: the fetch-time archive scan skips them and
+# the stage and payload scans enforce them.
+
+[[deny]]
+pattern = "libgstx264*"
+reason = "GStreamer codecs-gpl-restricted: x264 is GPL and patent-encumbered"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstx265*"
+reason = "GStreamer codecs-gpl-restricted: x265 is GPL and patent-encumbered"
+scope = "payload"
+
+[[deny]]
+pattern = "libx264.*"
+reason = "GStreamer codecs-gpl-restricted: x264 library"
+scope = "payload"
+
+[[deny]]
+pattern = "libx265.*"
+reason = "GStreamer codecs-gpl-restricted: x265 library"
+scope = "payload"
+
+[[deny]]
+pattern = "libgsta52dec*"
+reason = "GStreamer codecs-gpl: a52dec is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstdtsdec*"
+reason = "GStreamer codecs-gpl: dtsdec is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "liba52.*"
+reason = "GStreamer codecs-gpl: liba52 is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "libdca.*"
+reason = "GStreamer codecs-gpl: libdca is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstasf*"
+reason = "GStreamer codecs-restricted: ASF/WMV demuxer and muxer"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstmpegps*"
+reason = "GStreamer codecs-restricted: MPEG-PS demuxer and muxer"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstmpegts[dm]*"
+reason = "GStreamer codecs-restricted: MPEG-TS demuxer and muxer (libgstmpegts-1.0 and mpegtslive stay)"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstrealmedia*"
+reason = "GStreamer codecs-restricted: RealMedia"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstdvdlpcmdec*"
+reason = "GStreamer codecs-restricted: DVD LPCM"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstdvdsub*"
+reason = "GStreamer codecs-restricted: DVD subtitles"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstvoaacenc*"
+reason = "GStreamer codecs-restricted: VisualOn AAC encoder"
+scope = "payload"
+
+[[deny]]
+pattern = "libvo-aacenc.*"
+reason = "GStreamer codecs-restricted: VisualOn AAC library"
+scope = "payload"
+
+[[deny]]
+pattern = "libvvdec.*"
+reason = "GStreamer codecs-restricted: VVC decoder"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstrtmp.dylib"
+reason = "GStreamer net-restricted: librtmp is GPL (the Rust rtmp2 plugin in net stays)"
+scope = "payload"
+
+[[deny]]
+pattern = "librtmp.*"
+reason = "GStreamer net-restricted: librtmp is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstdvdread*"
+reason = "GStreamer dvd-gpl: dvdread is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstresindvd*"
+reason = "GStreamer dvd-gpl: resindvd is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "libdvdnav.*"
+reason = "GStreamer dvd-gpl: libdvdnav is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "libdvdread.*"
+reason = "GStreamer dvd-gpl: libdvdread is GPL"
+scope = "payload"
+
+[[deny]]
+pattern = "libgstlibav*"
+reason = "GStreamer libav: ffmpeg duplicates the codec set with the same patent exposure"
+scope = "payload"
+
+[[deny]]
+pattern = "libavcodec.*"
+reason = "GStreamer libav: ffmpeg library"
+scope = "payload"
+
+[[deny]]
+pattern = "libavformat.*"
+reason = "GStreamer libav: ffmpeg library"
+scope = "payload"
+
+[[deny]]
+pattern = "libavfilter.*"
+reason = "GStreamer libav: ffmpeg library"
+scope = "payload"
+
+[[deny]]
+pattern = "libavutil.*"
+reason = "GStreamer libav: ffmpeg library"
+scope = "payload"
+
+[[deny]]
+pattern = "libswscale.*"
+reason = "GStreamer libav: ffmpeg library"
+scope = "payload"
+
+[[deny]]
+pattern = "libswresample.*"
+reason = "GStreamer libav: ffmpeg library"
+scope = "payload"
