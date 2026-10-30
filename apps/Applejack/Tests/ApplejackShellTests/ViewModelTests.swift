@@ -305,7 +305,7 @@ final class ViewModelTests: XCTestCase {
         let model = D3DMetalImportViewModel(app: app)
         await model.requestImport()
         XCTAssertFalse(model.showingLicense, "no volume, nothing to acknowledge")
-        model.volumePath = "/Volumes/Game Porting Toolkit"
+        model.chooseVolume("/Volumes/Game Porting Toolkit")
         await model.requestImport()
         XCTAssertTrue(model.showingLicense)
         XCTAssertEqual(model.importState, .idle)
@@ -321,6 +321,36 @@ final class ViewModelTests: XCTestCase {
         let imports = try requests(for: "engine.d3dmetal.import")
         XCTAssertEqual(imports.count, 1)
         XCTAssertTrue(imports[0].contains("\"params\":{\"license_acknowledged\":true,\"path\":\"/Volumes/Game Porting Toolkit\"}"))
+        XCTAssertEqual(model.licenseURL?.path, "/Volumes/Game Porting Toolkit/License.pdf")
+        await app.shutdown()
+    }
+
+    func testEachD3DMetalImportNeedsItsOwnAcknowledgement() async throws {
+        let app = makeApp()
+        let model = D3DMetalImportViewModel(app: app)
+        model.chooseVolume("/Volumes/Game Porting Toolkit")
+        await model.requestImport()
+        await model.acknowledgeLicense()
+        XCTAssertEqual(try requests(for: "engine.d3dmetal.import").count, 1)
+        XCTAssertFalse(model.licenseAcknowledged, "the import consumed the acknowledgement")
+
+        // A second import asks again and sends nothing until accepted.
+        await model.requestImport()
+        XCTAssertTrue(model.showingLicense)
+        _ = await app.run { try await $0.hostDoctor() }
+        XCTAssertEqual(try requests(for: "engine.d3dmetal.import").count, 1)
+
+        // Choosing another volume drops an acknowledgement given for the last one.
+        model.declineLicense()
+        model.licenseAcknowledged = true
+        model.chooseVolume("/Volumes/Game Porting Toolkit")
+        XCTAssertTrue(model.licenseAcknowledged, "the same volume keeps it")
+        model.chooseVolume("/Volumes/GPTK 4")
+        XCTAssertFalse(model.licenseAcknowledged)
+        await model.requestImport()
+        XCTAssertTrue(model.showingLicense)
+        _ = await app.run { try await $0.hostDoctor() }
+        XCTAssertEqual(try requests(for: "engine.d3dmetal.import").count, 1)
         await app.shutdown()
     }
 
