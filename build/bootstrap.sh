@@ -68,7 +68,7 @@ else
   gap "llvm-mingw $LLVM_MINGW_VERSION under $TOOLCHAIN/" "sh build/bootstrap.sh (extracts the llvm-mingw pin)"
 fi
 for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
-  if command -v "$cc" >/dev/null 2>&1; then ok "$cc on PATH (Homebrew mingw-w64, fallback only)"; else echo "info:    $cc not on PATH (optional fallback)"; fi
+  if command -v "$cc" >/dev/null 2>&1; then ok "$cc on PATH (mingw-w64, probe fallback only)"; else echo "info:    $cc not on PATH (optional fallback)"; fi
 done
 
 echo "== x86-64 Homebrew (Wine build dependencies)"
@@ -83,6 +83,13 @@ if [ -x "$X86_BREW" ] && X86_PREFIX=$(arch -x86_64 "$X86_BREW" --prefix 2>/dev/n
       gap "brew (x86-64) $dep" "arch -x86_64 $X86_BREW install $dep"
     fi
   done
+  # build/wine/build.sh puts the x86-64 Homebrew bin ahead of llvm-mingw, so a
+  # mingw-w64 there would take over the prefixed tools make looks up by name.
+  if [ -x "$X86_PREFIX/bin/x86_64-w64-mingw32-gcc" ]; then
+    gap "an x86-64 Homebrew without mingw-w64 ($X86_PREFIX/bin/x86_64-w64-mingw32-gcc would shadow llvm-mingw's)" "arch -x86_64 $X86_BREW uninstall mingw-w64"
+  else
+    ok "no mingw-w64 in the x86-64 Homebrew"
+  fi
   # The formula versions become payload inputs (their dylibs are copied in
   # step 7), so the record travels with the build output.
   mkdir -p "$WORK"
