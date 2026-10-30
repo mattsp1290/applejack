@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for Applejack.app and its embedded applejack-core. The
+  hardened runtime is a codesign option (`--options runtime`, work package
+  6d), not an entitlement. The shell neither JITs nor loads foreign code, so
+  no code-signing exception entitlement (allow-unsigned-executable-memory,
+  disable-library-validation, allow-dyld-environment-variables,
+  disable-executable-page-protection, allow-jit) may ever be added here;
+  those belong to the engine's loader set in BUNDLE.toml.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

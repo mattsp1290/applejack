@@ -8,13 +8,14 @@ use std::process::{Command, ExitCode};
 
 use applejack_manifest::Manifest;
 
+mod app_bundle;
 mod bundle_toml;
 mod denylist;
 mod engine_payload;
 mod pins;
 mod self_contained;
 
-const USAGE: &str = "usage: cargo xtask <check|manifest-verify|pins-verify|engine-payload <mode>>";
+const USAGE: &str = "usage: cargo xtask <check|manifest-verify|pins-verify|engine-payload <mode>|app-bundle [--debug]>";
 
 /// One quality-gate step. Sibling work packages append rows to `CHECK_STEPS`.
 struct Step {
@@ -106,6 +107,11 @@ const CHECK_STEPS: &[Step] = &[
             }
         }),
     },
+    Step {
+        name: "app-bundle",
+        command: |root| cargo(root, ["xtask", "app-bundle", "--debug"]),
+        precondition: None,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -116,6 +122,9 @@ fn main() -> ExitCode {
         [command] if command == "pins-verify" => engine_payload::pins_verify(&workspace_root()),
         [command, rest @ ..] if command == "engine-payload" => {
             engine_payload::run(&workspace_root(), rest)
+        }
+        [command, rest @ ..] if command == "app-bundle" => {
+            app_bundle::run_command(&workspace_root(), rest)
         }
         _ => {
             eprintln!("{USAGE}");

@@ -16,6 +16,14 @@
 #   FAKE_CORE_IGNORE_EOF=1     keep running after stdin closes (SIGTERM ends it)
 #   FAKE_CORE_MUTE=1           read every request and answer none of them
 #   FAKE_CORE_PID_FILE=<path>  write the fake's pid there at startup
+#   FAKE_CORE_IMPLEMENTED=1    answer the view-model methods (engine.*,
+#                              steam.*, config.*, session.list, app.install)
+#                              with canned results shaped like the Rust types;
+#                              engine.install and app.install run as jobs that
+#                              emit two job.progress then job.done
+#   FAKE_CORE_JOB_OUTCOME=failed  the jobs end with job.failed (code 1004)
+#   FAKE_CORE_REQUEST_LOG=<path>  append every request line to that file
+#   FAKE_CORE_SESSION_LOG=<path>  the log_path session.list reports
 set -u
 
 count=0
@@ -56,7 +64,81 @@ emit() {
   count=$((count + 1))
 }
 
+# job <id>: after the response, the notification sequence for one job.
+job() {
+  (
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":'"$1"',"phase":"download","done_bytes":1024,"total_bytes":4096,"message":""}}'
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":'"$1"',"phase":"extract","done_bytes":null,"total_bytes":null,"message":"unpacking"}}'
+    sleep 0.05
+    if [ "${FAKE_CORE_JOB_OUTCOME:-done}" = "failed" ]; then
+      write '{"jsonrpc":"2.0","method":"job.failed","params":{"job_id":'"$1"',"code":1004,"message":"checksum mismatch"}}'
+    else
+      write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":'"$1"'}}'
+    fi
+  ) &
+}
+
+# implemented <id> <method> <line>: the canned answer for a view-model
+# method, or 1 when the method has none.
+implemented() {
+  case "$2" in
+    engine.list)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"engines":[{"engine_id":"rosetta-wine","version":"10.0.1","installed":true,"active":true},{"engine_id":"rosetta-wine","version":"10.0.0","installed":true,"active":false}]}}'
+      ;;
+    engine.install)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":7}}'
+      job 7
+      ;;
+    app.install)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":8}}'
+      job 8
+      ;;
+    engine.use|engine.d3dmetal.import|steam.logout|config.set)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{}}'
+      ;;
+    engine.doctor)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"runnable":true,"findings":[{"severity":"info","message":"Rosetta present"},{"severity":"warning","message":"fake engine"}]}}'
+      ;;
+    engine.probe_cpuid)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"advertise_avx":true,"avx":true,"avx2":false,"osxsave":true}}'
+      ;;
+    steam.login.start)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"login-session-fake","step":{"kind":"qr_ready","payload":"https://s.team/q/1/fake-challenge"}}}'
+      ;;
+    steam.login.complete)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"login-session-fake","step":{"kind":"done","account_name":"fake-account"}}}'
+      ;;
+    steam.library)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"apps":[{"appid":220,"name":"Half-Life 2","drm":"steam","install_state":"installed"},{"appid":440,"name":"Team Fortress 2","drm":"unknown","install_state":"not_installed"}]}}'
+      ;;
+    config.get)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"engine_id":"rosetta-wine","engine_version":"10.0.1","graphics_backend":"dxmt","sync_mode":"esync","hidraw_enabled":false,"steam_input":null,"steam_overlay":true,"rosetta_advertise_avx":null,"extra_env":{"DXMT_LOG":"1"},"launch_mode":"client","launch_exe_override":null,"launch_args_override":null,"direct_verified_at":null,"isolated_prefix":false,"dx12_expectation":null,"notes":"fake"}}'
+      ;;
+    config.import)
+      case "$3" in
+        *'"accept_launch_overrides":true'*)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":true,"accepted":[{"field":"graphics_backend","value":"dxmt"},{"field":"launch_exe_override","value":"bin/game.exe"}],"rejected":[{"field":"extra_env.VK_ICD_FILENAMES","value":"/tmp/x.json","reason":"path outside the engine roots"}],"confirmations":[{"field":"launch_exe_override","value":"bin/game.exe"}]}}'
+          ;;
+        *)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":false,"accepted":[{"field":"graphics_backend","value":"dxmt"}],"rejected":[{"field":"extra_env.VK_ICD_FILENAMES","value":"/tmp/x.json","reason":"path outside the engine roots"}],"confirmations":[{"field":"launch_exe_override","value":"bin/game.exe"}]}}'
+          ;;
+      esac
+      ;;
+    session.list)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"sessions":[{"id":1,"appid":220,"started_at":"2026-10-30T00:00:00Z","ended_at":null,"engine_id":"rosetta-wine","engine_version":"10.0.1","exit_code":null,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}]}}'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 while IFS= read -r line; do
+  if [ -n "${FAKE_CORE_REQUEST_LOG:-}" ]; then
+    printf '%s\n' "$line" >> "$FAKE_CORE_REQUEST_LOG"
+  fi
   if [ "${FAKE_CORE_MUTE:-0}" = "1" ]; then
     continue
   fi
@@ -104,7 +186,10 @@ while IFS= read -r line; do
       fi
       ;;
     *)
-      emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":1002,"message":"not implemented","data":{"method":"'"$method"'"}}}'
+      if [ "${FAKE_CORE_IMPLEMENTED:-0}" = "1" ] && implemented "$id" "$method" "$line"; then
+        continue
+      fi
+      emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":1002,"message":"`'"$method"'` is pending (fake core)","data":{"method":"'"$method"'"}}}'
       ;;
   esac
 done

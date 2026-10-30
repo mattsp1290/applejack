@@ -296,6 +296,64 @@ final class CoreClientTests: XCTestCase {
         await client.shutdown()
     }
 
+    func testJobNotificationsReachTheirHandleOnly() async throws {
+        let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1"])
+        let events = await client.events()
+        async let first = client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        async let second = client.startJob("app.install", params: AppInstallParams(appid: 220))
+        let (engine, app) = try await (first, second)
+        XCTAssertEqual(engine.jobId, JobId(rawValue: 7))
+        XCTAssertEqual(app.jobId, JobId(rawValue: 8))
+
+        var engineEvents: [JobEvent] = []
+        for try await event in engine.events {
+            engineEvents.append(event)
+        }
+        XCTAssertEqual(engineEvents.count, 3)
+        XCTAssertTrue(engineEvents.allSatisfy { $0.jobId == engine.jobId })
+        XCTAssertEqual(engineEvents.last, .done(JobDone(jobId: engine.jobId)))
+        var appEvents: [JobEvent] = []
+        for try await event in app.events {
+            appEvents.append(event)
+        }
+        XCTAssertEqual(appEvents.map(\.jobId), Array(repeating: app.jobId, count: 3))
+
+        // The unfiltered stream saw all six, interleaved or not.
+        var all: [CoreEvent] = []
+        for await event in events {
+            all.append(event)
+            if all.count == 6 { break }
+        }
+        XCTAssertEqual(all.filter { if case .job = $0 { true } else { false } }.count, 6)
+        await client.shutdown()
+    }
+
+    func testJobStreamThrowsWhenTheCoreExits() async throws {
+        // One answer (hello), then the job start; the next request kills the fake.
+        let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1", "FAKE_CORE_CRASH_AFTER": "2", "FAKE_CORE_JOB_OUTCOME": "never"])
+        let handle = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        await assertCoreExited(client)
+        do {
+            for try await _ in handle.events {}
+            XCTFail("the job stream must end with the exit")
+        } catch CoreClientError.coreExited(let status) {
+            XCTAssertEqual(status, 1)
+        }
+        await client.shutdown()
+    }
+
+    func testEventsStreamEndsOnShutdown() async throws {
+        let client = makeClient()
+        _ = try await client.hello()
+        let events = await client.events()
+        await client.shutdown()
+        var count = 0
+        for await _ in events {
+            count += 1
+        }
+        XCTAssertEqual(count, 0)
+    }
+
     /// The process's `ps` state, or `nil` once it is gone. A zombie answers
     /// `kill(pid, 0)` and shows as `Z`, so the state is what the tests check.
     private func processState(_ pid: Int32) -> String? {

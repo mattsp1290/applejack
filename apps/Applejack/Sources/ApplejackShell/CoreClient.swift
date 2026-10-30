@@ -24,6 +24,46 @@ public enum CoreClientError: Error, Equatable, Sendable {
     case shutDown
 }
 
+/// One `job.*` notification, decoded into the `RpcTypes` mirrors.
+public enum JobEvent: Equatable, Sendable {
+    case progress(JobProgress)
+    case done(JobDone)
+    case failed(JobFailed)
+
+    public var jobId: JobId {
+        switch self {
+        case .progress(let progress): progress.jobId
+        case .done(let done): done.jobId
+        case .failed(let failed): failed.jobId
+        }
+    }
+
+    /// `job.done` and `job.failed` end a job's stream.
+    public var isTerminal: Bool {
+        switch self {
+        case .progress: false
+        case .done, .failed: true
+        }
+    }
+}
+
+/// What `CoreClient.events()` delivers: every job notification the core
+/// sends, and every exit the client observes under its restart policy.
+public enum CoreEvent: Equatable, Sendable {
+    case job(JobEvent)
+    case exited(Int32)
+}
+
+/// A started job and the stream of its own notifications. The stream ends
+/// after `job.done` or `job.failed`, and throws `coreExited` or `shutDown`
+/// when the core goes away before either arrives.
+public struct JobHandle: Sendable {
+    public let started: JobStarted
+    public let events: AsyncThrowingStream<JobEvent, any Error>
+
+    public var jobId: JobId { started.jobId }
+}
+
 /// Drives `applejack serve --stdio`: newline-delimited JSON-RPC 2.0, requests
 /// matched to responses by id, one shared `hello` per spawn, and at most
 /// `maxRestarts` respawns after an unexpected exit.
@@ -88,6 +128,11 @@ public actor CoreClient {
     private var launched = false
     private var shuttingDown = false
     private var fatal: CoreClientError?
+    /// Live `events()` streams and the per-job subscriptions behind
+    /// `startJob`, by ticket. Each yields every `CoreEvent`; a job handle
+    /// filters its own id so a notification is never lost to another job.
+    private var subscribers: [Int: AsyncStream<CoreEvent>.Continuation] = [:]
+    private var nextSubscriber = 0
 
     private struct StdinWriter {
         let handle: FileHandle
@@ -140,11 +185,115 @@ public actor CoreClient {
         return try await send(method, params: params)
     }
 
+    /// Every job notification and every observed core exit from now on. The
+    /// subscription is registered before this returns, so an event the core
+    /// sends after the call cannot be missed. The stream ends on `shutdown()`.
+    public func events() -> AsyncStream<CoreEvent> {
+        let (stream, continuation) = AsyncStream<CoreEvent>.makeStream()
+        let ticket = addSubscriber(continuation)
+        continuation.onTermination = { [weak self] _ in
+            guard let self else { return }
+            Task { await self.removeSubscriber(ticket) }
+        }
+        return stream
+    }
+
+    /// Sends a request whose result is `JobStarted` and returns the stream of
+    /// that job's notifications. The subscription is registered before the
+    /// request is written, so a `job.progress` the core emits right after
+    /// answering is delivered even if it beats the response on the wire.
+    public func startJob<Params: Encodable & Sendable>(_ method: String, params: Params) async throws -> JobHandle {
+        _ = try await ensureRunning()
+        let (all, allContinuation) = AsyncStream<CoreEvent>.makeStream()
+        let ticket = addSubscriber(allContinuation)
+        let started: JobStarted
+        do {
+            started = try await send(method, params: params)
+        } catch {
+            removeSubscriber(ticket)
+            throw error
+        }
+        let jobId = started.jobId
+        let (events, eventsContinuation) = AsyncThrowingStream<JobEvent, any Error>.makeStream()
+        let forwarder = Task {
+            for await event in all {
+                switch event {
+                case .job(let job) where job.jobId == jobId:
+                    eventsContinuation.yield(job)
+                    if job.isTerminal {
+                        eventsContinuation.finish()
+                        return
+                    }
+                case .job:
+                    continue
+                case .exited(let status):
+                    eventsContinuation.finish(throwing: CoreClientError.coreExited(status))
+                    return
+                }
+            }
+            // The subscription ended without a terminal event: `shutdown()`.
+            eventsContinuation.finish(throwing: CoreClientError.shutDown)
+        }
+        eventsContinuation.onTermination = { [weak self] _ in
+            forwarder.cancel()
+            guard let self else { return }
+            Task { await self.removeSubscriber(ticket) }
+        }
+        return JobHandle(started: started, events: events)
+    }
+
     /// Closes the core's stdin, which ends its loop with exit 0, and
     /// terminates it if it is still running after `terminateGrace`.
     public func shutdown() {
         shuttingDown = true
         tearDown(failing: .shutDown)
+        let open = subscribers
+        subscribers = [:]
+        for continuation in open.values {
+            continuation.finish()
+        }
+    }
+
+    // MARK: - Events
+
+    private func addSubscriber(_ continuation: AsyncStream<CoreEvent>.Continuation) -> Int {
+        let ticket = nextSubscriber
+        nextSubscriber += 1
+        subscribers[ticket] = continuation
+        return ticket
+    }
+
+    private func removeSubscriber(_ ticket: Int) {
+        subscribers.removeValue(forKey: ticket)?.finish()
+    }
+
+    private func broadcast(_ event: CoreEvent) {
+        for continuation in subscribers.values {
+            continuation.yield(event)
+        }
+    }
+
+    private func deliverNotification(method: String, line: Data) {
+        struct Envelope<Params: Decodable>: Decodable {
+            var params: Params
+        }
+        func decode<Params: Decodable>(_: Params.Type) -> Params? {
+            (try? RpcCoding.decoder().decode(Envelope<Params>.self, from: line))?.params
+        }
+        let event: JobEvent?
+        switch method {
+        case JobProgress.method: event = decode(JobProgress.self).map(JobEvent.progress)
+        case JobDone.method: event = decode(JobDone.self).map(JobEvent.done)
+        case JobFailed.method: event = decode(JobFailed.self).map(JobEvent.failed)
+        default:
+            CoreClient.log("dropped notification `\(method)` that no view handles")
+            return
+        }
+        guard let event else {
+            CoreClient.log("dropped `\(method)` notification whose params do not decode")
+            return
+        }
+        broadcast(.job(event))
     }
 
     deinit {
@@ -347,8 +496,10 @@ public actor CoreClient {
             CoreClient.log("dropped \(line.count) bytes that are not a JSON message")
             return
         }
-        // A notification; no caller routes them until a job method lands.
-        if envelope.method != nil { return }
+        if let method = envelope.method {
+            deliverNotification(method: method, line: line)
+            return
+        }
         guard case .number(let id)? = envelope.id else {
             // The core could not read the id of some request line. The call
             // that sent it keeps waiting, because nothing says which one.
@@ -377,6 +528,9 @@ public actor CoreClient {
         helloResult = nil
         buffer = []
         failPending(with: shuttingDown ? .shutDown : .coreExited(status))
+        if !shuttingDown {
+            broadcast(.exited(status))
+        }
     }
 
     /// Drops the current process and fails every in-flight request. Closing
