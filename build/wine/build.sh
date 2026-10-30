@@ -72,7 +72,13 @@ HOST_PKG_CONFIG=$(command -v pkg-config || command -v pkgconf || true)
 # cargo, so pin_field and payload_dir cannot be called after it.
 # Homebrew's bison and flex are keg-only. Apple's /usr/bin/bison is 2.3 and
 # wine-11.0's configure refuses anything older than 3.0.
-export PATH="${MINGW_BIN:+$MINGW_BIN:}$BREW_PREFIX/opt/bison/bin:$BREW_PREFIX/opt/flex/bin:$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# llvm-mingw goes last: its bin/ also carries an unprefixed clang, clang++,
+# and ld.lld that know nothing of the macOS SDK ("ld: library 'System' not
+# found"). configure only needs the prefixed <cpu>-w64-mingw32-clang wrappers
+# from it (--with-mingw=llvm-mingw), and the host side builds with HOST_CC.
+export PATH="$BREW_PREFIX/opt/bison/bin:$BREW_PREFIX/opt/flex/bin:$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin${MINGW_BIN:+:$MINGW_BIN}"
+HOST_CC=/usr/bin/clang
+HOST_CXX=/usr/bin/clang++
 BISON=$(command -v bison || true)
 FLEX=$(command -v flex || true)
 [ -n "$BISON" ] || fail "bison (sh build/bootstrap.sh --install-brew-deps)" bootstrap
@@ -93,6 +99,20 @@ export LDFLAGS="-L$BREW_PREFIX/lib"
 export PKG_CONFIG_PATH="$BREW_PREFIX/lib/pkgconfig:$BREW_PREFIX/opt/openssl/lib/pkgconfig"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 JOBS=${WINE_JOBS:-$(sysctl -n hw.ncpu)}
+
+# The same conftest configure starts with, under the PATH and flags above, so
+# a compiler that cannot link an x86-64 host executable is named here instead
+# of as "C compiler cannot create executables".
+conftest_dir="$WORK/wine/conftest"
+mkdir -p "$conftest_dir"
+printf 'int main(void) { return 0; }\n' >"$conftest_dir/host.c"
+if arch -x86_64 "$HOST_CC" $CPPFLAGS $LDFLAGS "$conftest_dir/host.c" -o "$conftest_dir/host" >"$conftest_dir/host.log" 2>&1 \
+  && arch -x86_64 "$conftest_dir/host"; then
+  echo "host cc: $HOST_CC links and runs an x86-64 executable ($("$HOST_CC" --version | head -1))"
+  rm -rf "$conftest_dir"
+else
+  fail "host C compiler: arch -x86_64 $HOST_CC $CPPFLAGS $LDFLAGS cannot build and run a program; see $conftest_dir/host.log"
+fi
 
 # Failing the conftest here names the fix instead of configure's "Your bison
 # version is too old".
@@ -282,7 +302,7 @@ if grep -q 'AC_ARG_WITH(metal' "$WINE_SRC/configure.ac"; then
 fi
 
 if [ "$PREFLIGHT" = 1 ]; then
-  echo "preflight: configure would run as: arch -x86_64 $WINE_SRC/configure $* CC=clang CXX=clang++ BISON=${BISON:-bison} FLEX=${FLEX:-flex} GSTREAMER_CFLAGS='$GSTREAMER_CFLAGS' GSTREAMER_LIBS='$GSTREAMER_LIBS'"
+  echo "preflight: configure would run as: arch -x86_64 $WINE_SRC/configure $* CC=$HOST_CC CXX=$HOST_CXX BISON=${BISON:-bison} FLEX=${FLEX:-flex} GSTREAMER_CFLAGS='$GSTREAMER_CFLAGS' GSTREAMER_LIBS='$GSTREAMER_LIBS'"
   if [ "$GAPS" -gt 0 ]; then
     if [ "$GAPS" -eq "$BOOTSTRAP_GAPS" ]; then
       echo "preflight: $GAPS prerequisite(s) missing, all installed by sh build/bootstrap.sh; stopping before configure (exit 3)"
@@ -306,7 +326,7 @@ logged() {
 mkdir -p "$BUILD"
 : >"$LOG"
 echo "configure: $* (log: $LOG)"
-logged "$WINE_SRC/configure" "$@" CC=clang CXX=clang++ BISON="$BISON" FLEX="$FLEX" GSTREAMER_CFLAGS="$GSTREAMER_CFLAGS" GSTREAMER_LIBS="$GSTREAMER_LIBS"
+logged "$WINE_SRC/configure" "$@" CC="$HOST_CC" CXX="$HOST_CXX" BISON="$BISON" FLEX="$FLEX" GSTREAMER_CFLAGS="$GSTREAMER_CFLAGS" GSTREAMER_LIBS="$GSTREAMER_LIBS"
 logged make -j"$JOBS"
 # The stage is replaced only after make succeeded, so a failed rerun keeps the last good one.
 rm -rf "$STAGE"

@@ -115,7 +115,8 @@ Environment knobs:
 5. `sh build/wine/build.sh` — tool checks, the bison conftest, the pkg-config report,
    gate G4b (below), project patches from `build/wine/patches/`, then
    `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests`
-   with `CC=clang`, `BISON=`, `FLEX=`, `GSTREAMER_CFLAGS=`,
+   with `CC=/usr/bin/clang` (Apple's; llvm-mingw's unprefixed `clang` sits last
+   on PATH and cannot link against the macOS SDK), `BISON=`, `FLEX=`, `GSTREAMER_CFLAGS=`,
    `GSTREAMER_LIBS=`, `make`, `make install-lib` into
    `build/work/wine/stage/`. Hours. GStreamer reaches `configure` only
    through those two precious variables, computed from the devel tree alone
