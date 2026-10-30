@@ -108,8 +108,12 @@ Environment knobs:
    no `mpeg2dec` or `faad`). Games with such cutscenes show a black or
    skipped video until a codec decision (an ADR) adds `libav`. For the same
    reason `build/wine/build.sh` configures `--without-ffmpeg`: with the x86-64
-   Homebrew ffmpeg present, `winedmo.so` links it by absolute path, which
-   step 9 rejects; a pinned ffmpeg in the payload is that ADR's call. Bink and
+   Homebrew ffmpeg present, `winedmo.so` links it by absolute path, and
+   `libavcodec`, `libavformat`, and `libavutil` are payload denylist rules
+   (`build/denylist.toml`), so step 9 would reject the closure that step 7
+   copies in; a pinned ffmpeg in the payload is that ADR's call. Without
+   `winedmo`, `mfsrcsnk` falls back to the GStreamer byte-stream handler for
+   every container. Bink and
    Smacker are decoded by the games themselves and are unaffected. The
    staged `codecs` set also carries `libgstopenh264`, built from source
    (BSD-2-Clause); Cisco's H.264 patent coverage applies to Cisco's own
@@ -178,7 +182,8 @@ Environment knobs:
    packages the report misses), and 1 for anything else (Rosetta, the x86-64
    Homebrew, the msync patch set, the GStreamer stage or devel tree, a
    project patch that does not apply, a host compiler that cannot link, a
-   prefixed mingw tool shadowed on PATH), so CI can run it before bootstrap and
+   prefixed mingw tool shadowed on PATH or missing from the extracted
+   llvm-mingw), so CI can run it before bootstrap and
    still catch a recipe defect.
 6. `sh build/osslsigncode/build.sh` — the host-arch Authenticode tool for
    `probes/`, built with `-DOPENSSL_USE_STATIC_LIBS=ON` so Homebrew's

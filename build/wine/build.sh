@@ -95,7 +95,7 @@ if [ -n "$MINGW_BIN" ]; then
       mingw_tools=$((mingw_tools + 1))
     done
   done
-  echo "mingw: $mingw_tools prefixed tools resolve to $MINGW_BIN"
+  echo "mingw: $mingw_tools of 22 prefixed tools resolve to $MINGW_BIN"
 fi
 BISON=$(command -v bison || true)
 FLEX=$(command -v flex || true)
