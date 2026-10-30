@@ -13,8 +13,23 @@ bundle spec; edit `build/bundle-spec.toml`, not this file.
 | MoltenVK | 1.4.2 | Apache-2.0 | `vulkan/` |
 | GStreamer | 1.28.8 | LGPL-2.1-or-later | `wine/lib/GStreamer.framework` |
 | osslsigncode | 2.14 | GPL-3.0-or-later | `probes/osslsigncode` |
+| freetype | 2.13.3 | FTL | `wine/lib/` (x86-64 Homebrew formula `freetype`, copied by the dylib closure) |
+| gettext | 0.26 | LGPL-2.1-or-later | `wine/lib/` (x86-64 Homebrew formula `gettext`, copied by the dylib closure) |
+| gmp | 6.3.0 | LGPL-3.0-or-later OR GPL-2.0-or-later | `wine/lib/` (x86-64 Homebrew formula `gmp`, copied by the dylib closure) |
+| gnutls | 3.8.10 | LGPL-2.1-or-later | `wine/lib/` (x86-64 Homebrew formula `gnutls`, copied by the dylib closure) |
+| libidn2 | 2.3.8 | (GPL-2.0-or-later OR LGPL-3.0-or-later) AND Unicode-DFS-2016 | `wine/lib/` (x86-64 Homebrew formula `libidn2`, copied by the dylib closure) |
+| libpng | 1.6.50 | libpng-2.0 | `wine/lib/` (x86-64 Homebrew formula `libpng`, copied by the dylib closure) |
+| libtasn1 | 4.20.0 | LGPL-2.1-or-later | `wine/lib/` (x86-64 Homebrew formula `libtasn1`, copied by the dylib closure) |
+| libunistring | 1.3 | GPL-2.0-or-later OR LGPL-3.0-or-later | `wine/lib/` (x86-64 Homebrew formula `libunistring`, copied by the dylib closure) |
+| nettle | 3.10.2 | GPL-2.0-or-later OR LGPL-3.0-or-later | `wine/lib/` (x86-64 Homebrew formula `nettle`, copied by the dylib closure) |
+| p11-kit | 0.25.5 | BSD-3-Clause | `wine/lib/` (x86-64 Homebrew formula `p11-kit`, copied by the dylib closure) |
+| sdl2 | 2.32.8 | Zlib | `wine/lib/` (x86-64 Homebrew formula `sdl2`, copied by the dylib closure) |
 
 The GStreamer row covers only the sub-packages `build/gstreamer/fetch.sh` stages
 (the LGPL, MIT, BSD, and Apache set); the GPL and patent-restricted sub-packages
 of the upstream package are not shipped. `osslsigncode` is a host-arch tool the
 launcher runs to verify Authenticode signatures; it is not linked into Wine.
+The `wine/lib/` rows are the x86-64 Homebrew libraries Wine links or loads by
+name, copied in by `cargo xtask engine-payload --close` with the formula version
+the build host had installed; each license is the shipped library's own, not
+that of the formula's command-line tools.

@@ -59,8 +59,11 @@ pub enum Wow64 {
     None,
 }
 
+/// The named rows are the pinned components; every other row is an x86-64
+/// Homebrew library family the dylib closure copies into `wine/lib/`, keyed
+/// by formula name. The flattened map takes every unknown key, which is why
+/// this struct alone carries no `deny_unknown_fields`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Components {
     pub dxmt: Component,
     pub vkd3d_proton: Component,
@@ -70,6 +73,11 @@ pub struct Components {
     pub gstreamer: Component,
     /// Host-arch Authenticode tool under `probes/`; GPL-3.0, hence listed.
     pub osslsigncode: Component,
+    /// `[components.<formula>]` for each Homebrew library family
+    /// `cargo xtask engine-payload --close` copies in; the closure refuses
+    /// to copy a file whose Cellar formula and version have no row here.
+    #[serde(flatten)]
+    pub libraries: BTreeMap<String, Component>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,7 +236,11 @@ impl BundleSpec {
             "The GStreamer row covers only the sub-packages `build/gstreamer/fetch.sh` stages\n\
              (the LGPL, MIT, BSD, and Apache set); the GPL and patent-restricted sub-packages\n\
              of the upstream package are not shipped. `osslsigncode` is a host-arch tool the\n\
-             launcher runs to verify Authenticode signatures; it is not linked into Wine."
+             launcher runs to verify Authenticode signatures; it is not linked into Wine.\n\
+             The `wine/lib/` rows are the x86-64 Homebrew libraries Wine links or loads by\n\
+             name, copied in by `cargo xtask engine-payload --close` with the formula version\n\
+             the build host had installed; each license is the shipped library's own, not\n\
+             that of the formula's command-line tools."
         );
         Ok(out)
     }
@@ -267,6 +279,7 @@ impl BundleSpec {
             )));
         }
         validate_version(&self.version)?;
+        self.components.validate()?;
         if self.sync_modes.is_empty() {
             return Err(Error::Invalid("`sync_modes` is empty".into()));
         }
@@ -329,7 +342,7 @@ impl BundleSpec {
 impl Components {
     /// Every shipped component in notices order, with its display name and
     /// where it lands in the bundle.
-    fn rows(&self) -> Vec<(&'static str, &Component, &'static str)> {
+    fn rows(&self) -> Vec<(String, &Component, String)> {
         let mut rows = vec![
             (
                 "DXMT",
@@ -348,7 +361,47 @@ impl Components {
             "`wine/lib/GStreamer.framework`",
         ));
         rows.push(("osslsigncode", &self.osslsigncode, "`probes/osslsigncode`"));
+        let mut rows: Vec<(String, &Component, String)> = rows
+            .into_iter()
+            .map(|(name, component, location)| (name.to_owned(), component, location.to_owned()))
+            .collect();
+        rows.extend(self.libraries.iter().map(|(formula, component)| {
+            (
+                formula.clone(),
+                component,
+                format!(
+                    "`wine/lib/` (x86-64 Homebrew formula `{formula}`, copied by the dylib closure)"
+                ),
+            )
+        }));
         rows
+    }
+
+    /// Library rows are keyed by Homebrew formula name, which TOML writes as
+    /// a bare key when it is `[A-Za-z0-9_-]+`.
+    fn validate(&self) -> Result<(), Error> {
+        for (formula, component) in &self.libraries {
+            if formula.is_empty()
+                || !formula
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return Err(Error::Invalid(format!(
+                    "`components.{formula}` is not a Homebrew formula name (letters, digits, `_`, `-`)"
+                )));
+            }
+            for (field, value) in [
+                ("version", &component.version),
+                ("license", &component.license),
+            ] {
+                if value.is_empty() {
+                    return Err(Error::Invalid(format!(
+                        "`components.{formula}.{field}` is empty"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -455,6 +508,7 @@ mod tests {
                 kosmickrisp: None,
                 gstreamer: component("1.28.8", "LGPL-2.1-or-later"),
                 osslsigncode: component("2.14", "GPL-3.0-or-later"),
+                libraries: BTreeMap::new(),
             },
             overrides: Overrides {
                 dxmt: DllOverrides {

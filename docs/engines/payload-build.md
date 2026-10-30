@@ -203,12 +203,86 @@ Environment knobs:
    tool; GPL-3.0, listed in the notices), then `BUNDLE.toml` and
    `THIRD_PARTY_NOTICES.md` rendered from `build/bundle-spec.toml` (step 8).
    `ASSEMBLE_PARTIAL=1` tolerates unbuilt probes and an unbuilt
-   `osslsigncode`. `cargo xtask engine-payload --build` runs steps 3 through 7
-   in order and stops here. What remains unscripted is the dylib closure: walk
-   every Mach-O with `otool -L`, copy non-system dependencies (the x86-64
-   Homebrew dylibs recorded in `brew-versions.txt`) into `wine/lib/`, rewrite
-   install names and `LC_RPATH` entries to `@rpath`/`@loader_path` with
-   `install_name_tool`, repeat until stable. A reassembly discards that work.
+   `osslsigncode`. The script's last step, inside the `.tmp` tree so a
+   failure leaves the previous payload untouched, is the dylib closure,
+   `cargo xtask engine-payload --close <payload>` (`xtask/src/closure.rs`),
+   which makes the tree self-contained and ends with step 9's check.
+   `cargo xtask engine-payload --build` runs steps 3 through 7 in order and
+   then checks the payload at its final location.
+
+   The closure is a fixed-point loop: read every Mach-O's load commands
+   (`otool -l`), plan one round, apply it, look again, until a round plans
+   nothing (a closed payload is left as it is; a tree that keeps changing
+   after eight rounds fails). One round does, in this order:
+
+   - **SONAMEs.** Wine `dlopen`s some libraries by bare SONAME rather than
+     linking them: `config.h` in the build tree defines
+     `SONAME_LIBFREETYPE` (`win32u`, `dwrite`), `SONAME_LIBGNUTLS`
+     (`bcrypt`, `crypt32`, `secur32`), `SONAME_LIBSDL2` (`winebus.sys`),
+     `SONAME_LIBVULKAN`/`SONAME_LIBMOLTENVK` (`win32u`), `SONAME_LIBCUPS`
+     (`localspl`, `winspool.drv`), and `SONAME_LIBODBC` (`odbc32`). Wine
+     sets no search path for them (`dlls/ntdll/unix/loader.c` touches
+     `DYLD_LIBRARY_PATH` only for an in-tree build), and dyld resolves a
+     bare leaf name as `@rpath/<leaf>` through the run paths of the
+     calling image and of the main executable, then the working directory
+     and `/usr/lib`; it never looks in `/usr/local/lib`, so a payload
+     without the closure runs with no fonts, no TLS, no game controllers
+     through SDL, and no Vulkan even on the build host. Each SONAME must
+     therefore be a file under `wine/lib/`: copied from the x86-64
+     Homebrew (`/usr/local/lib/<soname>`) by default, or per the
+     `SONAME_POLICY` table in `closure.rs`: `libMoltenVK.dylib` is a
+     relative link to the pinned `vulkan/libMoltenVK.dylib` (not
+     Homebrew's `molten-vk`), `libcups.2.dylib` is the system's (dyld
+     serves it from the shared cache; no file exists under `/usr/lib`),
+     and `libodbc.dylib` is optional (copied when the x86-64 Homebrew has
+     unixODBC, skipped with a message otherwise). A SONAME that is neither
+     in the table nor in the x86-64 Homebrew fails the closure. Every Unix
+     module under `wine/lib/wine/` whose bytes contain a supplied SONAME is
+     a `dlopen` caller and gets `LC_RPATH @loader_path/../..`, which is
+     `wine/lib/`; the executables (`wine/bin/wine`, `wine/bin/wineserver`,
+     `wine/lib/wine/x86_64-unix/wine`) carry no run path because Wine
+     links them without header padding, so `install_name_tool` cannot add
+     one, and the caller's run path suffices.
+   - **Links.** For every Mach-O: an install name outside `/usr/lib` and
+     `/System` becomes `@rpath/<file name>`; an absolute `LC_RPATH` outside
+     them is deleted; a dependency on an absolute non-system path (a
+     Homebrew `opt/` or `Cellar/` path) is copied into `wine/lib/` under
+     its leaf name when absent (thinned to x86-64 with `lipo` if
+     universal; the copy must be an x86-64 Mach-O) and rewritten to
+     `@rpath/<leaf>`; and every `@rpath/<leaf>` dependency must then
+     resolve through the binary's own `@loader_path` run paths, else the
+     closure adds the run path to the one payload directory holding that
+     leaf (the binary's own directory wins a tie, any other tie is an
+     error, and a leaf nowhere in the payload is copied from Homebrew).
+     This is what gives `winegstreamer.so`
+     `@loader_path/../../GStreamer.framework/Versions/1.0/lib` for its
+     `libgst*` references and gives each copied library `@loader_path`
+     for its siblings. `@loader_path/` and `@executable_path/` references
+     are left to step 9's chain rules. Each rewritten binary is re-signed
+     ad hoc (`codesign --force --sign -`).
+   - **Gates.** Before a round lands, the destinations are scanned against
+     `build/denylist.toml`, and every copy's Homebrew provenance
+     (`/usr/local/Cellar/<formula>/<version>/`) must match a
+     `[components.<formula>]` row of `BUNDLE.toml` with that version, so
+     the notices list every copied library family or the build fails;
+     `build/bundle-spec.toml` carries those rows (freetype, libpng, gnutls,
+     gettext, p11-kit, libidn2, libunistring, libtasn1, nettle, gmp,
+     sdl2, with `brew list --versions` in `build/work/brew-versions.txt`
+     and the Cellar as the source of the versions). Anything the closure
+     cannot resolve fails the run with the binary and the reference named,
+     and nothing of that round is applied.
+
+   On the planning host (2026-10-30) the closure applies three rounds and
+   the fourth plans nothing: it copies twelve dylibs (`libfreetype.6`,
+   `libpng16.16`, `libgnutls.30`, `libintl.8`, `libp11-kit.0`,
+   `libidn2.0`, `libunistring.5`, `libtasn1.6`, `libhogweed.6`,
+   `libnettle.8`, `libgmp.10`, `libSDL2-2.0.0`), links
+   `libMoltenVK.dylib`, and rewrites nineteen binaries: the twelve copies,
+   `winegstreamer.so`, and the six `dlopen` callers of a supplied SONAME
+   (`win32u`, `dwrite`, `bcrypt`, `crypt32`, `secur32`, `winebus`;
+   `localspl` and `winspool` name only the system's cups, `odbc32` only
+   the absent odbc). About a minute, most of it `otool`. A rerun on the
+   closed tree changes nothing.
 8. `cargo xtask engine-payload --write-bundle-toml build/bundle-spec.toml <payload>/BUNDLE.toml`
    — renders `BUNDLE.toml` and, beside it, `THIRD_PARTY_NOTICES.md` (one row
    per `[components]` entry plus Wine, with version, SPDX license, and
@@ -319,7 +393,9 @@ Environment knobs:
    The report prints the chain list it derived. After the real build
    `wineserver` is a chain too, although it dlopens no Unix module: a
    violation reported only under its chain is a candidate for a rule
-   change, not a payload defect.
+   change, not a payload defect. The check sees load commands only: a
+   library Wine `dlopen`s by bare SONAME (step 7) is not a reference it can
+   resolve, so the runtime probe below is what proves those load.
 
 ## Running the built Wine
 
@@ -331,6 +407,19 @@ export WINEPREFIX=$(mktemp -d)
 <payload>/wine/bin/wine wineboot --init
 <payload>/wine/bin/wineserver -w
 ```
+
+To see where every library of a running process comes from, keep one
+alive and list its mapped files; nothing may come from `/usr/local` or
+`/opt/homebrew`:
+
+```sh
+<payload>/wine/bin/wine <payload>/probes/xinput-check.exe &
+sleep 5; lsof -p "$(pgrep -f xinput-check.exe | head -1)" | grep -E 'dylib|\.so'
+```
+
+`DYLD_PRINT_LIBRARIES=1` prints the same for a single process, but
+`arch -x86_64` strips `DYLD_*` from the environment, so pass it through
+`/usr/bin/env` after `arch` or run the (thin x86-64) loader directly.
 
 Gate G4c (DXMT) copies the DLLs into that prefix:
 `<payload>/dxmt/x86_64-windows/{d3d11,dxgi,d3d10core,winemetal}.dll` into

@@ -9,6 +9,7 @@ use std::process::{Command, ExitCode};
 use applejack_manifest::Manifest;
 
 mod bundle_toml;
+mod closure;
 mod denylist;
 mod engine_payload;
 mod pins;

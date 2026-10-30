@@ -33,6 +33,37 @@ moltenvk = { version = "1.4.2", license = "Apache-2.0" }
 # kosmickrisp: no x86-64 build is pinned (plan 03 step 4); omitted.
 gstreamer = { version = "1.28.8", license = "LGPL-2.1-or-later" }
 osslsigncode = { version = "2.14", license = "GPL-3.0-or-later" }
+# The x86-64 Homebrew libraries `cargo xtask engine-payload --close` copies
+# into wine/lib/ (docs/engines/payload-build.md step 7), one row per formula,
+# keyed by formula name. The closure refuses to copy a file whose Cellar
+# formula and version have no matching row, so these follow `brew list
+# --versions` in build/work/brew-versions.txt and the Cellar. Each license is
+# the shipped library's own (gnutls and gettext ship GPL-3.0 tools that are
+# not copied); dual-licensed libraries carry the SPDX expression.
+#   freetype:     libfreetype.6.dylib (Wine dlopens it: win32u, dwrite)
+#   libpng:       libpng16.16.dylib (freetype)
+#   gnutls:       libgnutls.30.dylib (Wine dlopens it: bcrypt, crypt32, secur32)
+#   gettext:      libintl.8.dylib (gnutls, libidn2)
+#   p11-kit:      libp11-kit.0.dylib (gnutls)
+#   libidn2:      libidn2.0.dylib (gnutls)
+#   libunistring: libunistring.5.dylib (gnutls, libidn2)
+#   libtasn1:     libtasn1.6.dylib (gnutls)
+#   nettle:       libnettle.8.dylib, libhogweed.6.dylib (gnutls)
+#   gmp:          libgmp.10.dylib (gnutls, hogweed)
+#   sdl2:         libSDL2-2.0.0.dylib (Wine dlopens it: winebus)
+# molten-vk is not a row: Wine's libMoltenVK.dylib is a link to the pinned
+# MoltenVK under vulkan/ (the `moltenvk` row above).
+freetype = { version = "2.13.3", license = "FTL" }
+libpng = { version = "1.6.50", license = "libpng-2.0" }
+gnutls = { version = "3.8.10", license = "LGPL-2.1-or-later" }
+gettext = { version = "0.26", license = "LGPL-2.1-or-later" }
+p11-kit = { version = "0.25.5", license = "BSD-3-Clause" }
+libidn2 = { version = "2.3.8", license = "(GPL-2.0-or-later OR LGPL-3.0-or-later) AND Unicode-DFS-2016" }
+libunistring = { version = "1.3", license = "GPL-2.0-or-later OR LGPL-3.0-or-later" }
+libtasn1 = { version = "4.20.0", license = "LGPL-2.1-or-later" }
+nettle = { version = "3.10.2", license = "GPL-2.0-or-later OR LGPL-3.0-or-later" }
+gmp = { version = "6.3.0", license = "LGPL-3.0-or-later OR GPL-2.0-or-later" }
+sdl2 = { version = "2.32.8", license = "Zlib" }
 
 # Bundle-relative DLL paths per Windows architecture; the installer copies
 # each into the prefix and overrides its stem. winemetal.dll is DXMT's bridge

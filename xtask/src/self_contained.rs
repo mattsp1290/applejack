@@ -97,16 +97,23 @@ pub fn check_rpaths(
 }
 
 /// The `path` of every `LC_RPATH` load command in `otool -l` output.
-fn rpath_entries(load_commands: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn rpath_entries(load_commands: &str) -> impl Iterator<Item = &str> {
     command_values(load_commands, "path ", |command| command == "LC_RPATH")
 }
 
 /// The `name` of every dependency load command in `otool -l` output. The
 /// binary's own `LC_ID_DYLIB` is not a dependency and is left out.
-fn dependency_entries(load_commands: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn dependency_entries(load_commands: &str) -> impl Iterator<Item = &str> {
     command_values(load_commands, "name ", |command| {
         DEPENDENCY_COMMANDS.contains(&command)
     })
+}
+
+/// The `name` of the `LC_ID_DYLIB` load command in `otool -l` output: the
+/// install name a dylib carries, which other binaries copy as their
+/// dependency reference. `None` for an executable or a bundle.
+pub(crate) fn id_entry(load_commands: &str) -> Option<&str> {
+    command_values(load_commands, "name ", |command| command == "LC_ID_DYLIB").next()
 }
 
 /// The `<field> <value> (offset N)` line of each load command `wanted`

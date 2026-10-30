@@ -1,6 +1,7 @@
 //! `cargo xtask engine-payload`: fetches the pinned inputs of the Rosetta
-//! engine payload, checks an assembled payload tree, and writes `BUNDLE.toml`.
-//! The Wine build itself runs through the scripts under `build/`.
+//! engine payload, checks an assembled payload tree, closes its dylib
+//! references (`closure.rs`), and writes `BUNDLE.toml`. The Wine build itself
+//! runs through the scripts under `build/`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -12,6 +13,7 @@ use std::process::{Command, ExitCode};
 use sha2::{Digest, Sha256};
 
 use crate::bundle_toml::BundleSpec;
+use crate::closure;
 use crate::denylist::{Denylist, Hit};
 use crate::pins::{Pin, Pins};
 use crate::self_contained::{
@@ -23,10 +25,11 @@ pub const USAGE: &str = "\
 usage: cargo xtask engine-payload <mode>
   --fetch [id ...]                    download every pin (or the named ones) into build/work/, verify SHA-256, and denylist-scan the listing
   --check <payload-dir>               denylist scan plus self-containment of every Mach-O and symlink; references resolve along the load chains of the executables <payload-dir>/BUNDLE.toml declares and of every executable under wine/
+  --close <payload-dir>               the dylib closure: copy the x86-64 Homebrew libraries Wine links or dlopens into wine/lib/, rewrite install names and references to @rpath, add the run paths, re-sign, repeat until stable, then --check
   --check-listing <file|->            denylist scan of an archive listing, one path per line (an empty listing fails)
   --write-bundle-toml <spec> <out>    render BUNDLE.toml from a typed spec file, plus THIRD_PARTY_NOTICES.md beside it
   --print-pin <id> [field]            print a pin (all fields as key=value, or one field)
-  --build                             run the build scripts under build/ in order";
+  --build                             run the build scripts under build/ in order (assemble.sh ends with --close), then --check the payload";
 
 const PINS_FILE: &str = "build/pins.toml";
 const DENYLIST_FILE: &str = "build/denylist.toml";
@@ -54,6 +57,7 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     let result = match args.as_slice() {
         ["--fetch", ids @ ..] => fetch(root, ids),
         ["--check", payload] => check(root, Path::new(payload)),
+        ["--close", payload] => closure::close(root, Path::new(payload)),
         ["--check-listing", listing] => check_listing(root, listing),
         ["--write-bundle-toml", spec, out] => write_bundle_toml(Path::new(spec), Path::new(out)),
         ["--print-pin", id] => print_pin(root, id, None),
@@ -102,7 +106,7 @@ fn load_pins(root: &Path) -> Result<Pins, String> {
     Pins::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn load_denylist(root: &Path) -> Result<Denylist, String> {
+pub(crate) fn load_denylist(root: &Path) -> Result<Denylist, String> {
     let path = root.join(DENYLIST_FILE);
     let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     Denylist::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
@@ -424,7 +428,7 @@ struct Report {
     left_to_dyld: Vec<(String, String)>,
 }
 
-fn check(root: &Path, payload: &Path) -> Result<(), String> {
+pub(crate) fn check(root: &Path, payload: &Path) -> Result<(), String> {
     let report = inspect(root, payload)?;
     for hit in &report.hits {
         eprintln!("[xtask] denylist: {hit}");
@@ -563,7 +567,7 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
     })
 }
 
-const BUNDLE_FILE: &str = "BUNDLE.toml";
+pub(crate) const BUNDLE_FILE: &str = "BUNDLE.toml";
 
 /// The executables `BUNDLE.toml` declares, bundle-relative: the loader, the
 /// server, the preloader when present, and the probes. Together with the
@@ -921,10 +925,29 @@ fn build(root: &Path) -> Result<(), String> {
     for script in BUILD_SCRIPTS {
         run_script(root, script, &[])?;
     }
+    // assemble.sh already closed and checked the tree it swapped in; checking
+    // the final location proves the swap kept it whole.
+    let payload = payload_dir(root)?;
     println!(
-        "[xtask] build scripts finished; the dylib closure (docs/engines/payload-build.md step 7) is not scripted yet"
+        "[xtask] build scripts finished; checking {}",
+        payload.display()
     );
-    Ok(())
+    check(root, &payload)
+}
+
+/// Where `build/lib.sh`'s `payload_dir` assembles the tree:
+/// `$APPLEJACK_PAYLOAD_DIR`, else `fixtures/payloads/rosetta-wine-<wine version>`.
+fn payload_dir(root: &Path) -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("APPLEJACK_PAYLOAD_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let pins = load_pins(root)?;
+    let wine = pins
+        .get("wine")
+        .ok_or_else(|| format!("no pin with id `wine` in {PINS_FILE}"))?;
+    Ok(root
+        .join("fixtures/payloads")
+        .join(format!("rosetta-wine-{}", wine.version)))
 }
 
 fn run_script(root: &Path, script: &str, args: &[&str]) -> Result<(), String> {
@@ -946,15 +969,15 @@ fn run_script(root: &Path, script: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-struct Entry {
-    relative: String,
-    absolute: PathBuf,
-    is_file: bool,
+pub(crate) struct Entry {
+    pub(crate) relative: String,
+    pub(crate) absolute: PathBuf,
+    pub(crate) is_file: bool,
     /// Set for a symlink: where it points, as stored.
-    link_target: Option<PathBuf>,
+    pub(crate) link_target: Option<PathBuf>,
 }
 
-fn walk(base: &Path, dir: &Path, entries: &mut Vec<Entry>) -> Result<(), String> {
+pub(crate) fn walk(base: &Path, dir: &Path, entries: &mut Vec<Entry>) -> Result<(), String> {
     let listing = fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     let mut children: Vec<PathBuf> = listing
         .map(|entry| entry.map(|entry| entry.path()))
@@ -1003,7 +1026,7 @@ const MACHO_MAGICS: [[u8; 4]; 8] = [
     [0xbf, 0xba, 0xfe, 0xca],
 ];
 
-fn is_macho(path: &Path) -> Result<bool, String> {
+pub(crate) fn is_macho(path: &Path) -> Result<bool, String> {
     let mut file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut magic = [0_u8; 4];
     let mut read = 0;
@@ -1019,7 +1042,7 @@ fn is_macho(path: &Path) -> Result<bool, String> {
     Ok(MACHO_MAGICS.contains(&magic))
 }
 
-fn otool(path: &Path, flag: &str) -> Result<String, String> {
+pub(crate) fn otool(path: &Path, flag: &str) -> Result<String, String> {
     let output = Command::new("otool")
         .arg(flag)
         .arg(path)
