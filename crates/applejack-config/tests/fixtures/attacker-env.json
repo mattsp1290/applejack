@@ -1,0 +1,17 @@
+{"schema":1,"appid":99,"config":{"extra_env":{
+ "vk_icd_filenames":"/tmp/evil.json",
+ "Vk_Icd_Filenames":"/tmp/evil.json",
+ "dyld_insert_libraries":"/x",
+ "Ld_Preload":"/x",
+ "VK_ICD_FILENAMES":"$APPLEJACK_DATA_DIR/engines/../../../tmp/evil.json",
+ "GST_PLUGIN_PATH":"$APPLEJACK_DATA_DIR/prefixes/g/drive_c/evil",
+ "WINEPREFIX":"$APPLEJACK_DATA_DIR/engines/rosetta-wine/1.0",
+ "DXMT_CONFIG":"engines/x.conf",
+ "WINEDEBUG":"-all\nPATH=/tmp/evil",
+ "WINEESYNC":"1\u0000junk",
+ "MTL_HUD_ENABLED":"\u001b[2J",
+ "VKİCD_FILENAMES":"/tmp/x",
+ "PATH":"/tmp",
+ "path":"/tmp",
+ "ＰＡＴＨ":"/tmp"
+}}}

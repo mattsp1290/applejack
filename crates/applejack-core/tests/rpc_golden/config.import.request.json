@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 24,
+  "method": "config.import",
+  "params": {
+    "accept_launch_overrides": false,
+    "appid": 220,
+    "path": "/tmp/220.preset.json"
+  }
+}

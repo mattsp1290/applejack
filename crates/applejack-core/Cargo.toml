@@ -9,8 +9,6 @@ applejack-config = { workspace = true }
 applejack-engine = { workspace = true }
 applejack-steam = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
 
 [lints]

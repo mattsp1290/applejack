@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "method": "steam.login.complete",
+  "params": {
+    "session_id": "login-session-example",
+    "steam_guard_code": "ABCDE"
+  }
+}

@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 applejack-manifest = { workspace = true }
 rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+unicode-normalization = "0.1.26"
 
 [lints]
 workspace = true

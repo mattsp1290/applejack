@@ -1,0 +1,12 @@
+{
+  "HelloRequired": 1001,
+  "Internal": 1003,
+  "InternalError": -32603,
+  "InvalidParams": -32602,
+  "InvalidRequest": -32600,
+  "JobFailed": 1004,
+  "MethodNotFound": -32601,
+  "NotImplemented": 1002,
+  "ParseError": -32700,
+  "ProtocolMismatch": 1000
+}

@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 15,
+  "method": "app.run",
+  "params": {
+    "appid": 220,
+    "probe_direct": false
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 14,
+  "method": "app.install",
+  "params": {
+    "appid": 220,
+    "branch": "public",
+    "update": false,
+    "verify": false
+  }
+}
