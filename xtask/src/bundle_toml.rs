@@ -61,8 +61,10 @@ pub enum Wow64 {
 
 /// The named rows are the pinned components; every other row is an x86-64
 /// Homebrew library family the dylib closure copies into `wine/lib/`, keyed
-/// by formula name. The flattened map takes every unknown key, which is why
-/// this struct alone carries no `deny_unknown_fields`.
+/// by formula name. serde cannot combine `deny_unknown_fields` with the
+/// flattened map, so [`Components::validate`] is the strictness instead: a
+/// key that spells a named row (`kosmic_krisp`, `MoltenVK`) or is no
+/// Homebrew formula name fails the parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Components {
     pub dxmt: Component,
@@ -240,8 +242,20 @@ impl BundleSpec {
              The `wine/lib/` rows are the x86-64 Homebrew libraries Wine links or loads by\n\
              name, copied in by `cargo xtask engine-payload --close` with the formula version\n\
              the build host had installed; each license is the shipped library's own, not\n\
-             that of the formula's command-line tools."
+             that of the formula's command-line tools. Libraries the GStreamer framework\n\
+             already ships (freetype, libintl) are not copied again: Wine reaches the\n\
+             framework's files, and the GStreamer row covers them."
         );
+        let choices = self.components.choices();
+        if !choices.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "Where a license above is an `OR` expression ({}), this bundle exercises\n\
+                 the {EXERCISED_OPTION} option.",
+                choices.join(", ")
+            );
+        }
         Ok(out)
     }
 
@@ -377,17 +391,28 @@ impl Components {
         rows
     }
 
-    /// Library rows are keyed by Homebrew formula name, which TOML writes as
-    /// a bare key when it is `[A-Za-z0-9_-]+`.
+    /// The rows whose license is an `OR` expression, in notices order.
+    fn choices(&self) -> Vec<String> {
+        self.rows()
+            .into_iter()
+            .filter(|(_, component, _)| component.license.contains(" OR "))
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    /// Library rows are keyed by Homebrew formula name; a key that spells a
+    /// named row is a typo of a pinned component. Every `OR` license must
+    /// offer [`EXERCISED_OPTION`], the one the notices say the bundle takes.
     fn validate(&self) -> Result<(), Error> {
         for (formula, component) in &self.libraries {
-            if formula.is_empty()
-                || !formula
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
+            if let Some(row) = NAMED_ROWS.iter().find(|row| fold(row) == fold(formula)) {
                 return Err(Error::Invalid(format!(
-                    "`components.{formula}` is not a Homebrew formula name (letters, digits, `_`, `-`)"
+                    "`components.{formula}` spells the pinned component row `{row}`; use that row"
+                )));
+            }
+            if !is_formula_name(formula) {
+                return Err(Error::Invalid(format!(
+                    "`components.{formula}` is not a Homebrew formula name (`[A-Za-z0-9_+.-]+`, optionally `@<version>`)"
                 )));
             }
             for (field, value) in [
@@ -401,8 +426,58 @@ impl Components {
                 }
             }
         }
+        for (name, component, _) in self.rows() {
+            if component.license.contains(" OR ") && !component.license.contains(EXERCISED_OPTION) {
+                return Err(Error::Invalid(format!(
+                    "the `{name}` license `{}` offers a choice without {EXERCISED_OPTION}, the option the notices state",
+                    component.license
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// The named rows of [`Components`]; a library key that spells one of them
+/// in any case, with or without `-` and `_`, is a typo, not a Homebrew
+/// formula.
+const NAMED_ROWS: [&str; 6] = [
+    "dxmt",
+    "vkd3d_proton",
+    "moltenvk",
+    "kosmickrisp",
+    "gstreamer",
+    "osslsigncode",
+];
+
+fn fold(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '-' | '_'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The option this bundle exercises where a component's license is an `OR`
+/// expression: the LGPL beside Wine's own LGPL-2.1-or-later.
+pub const EXERCISED_OPTION: &str = "LGPL-3.0-or-later";
+
+/// Homebrew's formula-name grammar, `[A-Za-z0-9_+.-]+` with an optional
+/// `@[A-Za-z0-9.]+` version suffix (`openssl@3`, `icu4c@77`). TOML quotes a
+/// key with `@`, `+`, or `.` by itself.
+pub(crate) fn is_formula_name(name: &str) -> bool {
+    let (base, version) = name
+        .split_once('@')
+        .map_or((name, None), |(base, version)| (base, Some(version)));
+    !base.is_empty()
+        && base
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'.' | b'-'))
+        && version.is_none_or(|version| {
+            !version.is_empty()
+                && version
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.')
+        })
 }
 
 /// The reader's `Version::new` rules: lowercase ASCII `[0-9a-z._+-]`, a
@@ -622,6 +697,94 @@ mod tests {
         full.notarization_submission_id = Some("abc".into());
         let text = full.to_toml().expect("serializes");
         assert_eq!(BundleSpec::parse(&text).expect("round trip"), full);
+    }
+
+    #[test]
+    fn a_versioned_formula_row_round_trips_as_a_quoted_key() {
+        let mut spec = spec();
+        spec.components
+            .libraries
+            .insert("openssl@3".into(), component("3.5.1", "Apache-2.0"));
+        spec.components
+            .libraries
+            .insert("c++.utils".into(), component("1", "MIT"));
+        let text = spec.to_toml().expect("renders");
+        assert!(text.contains("\"openssl@3\""), "{text}");
+        assert!(text.contains("\"c++.utils\""), "{text}");
+        assert_eq!(BundleSpec::parse(&text).expect("parses"), spec);
+        let notices = spec.to_notices().expect("renders");
+        assert!(
+            notices.contains("| openssl@3 | 3.5.1 | Apache-2.0 |"),
+            "{notices}"
+        );
+        for name in ["openssl@", "@3", "a b", "", "x@1@2", "gnu/tls"] {
+            let mut bad = spec.clone();
+            bad.components
+                .libraries
+                .insert(name.into(), component("1", "MIT"));
+            let error = bad.to_toml().unwrap_err();
+            assert!(
+                error.to_string().contains("not a Homebrew formula name"),
+                "{name:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typod_named_row_is_refused_rather_than_rendered_as_a_library() {
+        for typo in ["kosmic_krisp", "KosmicKrisp", "vkd3d-proton", "MoltenVK"] {
+            let text = format!(
+                "{}\n[components.\"{typo}\"]\nversion = \"9.9\"\nlicense = \"MIT\"\n",
+                spec().to_toml().expect("renders")
+            );
+            let error = BundleSpec::parse(&text).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("spells the pinned component row"),
+                "{typo}: {error}"
+            );
+        }
+        let mut bad = spec();
+        bad.components
+            .libraries
+            .insert("dxmt2".into(), component("1", "MIT"));
+        assert!(bad.to_toml().is_ok(), "a different name is a formula");
+    }
+
+    #[test]
+    fn an_or_license_names_the_exercised_option_in_the_notices() {
+        assert!(
+            !spec()
+                .to_notices()
+                .expect("renders")
+                .contains("OR` expression")
+        );
+        let mut dual = spec();
+        dual.components.libraries.insert(
+            "gmp".into(),
+            component("6.3.0", "LGPL-3.0-or-later OR GPL-2.0-or-later"),
+        );
+        dual.components.libraries.insert(
+            "libidn2".into(),
+            component(
+                "2.3.8",
+                "(GPL-2.0-or-later OR LGPL-3.0-or-later) AND Unicode-DFS-2016",
+            ),
+        );
+        let notices = dual.to_notices().expect("renders");
+        assert!(
+            notices.contains(
+                "Where a license above is an `OR` expression (gmp, libidn2), this bundle exercises\nthe LGPL-3.0-or-later option."
+            ),
+            "{notices}"
+        );
+        let mut bad = dual;
+        bad.components
+            .libraries
+            .insert("x".into(), component("1", "MIT OR GPL-2.0-only"));
+        let error = bad.to_notices().unwrap_err();
+        assert!(error.to_string().contains("offers a choice"), "{error}");
     }
 
     #[test]

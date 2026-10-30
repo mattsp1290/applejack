@@ -32,4 +32,9 @@ launcher runs to verify Authenticode signatures; it is not linked into Wine.
 The `wine/lib/` rows are the x86-64 Homebrew libraries Wine links or loads by
 name, copied in by `cargo xtask engine-payload --close` with the formula version
 the build host had installed; each license is the shipped library's own, not
-that of the formula's command-line tools.
+that of the formula's command-line tools. Libraries the GStreamer framework
+already ships (freetype, libintl) are not copied again: Wine reaches the
+framework's files, and the GStreamer row covers them.
+
+Where a license above is an `OR` expression (gmp, libidn2, libunistring, nettle), this bundle exercises
+the LGPL-3.0-or-later option.
