@@ -1,0 +1,1 @@
+{"schema":1,"appid":1,"config":{"extra_env":{"VK_ICD_FILENAMES":"$APPLEJACK_DATA_DIR","GST_PLUGIN_PATH":"$APPLEJACK_DATA_DIR/engines","DXMT_CONFIG":"${APPLEJACK_DATA_DIR}/engines/x"}, "launch_exe_override":"$APPLEJACK_DATA_DIR/../../../../bin/sh"}}

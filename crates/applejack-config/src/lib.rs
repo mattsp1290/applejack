@@ -3,15 +3,23 @@
 //! the only SQLite handle in the workspace and only `applejack-core` depends
 //! on it.
 
+mod apps;
 mod error;
+mod game_config;
 mod migrations;
+pub mod presets;
+pub mod resolve;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, ErrorCode};
+use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior};
 
+pub use apps::{AppRow, Drm};
 pub use error::Error;
+pub use game_config::{Field, GameConfig, GraphicsBackend, LaunchMode, SyncMode};
+pub use presets::{EnvPolicy, ImportOptions, ImportPlan, Preset, ValueCheck};
+pub use resolve::{Resolved, resolve};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 const WAL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -86,6 +94,102 @@ impl ConfigDb {
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(names)
+    }
+
+    /// Whether a `D3DMetal` overlay has been accepted for `engine_version`,
+    /// per the `d3dmetal` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlite`] when the query fails.
+    pub fn d3dmetal_accepted(&self, engine_version: &str) -> Result<bool, Error> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM d3dmetal WHERE engine_version = ?1",
+            [engine_version],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Records that the user accepted a `D3DMetal` overlay for
+    /// `engine_version`, so `graphics_backend = d3dmetal` imports for it.
+    /// `imported_from` is where the overlay came from and `gptk_version` the
+    /// Game Porting Toolkit release it was taken from; both are recorded with
+    /// the row so an accepted overlay always has its provenance.
+    /// `accepted_at` is the caller's timestamp text; this crate never reads
+    /// the clock. Accepting again replaces the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidValue`] when any argument is empty and
+    /// [`Error::Sqlite`] when the write fails.
+    pub fn d3dmetal_accept(
+        &self,
+        engine_version: &str,
+        imported_from: &str,
+        gptk_version: &str,
+        accepted_at: &str,
+    ) -> Result<(), Error> {
+        let columns = [
+            ("d3dmetal.engine_version", engine_version),
+            ("d3dmetal.imported_from", imported_from),
+            ("d3dmetal.gptk_version", gptk_version),
+            ("d3dmetal.accepted_at", accepted_at),
+        ];
+        if let Some(&(field, _)) = columns.iter().find(|(_, value)| value.is_empty()) {
+            return Err(Error::InvalidValue {
+                field,
+                value: String::new(),
+                reason: "must not be empty".to_owned(),
+            });
+        }
+        self.conn.execute(
+            "INSERT INTO d3dmetal (engine_version, imported_from, gptk_version, accepted_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(engine_version) DO UPDATE SET \
+             imported_from = excluded.imported_from, \
+             gptk_version = excluded.gptk_version, \
+             accepted_at = excluded.accepted_at",
+            columns.map(|(_, value)| value),
+        )?;
+        Ok(())
+    }
+
+    /// Runs `f` inside a `BEGIN IMMEDIATE` transaction, so a read-modify-write
+    /// of one row cannot interleave with another connection's write: the
+    /// write lock is taken before the read, and a second writer waits on the
+    /// busy timeout instead of overwriting with a stale copy. An error from
+    /// `f` rolls the transaction back. Called with a transaction already
+    /// open on this connection, it runs `f` inside a savepoint of that
+    /// transaction, so an inner error the outer closure swallows still undoes
+    /// the inner writes.
+    ///
+    /// Every transaction opened on this connection must be IMMEDIATE: nesting
+    /// is detected with `is_autocommit`, and a DEFERRED transaction that has
+    /// already read would lose the write-before-read guarantee (in WAL mode
+    /// the inner write then fails with `SQLITE_BUSY_SNAPSHOT`).
+    pub(crate) fn write_locked<T>(
+        &self,
+        f: impl FnOnce(&Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if !self.conn.is_autocommit() {
+            self.conn.execute_batch("SAVEPOINT write_locked")?;
+            return match f(self) {
+                Ok(value) => {
+                    self.conn.execute_batch("RELEASE write_locked")?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    self.conn
+                        .execute_batch("ROLLBACK TO write_locked; RELEASE write_locked")?;
+                    Err(error)
+                }
+            };
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let value = f(self)?;
+        tx.commit()?;
+        Ok(value)
     }
 }
 
@@ -268,6 +372,125 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn concurrent_set_field_on_two_connections_keeps_every_entry() {
+        const WRITES_PER_THREAD: usize = 20;
+        let temp = TempDb::new("race");
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|thread| {
+                    let barrier = &barrier;
+                    let path = &temp.path;
+                    scope.spawn(move || {
+                        let db = ConfigDb::open(path)?;
+                        barrier.wait();
+                        for i in 0..WRITES_PER_THREAD {
+                            db.set_field(40, "extra_env", &format!("WINEDEBUG_{thread}_{i}=x"))?;
+                        }
+                        Ok::<(), Error>(())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        let db = ConfigDb::open(&temp.path).unwrap();
+        let config = db.game_config(40).unwrap().unwrap();
+        assert_eq!(
+            config.extra_env.len(),
+            2 * WRITES_PER_THREAD,
+            "lost updates: {:?}",
+            config.extra_env.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn d3dmetal_accepted_reads_the_table() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        assert!(!db.d3dmetal_accepted("1.0.0").unwrap());
+        db.conn
+            .execute(
+                "INSERT INTO d3dmetal (engine_version, accepted_at) VALUES ('1.0.0', 'now')",
+                [],
+            )
+            .unwrap();
+        assert!(db.d3dmetal_accepted("1.0.0").unwrap());
+        assert!(!db.d3dmetal_accepted("1.0.1").unwrap());
+        db.d3dmetal_accept("1.0.1", "/tmp/gptk-1.dmg", "1.0", "2026-10-29T00:00:00Z")
+            .unwrap();
+        db.d3dmetal_accept("1.0.1", "/tmp/gptk-2.dmg", "2.1", "2026-10-30T00:00:00Z")
+            .unwrap();
+        assert!(db.d3dmetal_accepted("1.0.1").unwrap());
+        let row: (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT imported_from, gptk_version, accepted_at FROM d3dmetal \
+                 WHERE engine_version = '1.0.1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "/tmp/gptk-2.dmg".to_owned(),
+                "2.1".to_owned(),
+                "2026-10-30T00:00:00Z".to_owned()
+            )
+        );
+        for (version, from, gptk, at) in [
+            ("", "/tmp/g.dmg", "1.0", "now"),
+            ("1.0.2", "", "1.0", "now"),
+            ("1.0.2", "/tmp/g.dmg", "", "now"),
+            ("1.0.2", "/tmp/g.dmg", "1.0", ""),
+        ] {
+            let error = db.d3dmetal_accept(version, from, gptk, at).unwrap_err();
+            assert!(matches!(error, Error::InvalidValue { .. }), "{error}");
+        }
+        assert!(!db.d3dmetal_accepted("1.0.2").unwrap());
+    }
+
+    #[test]
+    fn write_locked_rolls_back_on_error_and_nests_inside_an_open_transaction() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        let error = db
+            .write_locked(|db| {
+                db.meta_set("k", "v")?;
+                Err::<(), _>(Error::InvalidSchemaVersion("x".to_owned()))
+            })
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidSchemaVersion(_)), "{error}");
+        assert_eq!(db.meta_get("k").unwrap(), None, "rolled back");
+        db.write_locked(|db| {
+            db.meta_set("k", "outer")?;
+            db.write_locked(|db| db.meta_set("k2", "inner"))
+        })
+        .unwrap();
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("outer"));
+        assert_eq!(db.meta_get("k2").unwrap().as_deref(), Some("inner"));
+        assert!(db.conn.is_autocommit(), "transaction closed");
+    }
+
+    #[test]
+    fn nested_write_locked_undoes_an_inner_error_the_outer_closure_swallows() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        db.write_locked(|db| {
+            db.meta_set("k", "outer")?;
+            let inner = db.write_locked(|db| {
+                db.meta_set("k2", "inner")?;
+                Err::<(), _>(Error::InvalidSchemaVersion("x".to_owned()))
+            });
+            assert!(inner.is_err());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some("outer"));
+        assert_eq!(db.meta_get("k2").unwrap(), None, "inner write rolled back");
+        assert!(db.conn.is_autocommit(), "transaction closed");
     }
 
     #[test]

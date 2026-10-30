@@ -3,10 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-const DATA_DIR_RELATIVE: &str = "Library/Application Support/applejack";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFacts {
@@ -47,7 +45,9 @@ impl HostFacts {
                 .and_then(|captured| parse_hw_machine(&captured.stdout)),
             rosetta_present: capture("/usr/bin/arch", ["-x86_64", "/usr/bin/true"])
                 .map(|captured| captured.success),
-            free_disk_bytes: free_disk_bytes(&data_dir()),
+            free_disk_bytes: crate::config::data_dir()
+                .ok()
+                .and_then(|dir| free_disk_bytes(&dir)),
             screen_recording: ScreenRecordingState::Unknown,
             developer_id_identities: capture(
                 "/usr/bin/security",
@@ -57,13 +57,6 @@ impl HostFacts {
             .map(|captured| count_developer_id_identities(&captured.stdout)),
         }
     }
-}
-
-#[must_use]
-pub fn data_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map_or_else(|| PathBuf::from("/"), PathBuf::from)
-        .join(DATA_DIR_RELATIVE)
 }
 
 #[must_use]
@@ -239,10 +232,5 @@ mod tests {
         assert!(json["free_disk_bytes"].is_null());
         assert!(json["rosetta_present"].is_null());
         assert!(json["developer_id_identities"].is_null());
-    }
-
-    #[test]
-    fn data_dir_lives_under_application_support() {
-        assert!(data_dir().ends_with(DATA_DIR_RELATIVE));
     }
 }
