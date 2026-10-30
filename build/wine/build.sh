@@ -79,19 +79,23 @@ HOST_PKG_CONFIG=$(command -v pkg-config || command -v pkgconf || true)
 export PATH="$BREW_PREFIX/opt/bison/bin:$BREW_PREFIX/opt/flex/bin:$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin${MINGW_BIN:+:$MINGW_BIN}"
 HOST_CC=/usr/bin/clang
 HOST_CXX=/usr/bin/clang++
-# configure fixes only the -clang name (configure.ac, --with-mingw=llvm-mingw);
-# winegcc and winebuild find -gcc, -ld, -as, -ar, -nm, and -dlltool by name
-# on PATH during make, so another mingw-w64 earlier on PATH (Homebrew's, for
-# one) would compile with llvm-mingw and link with GNU binutils.
+# configure fixes only the -clang name (configure.ac, --with-mingw=llvm-mingw)
+# and -strip; winegcc, winebuild, and makedep find -gcc, -ld, -as, -ar, -nm,
+# -ranlib, -dlltool, -windres, and -objcopy by name on PATH during make, so
+# another mingw-w64 earlier on PATH (the x86-64 Homebrew's, for one) would
+# compile with llvm-mingw and link with GNU binutils.
 if [ -n "$MINGW_BIN" ]; then
+  mingw_tools=0
   for cpu in i686 x86_64; do
-    for tool in clang gcc ld as ar nm ranlib dlltool strip windres widl; do
+    for tool in clang gcc ld as ar nm ranlib dlltool strip windres objcopy; do
       name="$cpu-w64-mingw32-$tool"
-      [ -x "$MINGW_BIN/$name" ] || fail "$name in $MINGW_BIN (llvm-mingw pin incomplete)"
+      [ -x "$MINGW_BIN/$name" ] || { fail "$name in $MINGW_BIN (llvm-mingw pin incomplete: rm -rf \"${MINGW_BIN%/bin}\" and rerun sh build/bootstrap.sh)"; continue; }
       found=$(command -v "$name" || true)
-      [ "$found" = "$MINGW_BIN/$name" ] || fail "$name from $MINGW_BIN: PATH resolves it to ${found:-nothing} (remove the other mingw-w64 from the x86-64 Homebrew or put it after PATH's llvm-mingw entry)"
+      [ "$found" = "$MINGW_BIN/$name" ] || { fail "$name from $MINGW_BIN: PATH resolves it to ${found:-nothing} (arch -x86_64 $X86_BREW uninstall mingw-w64)"; continue; }
+      mingw_tools=$((mingw_tools + 1))
     done
   done
+  echo "mingw: $mingw_tools prefixed tools resolve to $MINGW_BIN"
 fi
 BISON=$(command -v bison || true)
 FLEX=$(command -v flex || true)
@@ -120,7 +124,7 @@ JOBS=${WINE_JOBS:-$(sysctl -n hw.ncpu)}
 conftest_dir="$WORK/wine/conftest"
 mkdir -p "$conftest_dir"
 printf 'int main(void) { return 0; }\n' >"$conftest_dir/host.c"
-# shellcheck disable=SC2086
+# shellcheck disable=SC2086 # the flag variables are word lists, split as configure splits them
 if arch -x86_64 "$HOST_CC" $CPPFLAGS $LDFLAGS "$conftest_dir/host.c" -o "$conftest_dir/host" >"$conftest_dir/host.log" 2>&1 \
   && arch -x86_64 "$conftest_dir/host" >>"$conftest_dir/host.log" 2>&1; then
   echo "host cc: $HOST_CC links and runs an x86-64 executable ($("$HOST_CC" --version | head -1))"
@@ -311,7 +315,10 @@ fi
 # Positional parameters carry the configure arguments, so a checkout path
 # with a space survives. --with-gstreamer turns the "GStreamer won't be
 # supported" notice into a configure error.
-set -- "--prefix=$STAGE" --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests
+# --without-ffmpeg: with it on, winedmo.so links the x86-64 Homebrew ffmpeg by
+# absolute path, which the self-containment check rejects; whether a pinned
+# ffmpeg joins the payload is the parked codec ADR's call.
+set -- "--prefix=$STAGE" --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --without-ffmpeg --enable-winemac-drv --with-gstreamer --disable-tests
 if grep -q 'AC_ARG_WITH(metal' "$WINE_SRC/configure.ac"; then
   set -- "$@" --with-metal
 fi

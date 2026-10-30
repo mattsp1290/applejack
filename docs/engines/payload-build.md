@@ -24,7 +24,7 @@ every archive once at `--fetch`; the scripts extract without a second scan.
 | x86-64 Homebrew at `/usr/local` with `freetype gnutls sdl2 molten-vk bison flex pkgconf` | Wine's Unix-side dependencies; build inputs only. Install Homebrew per <https://brew.sh> under `arch -x86_64`; `bootstrap.sh` never runs that installer (it is an unpinned script). `pkgconf` is what `configure` runs for the Homebrew packages and what the report in `build/wine/build.sh` probes them with | present; `molten-vk` and `pkgconf` **missing** |
 | GStreamer devel package (pin `gstreamer-devel`) expanded under `build/work/gstreamer/devel/` | headers and `.pc` files `build/wine/build.sh` computes `GSTREAMER_CFLAGS` and `GSTREAMER_LIBS` from, off `PKG_CONFIG_PATH`; a build input (`kind = "toolchain"`), never staged | expanded by `sh build/gstreamer/fetch.sh` |
 | bison 3.0 or newer (`<x86 prefix>/opt/bison/bin/bison`, keg-only) | wine-11.0's `configure` feeds bison `%define parse.error verbose` and aborts on Apple's bison 2.3; `--check` runs that conftest, and `build/wine/build.sh` puts the keg on `PATH` and passes `BISON=`/`FLEX=` to `configure` | present (3.8.2) |
-| Homebrew mingw-w64 (`i686-` and `x86_64-w64-mingw32-gcc`) | fallback compiler for the probes only | present (14.0.0, GCC 15.2) |
+| Homebrew mingw-w64 (`i686-` and `x86_64-w64-mingw32-gcc`), host Homebrew only | fallback compiler for the probes when the llvm-mingw pin is absent; in the x86-64 Homebrew it would shadow llvm-mingw's prefixed tools on the build PATH, so `build/wine/build.sh` refuses to run with it there | present (14.0.0, GCC 15.2), host Homebrew |
 | `zstd` | the vkd3d-proton release is `.tar.zst` | present |
 | `cmake`, host-Homebrew `openssl@3` | `osslsigncode` host tool | present |
 
@@ -106,7 +106,10 @@ Environment knobs:
    `codecs-restricted` holds the ASF, MPEG-PS/TS, and RealMedia demuxers,
    and `libav` is the only decoder in the package for those formats (it has
    no `mpeg2dec` or `faad`). Games with such cutscenes show a black or
-   skipped video until a codec decision (an ADR) adds `libav`. Bink and
+   skipped video until a codec decision (an ADR) adds `libav`. For the same
+   reason `build/wine/build.sh` configures `--without-ffmpeg`: with the x86-64
+   Homebrew ffmpeg present, `winedmo.so` links it by absolute path, which
+   step 9 rejects; a pinned ffmpeg in the payload is that ADR's call. Bink and
    Smacker are decoded by the games themselves and are unaffected. The
    staged `codecs` set also carries `libgstopenh264`, built from source
    (BSD-2-Clause); Cisco's H.264 patent coverage applies to Cisco's own
@@ -116,7 +119,7 @@ Environment knobs:
    be the ones PATH resolves, and `/usr/bin/clang` must link and run an x86-64
    program under Rosetta), the bison conftest, the pkg-config report,
    gate G4b (below), project patches from `build/wine/patches/`, then
-   `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests`
+   `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --without-ffmpeg --enable-winemac-drv --with-gstreamer --disable-tests`
    with `CC=/usr/bin/clang` (Apple's; llvm-mingw's unprefixed `clang` sits last
    on PATH and cannot link against the macOS SDK), `BISON=`, `FLEX=`, `GSTREAMER_CFLAGS=`,
    `GSTREAMER_LIBS=`, `make`, `make install-lib` into
