@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "method": "config.set",
+  "params": {
+    "appid": 220,
+    "key": "graphics_backend",
+    "value": "dxmt"
+  }
+}

@@ -4,9 +4,7 @@ const SUBCOMMANDS: [&str; 9] = [
     "engine", "steam", "install", "run", "config", "prefix", "runtime", "serve", "doctor",
 ];
 
-const STUBS: [&str; 7] = [
-    "engine", "steam", "install", "run", "prefix", "runtime", "serve",
-];
+const STUBS: [&str; 6] = ["engine", "steam", "install", "run", "prefix", "runtime"];
 
 const DOCTOR_KEYS: [&str; 6] = [
     "macos_version",
@@ -55,7 +53,7 @@ fn stubs_exit_with_ex_unavailable() {
 
 #[test]
 fn stubs_ignore_trailing_arguments() {
-    assert_not_implemented("serve", &["--stdio"]);
+    assert_not_implemented("prefix", &["snapshot"]);
     assert_not_implemented("steam", &["login"]);
 }
 
@@ -490,4 +488,84 @@ fn doctor_json_has_expected_keys() {
         "unexpected keys in {facts}"
     );
     assert_eq!(facts["screen_recording"], "unknown");
+}
+
+const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":1}}"#;
+const DOCTOR: &str = r#"{"jsonrpc":"2.0","id":2,"method":"host.doctor","params":{}}"#;
+
+/// Runs `serve --stdio` with `input` on stdin; returns (exit code, stdout lines, stderr).
+fn serve(input: &str, extra: &[&str]) -> (Option<i32>, Vec<serde_json::Value>, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = applejack()
+        .args(["serve", "--stdio"])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawns");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .expect("writes");
+    let output = child.wait_with_output().expect("exits");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let responses = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}")))
+        .collect();
+    (
+        output.status.code(),
+        responses,
+        String::from_utf8(output.stderr).expect("utf-8"),
+    )
+}
+
+#[test]
+fn serve_without_stdio_exits_2_with_usage() {
+    let output = applejack().arg("serve").output().expect("runs");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("usage: applejack serve --stdio"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn serve_stdio_answers_hello_and_host_doctor_then_exits_0() {
+    let (code, responses, stderr) = serve(&format!("{HELLO}\n{DOCTOR}\n"), &[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["result"]["protocol_version"], 1);
+    assert_eq!(responses[1]["id"], 2);
+    assert!(responses[1]["result"]["macos_version"].is_string());
+    assert!(
+        stderr.is_empty(),
+        "stderr is silent without --log: {stderr}"
+    );
+}
+
+#[test]
+fn serve_stdio_logs_to_stderr_only_with_log_flag() {
+    let (code, responses, stderr) = serve(&format!("{HELLO}\n{DOCTOR}\n"), &["--log"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(responses.len(), 2, "log lines must not reach stdout");
+    assert!(stderr.contains("-> hello"), "{stderr}");
+    assert!(stderr.contains("<- host.doctor ok"), "{stderr}");
+}
+
+#[test]
+fn serve_stdio_exits_non_zero_on_protocol_mismatch() {
+    let mismatch = r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":99}}"#;
+    let (code, responses, _) = serve(&format!("{mismatch}\n{DOCTOR}\n"), &[]);
+    assert_eq!(code, Some(65));
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["error"]["code"], 1000);
 }

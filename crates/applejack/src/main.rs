@@ -47,7 +47,7 @@ enum Command {
     /// Manage the shared Steam client prefix
     Runtime(Pending),
     /// Serve JSON-RPC over stdio for the app shell
-    Serve(Pending),
+    Serve(cmd::serve::ServeArgs),
     /// Report host readiness facts
     Doctor {
         /// Print the facts as JSON
@@ -77,6 +77,7 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Doctor { json } => doctor(json),
         Command::Config(args) => cmd::config::run(args),
+        Command::Serve(args) => cmd::serve::run(args),
         stub => not_implemented(stub.name()),
     }
 }

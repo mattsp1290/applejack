@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 16,
+  "method": "app.cancel",
+  "params": {
+    "appid": 220,
+    "kill_prefix": false
+  }
+}
