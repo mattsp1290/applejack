@@ -112,7 +112,9 @@ Environment knobs:
    (BSD-2-Clause); Cisco's H.264 patent coverage applies to Cisco's own
    binaries only, so that plugin carries H.264 patent exposure of its own,
    while VideoToolbox in `system` already decodes H.264.
-5. `sh build/wine/build.sh` — tool checks, the bison conftest, the pkg-config report,
+5. `sh build/wine/build.sh` — tool checks (the prefixed llvm-mingw tools must
+   be the ones PATH resolves, and `/usr/bin/clang` must link and run an x86-64
+   program under Rosetta), the bison conftest, the pkg-config report,
    gate G4b (below), project patches from `build/wine/patches/`, then
    `arch -x86_64 configure --enable-archs=i386,x86_64 --with-mingw=llvm-mingw --without-x --enable-winemac-drv --with-gstreamer --disable-tests`
    with `CC=/usr/bin/clang` (Apple's; llvm-mingw's unprefixed `clang` sits last
@@ -165,12 +167,15 @@ Environment knobs:
    `sh build/wine/build.sh --preflight` runs everything up to `configure`
    without changing the tree: it reports the msync dry runs, the project-patch
    trial (on the tree without msync applied, since preflight applies nothing),
-   the bison outcome, and the pkg-config report. It exits 0 when the build
+   the host compiler conftest (the failure configure would report as "C
+   compiler cannot create executables"), the bison outcome, and the
+   pkg-config report. It exits 0 when the build
    can start, 3 when the only gaps are ones `sh build/bootstrap.sh` installs
    (llvm-mingw, the Homebrew bison, flex, pkgconf, molten-vk, and the
    packages the report misses), and 1 for anything else (Rosetta, the x86-64
    Homebrew, the msync patch set, the GStreamer stage or devel tree, a
-   project patch that does not apply), so CI can run it before bootstrap and
+   project patch that does not apply, a host compiler that cannot link, a
+   prefixed mingw tool shadowed on PATH), so CI can run it before bootstrap and
    still catch a recipe defect.
 6. `sh build/osslsigncode/build.sh` — the host-arch Authenticode tool for
    `probes/`, built with `-DOPENSSL_USE_STATIC_LIBS=ON` so Homebrew's

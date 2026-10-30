@@ -79,6 +79,20 @@ HOST_PKG_CONFIG=$(command -v pkg-config || command -v pkgconf || true)
 export PATH="$BREW_PREFIX/opt/bison/bin:$BREW_PREFIX/opt/flex/bin:$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin${MINGW_BIN:+:$MINGW_BIN}"
 HOST_CC=/usr/bin/clang
 HOST_CXX=/usr/bin/clang++
+# configure fixes only the -clang name (configure.ac, --with-mingw=llvm-mingw);
+# winegcc and winebuild find -gcc, -ld, -as, -ar, -nm, and -dlltool by name
+# on PATH during make, so another mingw-w64 earlier on PATH (Homebrew's, for
+# one) would compile with llvm-mingw and link with GNU binutils.
+if [ -n "$MINGW_BIN" ]; then
+  for cpu in i686 x86_64; do
+    for tool in clang gcc ld as ar nm ranlib dlltool strip windres widl; do
+      name="$cpu-w64-mingw32-$tool"
+      [ -x "$MINGW_BIN/$name" ] || fail "$name in $MINGW_BIN (llvm-mingw pin incomplete)"
+      found=$(command -v "$name" || true)
+      [ "$found" = "$MINGW_BIN/$name" ] || fail "$name from $MINGW_BIN: PATH resolves it to ${found:-nothing} (remove the other mingw-w64 from the x86-64 Homebrew or put it after PATH's llvm-mingw entry)"
+    done
+  done
+fi
 BISON=$(command -v bison || true)
 FLEX=$(command -v flex || true)
 [ -n "$BISON" ] || fail "bison (sh build/bootstrap.sh --install-brew-deps)" bootstrap
@@ -106,8 +120,9 @@ JOBS=${WINE_JOBS:-$(sysctl -n hw.ncpu)}
 conftest_dir="$WORK/wine/conftest"
 mkdir -p "$conftest_dir"
 printf 'int main(void) { return 0; }\n' >"$conftest_dir/host.c"
+# shellcheck disable=SC2086
 if arch -x86_64 "$HOST_CC" $CPPFLAGS $LDFLAGS "$conftest_dir/host.c" -o "$conftest_dir/host" >"$conftest_dir/host.log" 2>&1 \
-  && arch -x86_64 "$conftest_dir/host"; then
+  && arch -x86_64 "$conftest_dir/host" >>"$conftest_dir/host.log" 2>&1; then
   echo "host cc: $HOST_CC links and runs an x86-64 executable ($("$HOST_CC" --version | head -1))"
   rm -rf "$conftest_dir"
 else
