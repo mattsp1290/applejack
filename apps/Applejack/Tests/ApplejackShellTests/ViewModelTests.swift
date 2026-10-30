@@ -431,6 +431,41 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
+    func testAStoppedCoreIsRetryableAndAHealthyCallClearsTheBanner() async throws {
+        let app = makeApp()
+        await app.start()
+        let host = HostViewModel(app: app)
+        app.note(.notRunning)
+        XCTAssertEqual(app.coreStatus, .stopped(.notRunning))
+        app.note(.launchFailed("spawn"))
+        XCTAssertEqual(app.coreStatus, .stopped(.launchFailed("spawn")))
+        app.note(.handshakeTimedOut)
+        XCTAssertEqual(app.coreStatus, .stopped(.handshakeTimedOut))
+        // The next call respawns lazily; a success proves the core is up.
+        await host.load()
+        XCTAssertEqual(host.facts.value?.arch, "arm64")
+        guard case .running = app.coreStatus else { return XCTFail("expected running, got \(app.coreStatus)") }
+
+        app.note(.restartLimit)
+        XCTAssertEqual(app.coreStatus, .failed(.restartLimit))
+        app.note(.rpc(RpcError(code: RpcErrorCode.internal.rawValue, message: "boom")))
+        XCTAssertEqual(app.coreStatus, .failed(.restartLimit), "an rpc error never touches the banner")
+        await app.shutdown()
+    }
+
+    func testACallAfterAnExitClearsTheBannerWithoutRestart() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_CRASH_AFTER": "2"])
+        await app.start()
+        let host = HostViewModel(app: app)
+        await host.load()
+        await host.load()
+        XCTAssertEqual(app.coreStatus, .exited(1))
+        await host.load()
+        XCTAssertEqual(host.facts.value?.arch, "arm64")
+        guard case .running = app.coreStatus else { return XCTFail("expected running after the lazy respawn, got \(app.coreStatus)") }
+        await app.shutdown()
+    }
+
     func testAnIdleCoreExitReachesTheBannerThroughEvents() async throws {
         let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
         defer { try? FileManager.default.removeItem(at: pidFile) }

@@ -15,8 +15,12 @@ public final class AppModel {
         /// The core exited with this status; the next call respawns it
         /// under the restart cap, which "Restart" triggers.
         case exited(Int32)
-        /// `restartLimit`, `launchFailed`, `handshakeTimedOut`, or
-        /// `protocolMismatch`: the core is unusable until the app is reopened.
+        /// `notRunning`, `launchFailed`, or `handshakeTimedOut`: no core is
+        /// running and no exit status was seen. Recoverable like `exited`:
+        /// the next call respawns (`docs/rpc-protocol.md`, "Restart policy").
+        case stopped(CoreClientError)
+        /// `restartLimit` or `protocolMismatch`: the client refuses every
+        /// further call, so the core is unusable until the app is reopened.
         case failed(CoreClientError)
     }
 
@@ -53,7 +57,7 @@ public final class AppModel {
         await greet(client)
     }
 
-    /// Respawns the core (lazily, through `hello`) after an exit.
+    /// Respawns the core (lazily, through `hello`) after an exit or a stop.
     public func restart() async {
         guard let client else { return }
         coreStatus = .starting
@@ -83,7 +87,9 @@ public final class AppModel {
         switch error {
         case .coreExited(let status):
             coreStatus = .exited(status)
-        case .restartLimit, .launchFailed, .handshakeTimedOut, .protocolMismatch, .notRunning:
+        case .notRunning, .launchFailed, .handshakeTimedOut:
+            coreStatus = .stopped(error)
+        case .restartLimit, .protocolMismatch:
             coreStatus = .failed(error)
         case .shutDown, .rpc, .malformedResponse:
             break
@@ -145,14 +151,16 @@ public final class AppModel {
         }
     }
 
+    /// A call that succeeded proves the core is up, whatever the banner
+    /// showed: the respawn it rode on is this spawn's `hello`.
     private func noteHealthy(_ client: CoreClient) async {
         switch coreStatus {
-        case .exited, .starting:
+        case .missing, .running:
+            break
+        case .starting, .exited, .stopped, .failed:
             if let hello = await client.helloResult {
                 coreStatus = .running(hello)
             }
-        case .missing, .running, .failed:
-            break
         }
     }
 }

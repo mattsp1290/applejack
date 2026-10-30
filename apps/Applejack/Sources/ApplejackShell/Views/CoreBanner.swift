@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// The core's lifecycle, above every view: hidden while it runs, a restart
-/// action after an exit, and the final states the restart cap leaves.
+/// action after an exit or a stop, and the final states the client refuses
+/// to recover from.
 public struct CoreBanner: View {
     let app: AppModel
 
@@ -23,6 +24,10 @@ public struct CoreBanner: View {
             )
         case .exited(let status):
             banner(systemImage: "bolt.slash", text: "The core exited (status \(status)).", tint: .red) {
+                Button("Restart") { Task { await app.restart() } }
+            }
+        case .stopped(let error):
+            banner(systemImage: "bolt.slash", text: describe(error), tint: .orange) {
                 Button("Restart") { Task { await app.restart() } }
             }
         case .failed(let error):
