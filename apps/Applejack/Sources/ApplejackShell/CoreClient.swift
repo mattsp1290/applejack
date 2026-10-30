@@ -56,7 +56,9 @@ public enum CoreEvent: Equatable, Sendable {
 
 /// A started job and the stream of its own notifications. The stream ends
 /// after `job.done` or `job.failed`, and throws `coreExited` or `shutDown`
-/// when the core goes away before either arrives.
+/// when the core goes away before either arrives. A handle that is kept but
+/// no longer iterated holds its subscription until one of those ends it;
+/// drop the handle or cancel the consuming task to release it earlier.
 public struct JobHandle: Sendable {
     public let started: JobStarted
     public let events: AsyncThrowingStream<JobEvent, any Error>
@@ -76,7 +78,9 @@ public struct JobHandle: Sendable {
 /// - `generation` increases on every `spawn()` and every `tearDown()` that
 ///   drops a process. Every callback from a process (chunks, exit, write
 ///   failure, handshake deadline) carries the generation it was spawned under
-///   and is ignored if it does not match.
+///   and is ignored if it does not match. Whichever of `coreExited` and
+///   `tearDown` drops the process broadcasts `.exited` (outside `shutdown()`),
+///   so every job stream ends and no handle outlives its core.
 /// - `process != nil` implies that `helloResult` is set or `handshake` is in
 ///   flight, for the same generation. A `hello` that fails for any reason,
 ///   including the deadline, ends in `tearDown`. The handshake is completed
@@ -538,6 +542,7 @@ public actor CoreClient {
     /// `terminateGrace` is terminated, and killed `killGrace` later if it
     /// ignores that too.
     private func tearDown(failing error: CoreClientError) {
+        var dropped: Int32?
         if let process {
             generation += 1
             if let writer {
@@ -548,6 +553,9 @@ public actor CoreClient {
             self.process = nil
             helloResult = nil
             buffer = []
+            // -1 while it still runs: its real status arrives under the old
+            // generation and is never reported.
+            dropped = process.isRunning ? -1 : process.terminationStatus
             Task.detached {
                 try? await Task.sleep(for: CoreClient.terminateGrace)
                 guard process.isRunning else { return }
@@ -559,6 +567,11 @@ public actor CoreClient {
             }
         }
         failPending(with: error)
+        // The generation bump makes `coreExited` ignore this spawn, so the
+        // exit is announced here or never.
+        if let dropped, !shuttingDown {
+            broadcast(.exited(dropped))
+        }
     }
 
     private func failPending(with error: CoreClientError) {

@@ -42,7 +42,8 @@ public final class AppModel {
         if exitObserver == nil {
             exitObserver = Task { [weak self] in
                 for await event in await client.events() {
-                    guard let self, case .exited(let status) = event else { continue }
+                    guard let self else { return }
+                    guard case .exited(let status) = event else { continue }
                     if case .running = coreStatus {
                         coreStatus = .exited(status)
                     }

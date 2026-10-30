@@ -342,6 +342,79 @@ final class CoreClientTests: XCTestCase {
         await client.shutdown()
     }
 
+    func testAnEarlyNotificationBeatsTheResponseAndStillReachesItsHandle() async throws {
+        // The fake writes a progress line for job 7, and one for a job 99
+        // nobody started, before the `{"job_id":7}` response.
+        let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1", "FAKE_CORE_NOTIFY_FIRST": "1"])
+        let handle = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        var events: [JobEvent] = []
+        for try await event in handle.events {
+            events.append(event)
+        }
+        guard case .progress(let early)? = events.first else {
+            return XCTFail("expected the early progress first, got \(events)")
+        }
+        XCTAssertEqual(early.phase, "early")
+        XCTAssertEqual(events.count, 4)
+        XCTAssertTrue(events.allSatisfy { $0.jobId == handle.jobId }, "job 99's notification must not reach this handle")
+        XCTAssertEqual(events.last, .done(JobDone(jobId: handle.jobId)))
+        await client.shutdown()
+    }
+
+    func testAWriteToADeadCoreEndsJobStreamsAndAnnouncesTheExit() async throws {
+        // `fake.die` exits 3 and leaves a grandchild holding stdout, so for
+        // `exitDrainGrace` the client still has a process. The next write
+        // hits EPIPE and the teardown runs from `writeFailed`, not from
+        // `coreExited`. Regression for the review of 747fac1 (probe P2/P2c).
+        let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1", "FAKE_CORE_JOB_OUTCOME": "never", "FAKE_CORE_DIE_HOLD": "1"])
+        _ = try await client.hello()
+        let events = await client.events()
+        let stale = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        let die = Task { try await client.call("fake.die", params: EmptyParams()) as EmptyResult }
+        try await Task.sleep(for: .milliseconds(100))
+        do {
+            _ = try await client.hostDoctor()
+            XCTFail("the write to the dead core must fail")
+        } catch CoreClientError.coreExited(let status) {
+            XCTAssertEqual(status, 3)
+        }
+        _ = try? await die.value
+
+        do {
+            for try await _ in stale.events {}
+            XCTFail("the job stream must end with the exit")
+        } catch CoreClientError.coreExited(let status) {
+            XCTAssertEqual(status, 3)
+        }
+        var exit: CoreEvent?
+        for await event in events {
+            if case .exited = event {
+                exit = event
+                break
+            }
+        }
+        XCTAssertEqual(exit, .exited(3))
+
+        // The respawned core reuses job id 7; its events belong to the new
+        // handle alone, and the stale one is already finished.
+        let fresh = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        XCTAssertEqual(fresh.jobId, stale.jobId)
+        let restarts = await client.restarts
+        XCTAssertEqual(restarts, 1)
+        var freshEvents: [JobEvent] = []
+        for try await event in fresh.events {
+            freshEvents.append(event)
+            if freshEvents.count == 2 { break }
+        }
+        XCTAssertEqual(freshEvents.map(\.jobId), [fresh.jobId, fresh.jobId])
+        var staleAfterRespawn = 0
+        for try await _ in stale.events {
+            staleAfterRespawn += 1
+        }
+        XCTAssertEqual(staleAfterRespawn, 0, "a finished handle must not adopt the new core's job")
+        await client.shutdown()
+    }
+
     func testEventsStreamEndsOnShutdown() async throws {
         let client = makeClient()
         _ = try await client.hello()

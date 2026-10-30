@@ -22,8 +22,15 @@
 #                              engine.install and app.install run as jobs that
 #                              emit two job.progress then job.done
 #   FAKE_CORE_JOB_OUTCOME=failed  the jobs end with job.failed (code 1004)
+#   FAKE_CORE_JOB_OUTCOME=never   the jobs emit their progress and no terminal
+#                                 notification
+#   FAKE_CORE_NOTIFY_FIRST=1   engine.install writes a job.progress for job 7
+#                              and one for a job 99 nobody started before the
+#                              {"job_id":7} response
+#   FAKE_CORE_DIE_HOLD=1       `fake.die` leaves a `sleep` child holding stdout
+#                              (without it the fake just exits 3 on `fake.die`)
 #   FAKE_CORE_REQUEST_LOG=<path>  append every request line to that file
-#   FAKE_CORE_SESSION_LOG=<path>  the log_path session.list reports
+#   FAKE_CORE_SESSION_LOG=<path>  the log_path session.list and app.run report
 set -u
 
 count=0
@@ -72,7 +79,9 @@ job() {
     sleep 0.05
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":'"$1"',"phase":"extract","done_bytes":null,"total_bytes":null,"message":"unpacking"}}'
     sleep 0.05
-    if [ "${FAKE_CORE_JOB_OUTCOME:-done}" = "failed" ]; then
+    if [ "${FAKE_CORE_JOB_OUTCOME:-done}" = "never" ]; then
+      :
+    elif [ "${FAKE_CORE_JOB_OUTCOME:-done}" = "failed" ]; then
       write '{"jsonrpc":"2.0","method":"job.failed","params":{"job_id":'"$1"',"code":1004,"message":"checksum mismatch"}}'
     else
       write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":'"$1"'}}'
@@ -88,8 +97,15 @@ implemented() {
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"engines":[{"engine_id":"rosetta-wine","version":"10.0.1","installed":true,"active":true},{"engine_id":"rosetta-wine","version":"10.0.0","installed":true,"active":false}]}}'
       ;;
     engine.install)
+      if [ "${FAKE_CORE_NOTIFY_FIRST:-0}" = "1" ]; then
+        write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":99,"phase":"orphan","done_bytes":null,"total_bytes":null,"message":"nobody started this job"}}'
+        write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":7,"phase":"early","done_bytes":1,"total_bytes":2,"message":"before the response"}}'
+      fi
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":7}}'
       job 7
+      ;;
+    app.run)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"fake-session","log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
       ;;
     app.install)
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":8}}'
@@ -169,6 +185,15 @@ while IFS= read -r line; do
       ;;
     host.doctor)
       emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"macos_version":"26.0","arch":"arm64","rosetta_present":true,"free_disk_bytes":123456789,"screen_recording":"unknown","developer_id_identities":0}}'
+      ;;
+    fake.die)
+      # Exits 3 without answering. The grandchild inherits stdout only (an
+      # asynchronous list reads /dev/null), so the next write to stdin fails
+      # while stdout has not reached EOF.
+      if [ "${FAKE_CORE_DIE_HOLD:-0}" = "1" ]; then
+        sleep 3 &
+      fi
+      exit 3
       ;;
     fake.echo)
       params=$(printf '%s' "$line" | sed -nE 's/^\{"id":[0-9]+,"jsonrpc":"2\.0","method":"fake\.echo","params":(.*)\}$/\1/p')

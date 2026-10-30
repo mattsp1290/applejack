@@ -174,6 +174,22 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
+    func testCoreDeathDuringAJobFailsTheFlowAndShowsTheBanner() async throws {
+        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let app = makeApp(environment: ["FAKE_CORE_JOB_OUTCOME": "never", "FAKE_CORE_PID_FILE": pidFile.path])
+        await app.start()
+        let engines = EnginesViewModel(app: app)
+        let install = Task { await engines.install("rosetta-wine") }
+        try await waitUntil { engines.install.value != nil }
+        let pid = try XCTUnwrap(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+        kill(pid, SIGKILL)
+        await install.value
+        XCTAssertEqual(engines.install, .failed(.coreExited(9)))
+        XCTAssertEqual(app.coreStatus, .exited(9))
+        await app.shutdown()
+    }
+
     func testEngineListUseDoctorAndProbe() async throws {
         let app = makeApp()
         let engines = EnginesViewModel(app: app)
