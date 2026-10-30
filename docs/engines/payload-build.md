@@ -222,16 +222,22 @@ Environment knobs:
      bare-leaf `dlopen("libfreetype.6.dylib")` binds to it, whatever run
      paths the client has. Two regular files with one install name would
      therefore let load order pick the library (the staged GStreamer
-     framework ships `libfreetype.6.dylib`, `libintl.8.dylib`, and a
-     `libMoltenVK.dylib` of its own, 1.2.9, for its vulkan and applemedia
-     plugins). The round first groups the tree's regular Mach-O files by
-     install name: where the `SONAME_POLICY` table names one of a group's
-     files as the payload's copy, the others become relative links to it
-     (the framework's `libMoltenVK.dylib` becomes a link to the pinned
+     framework ships `libfreetype.6.dylib`, `libintl.8.dylib` (proxy-libintl,
+     a stub gettext runtime, not gettext's), and a `libMoltenVK.dylib` of
+     its own, 1.2.9, for its vulkan and applemedia plugins). The round
+     first groups the tree's regular Mach-O files by install name: where
+     the `SONAME_POLICY` table names one of a group's files as the
+     payload's copy, the others become relative links to it (the
+     framework's `libMoltenVK.dylib` becomes a link to the pinned
      `vulkan/libMoltenVK.dylib`, whose exports cover every symbol those
      plugins import); any other group fails the closure with every file
-     named. The rules below never create a duplicate: a library the payload
-     already ships is linked or reached by a run path, not copied again.
+     named. A file replaced this way gets no edit in the same round: an
+     edit planned from its own load commands would run through the new
+     link onto the canonical file, and `apply` refuses to run
+     `install_name_tool` or `codesign` on any path that is a link, naming
+     the link and its target. The rules below never create a duplicate: a
+     library the payload already ships is linked or reached by a run path,
+     not copied again.
    - **SONAMEs.** Wine `dlopen`s some libraries by bare SONAME rather than
      linking them: `config.h` in the build tree defines
      `SONAME_LIBFREETYPE` (`win32u`, `dwrite`), `SONAME_LIBGNUTLS`
@@ -273,25 +279,48 @@ Environment knobs:
      `/System` becomes `@rpath/<file name>`; an absolute `LC_RPATH` outside
      them is deleted; a dependency on an absolute non-system path (a
      Homebrew `opt/` or `Cellar/` path) is rewritten to `@rpath/<leaf>`
-     and, when `wine/lib/` lacks the leaf, either reached by a run path to
-     the one payload directory that already holds it (the framework's
-     `libintl.8.dylib` for gnutls and libidn2) or, when none does, copied
-     into `wine/lib/` (thinned to x86-64 with `lipo` if universal; the
-     copy must be an x86-64 Mach-O); and every `@rpath/<leaf>` dependency
-     must then resolve through the binary's own `@loader_path` run paths,
-     else the closure adds the run path to the one payload directory
-     holding that leaf (the binary's own directory wins a tie; a leaf
-     nowhere in the payload is copied from Homebrew). A leaf in two
-     directories (one of them a link, since two regular files are refused
-     above) is judged after the binary's unambiguous references have
-     settled its run paths, so load-command order does not decide; a
-     reference still ambiguous then is an error naming both directories.
-     This is what gives `winegstreamer.so`
+     and bound to `wine/lib/<leaf>` when that exists (the closure's own
+     copies and policy links), else to the one file of that name another
+     component ships, which takes a `SONAME_POLICY` row naming the file:
+     the framework's proxy-libintl `libintl.8.dylib` for gnutls and
+     libidn2. Either way the planner checks the dependent's required
+     compatibility version against the file's `LC_ID_DYLIB` current
+     version and fails with both numbers when the requirement is higher,
+     unless the row carries `allow_older_compat` with a reason, which
+     every round that relies on it prints. The libintl row does: gnutls
+     and libidn2 record 13.0.0 against gettext 0.26, proxy-libintl reports
+     10.5.0, the two symbols they import are exported, and dyld does not
+     enforce the compatibility version (observed on macOS 26; unverified
+     on the macOS 14 to 25 range the plan supports on a best-effort basis).
+     A leaf the payload holds nowhere is copied into `wine/lib/` (thinned
+     to x86-64 with `lipo` if universal; the copy must be an x86-64
+     Mach-O); and every `@rpath/<leaf>` dependency must then resolve
+     through the binary's own `@loader_path` run paths, else the closure
+     adds the run path to the one payload directory holding that leaf
+     (the binary's own directory wins a tie; a leaf nowhere in the payload
+     is copied from Homebrew). A link and the file it resolves to are one
+     image, so a leaf in two directories that way is no tie; a leaf in two
+     directories as two files is judged after the binary's unambiguous
+     references have settled its run paths, so load-command order does
+     not decide, and a reference still ambiguous then is an error naming
+     both directories. This is what gives `winegstreamer.so`
      `@loader_path/../../GStreamer.framework/Versions/1.0/lib` for its
      `libgst*` references and gives each copied library `@loader_path`
      for its siblings. `@loader_path/` and `@executable_path/` references
      are left to step 9's chain rules. Each rewritten binary is re-signed
-     ad hoc (`codesign --force --sign -`).
+     ad hoc (`codesign --force --sign -
+     --preserve-metadata=entitlements,flags,runtime`, so an edit of a
+     signed binary keeps what it had rather than dropping it silently).
+   - **Links the tree carries.** Every path a round writes resolves inside
+     the payload. A destination at or below a symlink that is dangling,
+     leaves the payload, or names a directory is an occupied slot, not an
+     empty one: the planner fails naming the link, its target, and the
+     component, and `apply` walks each path component by component again
+     before writing, as the engine's install check does, and refuses to
+     overwrite anything the plan expected absent. What a round rewrites or
+     replaces is journaled first (a pre-existing link as its target, so it
+     comes back as a link), and the rollback message counts created paths
+     removed and pre-existing files restored separately.
    - **Gates.** Before a round lands, the destinations are scanned against
      `build/denylist.toml`, and every copy's Homebrew provenance
      (`/usr/local/Cellar/<formula>/<version>/`) must match a
@@ -300,12 +329,20 @@ Environment knobs:
      `build/bundle-spec.toml` carries those rows (gnutls, p11-kit,
      libidn2, libunistring, libtasn1, nettle, gmp, sdl2; the Cellar path
      of each copy is the source of the versions, and a versioned formula
-     such as `openssl@3` is a quoted key). Anything the closure cannot
-     resolve fails the run with the binary and the reference named, and
-     nothing of that round is applied. A tool failure part-way through a
-     round (`install_name_tool`, `codesign`, `lipo`) puts every file the
-     round created, replaced, or rewrote back from its pre-image, then
-     fails naming the file and the tool's stderr.
+     such as `openssl@3` is a quoted key). The two libraries Wine binds
+     to inside the framework have rows too, rendered at their real
+     location rather than as copies: `freetype` (FreeType 2.13.3 under
+     the `FTL`, whose binary redistribution requires the FreeType credit
+     the notices carry) and `proxy-libintl` (LGPL-2.0-or-later); the
+     GStreamer row's LGPL-2.1-or-later is GStreamer's own and covers
+     neither. A run that copied anything reports a library row no copy
+     came from, so a stale row cannot sit in the notices unnoticed.
+     Anything the closure cannot resolve fails the run with the binary
+     and the reference named, and nothing of that round is applied. A
+     tool failure part-way through a round (`install_name_tool`,
+     `codesign`, `lipo`) removes what the round created and puts every
+     file it replaced or rewrote back from its pre-image, then fails
+     naming the file and the tool's stderr.
 
    On the planning host (2026-10-30) the closure applies three rounds and
    the fourth plans nothing: it replaces the framework's `libMoltenVK.dylib`

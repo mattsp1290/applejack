@@ -15,7 +15,8 @@
 # into place, so nothing an earlier run produced survives a rerun and a run
 # that fails anywhere (the closure included) leaves the previous payload
 # untouched. ASSEMBLE_PARTIAL=1 tolerates unbuilt probes and an unbuilt
-# osslsigncode.
+# osslsigncode; the closure and its check still run when wine/ is built (a
+# declared probe that is absent is skipped, not a violation).
 set -eu
 . "$(dirname "$0")/lib.sh"
 

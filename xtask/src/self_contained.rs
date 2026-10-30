@@ -116,6 +116,57 @@ pub(crate) fn id_entry(load_commands: &str) -> Option<&str> {
     command_values(load_commands, "name ", |command| command == "LC_ID_DYLIB").next()
 }
 
+/// One dylib load command of `otool -l` output: the install name it names
+/// and the two versions it records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DylibCommand<'a> {
+    pub(crate) command: &'a str,
+    pub(crate) name: &'a str,
+    /// `current version X.Y.Z`.
+    pub(crate) current: &'a str,
+    /// `compatibility version X.Y.Z`: for `LC_ID_DYLIB` what the file
+    /// promises, for a dependency what the binary requires of it.
+    pub(crate) compatibility: &'a str,
+}
+
+/// The `LC_ID_DYLIB` and dependency load commands with their versions, in
+/// load-command order.
+pub(crate) fn dylib_commands(load_commands: &str) -> Vec<DylibCommand<'_>> {
+    let mut out = Vec::new();
+    let mut command: Option<&str> = None;
+    let mut name: Option<&str> = None;
+    let mut current: Option<&str> = None;
+    for line in load_commands.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("cmd ") {
+            let rest = rest.trim();
+            command =
+                (rest == "LC_ID_DYLIB" || DEPENDENCY_COMMANDS.contains(&rest)).then_some(rest);
+            name = None;
+            current = None;
+        } else if command.is_none() {
+        } else if let Some(rest) = line.strip_prefix("name ") {
+            name = Some(
+                rest.rsplit_once(" (offset ")
+                    .map_or(rest, |(value, _)| value)
+                    .trim(),
+            );
+        } else if let Some(rest) = line.strip_prefix("current version ") {
+            current = Some(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("compatibility version ") {
+            if let (Some(command), Some(name), Some(current)) = (command, name, current) {
+                out.push(DylibCommand {
+                    command,
+                    name,
+                    current,
+                    compatibility: rest.trim(),
+                });
+            }
+            command = None;
+        }
+    }
+    out
+}
+
 /// The `<field> <value> (offset N)` line of each load command `wanted`
 /// accepts.
 fn command_values<'a>(
@@ -412,6 +463,67 @@ wine/bin/wine64:
 \t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 1000.0.0)
 \t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1000.0.0)
 ";
+
+    #[test]
+    fn dylib_commands_carry_the_versions_of_the_id_and_of_each_dependency() {
+        let load_commands = "\
+Load command 2
+          cmd LC_ID_DYLIB
+      cmdsize 48
+         name @rpath/libintl.8.dylib (offset 24)
+   time stamp 1 Wed Dec 31 18:00:01 1969
+      current version 10.5.0
+compatibility version 10.0.0
+Load command 3
+          cmd LC_LOAD_DYLIB
+      cmdsize 56
+         name /usr/lib/libSystem.B.dylib (offset 24)
+   time stamp 2 Wed Dec 31 18:00:02 1969
+      current version 1356.0.0
+compatibility version 1.0.0
+Load command 4
+          cmd LC_RPATH
+      cmdsize 32
+         path @loader_path/../lib (offset 12)
+Load command 5
+          cmd LC_LOAD_WEAK_DYLIB
+      cmdsize 64
+         name @rpath/libgnutls.30.dylib (offset 24)
+   time stamp 2 Wed Dec 31 18:00:02 1969
+      current version 68.2.0
+compatibility version 68.0.0
+";
+        let commands = super::dylib_commands(load_commands);
+        let described: Vec<(&str, &str, &str, &str)> = commands
+            .iter()
+            .map(|command| {
+                (
+                    command.command,
+                    command.name,
+                    command.current,
+                    command.compatibility,
+                )
+            })
+            .collect();
+        assert_eq!(
+            described,
+            [
+                ("LC_ID_DYLIB", "@rpath/libintl.8.dylib", "10.5.0", "10.0.0"),
+                (
+                    "LC_LOAD_DYLIB",
+                    "/usr/lib/libSystem.B.dylib",
+                    "1356.0.0",
+                    "1.0.0"
+                ),
+                (
+                    "LC_LOAD_WEAK_DYLIB",
+                    "@rpath/libgnutls.30.dylib",
+                    "68.2.0",
+                    "68.0.0"
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn flags_every_non_system_absolute_reference() {

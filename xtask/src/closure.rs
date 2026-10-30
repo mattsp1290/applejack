@@ -27,25 +27,30 @@
 //! the same install name is never loaded, whichever run path a client has.
 //! The payload therefore holds exactly one regular file per install name. A
 //! library the payload already ships (the `GStreamer` framework's freetype
-//! and libintl, the pinned `MoltenVK`) is linked or reached by a run path, never
-//! copied again, and a duplicate the tree carries becomes a relative link to
-//! the file the SONAME policy names, or is refused.
+//! and proxy-libintl, the pinned `MoltenVK`) is linked or reached by a run
+//! path, never copied again, and only through a [`SONAME_POLICY`] row that
+//! names the file and that the dependent's compatibility version is checked
+//! against; a duplicate the tree carries becomes a relative link to that
+//! file, or is refused. Every path a round writes resolves inside the
+//! payload: a link that leads out of it is an occupied slot, not an empty
+//! one, and a tool never runs on a link.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs;
 use std::io::Read as _;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::bundle_toml::{BundleSpec, is_formula_name};
+use crate::bundle_toml::{BundleSpec, is_formula_name, named_row, shipped_elsewhere};
 use crate::denylist::Denylist;
 use crate::engine_payload::{BUNDLE_FILE, check, is_macho, load_denylist, otool, walk};
 use crate::self_contained::{
-    Violation, binary_dir, dependency_entries, id_entry, is_executable, normalize_relative,
-    rpath_entries,
+    Violation, binary_dir, dependency_entries, dylib_commands, id_entry, is_executable,
+    normalize_relative, rpath_entries,
 };
 
 /// Where copied libraries land, and the one directory a SONAME resolves in.
@@ -74,10 +79,18 @@ pub enum SonamePolicy {
     /// Copied from `/usr/local/lib/<soname>`; the default for any SONAME
     /// without a row in [`SONAME_POLICY`].
     Homebrew,
-    /// A file the payload already ships at this bundle-relative path;
-    /// `wine/lib/<soname>` becomes a relative link to it, and any other
-    /// regular file carrying its install name becomes a link to it too.
-    Payload(&'static str),
+    /// A file the payload already ships at this bundle-relative path. For a
+    /// SONAME, `wine/lib/<soname>` becomes a relative link to it; any other
+    /// regular file carrying its install name becomes a link to it too; and
+    /// an absolute dependency whose leaf this is binds to it, provided the
+    /// file's current version satisfies the dependent's compatibility
+    /// version. dyld does not enforce that version, so a row may allow an
+    /// older file when every imported symbol has been verified; the reason
+    /// is recorded here and printed by every round that relies on it.
+    Payload {
+        file: &'static str,
+        allow_older_compat: Option<&'static str>,
+    },
     /// A macOS library dyld finds in the shared cache on its own.
     System,
     /// Copied when the x86-64 Homebrew has it, skipped with a message
@@ -85,10 +98,13 @@ pub enum SonamePolicy {
     Optional,
 }
 
-/// The SONAMEs that are not plain Homebrew copies. A new SONAME in
-/// `config.h` that is neither here nor in the x86-64 Homebrew fails the
-/// closure, which is the moment to classify it; so does a SONAME the payload
-/// already ships somewhere without a row here.
+/// The SONAMEs and dependency leaves that are not plain Homebrew copies. A
+/// new SONAME in `config.h` that is neither here nor in the x86-64 Homebrew
+/// fails the closure, which is the moment to classify it; so does a SONAME
+/// or an absolute dependency's leaf the payload already ships somewhere
+/// without a row here. A formula that spells a pinned component
+/// (`molten-vk`) can never gain a `[components]` row, so a row here is the
+/// only way its library enters the payload.
 pub const SONAME_POLICY: &[(&str, SonamePolicy)] = &[
     // Wine's SONAME_LIBVULKAN and SONAME_LIBMOLTENVK: the pinned MoltenVK
     // release (`components.moltenvk`), not Homebrew's molten-vk formula. The
@@ -97,20 +113,56 @@ pub const SONAME_POLICY: &[(&str, SonamePolicy)] = &[
     // the pin, whose exports cover every symbol those plugins import.
     (
         "libMoltenVK.dylib",
-        SonamePolicy::Payload("vulkan/libMoltenVK.dylib"),
+        SonamePolicy::Payload {
+            file: "vulkan/libMoltenVK.dylib",
+            allow_older_compat: None,
+        },
     ),
     // The framework's freetype, which its fontconfig, harfbuzz, cairo, pango,
     // and libass link, rather than a second copy from Homebrew; it exports
     // every FT_* symbol win32u and dwrite look up.
     (
         "libfreetype.6.dylib",
-        SonamePolicy::Payload("wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib"),
+        SonamePolicy::Payload {
+            file: "wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib",
+            allow_older_compat: None,
+        },
+    ),
+    // gnutls and libidn2 link gettext's libintl by absolute path; the one
+    // libintl.8.dylib the payload ships is the framework's proxy-libintl
+    // (a stub whose dgettext returns the message id), so they bind to it.
+    (
+        "libintl.8.dylib",
+        SonamePolicy::Payload {
+            file: "wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib",
+            allow_older_compat: Some(
+                "gnutls 3.8.10 and libidn2 2.3.8 record compatibility version 13.0.0 against gettext 0.26, and proxy-libintl's current version is 10.5.0; the two symbols they import (libintl_bindtextdomain, libintl_dgettext) are both exported, and dyld does not enforce the compatibility version (gnutls_global_init ran through it on macOS 26)",
+            ),
+        },
     ),
     // No file under /usr/lib since macOS 11; dyld serves it from the cache.
     ("libcups.2.dylib", SonamePolicy::System),
     // unixODBC; odbc32 dlopens it lazily and reports no driver without it.
     ("libodbc.dylib", SonamePolicy::Optional),
 ];
+
+/// A dylib version as `otool -l` prints it, `X.Y.Z`, ordered numerically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version(pub u32, pub u32, pub u32);
+
+impl Version {
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.trim().split('.').map(|part| part.parse::<u32>().ok());
+        let version = Self(parts.next()??, parts.next()??, parts.next()??);
+        parts.next().is_none().then_some(version)
+    }
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.0, self.1, self.2)
+    }
+}
 
 fn policy(soname: &str) -> SonamePolicy {
     SONAME_POLICY
@@ -133,6 +185,11 @@ pub struct Image {
     pub executable: bool,
     /// The SONAMEs this image's bytes contain, filled for Unix modules only.
     pub sonames: BTreeSet<String>,
+    /// `LC_ID_DYLIB`'s current version, what the file offers its clients.
+    pub current_version: Option<Version>,
+    /// The compatibility version each dependency load command requires of
+    /// the library it names, by reference.
+    pub required: BTreeMap<String, Version>,
 }
 
 /// The tree a round plans against.
@@ -143,6 +200,13 @@ pub struct Tree {
     /// Payload-relative paths of every regular file and of every symlink that
     /// resolves to a file inside the payload.
     pub files: BTreeSet<PathBuf>,
+    /// Each symlink of `files` and the regular file it resolves to, both
+    /// payload-relative: one image to dyld, whichever path names it.
+    pub links: BTreeMap<PathBuf, PathBuf>,
+    /// Symlinks that do not resolve to a regular file inside the payload
+    /// (dangling, escaping, or a directory), with what each is. A planned
+    /// destination at or below one of them is occupied, not free.
+    pub occupied: BTreeMap<PathBuf, String>,
 }
 
 /// A library to copy in, thinned to x86-64.
@@ -220,20 +284,25 @@ pub type Runner<'a> = dyn FnMut(&str, &[&OsStr]) -> Result<(), String> + 'a;
 ///
 /// First, every install name carried by more than one regular file: the
 /// others become links to the file the SONAME policy names, or the group is
-/// an error. For every SONAME: present under `wine/lib/`, or linked per
-/// [`SONAME_POLICY`], or copied from the x86-64 Homebrew (an error when the
-/// payload ships it elsewhere without a policy row). For every image: a
-/// foreign install name becomes `@rpath/<file name>`; a foreign absolute
-/// `LC_RPATH` is dropped; a Unix module naming a supplied SONAME gets the run
-/// path to `wine/lib/`; each foreign absolute dependency is rewritten to
-/// `@rpath/<leaf>` with the run path to the one payload directory already
-/// holding the leaf, else copied to `wine/lib/`; each `@rpath/<leaf>`
-/// dependency must be reachable through the image's own `@loader_path` run
-/// paths (existing or planned this round), else the run path to the one
-/// directory holding the leaf is added (the image's own directory wins a
-/// tie; any other tie is an error naming the directories), else the leaf is
-/// copied from Homebrew. `@loader_path/` and `@executable_path/` references
-/// are left for the checker, whose chain rules decide them.
+/// an error; a file replaced this way gets no edit this round. For every
+/// SONAME: present under `wine/lib/`, or linked per [`SONAME_POLICY`], or
+/// copied from the x86-64 Homebrew (an error when the payload ships it
+/// elsewhere without a policy row). For every other image: a foreign
+/// install name becomes `@rpath/<file name>`; a foreign absolute `LC_RPATH`
+/// is dropped; a Unix module naming a supplied SONAME gets the run path to
+/// `wine/lib/`; each foreign absolute dependency is rewritten to
+/// `@rpath/<leaf>`, bound to `wine/lib/<leaf>` when that exists, else to the
+/// one payload file of that name a policy row names (the dependent's
+/// compatibility version checked against the file's current version), else
+/// copied to `wine/lib/`; each `@rpath/<leaf>` dependency must be reachable
+/// through the image's own `@loader_path` run paths (existing or planned
+/// this round), else the run path to the one directory holding the leaf is
+/// added (a link and its target are one file; the image's own directory
+/// wins a tie; any other tie is an error naming the directories), else the
+/// leaf is copied from Homebrew. A destination at or below a link that does
+/// not resolve to a file inside the payload is an error naming the link.
+/// `@loader_path/` and `@executable_path/` references are left for the
+/// checker, whose chain rules decide them.
 pub fn plan(tree: &Tree, sonames: &[String], source: &Source<'_>) -> Plan {
     let mut round = Round {
         tree,
@@ -243,10 +312,22 @@ pub fn plan(tree: &Tree, sonames: &[String], source: &Source<'_>) -> Plan {
         supplied: BTreeSet::new(),
     };
     round.duplicates();
+    // An edit planned from a replaced file's load commands would run through
+    // the new link onto the canonical file.
+    let replaced: BTreeSet<String> = round
+        .plan
+        .replaced
+        .iter()
+        .map(|link| link.link.to_string_lossy().into_owned())
+        .collect();
     for soname in sonames {
         round.soname(soname);
     }
-    for image in &tree.images {
+    for image in tree
+        .images
+        .iter()
+        .filter(|image| !replaced.contains(&image.relative))
+    {
         round.image(image);
     }
     round.plan
@@ -303,6 +384,111 @@ impl Round<'_> {
         });
     }
 
+    /// The regular file behind `path`, which may be a link.
+    fn canonical(&self, path: &Path) -> PathBuf {
+        self.tree
+            .links
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// A path the round would create must be free: a link there that does
+    /// not resolve to a file inside the payload is an occupied slot, not an
+    /// empty one, and so is such a link among the parent directories.
+    fn free(&mut self, binary: &str, reference: &str, dest: &Path) -> bool {
+        let occupied = dest.ancestors().find_map(|path| {
+            self.tree.occupied.get(path).map(|what| {
+                format!(
+                    "{} is {what}; the closure writes only inside the payload",
+                    path.display()
+                )
+            })
+        });
+        match occupied {
+            Some(reason) => {
+                self.fail(binary, reference, &reason);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// The directories providing `rest`, one per distinct file: a link and
+    /// the file it resolves to are one image to dyld, so they are no tie,
+    /// and the directory holding the regular file is the one kept.
+    fn providers(&self, rest: &Path) -> Vec<PathBuf> {
+        let mut by_file: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+        for dir in dirs_providing(self.tree, &self.planned, rest) {
+            let path = dir.join(rest);
+            let file = self.canonical(&path);
+            let kept = by_file.entry(file.clone()).or_insert_with(|| dir.clone());
+            if path == file {
+                *kept = dir;
+            }
+        }
+        let mut dirs: Vec<PathBuf> = by_file.into_values().collect();
+        dirs.sort();
+        dirs
+    }
+
+    /// The dependent's required compatibility version against the current
+    /// version of the payload file it will bind to (`file` payload-relative;
+    /// a link is resolved). dyld does not enforce the requirement, so a
+    /// policy row may allow an older file with a reason, which the round
+    /// notes; without one, an older file is an error naming both numbers.
+    fn compatible(
+        &mut self,
+        image: &Image,
+        reference: &str,
+        file: &Path,
+        allow_older: Option<&str>,
+    ) -> bool {
+        let file = self.canonical(file);
+        let Some(required) = image.required.get(reference).copied() else {
+            return true;
+        };
+        let current = self
+            .tree
+            .images
+            .iter()
+            .find(|candidate| Path::new(&candidate.relative) == file)
+            .and_then(|candidate| candidate.current_version);
+        match (current, allow_older) {
+            (Some(current), _) if required <= current => true,
+            (Some(current), Some(reason)) => {
+                self.plan.notes.push(format!(
+                    "{}: {reference} requires compatibility version {required} and {} is current version {current}; allowed by its SONAME_POLICY row: {reason}",
+                    image.relative,
+                    file.display()
+                ));
+                true
+            }
+            (Some(current), None) => {
+                self.fail(
+                    &image.relative,
+                    reference,
+                    &format!(
+                        "requires compatibility version {required} but {} is current version {current}; only a SONAME_POLICY row with allow_older_compat and a reason binds a dependent to an older file",
+                        file.display()
+                    ),
+                );
+                false
+            }
+            (None, _) => {
+                self.fail(
+                    &image.relative,
+                    reference,
+                    &format!(
+                        "requires compatibility version {required} and {} has no LC_ID_DYLIB current version to check it against",
+                        file.display()
+                    ),
+                );
+                false
+            }
+        }
+    }
+
     /// Two regular files with one install name: the ones that are not the
     /// policy's file become links to it, or the group is refused.
     fn duplicates(&mut self) {
@@ -320,7 +506,9 @@ impl Round<'_> {
                 continue;
             }
             match policy(file_name(&id)) {
-                SonamePolicy::Payload(canonical) if files.iter().any(|file| file == canonical) => {
+                SonamePolicy::Payload {
+                    file: canonical, ..
+                } if files.iter().any(|file| file == canonical) => {
                     for file in files.iter().filter(|file| *file != canonical) {
                         self.plan.replaced.push(Link {
                             link: PathBuf::from(file),
@@ -340,9 +528,12 @@ impl Round<'_> {
             return;
         }
         let policy = policy(soname);
+        if policy != SonamePolicy::System && !self.free(CONFIG_H, soname, &dest) {
+            return;
+        }
         match policy {
             SonamePolicy::System => {}
-            SonamePolicy::Payload(path) => {
+            SonamePolicy::Payload { file: path, .. } => {
                 if self.tree.files.contains(Path::new(path)) {
                     self.plan.links.push(Link {
                         link: dest.clone(),
@@ -442,10 +633,9 @@ impl Round<'_> {
         // The unambiguous references settle the image's run paths first, so
         // a leaf the payload holds in two directories is judged against every
         // run path the image will have, whatever the load-command order.
-        let (ambiguous, plain): (Vec<_>, Vec<_>) =
-            rpath_references.into_iter().partition(|(_, rest)| {
-                dirs_providing(self.tree, &self.planned, Path::new(rest)).len() > 1
-            });
+        let (ambiguous, plain): (Vec<_>, Vec<_>) = rpath_references
+            .into_iter()
+            .partition(|(_, rest)| self.providers(Path::new(rest)).len() > 1);
         for (reference, rest) in plain.into_iter().chain(ambiguous) {
             self.rpath_dependency(image, &mut pending, reference, rest);
         }
@@ -461,33 +651,44 @@ impl Round<'_> {
         reference: &str,
         rest: &str,
     ) {
-        let candidates = dirs_providing(self.tree, &self.planned, Path::new(rest));
-        if candidates
+        // Any directory holding the leaf, link or file, satisfies a run path
+        // the image already has; the tie is judged over distinct files.
+        let holding = dirs_providing(self.tree, &self.planned, Path::new(rest));
+        if holding
             .iter()
             .any(|candidate| pending.reachable.contains(candidate))
         {
             return;
         }
-        if candidates.contains(&pending.dir) {
+        if holding.contains(&pending.dir) {
             let own = pending.dir.clone();
             pending.reach(&own);
             return;
         }
+        let candidates = self.providers(Path::new(rest));
         match candidates.as_slice() {
             [] if rest.contains('/') => {
                 self.fail(&image.relative, reference, "names no file in the payload");
             }
-            [] => match (self.source)(rest) {
-                Ok(file) => {
-                    self.copy(file, Path::new(LIB_DIR).join(rest));
-                    pending.reach(Path::new(LIB_DIR));
+            [] => {
+                let dest = Path::new(LIB_DIR).join(rest);
+                if !self.free(&image.relative, reference, &dest) {
+                    return;
                 }
-                Err(reason) => self.fail(
-                    &image.relative,
-                    reference,
-                    &format!("names no file in the payload, and {HOMEBREW_LIB}/{rest}: {reason}"),
-                ),
-            },
+                match (self.source)(rest) {
+                    Ok(file) => {
+                        self.copy(file, dest);
+                        pending.reach(Path::new(LIB_DIR));
+                    }
+                    Err(reason) => self.fail(
+                        &image.relative,
+                        reference,
+                        &format!(
+                            "names no file in the payload, and {HOMEBREW_LIB}/{rest}: {reason}"
+                        ),
+                    ),
+                }
+            }
             [only] => pending.reach(only),
             several => self.fail(
                 &image.relative,
@@ -505,24 +706,60 @@ impl Round<'_> {
         let leaf = file_name(reference);
         let dest = Path::new(LIB_DIR).join(leaf);
         let reach = if self.present(&dest) {
+            // wine/lib/ is the closure's own directory: the leaf there is a
+            // copy an earlier round made (or this one plans) or a policy
+            // link, so only its version needs checking.
+            if self.tree.files.contains(&dest) && !self.compatible(image, reference, &dest, None) {
+                return;
+            }
             PathBuf::from(LIB_DIR)
         } else {
-            let providers = dirs_providing(self.tree, &self.planned, Path::new(leaf));
+            let providers = self.providers(Path::new(leaf));
             match providers.as_slice() {
-                [] => match (self.source)(reference) {
-                    Ok(file) => {
-                        self.copy(file, dest);
-                        PathBuf::from(LIB_DIR)
-                    }
-                    Err(reason) => {
-                        self.fail(&image.relative, reference, &reason);
+                [] => {
+                    if !self.free(&image.relative, reference, &dest) {
                         return;
                     }
-                },
-                // The payload ships the leaf already (the framework's
-                // libintl for gnutls): one file per install name, so the
-                // reference turns to that file instead of a second copy.
-                [only] => only.clone(),
+                    match (self.source)(reference) {
+                        Ok(file) => {
+                            self.copy(file, dest);
+                            PathBuf::from(LIB_DIR)
+                        }
+                        Err(reason) => {
+                            self.fail(&image.relative, reference, &reason);
+                            return;
+                        }
+                    }
+                }
+                // Another component ships the leaf (the framework's
+                // proxy-libintl for gnutls): one file per install name, so
+                // the reference turns to that file instead of a second copy,
+                // but only through a policy row that names it, and only if
+                // the file is new enough for the dependent.
+                [only] => {
+                    let shipped = self.canonical(&only.join(leaf));
+                    let allow_older = match policy(leaf) {
+                        SonamePolicy::Payload {
+                            file,
+                            allow_older_compat,
+                        } if Path::new(file) == shipped => allow_older_compat,
+                        _ => {
+                            self.fail(
+                                &image.relative,
+                                reference,
+                                &format!(
+                                    "{} already ships {leaf}; a rebinding to a file the payload ships needs a SONAME_POLICY row naming that file",
+                                    shipped.display()
+                                ),
+                            );
+                            return;
+                        }
+                    };
+                    if !self.compatible(image, reference, &shipped, allow_older) {
+                        return;
+                    }
+                    only.clone()
+                }
                 several => {
                     self.fail(
                         &image.relative,
@@ -733,6 +970,17 @@ pub fn close(root: &Path, payload: &Path) -> Result<(), String> {
     let gate = |plan: &Plan| gate_copies(&denylist, &spec, plan);
     let mut runner = |program: &str, args: &[&OsStr]| run(program, args);
     let outcome = settle(&payload, &sonames, &source, &scan_tree, &gate, &mut runner)?;
+    // A run that copied anything saw every formula the tree needs; a row
+    // none of them matched would stay in the notices as a copied library.
+    if outcome.copied > 0 {
+        for formula in spec.components.libraries.keys() {
+            if !outcome.formulas.contains(formula) && shipped_elsewhere(formula).is_none() {
+                eprintln!(
+                    "[xtask] close: [components.{formula}] names a formula no copy came from; a stale row stays in the notices"
+                );
+            }
+        }
+    }
     println!(
         "[xtask] close {}: settled after {} round(s): {} librar{} copied, {} link(s) made, {} binar{} rewritten",
         payload.display(),
@@ -759,6 +1007,8 @@ pub struct Outcome {
     /// Links created, the replaced duplicates included.
     pub linked: usize,
     pub rewritten: BTreeSet<String>,
+    /// The Homebrew formulas the copies came from.
+    pub formulas: BTreeSet<String>,
 }
 
 /// The fixed-point loop: scan, plan, gate, apply, until a round plans
@@ -806,6 +1056,11 @@ fn settle(
         outcome.copied += plan.copies.len();
         outcome.linked += plan.links.len() + plan.replaced.len();
         outcome.rewritten.extend(plan.edits.keys().cloned());
+        outcome.formulas.extend(
+            plan.copies
+                .iter()
+                .filter_map(|copy| homebrew_formula(&copy.source).map(|(formula, _)| formula)),
+        );
     }
 }
 
@@ -836,8 +1091,13 @@ fn gate_copies(denylist: &Denylist, spec: &BundleSpec, plan: &Plan) -> Result<()
     let mut missing = Vec::new();
     for copy in &plan.copies {
         let Some((formula, version)) = homebrew_formula(&copy.source) else {
+            let why = if copy.source.starts_with(HOMEBREW_CELLAR) {
+                "its Cellar directory is not a Homebrew formula name"
+            } else {
+                "not under /usr/local/Cellar/<formula>/<version>/"
+            };
             return Err(format!(
-                "{}: not under {HOMEBREW_CELLAR}/<formula>/<version>/, so its formula and version are unknown",
+                "{}: {why}, so its formula and version are unknown",
                 copy.source.display()
             ));
         };
@@ -848,10 +1108,18 @@ fn gate_copies(denylist: &Denylist, spec: &BundleSpec, plan: &Plan) -> Result<()
                 copy.dest.display(),
                 component.version
             )),
-            None => missing.push(format!(
-                "{} comes from {formula} {version} and build/bundle-spec.toml has no [components.{formula}] row",
-                copy.dest.display()
-            )),
+            None => match named_row(&formula) {
+                // The spec refuses such a row by design; the pinned file
+                // enters the payload through the SONAME policy instead.
+                Some(row) => missing.push(format!(
+                    "{} comes from {formula} {version}, which spells the pinned component row `{row}`; a copy of it is never right: a SONAME_POLICY row naming the pinned file is",
+                    copy.dest.display()
+                )),
+                None => missing.push(format!(
+                    "{} comes from {formula} {version} and build/bundle-spec.toml has no [components.{formula}] row",
+                    copy.dest.display()
+                )),
+            },
         }
     }
     for line in &missing {
@@ -874,11 +1142,34 @@ fn scan(payload: &Path, sonames: &[String]) -> Result<Tree, String> {
     walk(payload, payload, &mut entries)?;
     let mut tree = Tree::default();
     for entry in &entries {
-        if entry.link_target.is_some() {
-            if fs::canonicalize(&entry.absolute)
-                .is_ok_and(|real| real.starts_with(payload) && real.is_file())
-            {
-                tree.files.insert(PathBuf::from(&entry.relative));
+        if let Some(target) = &entry.link_target {
+            let path = PathBuf::from(&entry.relative);
+            match fs::canonicalize(&entry.absolute) {
+                Ok(real) if real.starts_with(payload) && real.is_file() => {
+                    let real = real
+                        .strip_prefix(payload)
+                        .map_or_else(|_| real.clone(), Path::to_path_buf);
+                    tree.files.insert(path.clone());
+                    tree.links.insert(path, real);
+                }
+                Ok(real) if real.starts_with(payload) => {
+                    tree.occupied
+                        .insert(path, format!("a link to {}, a directory", target.display()));
+                }
+                Ok(real) => {
+                    tree.occupied.insert(
+                        path,
+                        format!(
+                            "a link to {} that resolves outside the payload ({})",
+                            target.display(),
+                            real.display()
+                        ),
+                    );
+                }
+                Err(_) => {
+                    tree.occupied
+                        .insert(path, format!("a dangling link to {}", target.display()));
+                }
             }
             continue;
         }
@@ -891,6 +1182,7 @@ fn scan(payload: &Path, sonames: &[String]) -> Result<Tree, String> {
         }
         let load_commands = otool(&entry.absolute, "-l")?;
         let executable = is_executable(&load_commands);
+        let versions = dylib_commands(&load_commands);
         let mut image = Image {
             relative: entry.relative.clone(),
             id: id_entry(&load_commands).map(str::to_owned),
@@ -900,6 +1192,20 @@ fn scan(payload: &Path, sonames: &[String]) -> Result<Tree, String> {
             rpaths: rpath_entries(&load_commands).map(str::to_owned).collect(),
             executable,
             sonames: BTreeSet::new(),
+            current_version: versions
+                .iter()
+                .find(|command| command.command == "LC_ID_DYLIB")
+                .and_then(|command| Version::parse(command.current)),
+            required: versions
+                .iter()
+                .filter(|command| command.command != "LC_ID_DYLIB")
+                .filter_map(|command| {
+                    Some((
+                        command.name.to_owned(),
+                        Version::parse(command.compatibility)?,
+                    ))
+                })
+                .collect(),
         };
         if !executable && entry.relative.starts_with(MODULE_DIR) {
             let bytes = fs::read(&entry.absolute)
@@ -922,20 +1228,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-/// Applies one round, whole or not at all: every file the round creates,
-/// replaces, or rewrites is journaled, and a failure puts each one back from
-/// its pre-image before the error (the file and the tool's stderr) returns.
+/// Applies one round, whole or not at all: every path the round creates,
+/// replaces, or rewrites is journaled, and a failure removes what was
+/// created and puts back what existed before, from its pre-image, before the
+/// error (the file and the tool's stderr) returns. Every path is checked to
+/// resolve inside the payload first, and no tool runs on a link.
 fn apply(payload: &Path, plan: &Plan, run: &mut Runner<'_>) -> Result<(), String> {
+    let payload = payload
+        .canonicalize()
+        .map_err(|error| format!("{}: {error}", payload.display()))?;
     let mut journal = Journal::new()?;
-    match apply_journaled(payload, plan, run, &mut journal) {
+    match apply_journaled(&payload, plan, run, &mut journal) {
         Ok(()) => {
             journal.discard();
             Ok(())
         }
         Err(error) => Err(match journal.restore() {
-            Ok(restored) => {
-                format!("{error}; the round was rolled back ({restored} file(s) restored)")
-            }
+            Ok((removed, restored)) => format!(
+                "{error}; the round was rolled back ({removed} created path(s) removed, {restored} pre-existing file(s) restored)"
+            ),
             Err(failure) => format!("{error}; rolling the round back failed too: {failure}"),
         }),
     }
@@ -948,8 +1259,9 @@ fn apply_journaled(
     journal: &mut Journal,
 ) -> Result<(), String> {
     for copy in &plan.copies {
-        let dest = payload.join(&copy.dest);
-        journal.created(&dest);
+        let dest = inside(payload, &copy.dest)?;
+        journal.create_dirs(payload, &copy.dest)?;
+        journal.created(&dest)?;
         copy_library(&copy.source, &dest, run)?;
         println!(
             "[xtask] close: copied {} <- {}",
@@ -958,8 +1270,9 @@ fn apply_journaled(
         );
     }
     for link in &plan.links {
-        let path = payload.join(&link.link);
-        journal.created(&path);
+        let path = inside(payload, &link.link)?;
+        journal.create_dirs(payload, &link.link)?;
+        journal.created(&path)?;
         symlink(&link.target, &path).map_err(|error| format!("{}: {error}", path.display()))?;
         println!(
             "[xtask] close: linked {} -> {}",
@@ -968,7 +1281,8 @@ fn apply_journaled(
         );
     }
     for link in &plan.replaced {
-        let path = payload.join(&link.link);
+        let path = inside(payload, &link.link)?;
+        regular(&link.link, &path)?;
         journal.save(&path)?;
         fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         symlink(&link.target, &path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -979,7 +1293,8 @@ fn apply_journaled(
         );
     }
     for (binary, edit) in &plan.edits {
-        let path = payload.join(binary);
+        let path = inside(payload, Path::new(binary))?;
+        regular(Path::new(binary), &path)?;
         journal.save(&path)?;
         install_name_tool(&path, edit, run)?;
         codesign(&path, run)?;
@@ -988,14 +1303,84 @@ fn apply_journaled(
     Ok(())
 }
 
+/// `payload/relative`, once every component on the way is known to stay
+/// inside the payload: a link among them that leads out of the tree, or
+/// nowhere, is an error naming the link, its target, and the component,
+/// whatever a stale or hand-placed stage says. `payload` is canonical.
+fn inside(payload: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let mut current = payload.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(format!("{}: not a plain relative path", relative.display()));
+        };
+        current.push(name);
+        let Ok(meta) = fs::symlink_metadata(&current) else {
+            // The rest does not exist yet; nothing there can redirect.
+            break;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        let component = current
+            .strip_prefix(payload)
+            .map_or_else(|_| current.clone(), Path::to_path_buf);
+        let target =
+            fs::read_link(&current).map_err(|error| format!("{}: {error}", current.display()))?;
+        match fs::canonicalize(&current) {
+            Ok(real) if real.starts_with(payload) => {}
+            Ok(real) => {
+                return Err(format!(
+                    "{}: {} is a link to {} that resolves outside the payload ({}); nothing written",
+                    relative.display(),
+                    component.display(),
+                    target.display(),
+                    real.display()
+                ));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "{}: {} is a dangling link to {}; nothing written",
+                    relative.display(),
+                    component.display(),
+                    target.display()
+                ));
+            }
+        }
+    }
+    Ok(payload.join(relative))
+}
+
+/// Refuses a link where a regular file is to be rewritten or replaced:
+/// `install_name_tool` and `codesign` open the path they are given, so an
+/// edit through a link lands on its target.
+fn regular(relative: &Path, path: &Path) -> Result<(), String> {
+    let meta =
+        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", relative.display()))?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(path).unwrap_or_default();
+        return Err(format!(
+            "{}: is a link to {}; install_name_tool and codesign would rewrite its target",
+            relative.display(),
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
 static JOURNALS: AtomicUsize = AtomicUsize::new(0);
 
-/// The pre-images of one round: files it created (to remove) and copies of
-/// files it rewrote or replaced (to put back).
+/// A pre-image: a regular file copied aside, or a link's target.
+enum Saved {
+    File { path: PathBuf, backup: PathBuf },
+    Link { path: PathBuf, target: PathBuf },
+}
+
+/// The pre-images of one round: paths it created (to remove) and what
+/// existed at the paths it rewrote or replaced (to put back).
 struct Journal {
     dir: PathBuf,
     created: Vec<PathBuf>,
-    saved: Vec<(PathBuf, PathBuf)>,
+    saved: Vec<Saved>,
 }
 
 impl Journal {
@@ -1013,13 +1398,70 @@ impl Journal {
         })
     }
 
-    /// Records a path the round is about to create.
-    fn created(&mut self, path: &Path) {
-        self.created.push(path.to_path_buf());
+    /// Records a path the round is about to create, which must not exist:
+    /// what is there already (a link the planner did not count, say) is
+    /// never overwritten, and only what the round creates is removed on
+    /// rollback.
+    fn created(&mut self, path: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.created.push(path.to_path_buf());
+                Ok(())
+            }
+            Ok(meta) => {
+                let what = if meta.file_type().is_symlink() {
+                    format!(
+                        "a link to {}",
+                        fs::read_link(path).unwrap_or_default().display()
+                    )
+                } else if meta.is_dir() {
+                    "a directory".to_owned()
+                } else {
+                    "a file".to_owned()
+                };
+                Err(format!(
+                    "{}: already exists ({what}); the plan expected it absent",
+                    path.display()
+                ))
+            }
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        }
     }
 
-    /// Copies a file aside before the round rewrites or replaces it.
+    /// Creates the missing parent directories of `payload/relative`, each
+    /// recorded as created.
+    fn create_dirs(&mut self, payload: &Path, relative: &Path) -> Result<(), String> {
+        let mut current = payload.to_path_buf();
+        for component in relative.parent().unwrap_or(Path::new("")).components() {
+            current.push(component);
+            if fs::symlink_metadata(&current).is_err() {
+                self.created.push(current.clone());
+                fs::create_dir(&current)
+                    .map_err(|error| format!("{}: {error}", current.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Saves what is at `path` before the round rewrites or replaces it: a
+    /// regular file is copied aside, a link's target is recorded so the
+    /// link comes back as a link.
     fn save(&mut self, path: &Path) -> Result<(), String> {
+        let meta = fs::symlink_metadata(path).map_err(|error| {
+            format!(
+                "{}: cannot save it aside before rewriting it: {error}",
+                path.display()
+            )
+        })?;
+        if meta.file_type().is_symlink() {
+            let target =
+                fs::read_link(path).map_err(|error| format!("{}: {error}", path.display()))?;
+            self.saved.push(Saved::Link {
+                path: path.to_path_buf(),
+                target,
+            });
+            return Ok(());
+        }
         let backup = self.dir.join(self.saved.len().to_string());
         fs::copy(path, &backup).map_err(|error| {
             format!(
@@ -1027,35 +1469,46 @@ impl Journal {
                 path.display()
             )
         })?;
-        self.saved.push((path.to_path_buf(), backup));
+        self.saved.push(Saved::File {
+            path: path.to_path_buf(),
+            backup,
+        });
         Ok(())
     }
 
-    /// Removes what the round created and puts back what it changed, in
-    /// reverse order; the count of files touched, or every failure.
-    fn restore(self) -> Result<usize, String> {
+    /// Removes what the round created and puts back what existed before, in
+    /// reverse order; `(removed, restored)`, or every failure. Only what
+    /// existed before the round counts as restored.
+    fn restore(self) -> Result<(usize, usize), String> {
+        let mut removed = 0;
         let mut restored = 0;
         let mut failures = Vec::new();
         for path in self.created.iter().rev() {
             match remove(path) {
-                Ok(()) => restored += 1,
+                Ok(()) => removed += 1,
                 Err(error) => failures.push(error),
             }
         }
-        for (path, backup) in self.saved.iter().rev() {
+        for saved in self.saved.iter().rev() {
+            let (path, put_back): (&Path, Box<dyn Fn() -> std::io::Result<()>>) = match saved {
+                Saved::File { path, backup } => {
+                    (path, Box::new(move || fs::copy(backup, path).map(|_| ())))
+                }
+                Saved::Link { path, target } => (path, Box::new(move || symlink(target, path))),
+            };
             // A replaced file is a link now; the copy must not follow it.
             if let Err(error) = remove(path) {
                 failures.push(error);
                 continue;
             }
-            match fs::copy(backup, path) {
-                Ok(_) => restored += 1,
+            match put_back() {
+                Ok(()) => restored += 1,
                 Err(error) => failures.push(format!("{}: {error}", path.display())),
             }
         }
         let _ = fs::remove_dir_all(&self.dir);
         if failures.is_empty() {
-            Ok(restored)
+            Ok((removed, restored))
         } else {
             Err(failures.join("; "))
         }
@@ -1066,13 +1519,15 @@ impl Journal {
     }
 }
 
-/// Removes a file or symlink; an absent path is fine.
+/// Removes a file, a symlink, or an empty directory; an absent path is fine.
 fn remove(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("{}: {error}", path.display())),
-    }
+    let result = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => Err(error),
+    };
+    result.map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn describe(edit: &Edit) -> String {
@@ -1092,12 +1547,9 @@ fn describe(edit: &Edit) -> String {
     parts.join(", ")
 }
 
-/// Copies one library, thinning a universal file to x86-64, and refuses
-/// anything that is not an x86-64 Mach-O afterwards.
+/// Copies one library into an existing directory, thinning a universal file
+/// to x86-64, and refuses anything that is not an x86-64 Mach-O afterwards.
 fn copy_library(source: &Path, dest: &Path, run: &mut Runner<'_>) -> Result<(), String> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    }
     let mut magic = [0_u8; 8];
     fs::File::open(source)
         .and_then(|mut file| file.read(&mut magic).map(|_| ()))
@@ -1159,6 +1611,10 @@ fn install_name_tool(path: &Path, edit: &Edit, run: &mut Runner<'_>) -> Result<(
     run("install_name_tool", &args)
 }
 
+/// Ad-hoc re-sign after `install_name_tool`. Nothing the closure edits today
+/// was signed, so there is nothing to keep; the flag makes an edit of a
+/// signed binary keep its entitlements, flags, and hardened runtime rather
+/// than drop them silently.
 fn codesign(path: &Path, run: &mut Runner<'_>) -> Result<(), String> {
     run(
         "codesign",
@@ -1166,6 +1622,7 @@ fn codesign(path: &Path, run: &mut Runner<'_>) -> Result<(), String> {
             OsStr::new("--force"),
             OsStr::new("--sign"),
             OsStr::new("-"),
+            OsStr::new("--preserve-metadata=entitlements,flags,runtime"),
             path.as_os_str(),
         ],
     )
@@ -1195,16 +1652,19 @@ fn run(program: &str, args: &[&OsStr]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
     use std::fs;
+    use std::io::Write as _;
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
 
     use super::{
-        Copy, Edit, Header, Image, Link, Outcome, Plan, Tree, apply, gate_copies, header,
-        homebrew_formula, plan, relative_path, rpath_from, settle, sonames_from_config_h,
+        Copy, Edit, Header, Image, Journal, Link, Outcome, Plan, SONAME_POLICY, SonamePolicy, Tree,
+        Version, apply, gate_copies, header, homebrew_formula, plan, relative_path, rpath_from,
+        scan, settle, sonames_from_config_h,
     };
-    use crate::bundle_toml::BundleSpec;
+    use crate::bundle_toml::{BundleSpec, SHIPPED_ELSEWHERE};
     use crate::denylist::Denylist;
 
     const MODULES: &str = "wine/lib/wine/x86_64-unix";
@@ -1221,11 +1681,28 @@ mod tests {
             rpaths: rpaths.iter().map(|rpath| (*rpath).to_owned()).collect(),
             executable: false,
             sonames: BTreeSet::new(),
+            current_version: None,
+            required: BTreeMap::new(),
         }
     }
 
     fn naming(mut image: Image, sonames: &[&str]) -> Image {
         image.sonames = sonames.iter().map(|soname| (*soname).to_owned()).collect();
+        image
+    }
+
+    fn version(text: &str) -> Version {
+        Version::parse(text).expect("a version")
+    }
+
+    /// The image with its own current version and the compatibility version
+    /// it requires of each named dependency.
+    fn versioned(mut image: Image, current: &str, required: &[(&str, &str)]) -> Image {
+        image.current_version = Some(version(current));
+        image.required = required
+            .iter()
+            .map(|(reference, compat)| ((*reference).to_owned(), version(compat)))
+            .collect();
         image
     }
 
@@ -1235,7 +1712,11 @@ mod tests {
             .map(|image| PathBuf::from(&image.relative))
             .collect();
         files.extend(extra_files.iter().map(PathBuf::from));
-        Tree { images, files }
+        Tree {
+            images,
+            files,
+            ..Tree::default()
+        }
     }
 
     /// A Homebrew with gnutls, p11-kit, libpng, freetype, and gettext, none
@@ -1587,6 +2068,10 @@ mod tests {
     /// copied), a dependency copied beside it; then that one's install name
     /// and a stray absolute run path; then nothing.
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the three rounds are one walk over one tree; splitting them would repeat the setup"
+    )]
     fn copied_libraries_are_closed_over_their_dependencies() {
         let names = sonames(&SONAMES);
         let mut t = win32u_tree();
@@ -1600,19 +2085,43 @@ mod tests {
         for module in &mut t.images {
             module.rpaths.push("@loader_path/../..".into());
         }
-        t.images.push(image(
-            "wine/lib/libgnutls.30.dylib",
-            Some("/usr/local/opt/gnutls/lib/libgnutls.30.dylib"),
-            &[
-                "/usr/local/opt/gettext/lib/libintl.8.dylib",
-                "/usr/local/opt/p11-kit/lib/libp11-kit.0.dylib",
-                "/usr/lib/libSystem.B.dylib",
-            ],
+        t.images.push(versioned(
+            image(
+                &format!("{GST_LIB}/libintl.8.dylib"),
+                Some("@rpath/libintl.8.dylib"),
+                &[],
+                &["@loader_path/../lib"],
+            ),
+            "10.5.0",
             &[],
+        ));
+        t.images.push(versioned(
+            image(
+                "wine/lib/libgnutls.30.dylib",
+                Some("/usr/local/opt/gnutls/lib/libgnutls.30.dylib"),
+                &[
+                    "/usr/local/opt/gettext/lib/libintl.8.dylib",
+                    "/usr/local/opt/p11-kit/lib/libp11-kit.0.dylib",
+                    "/usr/lib/libSystem.B.dylib",
+                ],
+                &[],
+            ),
+            "68.2.0",
+            &[("/usr/local/opt/gettext/lib/libintl.8.dylib", "13.0.0")],
         ));
         let p = plan(&t, &names, &homebrew);
         assert_eq!(p.errors, []);
         assert_eq!(p.links, []);
+        // gnutls binds to the framework's older proxy-libintl through the
+        // policy row's allowance, which the round notes.
+        assert!(
+            p.notes
+                .iter()
+                .any(|note| note.contains("13.0.0")
+                    && note.contains("allowed by its SONAME_POLICY row")),
+            "{:?}",
+            p.notes
+        );
         assert_eq!(
             p.copies,
             [Copy {
@@ -1644,7 +2153,7 @@ mod tests {
         assert_eq!(p.edits.len(), 1, "{p:?}");
 
         t.files.insert("wine/lib/libp11-kit.0.dylib".into());
-        t.images[2] = image(
+        t.images[3] = image(
             "wine/lib/libgnutls.30.dylib",
             Some("@rpath/libgnutls.30.dylib"),
             &["@rpath/libintl.8.dylib", "@rpath/libp11-kit.0.dylib"],
@@ -1672,7 +2181,7 @@ mod tests {
         );
         assert_eq!(p.edits.len(), 1, "{p:?}");
 
-        t.images[3] = image(
+        t.images[4] = image(
             "wine/lib/libp11-kit.0.dylib",
             Some("@rpath/libp11-kit.0.dylib"),
             &["/usr/lib/libSystem.B.dylib"],
@@ -1681,13 +2190,14 @@ mod tests {
         assert!(plan(&t, &names, &homebrew).is_empty());
     }
 
-    /// A leaf in two directories, one of them a link: the image whose run
-    /// path reaches either is fine; one reaching neither is ambiguous, and
-    /// the error names both directories.
+    /// A leaf in two directories, one of them a link to the other's file:
+    /// one image to dyld, so no tie. The image whose run path reaches either
+    /// is fine, and one reaching neither gets the run path to the regular
+    /// file's directory.
     #[test]
-    fn a_leaf_behind_a_link_is_no_tie_for_a_reaching_image_and_names_both_dirs_otherwise() {
+    fn a_leaf_behind_a_link_is_one_file_not_a_tie() {
         let other = format!("{MODULES}/other.so");
-        let t = tree(
+        let mut t = tree(
             vec![
                 image(
                     &format!("{GST_LIB}/libharfbuzz.0.dylib"),
@@ -1707,18 +2217,129 @@ mod tests {
                 &format!("{GST_LIB}/libfreetype.6.dylib"),
             ],
         );
-        let p = plan(&t, &[], &homebrew);
-        assert_eq!(p.edits.len(), 0, "{p:?}");
-        assert_eq!(p.errors.len(), 1, "{p:?}");
-        assert_eq!(p.errors[0].binary, other);
-        assert_eq!(p.errors[0].reference, "@rpath/libfreetype.6.dylib");
-        assert!(
-            p.errors[0]
-                .reason
-                .contains(&format!("2 directories (wine/lib, {GST_LIB})")),
-            "{}",
-            p.errors[0]
+        t.links.insert(
+            "wine/lib/libfreetype.6.dylib".into(),
+            format!("{GST_LIB}/libfreetype.6.dylib").into(),
         );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(
+            edit(&p, &other),
+            &Edit {
+                add_rpaths: vec![GST_RPATH.into()],
+                ..Edit::default()
+            }
+        );
+        assert_eq!(p.edits.len(), 1, "{p:?}");
+    }
+
+    fn permutations(items: &[&'static str]) -> Vec<Vec<&'static str>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut out = Vec::new();
+        for index in 0..items.len() {
+            let mut rest = items.to_vec();
+            let head = rest.remove(index);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, head);
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// Every load-command order of winegstreamer's dependencies plans the
+    /// same round. (The round-two closure prover's probe.)
+    #[test]
+    fn every_dependency_order_plans_the_same_round() {
+        let winegstreamer = format!("{MODULES}/winegstreamer.so");
+        let deps = [
+            "@rpath/libintl.8.dylib",
+            "@rpath/libgstvideo-1.0.0.dylib",
+            "@rpath/libgstreamer-1.0.0.dylib",
+            "/usr/lib/libSystem.B.dylib",
+        ];
+        let mut seen = Vec::new();
+        for order in permutations(&deps) {
+            let mut images = vec![image(
+                &winegstreamer,
+                Some("@rpath/winegstreamer.so"),
+                &order,
+                &["@loader_path/"],
+            )];
+            images.extend(framework_images());
+            let t = tree(images, &["wine/lib/libintl.8.dylib"]);
+            let p = plan(&t, &[], &homebrew);
+            assert_eq!(p.errors, [], "{order:?}: {p:?}");
+            seen.push(format!("{p:?}"));
+        }
+        assert_eq!(seen.len(), 24);
+        assert!(seen.iter().all(|p| *p == seen[0]), "plans differ by order");
+    }
+
+    /// Two ambiguous leaves and one plain one, in every order: once the plain
+    /// one puts its directory on the run path, both ambiguous references
+    /// resolve through it; without it, both errors name both directories.
+    /// (The round-two closure prover's probe.)
+    #[test]
+    fn two_ambiguous_references_and_one_plain_resolve_in_every_order() {
+        let module = format!("{MODULES}/m.so");
+        let deps = [
+            "@rpath/libA.dylib",
+            "@rpath/libB.dylib",
+            "@rpath/libC.dylib",
+        ];
+        let files = [
+            "x/libA.dylib",
+            "y/libA.dylib",
+            "y/libB.dylib",
+            "z/libB.dylib",
+            "y/libC.dylib",
+        ];
+        let mut seen = Vec::new();
+        for order in permutations(&deps) {
+            let t = tree(
+                vec![image(
+                    &module,
+                    Some("@rpath/m.so"),
+                    &order,
+                    &["@loader_path/"],
+                )],
+                &files,
+            );
+            let p = plan(&t, &[], &homebrew);
+            assert_eq!(p.errors, [], "{order:?}: {p:?}");
+            assert_eq!(
+                edit(&p, &module).add_rpaths,
+                ["@loader_path/../../../../y"],
+                "{order:?}"
+            );
+            seen.push(format!("{p:?}"));
+        }
+        assert!(seen.iter().all(|p| *p == seen[0]));
+        for order in permutations(&deps[..2]) {
+            let t = tree(
+                vec![image(
+                    &module,
+                    Some("@rpath/m.so"),
+                    &order,
+                    &["@loader_path/"],
+                )],
+                &files,
+            );
+            let p = plan(&t, &[], &homebrew);
+            let reasons: Vec<&str> = p.errors.iter().map(|e| e.reason.as_str()).collect();
+            assert_eq!(p.errors.len(), 2, "{order:?}: {p:?}");
+            assert!(
+                reasons.iter().any(|r| r.contains("2 directories (x, y)")),
+                "{reasons:?}"
+            );
+            assert!(
+                reasons.iter().any(|r| r.contains("2 directories (y, z)")),
+                "{reasons:?}"
+            );
+        }
     }
 
     /// Two regular files with one install name: the framework's `MoltenVK`
@@ -1768,6 +2389,8 @@ mod tests {
         t.images.remove(1);
         assert!(plan(&t, &[], &homebrew).is_empty());
 
+        // A stale copy of libintl beside the framework's (the tree before
+        // the one-file rule) is repaired the same way.
         let t = tree(
             vec![
                 image(
@@ -1786,12 +2409,39 @@ mod tests {
             &[],
         );
         let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(
+            p.replaced,
+            [Link {
+                link: "wine/lib/libintl.8.dylib".into(),
+                target: "GStreamer.framework/Versions/1.0/lib/libintl.8.dylib".into(),
+            }]
+        );
+
+        let t = tree(
+            vec![
+                image(
+                    "wine/lib/libgmp.10.dylib",
+                    Some("@rpath/libgmp.10.dylib"),
+                    &[],
+                    &[],
+                ),
+                image(
+                    "wine/lib/x/libgmp.10.dylib",
+                    Some("@rpath/libgmp.10.dylib"),
+                    &[],
+                    &[],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
         assert_eq!(p.errors.len(), 1, "{p:?}");
         assert_eq!(
             p.errors[0].binary,
-            format!("wine/lib/libintl.8.dylib, {GST_LIB}/libintl.8.dylib")
+            "wine/lib/libgmp.10.dylib, wine/lib/x/libgmp.10.dylib"
         );
-        assert_eq!(p.errors[0].reference, "@rpath/libintl.8.dylib");
+        assert_eq!(p.errors[0].reference, "@rpath/libgmp.10.dylib");
         assert!(
             p.errors[0]
                 .reason
@@ -2026,9 +2676,9 @@ mod tests {
     }
 
     /// A tool failure on the second binary rolls the whole round back: the
-    /// copy and the link are gone, the first binary and the replaced
-    /// duplicate are back to their bytes, and the error names the binary and
-    /// the tool's stderr.
+    /// copy, its new directory, and the link are gone, the first binary and
+    /// the replaced duplicate are back to their bytes, a pre-existing link
+    /// is untouched, and the error names the binary and the tool's stderr.
     #[test]
     fn a_tool_failure_rolls_the_round_back() {
         let dir = scratch("rollback");
@@ -2037,12 +2687,13 @@ mod tests {
         fake_macho(&payload.join("wine/lib/b.so"), b"b");
         fake_macho(&payload.join("vulkan/libMoltenVK.dylib"), b"pin");
         fake_macho(&payload.join("fw/libMoltenVK.dylib"), b"dup");
+        symlink("libMoltenVK.dylib", payload.join("fw/alias.dylib")).expect("alias");
         fake_macho(&dir.join("src/libA.1.dylib"), b"A");
         let before = |name: &str| fs::read(payload.join(name)).expect(name);
         let plan = Plan {
             copies: vec![Copy {
                 source: dir.join("src/libA.1.dylib"),
-                dest: "wine/lib/libA.1.dylib".into(),
+                dest: "wine/lib/deps/libA.1.dylib".into(),
             }],
             links: vec![Link {
                 link: "wine/lib/libMoltenVK.dylib".into(),
@@ -2071,18 +2722,24 @@ mod tests {
         };
         let mut calls = Vec::new();
         let error = apply(&payload, &plan, &mut stub_runner(&mut calls, "b.so")).unwrap_err();
-        // The copy, the link, the replaced file, a.so, and b.so (saved
-        // before its tool failed) are all put back.
+        // The directory, the copy, and the link are removed; the replaced
+        // file, a.so, and b.so (saved before its tool failed) are put back.
         assert!(
             error.contains("wine/lib/b.so")
                 && error.contains("do not fit")
-                && error.contains("rolled back (5 file(s) restored)"),
+                && error.contains(
+                    "rolled back (3 created path(s) removed, 3 pre-existing file(s) restored)"
+                ),
             "{error}"
         );
         assert_eq!(calls.len(), 3, "{calls:?}");
         assert!(calls[0].ends_with("a.so") && calls[1].starts_with("codesign"));
-        assert!(!payload.join("wine/lib/libA.1.dylib").exists());
+        assert!(fs::symlink_metadata(payload.join("wine/lib/deps")).is_err());
         assert!(fs::symlink_metadata(payload.join("wine/lib/libMoltenVK.dylib")).is_err());
+        assert_eq!(
+            fs::read_link(payload.join("fw/alias.dylib")).expect("alias"),
+            PathBuf::from("libMoltenVK.dylib")
+        );
         assert_eq!(before("wine/lib/a.so"), [&X86_64_MAGIC[..], b"a"].concat());
         assert_eq!(before("wine/lib/b.so"), [&X86_64_MAGIC[..], b"b"].concat());
         let dup = fs::symlink_metadata(payload.join("fw/libMoltenVK.dylib")).expect("dup");
@@ -2210,6 +2867,7 @@ mod tests {
                 copied: 1,
                 linked: 0,
                 rewritten: [format!("{MODULES}/ok.so")].into_iter().collect(),
+                formulas: BTreeSet::new(),
             }
         );
         assert!(payload.join("wine/lib/libpng16.16.dylib").is_file());
@@ -2220,10 +2878,589 @@ mod tests {
             calls[0]
         );
         assert!(
-            calls[1].starts_with("codesign --force --sign - "),
+            calls[1].starts_with(
+                "codesign --force --sign - --preserve-metadata=entitlements,flags,runtime "
+            ),
             "{}",
             calls[1]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The framework's `MoltenVK` carries a foreign run path: the round
+    /// replaces the file with a link and plans no edit for it, since the
+    /// tool would follow the new link onto the pin. (Both round-two
+    /// reviewers' probe.)
+    #[test]
+    fn a_replaced_duplicate_gets_no_edit_in_the_same_round() {
+        let framework_mvk = format!("{GST_LIB}/libMoltenVK.dylib");
+        let t = tree(
+            vec![
+                image(
+                    "vulkan/libMoltenVK.dylib",
+                    Some("@rpath/libMoltenVK.dylib"),
+                    &["/usr/lib/libc++.1.dylib"],
+                    &[],
+                ),
+                image(
+                    &framework_mvk,
+                    Some("@rpath/libMoltenVK.dylib"),
+                    &["/usr/lib/libc++.1.dylib"],
+                    &["/usr/local/lib", "@loader_path/../lib"],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(p.replaced.len(), 1, "{p:?}");
+        assert!(p.edits.is_empty(), "{p:?}");
+    }
+
+    /// Opens the path it is given, as the real tools do (following a link),
+    /// and appends to it.
+    fn appending_runner(
+        calls: &mut Vec<String>,
+    ) -> impl FnMut(&str, &[&OsStr]) -> Result<(), String> + '_ {
+        move |program: &str, args: &[&OsStr]| {
+            calls.push(program.to_owned());
+            let target = Path::new(args.last().expect("a target"));
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(target)
+                .map_err(|error| error.to_string())?;
+            file.write_all(program.as_bytes())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    /// A plan that replaces a file and edits it too, or edits a path that
+    /// is already a link, is refused at `apply` naming the link and its
+    /// target; no tool runs, and the pin behind the link keeps its bytes.
+    #[test]
+    fn apply_refuses_to_run_a_tool_on_a_link() {
+        let dir = scratch("link-edit");
+        let payload = dir.join("payload");
+        fake_macho(&payload.join("vulkan/libMoltenVK.dylib"), b"pin");
+        fake_macho(&payload.join("fw/libMoltenVK.dylib"), b"dup");
+        fs::create_dir_all(payload.join("wine/lib")).expect("wine/lib");
+        symlink(
+            "../../vulkan/libMoltenVK.dylib",
+            payload.join("wine/lib/libMoltenVK.dylib"),
+        )
+        .expect("link");
+        let pin = || fs::read(payload.join("vulkan/libMoltenVK.dylib")).expect("pin");
+        let before = pin();
+        let edit = |binary: &str| {
+            [(
+                binary.to_owned(),
+                Edit {
+                    delete_rpaths: vec!["/usr/local/lib".into()],
+                    ..Edit::default()
+                },
+            )]
+            .into_iter()
+            .collect()
+        };
+        let plan = Plan {
+            replaced: vec![Link {
+                link: "fw/libMoltenVK.dylib".into(),
+                target: "../vulkan/libMoltenVK.dylib".into(),
+            }],
+            edits: edit("fw/libMoltenVK.dylib"),
+            ..Plan::default()
+        };
+        let mut calls = Vec::new();
+        let error = apply(&payload, &plan, &mut appending_runner(&mut calls)).unwrap_err();
+        assert!(
+            error.contains("fw/libMoltenVK.dylib: is a link to ../vulkan/libMoltenVK.dylib")
+                && error.contains(
+                    "rolled back (0 created path(s) removed, 1 pre-existing file(s) restored)"
+                ),
+            "{error}"
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(pin(), before);
+        let dup = fs::symlink_metadata(payload.join("fw/libMoltenVK.dylib")).expect("dup");
+        assert!(dup.file_type().is_file());
+        assert_eq!(
+            fs::read(payload.join("fw/libMoltenVK.dylib")).expect("dup"),
+            [&X86_64_MAGIC[..], b"dup"].concat()
+        );
+
+        let plan = Plan {
+            edits: edit("wine/lib/libMoltenVK.dylib"),
+            ..Plan::default()
+        };
+        let error = apply(&payload, &plan, &mut appending_runner(&mut calls)).unwrap_err();
+        assert!(
+            error.contains(
+                "wine/lib/libMoltenVK.dylib: is a link to ../../vulkan/libMoltenVK.dylib"
+            ),
+            "{error}"
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(pin(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A destination occupied by a link that leaves the payload, or by a
+    /// dangling one, is an error naming the link and its target, not an
+    /// empty slot; a link that resolves to a payload file is that file; a
+    /// link among the parent directories is caught too.
+    #[test]
+    fn a_destination_occupied_by_a_link_that_leaves_the_payload_is_an_error() {
+        let mut t = win32u_tree();
+        t.occupied.insert(
+            "wine/lib/libgnutls.30.dylib".into(),
+            "a link to /outside/libgnutls.30.dylib that resolves outside the payload (/outside/libgnutls.30.dylib)".into(),
+        );
+        t.occupied.insert(
+            "wine/lib/libMoltenVK.dylib".into(),
+            "a dangling link to /nonexistent/libMoltenVK.dylib".into(),
+        );
+        let p = plan(&t, &sonames(&SONAMES), &homebrew);
+        let described: Vec<(&str, &str)> = p
+            .errors
+            .iter()
+            .map(|error| (error.binary.as_str(), error.reference.as_str()))
+            .collect();
+        assert_eq!(
+            described,
+            [
+                (super::CONFIG_H, "libMoltenVK.dylib"),
+                (super::CONFIG_H, "libgnutls.30.dylib"),
+            ],
+            "{p:?}"
+        );
+        assert!(
+            p.errors[0].reason.starts_with(
+                "wine/lib/libMoltenVK.dylib is a dangling link to /nonexistent/libMoltenVK.dylib"
+            ),
+            "{}",
+            p.errors[0]
+        );
+        assert!(
+            p.errors[1].reason.starts_with(
+                "wine/lib/libgnutls.30.dylib is a link to /outside/libgnutls.30.dylib that resolves outside the payload"
+            ),
+            "{}",
+            p.errors[1]
+        );
+        assert_eq!(p.copies, []);
+        assert_eq!(p.links.len(), 1, "{p:?}");
+        assert_eq!(
+            p.links[0].link,
+            PathBuf::from("wine/lib/libfreetype.6.dylib")
+        );
+
+        let mut t = win32u_tree();
+        t.files.insert("wine/lib/libMoltenVK.dylib".into());
+        t.links.insert(
+            "wine/lib/libMoltenVK.dylib".into(),
+            "vulkan/libMoltenVK.dylib".into(),
+        );
+        let p = plan(&t, &sonames(&SONAMES), &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(p.links.len(), 1, "{p:?}");
+
+        let mut t = tree(vec![], &[]);
+        t.occupied.insert(
+            "wine/lib".into(),
+            "a link to ../../elsewhere that resolves outside the payload (/elsewhere)".into(),
+        );
+        let p = plan(&t, &sonames(&["libgnutls.30.dylib"]), &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert!(
+            p.errors[0]
+                .reason
+                .starts_with("wine/lib is a link to ../../elsewhere"),
+            "{}",
+            p.errors[0]
+        );
+        assert_eq!(p.copies, []);
+    }
+
+    /// `scan` tells links that resolve to a payload file (the file, with
+    /// its target recorded) from links that are dangling, escaping, or a
+    /// directory (occupied slots).
+    #[test]
+    fn scan_tells_resolving_links_from_occupied_slots() {
+        let dir = scratch("scan");
+        let payload = dir.join("payload");
+        fs::create_dir_all(payload.join("wine/lib")).expect("wine/lib");
+        fs::write(payload.join("wine/lib/real.txt"), b"text").expect("real");
+        fs::write(dir.join("outside.txt"), b"outside").expect("outside");
+        let link = |target: &str, name: &str| symlink(target, payload.join(name)).expect(name);
+        link("real.txt", "wine/lib/alias.txt");
+        link("../../../outside.txt", "wine/lib/escape.txt");
+        link("missing.txt", "wine/lib/dangling.txt");
+        link(".", "wine/lib/here");
+        let payload = payload.canonicalize().expect("canonical");
+        let t = scan(&payload, &[]).expect("scan");
+        assert_eq!(
+            t.files,
+            ["wine/lib/alias.txt", "wine/lib/real.txt"]
+                .map(PathBuf::from)
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            t.links,
+            [(
+                PathBuf::from("wine/lib/alias.txt"),
+                PathBuf::from("wine/lib/real.txt")
+            )]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            t.occupied.keys().cloned().collect::<Vec<_>>(),
+            [
+                "wine/lib/dangling.txt",
+                "wine/lib/escape.txt",
+                "wine/lib/here"
+            ]
+            .map(PathBuf::from)
+        );
+        assert_eq!(
+            t.occupied[Path::new("wine/lib/dangling.txt")],
+            "a dangling link to missing.txt"
+        );
+        assert!(
+            t.occupied[Path::new("wine/lib/escape.txt")]
+                .starts_with("a link to ../../../outside.txt that resolves outside the payload ("),
+            "{:?}",
+            t.occupied
+        );
+        assert_eq!(
+            t.occupied[Path::new("wine/lib/here")],
+            "a link to ., a directory"
+        );
+        assert_eq!(t.images, []);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A write through a link that leaves the payload never happens: the
+    /// copy whose destination is such a link, the copy below a linked
+    /// directory, and the link onto a dangling link each fail naming the
+    /// link and its target; nothing lands outside, and the pre-existing
+    /// links survive as they were. (The round-two closure prover's
+    /// clone-out and clone-dl cases.)
+    #[test]
+    fn apply_writes_nothing_through_a_link_that_leaves_the_payload() {
+        let dir = scratch("escape");
+        let payload = dir.join("payload");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::create_dir_all(payload.join("wine/lib")).expect("wine/lib");
+        fake_macho(&dir.join("src/libSDL2-2.0.0.dylib"), b"sdl");
+        let sdl_target = outside.join("libSDL2-2.0.0.dylib");
+        symlink(&sdl_target, payload.join("wine/lib/libSDL2-2.0.0.dylib")).expect("escaping link");
+        let copy = |dest: &str| Plan {
+            copies: vec![Copy {
+                source: dir.join("src/libSDL2-2.0.0.dylib"),
+                dest: dest.into(),
+            }],
+            ..Plan::default()
+        };
+        let mut calls = Vec::new();
+        let mut run = stub_runner(&mut calls, "<nothing fails>");
+        let error = apply(&payload, &copy("wine/lib/libSDL2-2.0.0.dylib"), &mut run).unwrap_err();
+        assert!(
+            error.contains("wine/lib/libSDL2-2.0.0.dylib is a dangling link to")
+                && error.contains(&sdl_target.display().to_string())
+                && error.contains("0 created path(s) removed, 0 pre-existing file(s) restored"),
+            "{error}"
+        );
+        assert!(!sdl_target.exists(), "written outside the payload");
+        assert_eq!(
+            fs::read_link(payload.join("wine/lib/libSDL2-2.0.0.dylib")).expect("link survives"),
+            sdl_target
+        );
+
+        fs::write(&sdl_target, b"theirs").expect("outside file");
+        let error = apply(&payload, &copy("wine/lib/libSDL2-2.0.0.dylib"), &mut run).unwrap_err();
+        assert!(
+            error.contains("wine/lib/libSDL2-2.0.0.dylib is a link to")
+                && error.contains("resolves outside the payload"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&sdl_target).expect("outside"), b"theirs");
+
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("elsewhere");
+        symlink(&elsewhere, payload.join("wine/ext")).expect("dir link");
+        let error = apply(&payload, &copy("wine/ext/libSDL2-2.0.0.dylib"), &mut run).unwrap_err();
+        assert!(
+            error.contains("wine/ext is a link to")
+                && error.contains("resolves outside the payload"),
+            "{error}"
+        );
+        assert_eq!(fs::read_dir(&elsewhere).expect("elsewhere").count(), 0);
+
+        symlink(
+            "/nonexistent/libMoltenVK.dylib",
+            payload.join("wine/lib/libMoltenVK.dylib"),
+        )
+        .expect("dangling");
+        let plan = Plan {
+            links: vec![Link {
+                link: "wine/lib/libMoltenVK.dylib".into(),
+                target: "../../vulkan/libMoltenVK.dylib".into(),
+            }],
+            ..Plan::default()
+        };
+        let error = apply(&payload, &plan, &mut run).unwrap_err();
+        assert!(
+            error.contains(
+                "wine/lib/libMoltenVK.dylib is a dangling link to /nonexistent/libMoltenVK.dylib"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_link(payload.join("wine/lib/libMoltenVK.dylib")).expect("link survives"),
+            PathBuf::from("/nonexistent/libMoltenVK.dylib")
+        );
+        drop(run);
+        assert!(calls.is_empty(), "{calls:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The journal saves a link as its target and restores it as a link,
+    /// counts only pre-existing paths as restored, and never records an
+    /// existing path as created.
+    #[test]
+    fn the_journal_restores_a_saved_link_as_a_link() {
+        let dir = scratch("journal");
+        fake_macho(&dir.join("real.dylib"), b"real");
+        let link = dir.join("link.dylib");
+        symlink("real.dylib", &link).expect("link");
+        let created = dir.join("new.dylib");
+        let mut journal = Journal::new().expect("journal");
+        journal.save(&link).expect("save");
+        journal.created(&created).expect("created");
+        fs::write(&created, b"new").expect("new");
+        fs::remove_file(&link).expect("remove link");
+        fs::write(&link, b"clobbered").expect("clobber");
+        assert_eq!(journal.restore().expect("restore"), (1, 1));
+        assert_eq!(
+            fs::read_link(&link).expect("a link again"),
+            PathBuf::from("real.dylib")
+        );
+        assert!(!created.exists());
+        let mut journal = Journal::new().expect("journal");
+        let error = journal.created(&link).unwrap_err();
+        assert!(
+            error.contains("already exists (a link to real.dylib)"),
+            "{error}"
+        );
+        journal.discard();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An absolute dependency on a leaf another component ships binds to it
+    /// only through a policy row naming that file: a bare match of names is
+    /// refused, and nothing is copied either.
+    #[test]
+    fn a_rebinding_to_a_file_the_payload_ships_needs_a_policy_row() {
+        let gnutls = "wine/lib/libgnutls.30.dylib";
+        let t = tree(
+            vec![
+                image(
+                    gnutls,
+                    Some("@rpath/libgnutls.30.dylib"),
+                    &["/usr/local/opt/libtasn1/lib/libtasn1.6.dylib"],
+                    &[],
+                ),
+                image(
+                    &format!("{GST_LIB}/libtasn1.6.dylib"),
+                    Some("@rpath/libtasn1.6.dylib"),
+                    &[],
+                    &["@loader_path/../lib"],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(
+            (p.errors[0].binary.as_str(), p.errors[0].reference.as_str()),
+            (gnutls, "/usr/local/opt/libtasn1/lib/libtasn1.6.dylib")
+        );
+        assert!(
+            p.errors[0].reason.starts_with(&format!(
+                "{GST_LIB}/libtasn1.6.dylib already ships libtasn1.6.dylib; a rebinding"
+            )),
+            "{}",
+            p.errors[0]
+        );
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    /// A rebinding through a policy row binds only if the file's current
+    /// version satisfies the dependent's compatibility version, unless the
+    /// row allows an older file with a reason, which the round notes.
+    #[test]
+    fn a_rebinding_binds_only_to_a_new_enough_file_unless_the_row_allows_older() {
+        let gnutls = "wine/lib/libgnutls.30.dylib";
+        let framework_intl = format!("{GST_LIB}/libintl.8.dylib");
+        let libx = "wine/lib/libx.dylib";
+        let freetype = "/usr/local/opt/freetype/lib/libfreetype.6.dylib";
+        let t = tree(
+            vec![
+                versioned(
+                    image(libx, Some("@rpath/libx.dylib"), &[freetype], &[]),
+                    "1.0.0",
+                    &[(freetype, "27.0.0")],
+                ),
+                versioned(
+                    image(
+                        &format!("{GST_LIB}/libfreetype.6.dylib"),
+                        Some("@rpath/libfreetype.6.dylib"),
+                        &[],
+                        &["@loader_path/../lib"],
+                    ),
+                    "26.2.20",
+                    &[],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert!(
+            p.errors[0]
+                .reason
+                .contains("requires compatibility version 27.0.0 but")
+                && p.errors[0]
+                    .reason
+                    .contains("libfreetype.6.dylib is current version 26.2.20"),
+            "{}",
+            p.errors[0]
+        );
+        assert!(p.is_empty(), "{p:?}");
+
+        let intl = "/usr/local/opt/gettext/lib/libintl.8.dylib";
+        let intl_image = |current: &str| {
+            versioned(
+                image(
+                    &framework_intl,
+                    Some("@rpath/libintl.8.dylib"),
+                    &[],
+                    &["@loader_path/../lib"],
+                ),
+                current,
+                &[],
+            )
+        };
+        let gnutls_image = |compat: &str| {
+            versioned(
+                image(gnutls, Some("@rpath/libgnutls.30.dylib"), &[intl], &[]),
+                "68.2.0",
+                &[(intl, compat)],
+            )
+        };
+        let t = tree(vec![gnutls_image("13.0.0"), intl_image("10.5.0")], &[]);
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(
+            edit(&p, gnutls),
+            &Edit {
+                changes: vec![(intl.into(), "@rpath/libintl.8.dylib".into())],
+                add_rpaths: vec!["@loader_path/GStreamer.framework/Versions/1.0/lib".into()],
+                ..Edit::default()
+            }
+        );
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+        assert!(
+            p.notes[0].contains("requires compatibility version 13.0.0")
+                && p.notes[0].contains("current version 10.5.0; allowed by its SONAME_POLICY row"),
+            "{}",
+            p.notes[0]
+        );
+
+        let t = tree(vec![gnutls_image("10.0.0"), intl_image("10.5.0")], &[]);
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(p.notes, Vec::<String>::new());
+    }
+
+    /// The same version check guards a leaf already under `wine/lib/`: a
+    /// copy an earlier round made that is too old for a later dependent.
+    #[test]
+    fn a_leaf_already_under_wine_lib_must_be_new_enough_too() {
+        let gmp = "/usr/local/opt/gmp/lib/libgmp.10.dylib";
+        let t = tree(
+            vec![
+                versioned(
+                    image(
+                        "wine/lib/libhogweed.6.dylib",
+                        Some("@rpath/libhogweed.6.dylib"),
+                        &[gmp],
+                        &[],
+                    ),
+                    "6.11.0",
+                    &[(gmp, "15.0.0")],
+                ),
+                versioned(
+                    image(
+                        "wine/lib/libgmp.10.dylib",
+                        Some("@rpath/libgmp.10.dylib"),
+                        &[],
+                        &[],
+                    ),
+                    "14.1.0",
+                    &[],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert!(
+            p.errors[0].reason.contains(
+                "requires compatibility version 15.0.0 but wine/lib/libgmp.10.dylib is current version 14.1.0"
+            ),
+            "{}",
+            p.errors[0]
+        );
+    }
+
+    /// Every policy file in another component's tree has the notices row
+    /// that names its license, and every such row names a policy file.
+    #[test]
+    fn every_policy_file_in_another_components_tree_has_a_notices_row() {
+        let spec =
+            BundleSpec::parse(include_str!("../../build/bundle-spec.toml")).expect("the spec");
+        let policy_files: BTreeSet<&str> = SONAME_POLICY
+            .iter()
+            .filter_map(|(_, policy)| match policy {
+                SonamePolicy::Payload { file, .. } => Some(*file),
+                _ => None,
+            })
+            .collect();
+        for file in &policy_files {
+            // The pinned MoltenVK is the `moltenvk` row.
+            if file.starts_with("vulkan/") {
+                continue;
+            }
+            let elsewhere = SHIPPED_ELSEWHERE
+                .iter()
+                .find(|elsewhere| elsewhere.file == *file)
+                .unwrap_or_else(|| panic!("{file}: no SHIPPED_ELSEWHERE entry"));
+            assert!(
+                spec.components.libraries.contains_key(elsewhere.key),
+                "{file}: no [components.{}] row",
+                elsewhere.key
+            );
+        }
+        for elsewhere in SHIPPED_ELSEWHERE {
+            assert!(
+                policy_files.contains(elsewhere.file),
+                "{}: no SONAME_POLICY row",
+                elsewhere.file
+            );
+        }
     }
 }
