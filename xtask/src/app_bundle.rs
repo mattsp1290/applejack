@@ -121,11 +121,30 @@ impl AppBundleLayout {
         }
         let plist = fs::read_to_string(self.info_plist())
             .map_err(|error| describe(&self.info_plist(), &error))?;
-        if !plist.contains("<string>Applejack</string>") {
-            return Err("Info.plist does not name the executable `Applejack`".to_owned());
+        for (key, value) in [
+            ("CFBundleExecutable", "Applejack"),
+            ("CFBundleIdentifier", "com.applejack.app"),
+            ("LSMinimumSystemVersion", "14.0"),
+        ] {
+            if !plist_has(&plist, key, value) {
+                return Err(format!("Info.plist lacks {key} = {value}"));
+            }
         }
         Ok(())
     }
+}
+
+/// Whether `plist` holds `<key>key</key>` directly followed, whitespace
+/// aside, by `<string>value</string>`. A substring match on the value alone
+/// would be satisfied by `CFBundleName`.
+fn plist_has(plist: &str, key: &str, value: &str) -> bool {
+    let marker = format!("<key>{key}</key>");
+    let Some(start) = plist.find(&marker) else {
+        return false;
+    };
+    plist[start + marker.len()..]
+        .trim_start()
+        .starts_with(&format!("<string>{value}</string>"))
 }
 
 /// The files that go into the bundle.
@@ -181,7 +200,11 @@ pub fn stage(inputs: &Inputs, layout: &AppBundleLayout) -> Result<(), String> {
         fs::rename(app, &old).map_err(|error| describe(app, &error))?;
     }
     fs::rename(&tmp, app).map_err(|error| describe(&tmp, &error))?;
-    remove_tree(&old)?;
+    // The new bundle is in place; a leftover `.old` is recovered or removed
+    // by the next run and must not fail this one.
+    if let Err(error) = remove_tree(&old) {
+        eprintln!("[xtask] app-bundle: left {} behind: {error}", old.display());
+    }
     Ok(())
 }
 
@@ -339,7 +362,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
-    use super::{AppBundleLayout, Inputs, PKG_INFO, stage};
+    use super::{AppBundleLayout, Inputs, PKG_INFO, plist_has, stage};
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -362,7 +385,7 @@ mod tests {
         executable(&core, &format!("#!/bin/sh\necho core {tag}\n"));
         fs::write(
             &plist,
-            "<plist><dict><key>CFBundleExecutable</key><string>Applejack</string></dict></plist>",
+            "<plist><dict>\n\t<key>CFBundleIdentifier</key>\n\t<string>com.applejack.app</string>\n\t<key>CFBundleName</key>\n\t<string>Applejack</string>\n\t<key>CFBundleExecutable</key>\n\t<string>Applejack</string>\n\t<key>LSMinimumSystemVersion</key>\n\t<string>14.0</string>\n</dict></plist>",
         )
         .expect("plist");
         Inputs {
@@ -453,5 +476,26 @@ mod tests {
         fs::write(layout.pkg_info(), b"XXXX????").unwrap();
         fs::set_permissions(layout.core(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(layout.verify().unwrap_err().contains("PkgInfo"));
+        fs::write(layout.pkg_info(), PKG_INFO).unwrap();
+        // `CFBundleName` alone must not pass for `CFBundleExecutable`.
+        fs::write(
+            layout.info_plist(),
+            "<plist><dict><key>CFBundleName</key><string>Applejack</string><key>CFBundleIdentifier</key><string>com.applejack.app</string><key>LSMinimumSystemVersion</key><string>14.0</string></dict></plist>",
+        )
+        .unwrap();
+        assert!(
+            layout
+                .verify()
+                .unwrap_err()
+                .contains("CFBundleExecutable = Applejack")
+        );
+    }
+
+    #[test]
+    fn plist_has_matches_key_and_value_pairs_only() {
+        let plist = "<key>CFBundleName</key>\n\t<string>Applejack</string>\n\t<key>CFBundleExecutable</key><string>Other</string>";
+        assert!(plist_has(plist, "CFBundleName", "Applejack"));
+        assert!(!plist_has(plist, "CFBundleExecutable", "Applejack"));
+        assert!(!plist_has(plist, "CFBundleIdentifier", "com.applejack.app"));
     }
 }
