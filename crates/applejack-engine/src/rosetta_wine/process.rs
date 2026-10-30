@@ -8,9 +8,21 @@
 //! [`match_record`] filters by uid and session id. No `unsafe` lives in this
 //! crate: `sysinfo` is the one safe wrapper over that `sysctl` in the local
 //! registry, and the workspace forbids calling `libc::sysctl` directly.
+//!
+//! Wine rewrites a Windows process's argv in place: the Windows command
+//! line, then an empty slot that the kernel's argument count still covers,
+//! then the zeroed rest of the old area, then the environment. `sysinfo`
+//! skips NUL runs while it counts arguments, so for every such process the
+//! first environment entry is reported as the last `cmd` entry and is absent
+//! from `environ`. `std::process::Command` sorts the environment it passes,
+//! and `APPLEJACK_SESSION` sorts first among the allowlisted names, so that
+//! entry is exactly the session variable. [`match_record`] therefore accepts
+//! the exact `NAME=value` entry in either place and cuts argv at it before
+//! deriving the executable name.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -56,6 +68,13 @@ pub struct ProcessRecord<'a> {
 
 /// The processes owned by `uid` whose environment carries
 /// `APPLEJACK_SESSION=<session_id>`, from a snapshot of every process.
+///
+/// One call reads the arguments and environment of every process on the
+/// host (31 to 34 ms with about 1,700 processes on an M4 Max), so a caller
+/// that polls should do so at a cadence it is happy to pay for. The
+/// prefix's `wineserver` inherits the environment of the session that
+/// started it and so is reported under that session's id for as long as it
+/// runs, including a later session's launches into the same prefix.
 #[must_use]
 pub fn find_session(session_id: &str) -> Vec<Process> {
     let uid = rustix::process::getuid().as_raw();
@@ -88,7 +107,10 @@ pub fn find_session(session_id: &str) -> Vec<Process> {
 }
 
 /// The [`Process`] for `record` when it is owned by `uid` and carries the
-/// session id; `None` otherwise.
+/// exact `APPLEJACK_SESSION=<session_id>` entry, in `environ` or (after
+/// Wine's argv rewrite, see the module doc) among the trailing `cmd`
+/// entries; `None` otherwise. Entries from the session variable on are not
+/// arguments and take no part in the executable name.
 #[must_use]
 pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> Option<Process> {
     if record.uid != Some(uid) {
@@ -98,16 +120,15 @@ pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> O
     wanted.extend_from_slice(SESSION_VARIABLE.as_bytes());
     wanted.push(b'=');
     wanted.extend_from_slice(session_id.as_bytes());
-    if !record
-        .environ
-        .iter()
-        .any(|entry| entry.as_bytes() == wanted.as_slice())
-    {
+    let is_session = |entry: &OsString| entry.as_bytes() == wanted.as_slice();
+    let folded = record.cmd.iter().position(is_session);
+    if folded.is_none() && !record.environ.iter().any(is_session) {
         return None;
     }
+    let cmd = folded.map_or(record.cmd, |at| &record.cmd[..at]);
     Some(Process {
         pid: record.pid,
-        exe: executable_name(record.cmd, record.exe),
+        exe: executable_name(cmd, record.exe),
         session_id: session_id.to_owned(),
     })
 }
@@ -164,12 +185,20 @@ pub fn server_socket(prefix_dir: &Path) -> Result<PathBuf> {
 /// "is anything running in this prefix" check. A connect to the socket
 /// succeeds only while the server is alive, so a socket file left by a
 /// killed server reads as not alive; the server drops the unused
-/// connection.
+/// connection. A prefix directory that no longer exists has no inode a
+/// server could be keyed on, so it reads as not alive rather than failing.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] when the prefix directory cannot be stat'ed.
+/// Returns [`Error::Io`] when the prefix directory exists but cannot be
+/// stat'ed.
 pub fn wineserver_alive(prefix_dir: &Path) -> Result<bool> {
-    let socket = server_socket(prefix_dir)?;
+    let socket = match server_socket(prefix_dir) {
+        Ok(socket) => socket,
+        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
     Ok(UnixStream::connect(socket).is_ok())
 }

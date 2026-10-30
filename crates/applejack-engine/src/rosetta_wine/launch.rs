@@ -36,6 +36,16 @@ pub const ADVERTISE_AVX: &str = "ROSETTA_ADVERTISE_AVX";
 /// `VK_ICD_FILENAMES` with the vkd3d-proton backend when present.
 pub const VULKAN_ICD: &str = "vulkan/MoltenVK_icd.json";
 
+/// How long `<server> -w` may take after `<server> -k` before the wait is
+/// abandoned: `-k` escalates to `SIGKILL` on its own after about ten
+/// seconds, so a `-w` still blocked after this is waiting on a server that
+/// was started again in the meantime, not on the one that was killed.
+pub const KILL_WAIT: Duration = Duration::from_secs(30);
+
+/// How long [`Session::cancel`] waits for the loader to exit after the
+/// server is gone before it kills the loader itself.
+pub const LOADER_EXIT_WAIT: Duration = Duration::from_secs(5);
+
 /// The `PATH` the children see: the loader's directory, then [`HOST_PATH`].
 #[must_use]
 pub fn child_path(installed: &InstalledEngine) -> OsString {
@@ -196,26 +206,64 @@ fn spawn_logged(
         })
 }
 
-/// Runs `<root>/<program> args` to completion with `env`, stdout and
-/// stderr appended to `log`.
-pub(crate) fn run_logged(
-    installed: &InstalledEngine,
+/// Waits for `child` up to `timeout`. `Ok(None)` means the deadline passed
+/// and the child was killed and reaped.
+pub(crate) fn wait_bounded(
+    child: &mut std::process::Child,
     program: &Path,
+    timeout: Duration,
+) -> Result<Option<ExitStatus>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| Error::io(program, error))?
+        {
+            return Ok(Some(status));
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn timed_out(command: String, timeout: Duration, log: &Path) -> Error {
+    Error::WineCommandFailed {
+        command,
+        status: format!("timed out after {}s", timeout.as_secs()),
+        log: log.to_path_buf(),
+    }
+}
+
+/// Runs `<loader> args` for `prefix_dir` to completion with `env`, stdout
+/// and stderr appended to `log`, bounded by `timeout`. On expiry the loader
+/// process is killed and reaped, the prefix's server is killed with `-k`,
+/// and the step is reported as failed with the log path; a Wine dialog can
+/// therefore not block the caller for longer than `timeout`.
+pub(crate) fn run_loader(
+    installed: &InstalledEngine,
+    prefix_dir: &Path,
     args: &[&str],
     env: &[EnvPair],
     cwd: &Path,
     log: &Path,
+    timeout: Duration,
 ) -> Result<()> {
-    let program = installed.root.join(program);
+    let loader = installed.root.join(&installed.bundle.wine.loader);
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    let status = spawn_logged(&program, &args, env, cwd, log, &[])?
-        .wait()
-        .map_err(|error| Error::io(&program, error))?;
+    let mut child = spawn_logged(&loader, &args, env, cwd, log, &[])?;
+    let Some(status) = wait_bounded(&mut child, &loader, timeout)? else {
+        let _ = kill_prefix_server(installed, prefix_dir, log);
+        return Err(timed_out(render(&loader, &args), timeout, log));
+    };
     if status.success() {
         Ok(())
     } else {
         Err(Error::WineCommandFailed {
-            command: render(&program, &args),
+            command: render(&loader, &args),
             status: status.to_string(),
             log: log.to_path_buf(),
         })
@@ -233,31 +281,18 @@ pub(crate) fn wait_for_server(
     let server = installed.root.join(&installed.bundle.wine.server);
     let path = child_path(installed);
     let mut child = server_command(&server, &path, prefix_dir, "-w", log)?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| Error::io(&server, error))?
-        {
-            if status.success() {
-                return Ok(());
-            }
-            return Err(Error::WineCommandFailed {
-                command: format!("{} -w", server.display()),
-                status: status.to_string(),
-                log: log.to_path_buf(),
-            });
-        }
-        if started.elapsed() > timeout {
-            let _ = child.kill();
-            kill_server(&server, &path, prefix_dir, log)?;
-            return Err(Error::WineCommandFailed {
-                command: format!("{} -w", server.display()),
-                status: format!("timed out after {}s", timeout.as_secs()),
-                log: log.to_path_buf(),
-            });
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    let Some(status) = wait_bounded(&mut child, &server, timeout)? else {
+        kill_server(&server, &path, prefix_dir, log)?;
+        return Err(timed_out(format!("{} -w", server.display()), timeout, log));
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::WineCommandFailed {
+            command: format!("{} -w", server.display()),
+            status: status.to_string(),
+            log: log.to_path_buf(),
+        })
     }
 }
 
@@ -278,15 +313,32 @@ fn server_command(
     spawn_logged(server, &[OsStr::new(flag)], &env, prefix_dir, log, &[])
 }
 
-/// `<server> -k` then `<server> -w`, so the caller returns once the server
-/// and every process of the prefix are gone.
+/// `<server> -k` then `<server> -w` bounded by [`KILL_WAIT`], so the caller
+/// returns once the server and every process of the prefix are gone, or
+/// with an error naming the wait when a server is still there after the
+/// bound.
 fn kill_server(server: &Path, path: &OsStr, prefix_dir: &Path, log: &Path) -> Result<()> {
     // `-k` exits non-zero when no server runs, which is the state wanted.
     let _ = server_command(server, path, prefix_dir, "-k", log)?.wait();
-    server_command(server, path, prefix_dir, "-w", log)?
-        .wait()
-        .map_err(|error| Error::io(server, error))?;
-    Ok(())
+    let mut child = server_command(server, path, prefix_dir, "-w", log)?;
+    match wait_bounded(&mut child, server, KILL_WAIT)? {
+        Some(_) => Ok(()),
+        None => Err(timed_out(
+            format!("{} -w", server.display()),
+            KILL_WAIT,
+            log,
+        )),
+    }
+}
+
+/// [`kill_server`] for the bundle's server and the children's `PATH`.
+pub(crate) fn kill_prefix_server(
+    installed: &InstalledEngine,
+    prefix_dir: &Path,
+    log: &Path,
+) -> Result<()> {
+    let server = installed.root.join(&installed.bundle.wine.server);
+    kill_server(&server, &child_path(installed), prefix_dir, log)
 }
 
 /// Spawns the loader for `spec` inside `prefix`.
@@ -352,6 +404,16 @@ pub(crate) fn spawn(
     })
 }
 
+impl Drop for Session {
+    /// Reaps the loader when it has already exited. A session dropped while
+    /// its loader still runs is not waited for; the loader is reaped by the
+    /// kernel when the launcher exits, so callers keep a `Session` until
+    /// [`Session::wait`] or [`Session::cancel`] has returned.
+    fn drop(&mut self) {
+        let _ = self.child.try_wait();
+    }
+}
+
 impl Session {
     /// Waits for the loader process to exit.
     ///
@@ -375,15 +437,18 @@ impl Session {
             .map_err(|error| Error::io(&self.log_path, error))
     }
 
-    /// Kills everything in the prefix with `<server> -k` and waits for the
-    /// server to be gone.
+    /// Kills everything in the prefix with `<server> -k`, waits for the
+    /// server to be gone (bounded by [`KILL_WAIT`]), and reaps the loader:
+    /// it normally exits on its own once the server is gone, and is killed
+    /// after [`LOADER_EXIT_WAIT`] otherwise, so no zombie outlives the call.
     ///
     /// # Errors
     ///
-    /// Returns the spawn or wait failure.
+    /// Returns the spawn or wait failure, or [`Error::WineCommandFailed`]
+    /// when a server is still running after the bound.
     pub fn cancel(&mut self) -> Result<()> {
         kill_server(&self.server, &self.path, &self.prefix_dir, &self.log_path)?;
-        let _ = self.child.try_wait();
+        wait_bounded(&mut self.child, &self.log_path, LOADER_EXIT_WAIT)?;
         Ok(())
     }
 
@@ -423,13 +488,15 @@ pub enum PeMachine {
 pub fn pe_machine(path: &Path) -> io::Result<Option<PeMachine>> {
     let mut file = File::open(path)?;
     let mut dos = [0u8; 64];
-    if file.read(&mut dos)? < 64 || &dos[..2] != b"MZ" {
+    // `read_exact`: a short read on a slow volume must not turn an i386 PE
+    // into "not a PE" and skip the refusal.
+    if file.read_exact(&mut dos).is_err() || &dos[..2] != b"MZ" {
         return Ok(None);
     }
     let offset = u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]);
     file.seek(SeekFrom::Start(u64::from(offset)))?;
     let mut header = [0u8; 6];
-    if file.read(&mut header)? < 6 || &header[..4] != b"PE\0\0" {
+    if file.read_exact(&mut header).is_err() || &header[..4] != b"PE\0\0" {
         return Ok(None);
     }
     Ok(Some(match u16::from_le_bytes([header[4], header[5]]) {

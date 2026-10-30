@@ -17,7 +17,10 @@ use super::snapshot::copy_tree;
 pub const README: &str = "README.md";
 /// Apple's license file at the volume root.
 pub const LICENSE: &str = "License.pdf";
-/// Where the GPTK volume holds the payload (assumption A1).
+/// Where the GPTK volume holds the payload (the plan's assumption A1: the
+/// toolkit volume keeps it under `redist/lib/external/`). When the README
+/// of a newer toolkit names another `lib/external` location, the import
+/// error prints it.
 pub const PAYLOAD_DIR: &str = "redist/lib/external";
 /// The framework inside [`PAYLOAD_DIR`].
 pub const FRAMEWORK: &str = "D3DMetal.framework";
@@ -98,11 +101,19 @@ pub fn import(
         (DYLIB, payload.join(DYLIB).is_file()),
     ] {
         if !is_present {
+            let named = named_payload_location(&readme_text).map_or_else(
+                || {
+                    format!(
+                        "check `{}` for where this toolkit version keeps it",
+                        readme.display()
+                    )
+                },
+                |location| format!("`{}` names `{location}` instead", readme.display()),
+            );
             return Err(Error::D3DMetalSource {
                 path: payload.join(entry),
                 reason: format!(
-                    "is missing; the payload is expected under `{PAYLOAD_DIR}/` (check `{}` for where this toolkit version keeps it)",
-                    readme.display()
+                    "is missing; the payload is expected under `{PAYLOAD_DIR}/` ({named})"
                 ),
             });
         }
@@ -125,7 +136,9 @@ pub fn import(
     })
 }
 
-/// Deletes the overlay payload. A missing overlay is not an error.
+/// Deletes the overlay payload and the empty directories it leaves behind
+/// up to the overlay root, so `doctor` and the directory agree. A missing
+/// overlay is not an error.
 ///
 /// # Errors
 ///
@@ -136,11 +149,20 @@ pub fn remove(installed: &InstalledEngine) -> Result<()> {
             version: installed.version.clone(),
         });
     };
-    crate::bundle::remove_stale(&target)
+    crate::bundle::remove_stale(&target)?;
+    let mut parent = target.parent();
+    while let Some(dir) = parent
+        && dir.starts_with(&installed.overlay_root)
+        && dir != installed.overlay_root
+        && fs::remove_dir(dir).is_ok()
+    {
+        parent = dir.parent();
+    }
+    Ok(())
 }
 
-/// The first `digits[.digits...]` token after "Game Porting Toolkit" in the
-/// README, ignoring case.
+/// The first `digits[.digits...]` token, with or without a leading `v`,
+/// after "Game Porting Toolkit" in the README, ignoring case.
 #[must_use]
 pub fn gptk_version(readme: &str) -> Option<String> {
     let lower = readme.to_ascii_lowercase();
@@ -149,6 +171,23 @@ pub fn gptk_version(readme: &str) -> Option<String> {
         .split_whitespace()
         .take(4)
         .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.'))
+        .map(|token| token.strip_prefix(['v', 'V']).unwrap_or(token))
         .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
         .map(ToOwned::to_owned)
+}
+
+/// A path in the README that names a `lib/external` location other than
+/// [`PAYLOAD_DIR`], when the README says the payload moved.
+#[must_use]
+pub fn named_payload_location(readme: &str) -> Option<&str> {
+    readme
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| {
+                    !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+                })
+                .trim_end_matches(['/', '.'])
+        })
+        .find(|token| token.contains("lib/external") && *token != PAYLOAD_DIR)
 }

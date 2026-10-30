@@ -6,6 +6,7 @@ mod common;
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
 use applejack_engine::rosetta_wine::launch::{
@@ -17,7 +18,8 @@ use applejack_engine::rosetta_wine::prefix::{
     render_registry_seeds,
 };
 use applejack_engine::rosetta_wine::process::{
-    Process, ProcessRecord, SESSION_VARIABLE, executable_name, match_record,
+    Process, ProcessRecord, SESSION_VARIABLE, executable_name, match_record, server_socket,
+    wineserver_alive,
 };
 use applejack_engine::rosetta_wine::{CpuidFeatures, CpuidProbe, cpuid, d3dmetal, snapshot};
 use applejack_engine::{
@@ -260,6 +262,7 @@ fn d3dmetal_backend_is_refused_without_a_verified_overlay() {
         hidraw: HidrawMode::Enabled,
         library_dir: None,
         log_dir: dir.path().join("logs"),
+        boot_timeout: None,
     };
     let prefix_dir = dir.path().join("prefix");
     assert!(matches!(
@@ -307,6 +310,7 @@ fn prefix_creation_refuses_a_relative_or_occupied_directory() {
         hidraw: HidrawMode::Enabled,
         library_dir: None,
         log_dir: dir.path().join("logs"),
+        boot_timeout: None,
     };
     assert!(matches!(
         RosettaWine.create_prefix(&engine, Path::new("relative/prefix"), &spec).unwrap_err(),
@@ -320,6 +324,51 @@ fn prefix_creation_refuses_a_relative_or_occupied_directory() {
         Error::PrefixUnusable { reason, .. } if reason.contains("not empty")
     ));
     assert!(occupied.join("system.reg").exists());
+    let target = dir.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let error = RosettaWine
+        .create_prefix(&engine, &link, &spec)
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::PrefixUnusable { reason, .. } if reason.contains("symlink")),
+        "{error}"
+    );
+    assert!(error.to_string().contains("is unusable"));
+}
+
+#[test]
+fn prefix_creation_refuses_a_relative_or_missing_library_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = installed(dir.path());
+    for (library, expected) in [
+        (PathBuf::from("relative/lib"), "absolute"),
+        (dir.path().join("does/not/exist"), "existing directory"),
+    ] {
+        let spec = PrefixSpec {
+            backend: GraphicsBackend::WineD3D,
+            sync_mode: SyncMode::None,
+            hidraw: HidrawMode::Enabled,
+            library_dir: Some(library.clone()),
+            log_dir: dir.path().join("logs"),
+            boot_timeout: None,
+        };
+        let prefix_dir = dir.path().join("prefix");
+        let error = RosettaWine
+            .create_prefix(&engine, &prefix_dir, &spec)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::LibraryDirUnusable { path, reason } if *path == library && reason.contains(expected)
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("drive S:"), "{error}");
+        assert!(!prefix_dir.exists(), "refused before wineboot");
+        assert!(!dir.path().join("logs").exists());
+    }
 }
 
 fn write_pe(path: &Path, machine: u16) {
@@ -489,6 +538,68 @@ fn process_discovery_matches_uid_and_exact_session_id() {
     );
 }
 
+/// The layout `sysinfo` reports once Wine has rewritten a Windows process's
+/// argv in place, captured on this host for `cmd /c ping` (review of
+/// 4719a27): the session entry is the last `cmd` entry and is missing from
+/// `environ`.
+#[test]
+fn process_discovery_accepts_the_session_entry_wine_folds_into_argv() {
+    let id = "launch-18e37181b5b90da8-1389-0";
+    let folded = format!("APPLEJACK_SESSION={id}");
+    let cmd = os(&[
+        "C:\\windows\\system32\\cmd.exe",
+        "/c",
+        "ping -n 30 127.0.0.1",
+        &folded,
+    ]);
+    let environ = os(&[
+        "HOME=/Users/me",
+        "PATH=/data/engines/rosetta-wine/11.0-1/wine/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "TMPDIR=/var/folders/3s/T/",
+        "WINEDEBUG=-all",
+        "WINEDLLOVERRIDES=mscoree=;mshtml=;d3d10core,d3d11,dxgi=n,b",
+        "WINEESYNC=1",
+        "WINEPREFIX=/data/prefixes/test",
+    ]);
+    let record = captured_record(&cmd, &environ);
+    assert_eq!(
+        match_record(&record, id, 501),
+        Some(Process {
+            pid: 4242,
+            exe: "cmd.exe".to_owned(),
+            session_id: id.to_owned(),
+        })
+    );
+    assert_eq!(match_record(&record, id, 502), None);
+    assert_eq!(
+        match_record(&record, "launch-18e37181b5b90da8-1389", 501),
+        None,
+        "a prefix of the id, folded or not, is not a match"
+    );
+
+    // Entries from the folded variable on are environment, not arguments:
+    // a `.exe` among them is not the executable name.
+    let cmd = os(&[
+        "Z:\\games\\Game.exe",
+        &folded,
+        "HOME=/Users/me",
+        "STEAM_COMPAT_TOOL=C:\\tool.exe",
+    ]);
+    let environ = os(&["PATH=/usr/bin"]);
+    assert_eq!(
+        match_record(&captured_record(&cmd, &environ), id, 501).map(|p| p.exe),
+        Some("Game.exe".to_owned())
+    );
+
+    // The entry in neither place is no match, whatever argv says.
+    let cmd = os(&["C:\\windows\\system32\\cmd.exe", "/c", "ping"]);
+    let environ = os(&["HOME=/Users/me", "APPLEJACK_SESSION=launch-other"]);
+    assert_eq!(
+        match_record(&captured_record(&cmd, &environ), id, 501),
+        None
+    );
+}
+
 #[test]
 fn executable_name_prefers_the_last_exe_in_argv() {
     assert_eq!(
@@ -618,12 +729,88 @@ fn snapshots_create_restore_reset_and_prune() {
     assert!(kept.iter().all(|snapshot| snapshot.dir.is_dir()));
     assert!(removed.iter().all(|snapshot| !snapshot.dir.exists()));
     assert_eq!(snapshot::prune(&root, "steam", 10).unwrap(), Vec::new());
-    for bad in ["", ".", "..", ".hidden", "a/b"] {
+}
+
+#[test]
+fn snapshot_names_are_validated_and_same_second_suffixes_sort() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("prefixes/steam");
+    let root = dir.path().join("prefixes/.snapshots");
+    fs::create_dir_all(&prefix).unwrap();
+    for bad in ["", ".", "..", ".hidden", "a/b", "nul\0byte"] {
         assert!(matches!(
             snapshot::create(&prefix, &root, bad).unwrap_err(),
             Error::InvalidSnapshotName { .. }
         ));
     }
+    assert!(matches!(
+        snapshot::create(&prefix, &root, "nul\0byte").unwrap_err(),
+        Error::InvalidSnapshotName { reason, .. } if reason.contains("NUL")
+    ));
+    let first = snapshot::create(&prefix, &root, "steam").unwrap();
+    let second = snapshot::create(&prefix, &root, "steam").unwrap();
+    assert!(
+        second.timestamp == format!("{}-001", first.timestamp)
+            || second.timestamp > first.timestamp,
+        "{} then {}: the suffix is zero-padded so string order is creation order",
+        first.timestamp,
+        second.timestamp
+    );
+    assert_eq!(snapshot::list(&root, "steam").unwrap(), [first, second]);
+}
+
+/// A listener on the socket path Wine would use for the prefix stands in
+/// for a running `wineserver`.
+#[test]
+fn snapshot_restore_and_reset_refuse_a_prefix_with_a_live_wineserver() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("prefixes/steam");
+    let root = dir.path().join("prefixes/.snapshots");
+    fs::create_dir_all(prefix.join("drive_c/users/me")).unwrap();
+    fs::write(prefix.join("system.reg"), "v1").unwrap();
+    let snap = snapshot::create(&prefix, &root, "steam").unwrap();
+    fs::write(prefix.join("system.reg"), "v2").unwrap();
+
+    let socket = server_socket(&prefix).unwrap();
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _ = fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).unwrap();
+    assert!(wineserver_alive(&prefix).unwrap());
+
+    let refused = snapshot::restore(&prefix, &root, "steam", &snap.timestamp).unwrap_err();
+    assert!(
+        matches!(&refused, Error::PrefixUnusable { path, reason } if *path == prefix && reason.contains("inode")),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("cancel the session first"));
+    assert!(matches!(
+        snapshot::reset(&prefix, &root, "steam", false, &mut |_| Ok(())).unwrap_err(),
+        Error::PrefixUnusable { .. }
+    ));
+    assert_eq!(fs::read_to_string(prefix.join("system.reg")).unwrap(), "v2");
+    assert_eq!(
+        snapshot::list(&root, "steam").unwrap().len(),
+        1,
+        "no safety snapshot is taken for a refused operation"
+    );
+    assert!(matches!(
+        snapshot::restore(&prefix, &root, "steam", "19700101T000000Z").unwrap_err(),
+        Error::SnapshotNotFound { .. }
+    ));
+
+    // A stale socket file (the server is gone) reads as dead, and the
+    // operations go through.
+    drop(listener);
+    assert!(socket.exists());
+    assert!(!wineserver_alive(&prefix).unwrap());
+    snapshot::restore(&prefix, &root, "steam", &snap.timestamp).unwrap();
+    assert_eq!(fs::read_to_string(prefix.join("system.reg")).unwrap(), "v1");
+    let _ = fs::remove_file(&socket);
+    let _ = fs::remove_dir(socket.parent().unwrap());
+
+    // A prefix directory that no longer exists has no server.
+    fs::remove_dir_all(&prefix).unwrap();
+    assert!(!wineserver_alive(&prefix).unwrap());
 }
 
 /// A GPTK volume as the import expects it.
@@ -703,6 +890,10 @@ fn d3dmetal_import_copies_the_payload_into_the_overlay_once_the_license_is_accep
     d3dmetal::remove(&engine).unwrap();
     assert!(!d3dmetal::overlay_present(&engine));
     assert!(!overlay.overlay_dir.exists());
+    assert!(
+        !engine.overlay_root.join("wine").exists(),
+        "empty parents are removed up to the overlay root"
+    );
     d3dmetal::remove(&engine).unwrap();
 }
 
@@ -728,9 +919,38 @@ fn d3dmetal_import_names_the_missing_readme_or_payload() {
     assert!(matches!(
         &error,
         Error::D3DMetalSource { path, reason }
-            if *path == volume.join("redist/lib/external/libd3dshared.dylib") && reason.contains("README.md")
+            if *path == volume.join("redist/lib/external/libd3dshared.dylib")
+                && reason.contains("README.md")
+                && reason.contains("check")
     ));
     assert!(!d3dmetal::overlay_present(&engine));
+
+    // A README that names another location: the error prints it.
+    let volume = gptk_volume(&dir.path().join("third"));
+    fs::write(
+        volume.join(d3dmetal::README),
+        "# Game Porting Toolkit v3.1\n\nThis release keeps D3DMetal under lib/external/ at the volume root.\n",
+    )
+    .unwrap();
+    fs::remove_file(volume.join(d3dmetal::PAYLOAD_DIR).join(d3dmetal::DYLIB)).unwrap();
+    let error = d3dmetal::import(&engine, &volume, true).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::D3DMetalSource { reason, .. }
+                if reason.contains("names `lib/external` instead") && reason.contains("README.md")
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        d3dmetal::named_payload_location("payload under redist/lib/external/."),
+        None,
+        "the expected location is not another location"
+    );
+    assert_eq!(
+        d3dmetal::named_payload_location("see (redist64/lib/external), then"),
+        Some("redist64/lib/external")
+    );
 
     // A bundle without `[d3dmetal]` cannot take an import at all.
     let other = tempfile::tempdir().unwrap();
@@ -750,6 +970,11 @@ fn d3dmetal_import_names_the_missing_readme_or_payload() {
     assert_eq!(d3dmetal::gptk_version("nothing here"), None);
     assert_eq!(
         d3dmetal::gptk_version("Apple Game Porting Toolkit v2.1 beta"),
+        Some("2.1".to_owned()),
+        "a leading v is not part of the version"
+    );
+    assert_eq!(
+        d3dmetal::gptk_version("Game Porting Toolkit for macOS Sonoma"),
         None,
         "a token that does not start with a digit is not a version"
     );

@@ -12,6 +12,7 @@ use std::process::Command;
 use crate::{Error, Result};
 
 use super::clock::Utc;
+use super::process::wineserver_alive;
 
 /// Snapshots kept per prefix name by default.
 pub const DEFAULT_KEEP: usize = 3;
@@ -52,7 +53,8 @@ pub fn create(prefix_dir: &Path, snapshots_root: &Path, name: &str) -> Result<Sn
     let mut n = 0;
     while fs::symlink_metadata(&dir).is_ok() {
         n += 1;
-        timestamp = format!("{base}-{n}");
+        // Zero-padded so `list`'s string order is creation order past `-9`.
+        timestamp = format!("{base}-{n:03}");
         dir = parent.join(&timestamp);
     }
     copy_tree(prefix_dir, &dir)?;
@@ -100,12 +102,15 @@ pub fn list(snapshots_root: &Path, name: &str) -> Result<Vec<Snapshot>> {
 /// taking a safety snapshot of the current state, which is returned. The
 /// snapshot is copied to `<prefix_dir>.restoring` first and swapped in with
 /// two renames, so an interrupted restore leaves the prefix either as it
-/// was or fully restored.
+/// was or fully restored. Refused while a `wineserver` runs for the prefix:
+/// the swap gives the path a new inode, and Wine keys the server socket on
+/// the inode, so a running session would keep writing into the unlinked
+/// directory and `wineserver_alive` would no longer see it.
 ///
 /// # Errors
 ///
-/// Returns [`Error::SnapshotNotFound`], or [`Error::Io`] from the copy or
-/// swap.
+/// Returns [`Error::SnapshotNotFound`], [`Error::PrefixUnusable`] while a
+/// server runs, or [`Error::Io`] from the copy or swap.
 pub fn restore(
     prefix_dir: &Path,
     snapshots_root: &Path,
@@ -113,6 +118,7 @@ pub fn restore(
     timestamp: &str,
 ) -> Result<Snapshot> {
     let source = find(snapshots_root, name, timestamp)?;
+    refuse_if_running(prefix_dir)?;
     let safety = create(prefix_dir, snapshots_root, name)?;
     let staging = sibling(prefix_dir, ".restoring");
     let replaced = sibling(prefix_dir, ".replaced");
@@ -133,11 +139,13 @@ pub fn restore(
 /// a fresh prefix at the same path, and with `keep_user_data` copies
 /// `drive_c/users/` back from the safety snapshot. Returns the safety
 /// snapshot. If `recreate` fails the prefix is gone and the safety
-/// snapshot holds the previous state.
+/// snapshot holds the previous state. Refused while a `wineserver` runs
+/// for the prefix, for the reason given at [`restore`].
 ///
 /// # Errors
 ///
-/// Returns the first failure.
+/// Returns [`Error::PrefixUnusable`] while a server runs, else the first
+/// failure.
 pub fn reset(
     prefix_dir: &Path,
     snapshots_root: &Path,
@@ -145,6 +153,7 @@ pub fn reset(
     keep_user_data: bool,
     recreate: &mut dyn FnMut(&Path) -> Result<()>,
 ) -> Result<Snapshot> {
+    refuse_if_running(prefix_dir)?;
     let safety = create(prefix_dir, snapshots_root, name)?;
     fs::remove_dir_all(prefix_dir).map_err(|error| Error::io(prefix_dir, error))?;
     recreate(prefix_dir)?;
@@ -176,6 +185,17 @@ pub fn prune(snapshots_root: &Path, name: &str, keep: usize) -> Result<Vec<Snaps
     Ok(removed)
 }
 
+fn refuse_if_running(prefix_dir: &Path) -> Result<()> {
+    if wineserver_alive(prefix_dir)? {
+        return Err(Error::PrefixUnusable {
+            path: prefix_dir.to_path_buf(),
+            reason: "a wineserver is running for it, and replacing the directory would change the \
+                     inode Wine keys the server socket on; cancel the session first",
+        });
+    }
+    Ok(())
+}
+
 fn find(snapshots_root: &Path, name: &str, timestamp: &str) -> Result<Snapshot> {
     list(snapshots_root, name)?
         .into_iter()
@@ -202,8 +222,10 @@ fn check_name(name: &str) -> Result<()> {
         Some("must not be `.` or `..`")
     } else if name.starts_with('.') {
         Some("must not start with `.`")
-    } else if name.contains('/') || name.contains('\0') {
+    } else if name.contains('/') {
         Some("must not contain `/`")
+    } else if name.contains('\0') {
+        Some("must not contain a NUL byte")
     } else {
         None
     };

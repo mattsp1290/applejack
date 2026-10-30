@@ -155,18 +155,31 @@ pub enum Error {
     )]
     RosettaMissing,
 
-    /// A prefix cannot be created at `path` because something is already
-    /// there, or the path is not absolute.
-    #[error("cannot create a prefix at `{}`: {reason}", path.display())]
+    /// The prefix directory `path` cannot be used for the operation: a
+    /// prefix cannot be created there because something is already there or
+    /// the path is not absolute, or a snapshot cannot be restored or reset
+    /// into it while a `wineserver` runs for it.
+    #[error("prefix directory `{}` is unusable: {reason}", path.display())]
     PrefixUnusable {
-        /// The requested prefix directory.
+        /// The prefix directory.
         path: PathBuf,
         /// What is wrong with it.
         reason: &'static str,
     },
 
-    /// `path` is not a prefix this engine made: it has no `applejack.toml`
-    /// record, the record is unreadable, or it names another engine.
+    /// The directory to map as drive `S:` is not an existing absolute
+    /// directory.
+    #[error("cannot map the game library `{}` as drive S:: {reason}", path.display())]
+    LibraryDirUnusable {
+        /// The library directory as given.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+
+    /// `path` is not a prefix this engine made: it has no
+    /// `applejack/prefix.toml` record, the record is unreadable, or it
+    /// names another engine.
     #[error("`{}` is not a usable prefix: {reason}", path.display())]
     InvalidPrefix {
         /// The prefix directory.
@@ -175,8 +188,9 @@ pub enum Error {
         reason: String,
     },
 
-    /// A Wine process the engine ran (`wineboot`, `regedit`, `wineserver`)
-    /// did not exit 0. The prefix is removed when `wineboot` fails; the log
+    /// A Wine process the engine ran (`wineboot`, `reg import`,
+    /// `wineserver`) did not exit 0, or ran past its time bound and was
+    /// killed. The prefix is removed when prefix creation fails; the log
     /// stays for inspection.
     #[error("`{command}` failed ({status}); log at `{}`", log.display())]
     WineCommandFailed {
@@ -266,8 +280,9 @@ pub enum Error {
         reason: &'static str,
     },
 
-    /// A probe printed output the engine cannot parse.
-    #[error("probe `{}` printed unparseable output: {reason}: {output:?}", probe.display())]
+    /// A probe printed output the engine cannot parse, exited non-zero, or
+    /// ran past its time bound.
+    #[error("probe `{}` failed: {reason}: {}", probe.display(), first_line(output))]
     ProbeOutput {
         /// The probe executable.
         probe: PathBuf,
@@ -294,6 +309,16 @@ pub enum Error {
     /// The engine manifest failed to parse or validate.
     #[error("engine manifest: {0}")]
     Manifest(#[from] applejack_manifest::Error),
+}
+
+/// The first non-empty line of a probe's output, trimmed, so the message
+/// stays printable; `(no output)` when there is none.
+fn first_line(output: &str) -> &str {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("(no output)")
 }
 
 fn required_variable_message(name: &str, rejected: Option<&DropReason>) -> String {

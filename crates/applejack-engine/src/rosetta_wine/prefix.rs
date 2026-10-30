@@ -2,7 +2,7 @@
 //! seeds, and the library drive, in the order [`PREFIX_STEPS`] lists. The
 //! engine's own state for a prefix lives in `<prefix>/applejack/`:
 //! `prefix.toml` (the [`PrefixRecord`]), the last `seeds.reg`, and its
-//! `regedit.log`.
+//! `reg-import.log`.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -20,7 +20,9 @@ use crate::{
 };
 
 use super::d3dmetal;
-use super::launch::{assemble_env, engine_rows, new_session_id, run_logged, wait_for_server};
+use super::launch::{
+    assemble_env, engine_rows, kill_prefix_server, new_session_id, run_loader, wait_for_server,
+};
 
 /// One step of prefix creation, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,7 +33,7 @@ pub enum PrefixStep {
     /// The backend's DLLs copied into `drive_c/windows/system32` (x86-64)
     /// and `syswow64` (i386).
     DllOverrides,
-    /// `regedit /S` of the rendered seeds: crash dialog off, `DllOverrides`
+    /// `reg import` of the rendered seeds: crash dialog off, `DllOverrides`
     /// persisted, the HID toggle.
     RegistrySeeds,
     /// `dosdevices/s:` linked to the shared library directory.
@@ -65,17 +67,25 @@ pub const STATE_DIR: &str = "applejack";
 pub const RECORD_FILE: &str = "prefix.toml";
 /// The `dosdevices` entry for the shared library.
 pub const LIBRARY_DRIVE: &str = "s:";
-/// How long `wineserver -w` may take after `wineboot` or `regedit` before
-/// the server is killed and the step reported failed.
+/// How long `<loader> wineboot --init` may run when
+/// [`PrefixSpec::boot_timeout`] is `None`. On expiry the loader is killed,
+/// the prefix's server stopped with `-k`, the prefix removed, and the error
+/// names `wineboot.log`. The Mono and Gecko override removes the known
+/// dialog; this bound covers any other modal `wineboot` could raise.
+pub const WINEBOOT_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long `wineserver -w` may take after `wineboot` or `reg import`, and
+/// how long `reg import` itself may run, before the server is killed and
+/// the step reported failed.
 pub const SERVER_WAIT: Duration = Duration::from_secs(180);
 
 const WINEBOOT_LOG: &str = "wineboot.log";
-const REGEDIT_LOG: &str = "regedit.log";
+const IMPORT_LOG: &str = "reg-import.log";
 const SEEDS_FILE: &str = "seeds.reg";
 
 /// What the engine last applied to a prefix, as `applejack/prefix.toml`.
+/// Unknown fields are kept, not refused: an older engine binary must still
+/// open a prefix a newer one annotated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PrefixRecord {
     /// Engine that created the prefix.
     pub engine: EngineId,
@@ -87,8 +97,11 @@ pub struct PrefixRecord {
     pub sync_mode: SyncMode,
     /// HID toggle applied with it.
     pub hidraw: HidrawMode,
-    /// DLL files the engine copied in, relative to the prefix, so the next
-    /// `apply_overrides` removes them before copying another backend's.
+    /// DLL files the engine copied in or was copying in when the record was
+    /// written, relative to the prefix, so the next `apply_overrides`
+    /// removes them before copying another backend's. The record is
+    /// rewritten before and after every copy, so it never names fewer files
+    /// than are on disk.
     #[serde(default)]
     pub copied_dlls: Vec<PathBuf>,
 }
@@ -228,7 +241,7 @@ fn all_stems(bundle: &BundleToml) -> Vec<String> {
     stems
 }
 
-/// Renders the `REGEDIT4` file `regedit /S` imports: the crash dialog off,
+/// Renders the `REGEDIT4` file `reg import` loads: the crash dialog off,
 /// `HKCU\Software\Wine\DllOverrides` set to `native,builtin` for the
 /// backend's DLLs and deleted for every other backend's, and the HID toggle
 /// at the bundle's `hidraw_key` (its last component is the value name).
@@ -284,15 +297,47 @@ fn split_registry_value(spec: &str) -> Option<(String, &str)> {
     Some((key, value))
 }
 
-/// Removes the DLLs an earlier apply copied and copies the backend's, into
-/// `system32` for x86-64 and `syswow64` for i386. Returns what was copied,
-/// relative to the prefix.
-fn copy_overrides(
+/// The backend's DLLs as `(source in the bundle, destination relative to
+/// the prefix)`: `x86_64` into `system32`, `i386` into `syswow64`.
+fn planned_overrides(
+    installed: &InstalledEngine,
+    backend: GraphicsBackend,
+) -> Vec<(PathBuf, PathBuf)> {
+    let table = override_dlls(&installed.bundle, backend);
+    let mut planned = Vec::new();
+    for (dlls, target) in [
+        (&table.x86_64, "drive_c/windows/system32"),
+        (&table.i386, "drive_c/windows/syswow64"),
+    ] {
+        for dll in dlls {
+            if let Some(name) = dll.file_name() {
+                planned.push((installed.root.join(dll), Path::new(target).join(name)));
+            }
+        }
+    }
+    planned
+}
+
+/// Replaces the DLLs an earlier apply copied (`previously`) with the ones
+/// `record.backend` needs, keeping `record` on disk in step with the tree:
+/// it is written first naming every file that may exist during the swap
+/// (the old set and the new), and again naming the new set once the copy is
+/// done. Whatever fails afterwards, the next apply knows what to remove.
+fn swap_overrides(
     installed: &InstalledEngine,
     prefix_dir: &Path,
-    backend: GraphicsBackend,
+    record: &mut PrefixRecord,
     previously: &[PathBuf],
-) -> Result<Vec<PathBuf>> {
+) -> Result<()> {
+    let planned = planned_overrides(installed, record.backend);
+    let mut during = previously.to_vec();
+    for (_, destination) in &planned {
+        if !during.contains(destination) {
+            during.push(destination.clone());
+        }
+    }
+    record.copied_dlls = during;
+    record.write(prefix_dir)?;
     for relative in previously {
         let path = prefix_dir.join(relative);
         match fs::remove_file(&path) {
@@ -301,59 +346,46 @@ fn copy_overrides(
             Err(error) => return Err(Error::io(path, error)),
         }
     }
-    let table = override_dlls(&installed.bundle, backend);
-    let mut copied = Vec::new();
-    for (dlls, target) in [
-        (&table.x86_64, "drive_c/windows/system32"),
-        (&table.i386, "drive_c/windows/syswow64"),
-    ] {
-        if dlls.is_empty() {
-            continue;
+    for (source, relative) in &planned {
+        let destination = prefix_dir.join(relative);
+        if let Some(dir) = destination.parent() {
+            fs::create_dir_all(dir).map_err(|error| Error::io(dir, error))?;
         }
-        let dir = prefix_dir.join(target);
-        fs::create_dir_all(&dir).map_err(|error| Error::io(&dir, error))?;
-        for dll in dlls {
-            let Some(name) = dll.file_name() else {
-                continue;
-            };
-            let destination = dir.join(name);
-            fs::copy(installed.root.join(dll), &destination)
-                .map_err(|error| Error::io(&destination, error))?;
-            copied.push(Path::new(target).join(name));
-        }
+        fs::copy(source, &destination).map_err(|error| Error::io(&destination, error))?;
     }
-    Ok(copied)
+    record.copied_dlls = planned.into_iter().map(|(_, relative)| relative).collect();
+    record.write(prefix_dir)
 }
 
-/// Creates the prefix. See [`PREFIX_STEPS`] for the order; the directory is
-/// removed when any step fails, and `wineboot`'s log under
-/// `<spec.log_dir>/<session>/` survives.
+/// Creates the prefix. See [`PREFIX_STEPS`] for the order. When any step
+/// fails the prefix's server is stopped, the directory is removed (or, when
+/// the caller supplied an existing empty directory, emptied), and
+/// `wineboot`'s log under `<spec.log_dir>/<session>/` survives.
 pub(crate) fn create(
     installed: &InstalledEngine,
     prefix_dir: &Path,
     spec: &PrefixSpec,
 ) -> Result<Prefix> {
     backend_available(installed, spec.backend)?;
-    check_prefix_dir(prefix_dir)?;
-    fs::create_dir_all(prefix_dir).map_err(|error| Error::io(prefix_dir, error))?;
+    let existed = check_prefix_dir(prefix_dir)?;
+    if let Some(library) = &spec.library_dir {
+        check_library_dir(library)?;
+    }
     let session = new_session_id("prefix");
     let log_dir = spec.log_dir.join(&session);
     fs::create_dir_all(&log_dir).map_err(|error| Error::io(&log_dir, error))?;
+    fs::create_dir_all(prefix_dir).map_err(|error| Error::io(prefix_dir, error))?;
     let built = build(installed, prefix_dir, spec, &session, &log_dir);
-    if let Err(error) = built {
-        let _ = fs::remove_dir_all(prefix_dir);
-        return Err(error);
+    if built.is_err() {
+        // `-k` needs the directory: Wine keys the server on its inode.
+        let _ = kill_prefix_server(installed, prefix_dir, &log_dir.join(WINEBOOT_LOG));
+        let _ = if existed {
+            clear_dir(prefix_dir)
+        } else {
+            fs::remove_dir_all(prefix_dir)
+        };
     }
-    let record = PrefixRecord {
-        engine: installed.id,
-        engine_version: installed.version.clone(),
-        backend: spec.backend,
-        sync_mode: spec.sync_mode,
-        hidraw: spec.hidraw,
-        copied_dlls: built?,
-    };
-    record.write(prefix_dir)?;
-    Ok(record.to_prefix(prefix_dir))
+    built
 }
 
 fn build(
@@ -362,7 +394,7 @@ fn build(
     spec: &PrefixSpec,
     session: &str,
     log_dir: &Path,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Prefix> {
     // No backend rows yet: the DLLs are copied after the boot.
     let rows = engine_rows(
         installed,
@@ -374,17 +406,26 @@ fn build(
     );
     let (env, _dropped) = assemble_env(installed, prefix_dir, &[], &rows)?;
     let log = log_dir.join(WINEBOOT_LOG);
-    run_logged(
+    run_loader(
         installed,
-        &installed.bundle.wine.loader,
+        prefix_dir,
         &["wineboot", "--init"],
         &env,
         prefix_dir,
         &log,
+        spec.boot_timeout.unwrap_or(WINEBOOT_TIMEOUT),
     )?;
     wait_for_server(installed, prefix_dir, &log, SERVER_WAIT)?;
 
-    let copied = copy_overrides(installed, prefix_dir, spec.backend, &[])?;
+    let mut record = PrefixRecord {
+        engine: installed.id,
+        engine_version: installed.version.clone(),
+        backend: spec.backend,
+        sync_mode: spec.sync_mode,
+        hidraw: spec.hidraw,
+        copied_dlls: Vec::new(),
+    };
+    swap_overrides(installed, prefix_dir, &mut record, &[])?;
     seed_registry(
         installed,
         prefix_dir,
@@ -397,10 +438,12 @@ fn build(
     if let Some(library) = &spec.library_dir {
         link_library_drive(prefix_dir, library)?;
     }
-    Ok(copied)
+    Ok(record.to_prefix(prefix_dir))
 }
 
-/// Re-applies overrides to an existing prefix of this engine.
+/// Re-applies overrides to an existing prefix of this engine. The record
+/// is rewritten as the DLLs change and before the registry is seeded, so a
+/// failed import leaves a record that still names every DLL on disk.
 pub(crate) fn apply(
     installed: &InstalledEngine,
     prefix: &Prefix,
@@ -419,7 +462,15 @@ pub(crate) fn apply(
     }
     backend_available(installed, backend)?;
     let previous = PrefixRecord::read(&prefix.dir)?;
-    let copied = copy_overrides(installed, &prefix.dir, backend, &previous.copied_dlls)?;
+    let mut record = PrefixRecord {
+        engine: installed.id,
+        engine_version: installed.version.clone(),
+        backend,
+        sync_mode,
+        hidraw,
+        copied_dlls: Vec::new(),
+    };
+    swap_overrides(installed, &prefix.dir, &mut record, &previous.copied_dlls)?;
     let session = new_session_id("apply");
     let state_dir = prefix.dir.join(STATE_DIR);
     seed_registry(
@@ -431,21 +482,14 @@ pub(crate) fn apply(
         &session,
         &state_dir,
     )?;
-    let record = PrefixRecord {
-        engine: installed.id,
-        engine_version: installed.version.clone(),
-        backend,
-        sync_mode,
-        hidraw,
-        copied_dlls: copied,
-    };
-    record.write(&prefix.dir)?;
     Ok(record.to_prefix(&prefix.dir))
 }
 
-/// Writes `seeds.reg` into `work_dir` and imports it with `regedit /S`
+/// Writes `seeds.reg` into `work_dir` and imports it with `reg import`
 /// from that directory (a relative file name needs no path translation),
-/// logging to `work_dir/regedit.log`.
+/// logging to `work_dir/reg-import.log`. `reg import` exits 1 for a
+/// missing or malformed file where `regedit /S` exits 0, so a failed seed
+/// is reported.
 fn seed_registry(
     installed: &InstalledEngine,
     prefix_dir: &Path,
@@ -464,25 +508,47 @@ fn seed_registry(
     .map_err(|error| Error::io(&seeds, error))?;
     let rows = engine_rows(installed, prefix_dir, session, backend, sync_mode, false);
     let (env, _dropped) = assemble_env(installed, prefix_dir, &[], &rows)?;
-    let log = work_dir.join(REGEDIT_LOG);
-    run_logged(
+    let log = work_dir.join(IMPORT_LOG);
+    run_loader(
         installed,
-        &installed.bundle.wine.loader,
-        &["regedit", "/S", SEEDS_FILE],
+        prefix_dir,
+        &["reg", "import", SEEDS_FILE],
         &env,
         work_dir,
         &log,
+        SERVER_WAIT,
     )?;
     wait_for_server(installed, prefix_dir, &log, SERVER_WAIT)
 }
 
+/// The library directory must exist and be absolute: a relative target
+/// would make `dosdevices/s:` point inside `dosdevices/`, and a missing one
+/// would fail inside Steam instead of here.
+fn check_library_dir(library_dir: &Path) -> Result<()> {
+    let unusable = |reason| Error::LibraryDirUnusable {
+        path: library_dir.to_path_buf(),
+        reason,
+    };
+    if !library_dir.is_absolute() {
+        return Err(unusable("the path must be absolute"));
+    }
+    if !library_dir.is_dir() {
+        return Err(unusable("the path is not an existing directory"));
+    }
+    Ok(())
+}
+
 fn link_library_drive(prefix_dir: &Path, library_dir: &Path) -> Result<()> {
+    check_library_dir(library_dir)?;
     let link = prefix_dir.join("dosdevices").join(LIBRARY_DRIVE);
     crate::bundle::remove_stale(&link)?;
     symlink(library_dir, &link).map_err(|error| Error::io(&link, error))
 }
 
-fn check_prefix_dir(prefix_dir: &Path) -> Result<()> {
+/// Whether `prefix_dir` can take a new prefix; `Ok(true)` when it is an
+/// existing empty directory the caller supplied (which a failed creation
+/// empties rather than removes), `Ok(false)` when it does not exist yet.
+fn check_prefix_dir(prefix_dir: &Path) -> Result<bool> {
     let unusable = |reason| Error::PrefixUnusable {
         path: prefix_dir.to_path_buf(),
         reason,
@@ -491,8 +557,10 @@ fn check_prefix_dir(prefix_dir: &Path) -> Result<()> {
         return Err(unusable("the path must be absolute"));
     }
     match fs::symlink_metadata(prefix_dir) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(Error::io(prefix_dir, error)),
+        // Wine would key the server on the target's inode, not the link's.
+        Ok(meta) if meta.is_symlink() => Err(unusable("the path is a symlink")),
         Ok(meta) if !meta.is_dir() => Err(unusable("something that is not a directory is there")),
         Ok(_) => {
             let mut entries =
@@ -500,8 +568,22 @@ fn check_prefix_dir(prefix_dir: &Path) -> Result<()> {
             if entries.next().is_some() {
                 Err(unusable("the directory is not empty"))
             } else {
-                Ok(())
+                Ok(true)
             }
         }
     }
+}
+
+/// Removes the contents of `dir`, not `dir` itself.
+fn clear_dir(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }

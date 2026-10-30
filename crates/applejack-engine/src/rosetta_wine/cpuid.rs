@@ -4,13 +4,19 @@
 //! only when a recorded probe says it does.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, InstalledEngine, Result};
 
-use super::launch::{ADVERTISE_AVX, child_path};
+use super::launch::{ADVERTISE_AVX, child_path, wait_bounded};
+
+/// How long one probe run may take. The probe is a small Mach-O that
+/// returns in well under a second; the bound covers a Rosetta first-run
+/// prompt that would otherwise block the caller for good.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One run of the probe, as the JSON line it prints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,14 +86,29 @@ pub(crate) fn run(installed: &InstalledEngine) -> Result<CpuidProbe> {
 
 fn run_once(installed: &InstalledEngine, probe: &Path, advertise: bool) -> Result<CpuidFeatures> {
     let mut command = Command::new(probe);
-    command.env_clear().env("PATH", child_path(installed));
+    command
+        .env_clear()
+        .env("PATH", child_path(installed))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if advertise {
         command.env(ADVERTISE_AVX, "1");
     }
-    let output = command.output().map_err(|error| Error::Spawn {
+    let mut child = command.spawn().map_err(|error| Error::Spawn {
         program: probe.to_path_buf(),
         source: error,
     })?;
+    if wait_bounded(&mut child, probe, PROBE_TIMEOUT)?.is_none() {
+        return Err(Error::ProbeOutput {
+            probe: probe.to_path_buf(),
+            reason: format!("timed out after {}s", PROBE_TIMEOUT.as_secs()),
+            output: String::new(),
+        });
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| Error::io(probe, error))?;
     if !output.status.success() {
         return Err(Error::ProbeOutput {
             probe: probe.to_path_buf(),

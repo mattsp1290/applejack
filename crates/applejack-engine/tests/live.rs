@@ -2,21 +2,32 @@
 //! `APPLEJACK_LIVE_ENGINE=1`; the payload comes from `APPLEJACK_PAYLOAD_DIR`
 //! or `fixtures/payloads/rosetta-wine-11.0` in the repository. Every test
 //! kills the prefix's `wineserver` before it returns.
+//!
+//! `dx11-sample.exe` creates a Metal device and a window, which needs a
+//! logged-in GUI session: from a context without display access it exits
+//! with `D3D11CreateDeviceAndSwapChain failed: 0x80004005`. Set
+//! `APPLEJACK_LIVE_HEADLESS=1` to have that reported rather than fail the
+//! test; process discovery then runs over `cmd /c ping` instead.
 
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-use applejack_engine::rosetta_wine::launch::child_path;
+use applejack_engine::rosetta_wine::launch::{MONO_GECKO_OVERRIDE, child_path};
+use applejack_engine::rosetta_wine::{Process, snapshot};
 use applejack_engine::{
-    BundleToml, Engine, EngineId, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec, Prefix,
-    PrefixSpec, RosettaWine, SyncMode,
+    BundleToml, Engine, EngineId, Error, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec,
+    Prefix, PrefixSpec, RosettaWine, Session, SyncMode,
 };
 
 fn enabled() -> bool {
     std::env::var_os("APPLEJACK_LIVE_ENGINE").is_some_and(|value| value == "1")
+}
+
+fn headless() -> bool {
+    std::env::var_os("APPLEJACK_LIVE_HEADLESS").is_some_and(|value| value == "1")
 }
 
 const FIXTURE_PAYLOAD: &str = "fixtures/payloads/rosetta-wine-11.0";
@@ -66,6 +77,7 @@ struct Live {
     engine: InstalledEngine,
     _tmp: tempfile::TempDir,
     logs: PathBuf,
+    snapshots: PathBuf,
     prefix: Prefix,
 }
 
@@ -105,12 +117,14 @@ fn setup(backend: GraphicsBackend) -> Live {
         bundle,
     };
     let logs = tmp.path().join("logs");
+    let tmp_snapshots = tmp.path().join("snapshots");
     let spec = PrefixSpec {
         backend,
         sync_mode: engine.bundle.default_sync_mode().unwrap(),
         hidraw: HidrawMode::Enabled,
         library_dir: Some(tmp.path().join("library")),
         log_dir: logs.clone(),
+        boot_timeout: None,
     };
     fs::create_dir_all(tmp.path().join("library")).unwrap();
     let prefix_dir = tmp.path().join("prefixes/test");
@@ -127,7 +141,73 @@ fn setup(backend: GraphicsBackend) -> Live {
         engine,
         _tmp: tmp,
         logs,
+        snapshots: tmp_snapshots,
         prefix,
+    }
+}
+
+/// `<loader> args` in `cwd` with the engine's `PATH`, the prefix, and the
+/// Mono/Gecko override, as a plain status check outside `launch`.
+fn loader_status(live: &Live, args: &[&str], cwd: &Path) -> ExitStatus {
+    Command::new(live.engine.root.join(&live.engine.bundle.wine.loader))
+        .args(args)
+        .env_clear()
+        .env("PATH", child_path(&live.engine))
+        .env("WINEPREFIX", &live.prefix.dir)
+        .env("WINEDLLOVERRIDES", MONO_GECKO_OVERRIDE)
+        .env("WINEDEBUG", "-all")
+        .current_dir(cwd)
+        .status()
+        .unwrap()
+}
+
+/// Launches `spec` and polls `Session::processes()` until, at least 2 s
+/// after launch (Wine has rewritten argv by then, so the session entry is
+/// only reachable through the folded last `cmd` entry), the title `title`
+/// and a Windows process other than the loader (pid != `session.pid`, `exe`
+/// ending in `.exe`) both carry the session id, or the loader exits first.
+/// Returns the session and what was seen, or the loader's early exit status
+/// and log.
+fn launch_and_discover(
+    live: &Live,
+    spec: &LaunchSpec,
+    title: &str,
+) -> Result<(Session, Vec<Process>), (ExitStatus, String)> {
+    let mut session = RosettaWine
+        .launch(&live.engine, &live.prefix, spec)
+        .expect("launch");
+    eprintln!(
+        "[live] session {} loader pid {} for {}",
+        session.id,
+        session.pid,
+        spec.exe.display()
+    );
+    let started = Instant::now();
+    loop {
+        let polled = Instant::now();
+        let processes = session.processes();
+        let cost = polled.elapsed();
+        let has_title = processes.iter().any(|p| p.exe.eq_ignore_ascii_case(title));
+        let has_other = processes
+            .iter()
+            .any(|p| p.pid != session.pid && p.exe.to_ascii_lowercase().ends_with(".exe"));
+        if has_title && has_other && started.elapsed() >= Duration::from_secs(2) {
+            eprintln!(
+                "[live] processes after {:.1}s (one processes() call took {cost:?}): {processes:#?}",
+                started.elapsed().as_secs_f64()
+            );
+            return Ok((session, processes));
+        }
+        if let Some(status) = session.try_wait().unwrap() {
+            let log = fs::read_to_string(&session.log_path).unwrap_or_default();
+            let _ = session.cancel();
+            return Err((status, log));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{title} and another Windows process of the session not both found by id within 10 s; saw {processes:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -140,6 +220,33 @@ fn launch_spec(live: &Live, exe: PathBuf, args: &[&str]) -> LaunchSpec {
         log_dir: live.logs.clone(),
         advertise_avx: false,
         cpuid_probe: None,
+    }
+}
+
+/// Shows where the session entry sits for each found process: as `sysinfo`
+/// reports it, the last `cmd` entry for a Wine-rewritten argv.
+fn print_argv_tails(processes: &[Process]) {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pids: Vec<Pid> = processes.iter().map(|p| Pid::from_u32(p.pid)).collect();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    for pid in pids {
+        if let Some(process) = system.process(pid) {
+            let in_environ = process
+                .environ()
+                .iter()
+                .any(|e| e.to_string_lossy().starts_with("APPLEJACK_SESSION="));
+            eprintln!(
+                "[live]   pid {pid}: cmd tail {:?}; APPLEJACK_SESSION in environ: {in_environ}",
+                process.cmd().iter().rev().take(2).rev().collect::<Vec<_>>()
+            );
+        }
     }
 }
 
@@ -211,58 +318,86 @@ fn prefix_hello32_dx11_sample_and_cpuid() {
     assert!(status.success());
     assert!(log.contains("hello32 ok"));
 
-    // dx11-sample: found by session id, cancelled, server gone.
+    // The seed import is `reg import` because it reports a bad file;
+    // `regedit /S` exits 0 for the same file.
+    let scratch = live.logs.join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    fs::write(
+        scratch.join("malformed.reg"),
+        "this is not a registry file\n",
+    )
+    .unwrap();
+    let import = loader_status(&live, &["reg", "import", "malformed.reg"], &scratch);
+    let regedit = loader_status(&live, &["regedit", "/S", "malformed.reg"], &scratch);
+    eprintln!("[live] malformed.reg: reg import {import}; regedit /S {regedit}");
+    assert!(
+        !import.success(),
+        "reg import must fail on a malformed file"
+    );
+
+    // Make the liveness check about the next session: stop the server the
+    // earlier sessions started (it lingers a few seconds on its own).
+    live.server_kill();
+    assert!(!applejack_engine::rosetta_wine::process::wineserver_alive(&prefix.dir).unwrap());
+
+    // dx11-sample: a Windows process found by session id, this session's
+    // server up, restore refused meanwhile, cancel, server gone, loader
+    // reaped, restore allowed.
     let sample = engine
         .root
         .join(&engine.bundle.probes.as_ref().unwrap().dx11_sample);
-    let mut session = RosettaWine
-        .launch(
-            engine,
-            prefix,
-            &launch_spec(&live, sample, &["--frames", "100000"]),
-        )
-        .expect("launch dx11-sample");
-    eprintln!(
-        "[live] dx11-sample session {} pid {}",
-        session.id, session.pid
-    );
-    let started = Instant::now();
-    let found = loop {
-        let processes = session.processes();
-        if processes
-            .iter()
-            .any(|p| p.exe.eq_ignore_ascii_case("dx11-sample.exe"))
-        {
-            break processes;
+    let sample_spec = launch_spec(&live, sample, &["--frames", "100000"]);
+    let (mut session, found) = match launch_and_discover(&live, &sample_spec, "dx11-sample.exe") {
+        Ok(found) => found,
+        Err((status, log)) if headless() => {
+            eprintln!(
+                "[live] dx11-sample exited early with {status} (APPLEJACK_LIVE_HEADLESS=1, reported, not a failure):\n{log}"
+            );
+            live.server_kill();
+            let ping = launch_spec(&live, PathBuf::from("cmd"), &["/c", "ping -n 60 127.0.0.1"]);
+            launch_and_discover(&live, &ping, "cmd.exe")
+                .unwrap_or_else(|(status, log)| panic!("cmd exited early with {status}:\n{log}"))
         }
-        if let Some(status) = session.try_wait().unwrap() {
-            let log = fs::read_to_string(&session.log_path).unwrap_or_default();
-            panic!("dx11-sample exited early with {status}:\n{log}");
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "dx11-sample not found by session id within 10 s; saw {processes:?}"
-        );
-        std::thread::sleep(Duration::from_millis(250));
+        Err((status, log)) => panic!("dx11-sample exited early with {status}:\n{log}"),
     };
-    eprintln!(
-        "[live] processes after {:.1}s: {found:?}",
-        started.elapsed().as_secs_f64()
-    );
-    assert!(session.wineserver_alive().unwrap());
-    session.cancel().expect("cancel");
+    let windows: Vec<&Process> = found
+        .iter()
+        .filter(|p| p.pid != session.pid && p.exe.to_ascii_lowercase().ends_with(".exe"))
+        .collect();
+    eprintln!("[live] Windows processes found by session id: {windows:?}");
+    let first = windows
+        .first()
+        .expect("a Windows process other than the loader");
+    assert_ne!(first.pid, session.pid);
+    print_argv_tails(&found);
     assert!(
-        !session.wineserver_alive().unwrap(),
-        "wineserver still alive after cancel"
+        session.wineserver_alive().unwrap(),
+        "this session's server is up"
     );
-    // `wineserver -k` lets the sample close its window and return, so the
-    // status is whatever it chose; the point is that it has exited.
-    let status = session.wait().unwrap();
-    eprintln!("[live] dx11-sample after cancel: {status}");
+    let snap = snapshot::create(&prefix.dir, &live.snapshots, "test").expect("snapshot");
+    let refused =
+        snapshot::restore(&prefix.dir, &live.snapshots, "test", &snap.timestamp).unwrap_err();
+    eprintln!("[live] restore while the server runs: {refused}");
+    assert!(matches!(refused, Error::PrefixUnusable { .. }));
+    session.cancel().expect("cancel");
+    let alive_after = session.wineserver_alive().unwrap();
+    eprintln!("[live] wineserver_alive after cancel: {alive_after}");
+    assert!(!alive_after, "wineserver still alive after cancel");
+    // `wineserver -k` lets the process close and return, so the status is
+    // whatever it chose; the point is that cancel reaped it.
+    let status = session
+        .try_wait()
+        .unwrap()
+        .expect("loader reaped by cancel");
+    eprintln!("[live] loader after cancel: {status}");
     let log = fs::read_to_string(&session.log_path).unwrap();
-    eprintln!("[live] dx11-sample log:\n{log}");
+    eprintln!("[live] session log:\n{log}");
     let leftovers = session.processes();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+    drop(session);
+    snapshot::restore(&prefix.dir, &live.snapshots, "test", &snap.timestamp)
+        .expect("restore once the server is gone");
+    assert_eq!(RosettaWine.open_prefix(&prefix.dir).unwrap(), *prefix);
 
     // The CPUID probe, both ways.
     let probe = RosettaWine.probe_cpuid(engine).expect("cpuid probe");

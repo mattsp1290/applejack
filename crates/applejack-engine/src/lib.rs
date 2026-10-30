@@ -14,6 +14,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +30,7 @@ pub use bundle::{ArchiveSource, BundleToml, Capabilities, InstallRequest, Instal
 pub use error::{Error, Result};
 pub use launch::{LaunchSpec, Session};
 pub use manifest::embedded_manifest;
-pub use rosetta_wine::RosettaWine;
+pub use rosetta_wine::{CpuidProbe, RosettaWine};
 pub use versions::Version;
 
 /// Which engine a bundle, prefix, or configuration refers to.
@@ -381,10 +382,16 @@ pub struct PrefixSpec {
     /// unmapped.
     pub library_dir: Option<PathBuf>,
     /// Log root. Prefix creation is a session like any launch: its
-    /// `wineboot` and `regedit` output goes to `<log_dir>/<session-id>/`,
+    /// `wineboot` and `reg import` output goes to `<log_dir>/<session-id>/`,
     /// outside the prefix, so the log survives the prefix being removed on
     /// failure.
     pub log_dir: PathBuf,
+    /// How long the engine's boot step (`wineboot --init` for
+    /// `rosetta-wine`) may run; `None` is the engine default
+    /// (`rosetta_wine::prefix::WINEBOOT_TIMEOUT`, 300 s). On expiry the
+    /// boot process and the prefix's server are killed, the prefix is
+    /// removed, and the error names the log.
+    pub boot_timeout: Option<Duration>,
 }
 
 /// A Wine prefix created by an engine, with the configuration last applied

@@ -7,8 +7,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Child;
 
-use crate::EnvPair;
-use crate::rosetta_wine::cpuid::CpuidProbe;
+use crate::{CpuidProbe, EnvPair};
 
 pub mod env;
 
