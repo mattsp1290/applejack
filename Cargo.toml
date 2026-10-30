@@ -25,6 +25,7 @@ tar = "0.4.46"
 security-framework = "3.7.0"
 tracing = "0.1.44"
 thiserror = "2.0.21"
+tempfile = "3.27.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
