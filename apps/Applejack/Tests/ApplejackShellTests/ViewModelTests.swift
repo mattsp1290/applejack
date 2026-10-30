@@ -142,7 +142,61 @@ final class ViewModelTests: XCTestCase {
         detail.declineLaunchOverrides()
         XCTAssertEqual(try requests(for: "config.import").count, 3)
         XCTAssertEqual(detail.importState, .idle)
+        XCTAssertNil(detail.pendingImport)
         await app.shutdown()
+    }
+
+    func testConfirmingThroughTheAlertSurvivesItsDismissal() async throws {
+        // The alert's confirm button holds the value it was presented with.
+        // SwiftUI then writes `false` to `isPresented` (the view declines)
+        // before the button's task runs, in that order; the confirmed import
+        // must still go out with `accept_launch_overrides: true`.
+        let app = makeApp()
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        await detail.importPreset(at: "/tmp/220.preset.json")
+        let presented = try XCTUnwrap(detail.pendingImport)
+        XCTAssertEqual(presented.path, "/tmp/220.preset.json")
+        XCTAssertEqual(presented.confirmations, [ImportItem(field: "launch_exe_override", value: "bin/game.exe")])
+        XCTAssertEqual(presented.rejected.map(\.field), ["extra_env.VK_ICD_FILENAMES"])
+
+        detail.declineLaunchOverrides()
+        XCTAssertNil(detail.pendingImport)
+        XCTAssertEqual(detail.importState, .idle)
+        await detail.confirmLaunchOverrides(path: presented.path)
+        XCTAssertEqual(detail.importState.value?.applied, true)
+        let imports = try requests(for: "config.import")
+        XCTAssertEqual(imports.count, 2)
+        XCTAssertTrue(imports[1].contains("\"accept_launch_overrides\":true"), imports[1])
+        XCTAssertEqual(try requests(for: "config.get").count, 1, "the applied import reloads the config")
+
+        // The other order: a dismissal after the confirm took the plan is a no-op.
+        await detail.importPreset(at: "/tmp/220.preset.json")
+        let again = try XCTUnwrap(detail.pendingImport)
+        await detail.confirmLaunchOverrides(path: again.path)
+        detail.declineLaunchOverrides()
+        XCTAssertEqual(detail.importState.value?.applied, true, "a late dismissal must not reset the applied import")
+        XCTAssertEqual(try requests(for: "config.import").count, 4)
+        await app.shutdown()
+    }
+
+    func testRunSendsAppRunAndNamesTheSessionLog() async throws {
+        let log = FileManager.default.temporaryDirectory.appendingPathComponent("fake-run-\(UUID().uuidString).log")
+        let app = makeApp(environment: ["FAKE_CORE_SESSION_LOG": log.path])
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        await detail.run()
+        XCTAssertEqual(detail.runState.value?.logPath, log.path)
+        XCTAssertTrue(try requests(for: "app.run")[0].contains("\"params\":{\"appid\":220,\"probe_direct\":false}"))
+        await app.shutdown()
+
+        // Today's core: the flow reads as unavailable, not as a failure.
+        let pending = makeApp(implemented: false)
+        let detailPending = GameDetailViewModel(app: pending, appid: 220)
+        await detailPending.run()
+        guard case .unavailable(let reason) = detailPending.runState else {
+            return XCTFail("expected unavailable, got \(detailPending.runState)")
+        }
+        XCTAssertEqual(reason.method, "app.run")
+        await pending.shutdown()
     }
 
     // MARK: - Engines and jobs

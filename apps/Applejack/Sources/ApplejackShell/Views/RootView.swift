@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// Every view model the window uses, built once per app.
-@MainActor
+/// Every view model the window uses, built once per app, and the sidebar
+/// selection, so a flow can open another view (Run opens Logs).
+@Observable @MainActor
 public final class ShellModels {
     public let app: AppModel
     public let host: HostViewModel
@@ -11,9 +12,13 @@ public final class ShellModels {
     public let logs: LogsViewModel
     public let controllers: ControllersViewModel
     public let d3dmetal: D3DMetalImportViewModel
+    public var section: ShellSection
 
-    public init(app: AppModel) {
+    /// `initialSection` picks the sidebar row shown first; `main.swift` reads
+    /// it from `APPLEJACK_SECTION` so a launch can land on any view.
+    public init(app: AppModel, initialSection: ShellSection? = nil) {
         self.app = app
+        section = initialSection ?? .library
         host = HostViewModel(app: app)
         library = LibraryViewModel(app: app)
         engines = EnginesViewModel(app: app)
@@ -55,19 +60,15 @@ public enum ShellSection: String, CaseIterable, Identifiable, Sendable {
 }
 
 public struct RootView: View {
-    let models: ShellModels
-    @State private var section: ShellSection?
+    @Bindable var models: ShellModels
 
-    /// `initialSection` picks the sidebar row shown first; `main.swift` reads
-    /// it from `APPLEJACK_SECTION` so a launch can land on any view.
-    public init(models: ShellModels, initialSection: ShellSection? = nil) {
+    public init(models: ShellModels) {
         self.models = models
-        _section = State(initialValue: initialSection ?? .library)
     }
 
     public var body: some View {
         NavigationSplitView {
-            List(ShellSection.allCases, selection: $section) { section in
+            List(ShellSection.allCases, selection: $models.section) { section in
                 Label(section.title, systemImage: section.systemImage).tag(section)
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
@@ -82,8 +83,8 @@ public struct RootView: View {
 
     @ViewBuilder
     private var detail: some View {
-        switch section ?? .library {
-        case .library: LibraryView(model: models.library, app: models.app)
+        switch models.section {
+        case .library: LibraryView(models: models)
         case .engines: EnginesView(model: models.engines)
         case .steam: SteamAccountView(model: models.steam)
         case .logs: LogsView(model: models.logs)

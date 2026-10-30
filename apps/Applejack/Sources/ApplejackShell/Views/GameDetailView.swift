@@ -2,11 +2,13 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 public struct GameDetailView: View {
+    let models: ShellModels
     @State private var model: GameDetailViewModel
     @State private var choosingPreset = false
 
-    public init(app: AppModel, appid: UInt32) {
-        _model = State(initialValue: GameDetailViewModel(app: app, appid: appid))
+    public init(models: ShellModels, appid: UInt32) {
+        self.models = models
+        _model = State(initialValue: GameDetailViewModel(app: models.app, appid: appid))
     }
 
     public var body: some View {
@@ -33,10 +35,12 @@ public struct GameDetailView: View {
             }
             saveStatus
             importStatus
+            runStatus
         }
         .padding()
         .navigationTitle("App \(model.appid)")
         .toolbar {
+            Button("Run") { Task { await runAndFollowLog() } }
             Button("Import preset…") { choosingPreset = true }
         }
         .fileImporter(isPresented: $choosingPreset, allowedContentTypes: [.json]) { result in
@@ -44,20 +48,40 @@ public struct GameDetailView: View {
                 Task { await model.importPreset(at: url.path) }
             }
         }
-        .alert("This preset changes how the game is launched", isPresented: confirmationShown) {
-            Button("Apply overrides") { Task { await model.confirmLaunchOverrides() } }
+        .alert("This preset changes how the game is launched", isPresented: confirmationShown, presenting: model.pendingImport) { pending in
+            // `pending` is the value the alert was presented with; the
+            // binding below has already declined by the time this task runs.
+            Button("Apply overrides") { Task { await model.confirmLaunchOverrides(path: pending.path) } }
             Button("Cancel", role: .cancel) { model.declineLaunchOverrides() }
-        } message: {
-            Text(model.pendingConfirmation.map { "\($0.field) = \($0.value)" }.joined(separator: "\n"))
+        } message: { pending in
+            Text(planSummary(pending))
         }
         .task { await model.load() }
     }
 
     private var confirmationShown: Binding<Bool> {
         Binding(
-            get: { !model.pendingConfirmation.isEmpty },
+            get: { model.pendingImport != nil },
             set: { shown in if !shown { model.declineLaunchOverrides() } }
         )
+    }
+
+    private func planSummary(_ pending: GameDetailViewModel.PendingImport) -> String {
+        var lines = pending.confirmations.map { "\($0.field) = \($0.value)" }
+        if !pending.rejected.isEmpty {
+            lines.append("")
+            lines.append(contentsOf: pending.rejected.map { "Rejected \($0.field): \($0.reason)" })
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// `app.run`, then Logs tails the session's log when the core named one.
+    private func runAndFollowLog() async {
+        await model.run()
+        if let path = model.runState.value?.logPath {
+            models.logs.follow(path)
+            models.section = .logs
+        }
     }
 
     @ViewBuilder
@@ -73,11 +97,29 @@ public struct GameDetailView: View {
     @ViewBuilder
     private var importStatus: some View {
         FlowStateView(model.importState, idle: "") { result in
-            if result.applied {
-                Text("Preset applied: \(result.accepted.count) accepted, \(result.rejected.count) rejected.")
+            VStack(alignment: .leading, spacing: 2) {
+                if result.applied {
+                    Text("Preset applied: \(result.accepted.count) accepted, \(result.rejected.count) rejected.")
+                } else {
+                    Text("Preset not applied: \(result.accepted.count) accepted, \(result.rejected.count) rejected, \(result.confirmations.count) awaiting confirmation.")
+                }
+                ForEach(result.accepted) { item in
+                    Text("Accepted \(item.field) = \(item.value)").font(.caption).foregroundStyle(.secondary)
+                }
                 ForEach(result.rejected) { item in
                     Text("Rejected \(item.field): \(item.reason)").font(.caption).foregroundStyle(.secondary)
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var runStatus: some View {
+        FlowStateView(model.runState, idle: "", retry: { Task { await runAndFollowLog() } }) { result in
+            if let path = result.logPath {
+                Text("Launched; the log is at \(path).").foregroundStyle(.secondary)
+            } else {
+                Text("Launched.").foregroundStyle(.secondary)
             }
         }
     }
@@ -89,11 +131,17 @@ struct ConfigFieldRow: View {
     let value: JSONValue
     let onSet: (JSONValue) -> Void
     @State private var text = ""
+    @FocusState private var focused: Bool
 
     var body: some View {
         switch key.kind {
         case .toggle:
-            Toggle(key.rawValue, isOn: Binding(get: { value.boolValue ?? false }, set: { onSet(.bool($0)) }))
+            HStack {
+                Toggle(key.rawValue, isOn: Binding(get: { value.boolValue ?? false }, set: { onSet(.bool($0)) }))
+                if value == .null {
+                    Text("unset").foregroundStyle(.secondary)
+                }
+            }
         case .choice(let options):
             Picker(key.rawValue, selection: Binding(get: { value.stringValue ?? "" }, set: { onSet($0.isEmpty ? .null : .string($0)) })) {
                 Text("unset").tag("")
@@ -101,9 +149,20 @@ struct ConfigFieldRow: View {
             }
         case .text:
             TextField(key.rawValue, text: $text, prompt: Text("unset"))
+                .focused($focused)
                 .onAppear { text = value.stringValue ?? "" }
                 .onChange(of: value) { _, newValue in text = newValue.stringValue ?? "" }
-                .onSubmit { onSet(text.isEmpty ? .null : .string(text)) }
+                .onChange(of: focused) { _, isFocused in if !isFocused { commit() } }
+                .onSubmit(commit)
+        }
+    }
+
+    /// Saves the field when its text differs from the stored value, so a
+    /// focus change without an edit sends nothing.
+    private func commit() {
+        let next: JSONValue = text.isEmpty ? .null : .string(text)
+        if next != value {
+            onSet(next)
         }
     }
 }

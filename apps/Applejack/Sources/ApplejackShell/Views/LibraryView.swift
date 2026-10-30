@@ -1,12 +1,11 @@
 import SwiftUI
 
 public struct LibraryView: View {
-    let model: LibraryViewModel
-    let app: AppModel
+    let models: ShellModels
+    var model: LibraryViewModel { models.library }
 
-    public init(model: LibraryViewModel, app: AppModel) {
-        self.model = model
-        self.app = app
+    public init(models: ShellModels) {
+        self.models = models
     }
 
     public var body: some View {
@@ -26,7 +25,7 @@ public struct LibraryView: View {
                 }
             }
             .navigationDestination(for: UInt32.self) { appid in
-                GameDetailView(app: app, appid: appid)
+                GameDetailView(models: models, appid: appid)
             }
             .navigationTitle("Library")
             .toolbar {
