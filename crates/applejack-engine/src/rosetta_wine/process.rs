@@ -234,6 +234,43 @@ pub fn wineserver_alive(prefix_dir: &Path) -> Result<bool> {
     wineserver_alive_in(Path::new(SERVER_BASE), prefix_dir)
 }
 
+/// True until a `wineserver` for `prefix_dir` has fully exited, which is
+/// later than [`wineserver_alive`] turns false: the server stops listening,
+/// then saves the registry into the prefix, and holds the `lock` file beside
+/// its socket until it exits. Anything that copies or deletes the prefix
+/// waits for this, not for the socket. The server's `fcntl` lock conflicts
+/// with `flock` on macOS.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the prefix directory exists but cannot be
+/// stat'ed.
+pub fn wineserver_running(prefix_dir: &Path) -> Result<bool> {
+    wineserver_running_in(Path::new(SERVER_BASE), prefix_dir)
+}
+
+/// [`wineserver_running`] under `base` (see [`server_socket_in`]).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the prefix directory exists but cannot be
+/// stat'ed.
+pub fn wineserver_running_in(base: &Path, prefix_dir: &Path) -> Result<bool> {
+    if wineserver_alive_in(base, prefix_dir)? {
+        return Ok(true);
+    }
+    let Ok(socket) = server_socket_in(base, prefix_dir) else {
+        return Ok(false);
+    };
+    let Ok(lock) = fs::File::open(socket.with_file_name("lock")) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive),
+        Err(rustix::io::Errno::WOULDBLOCK)
+    ))
+}
+
 /// [`wineserver_alive`] against the socket under `base` (see
 /// [`server_socket_in`]).
 ///

@@ -610,8 +610,11 @@ apart across processes.
 
 `snapshot`, `restore`, `reset`, and `remove` wait up to ten seconds
 (`prefixes::SERVER_SETTLE`) for a `wineserver` to leave: it outlives the last
-process by a few seconds and writes the registry on the way out. One that
-stays belongs to something running, and the command is refused.
+process by a few seconds, stops listening, and only then saves the registry
+into the prefix, holding the `lock` file beside its socket until it exits
+(`process::wineserver_running`; a `prefix remove` that watched only the socket
+hit `Directory not empty`). One that stays belongs to something running, and
+the command is refused.
 
 With `APPLEJACK_DATA_DIR` set, logs go to `<data_dir>/logs` instead of
 `~/Library/Logs/applejack`, so a throwaway data directory leaves nothing

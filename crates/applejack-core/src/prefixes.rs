@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::prefix::{LIBRARY_DRIVE, backend_available};
-use applejack_engine::rosetta_wine::process::{server_socket, wineserver_alive};
+use applejack_engine::rosetta_wine::process::{server_socket, wineserver_running};
 use applejack_engine::rosetta_wine::{Snapshot, snapshot};
 use applejack_engine::{
     Engine, Error as EngineError, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec, Prefix,
@@ -116,7 +116,7 @@ impl Core {
     /// [`SERVER_SETTLE`] belongs to something running.
     fn settle(dir: &Path) -> Result<(), CoreError> {
         let deadline = Instant::now() + SERVER_SETTLE;
-        while wineserver_alive(dir)? {
+        while wineserver_running(dir)? {
             if Instant::now() >= deadline {
                 return Err(EngineError::PrefixUnusable {
                     path: dir.to_path_buf(),

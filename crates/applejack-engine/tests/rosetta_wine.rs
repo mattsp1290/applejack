@@ -1448,3 +1448,33 @@ fn doctor_reports_rosetta_bundle_and_version_facts() {
     assert!(report.findings.iter().any(|f| f.message.contains("DXMT")));
     assert!(!RosettaWine.doctor(&host(None, "26.6.2"), None).runnable);
 }
+
+/// The window `wineserver_alive` misses: the socket is gone, and the server
+/// still holds `lock` while it saves the registry.
+#[test]
+fn a_server_counts_as_running_until_it_lets_go_of_its_lock() {
+    use applejack_engine::rosetta_wine::process::wineserver_running_in;
+    use rustix::fs::{FlockOperation, flock};
+
+    let base = tempfile::tempdir().unwrap();
+    let prefix = base.path().join("prefix");
+    fs::create_dir(&prefix).unwrap();
+    assert!(!wineserver_running_in(base.path(), &prefix).unwrap());
+
+    let socket = server_socket_in(base.path(), &prefix).unwrap();
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let lock = fs::File::create(socket.with_file_name("lock")).unwrap();
+    assert!(
+        !wineserver_running_in(base.path(), &prefix).unwrap(),
+        "a stale lock file holds nobody"
+    );
+    flock(&lock, FlockOperation::LockExclusive).unwrap();
+    assert!(!wineserver_alive_in(base.path(), &prefix).unwrap());
+    assert!(wineserver_running_in(base.path(), &prefix).unwrap());
+    drop(lock);
+    assert!(!wineserver_running_in(base.path(), &prefix).unwrap());
+    assert!(
+        !wineserver_running_in(base.path(), &base.path().join("gone")).unwrap(),
+        "a missing prefix has no server"
+    );
+}
