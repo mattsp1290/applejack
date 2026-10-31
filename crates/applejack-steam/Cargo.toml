@@ -5,19 +5,28 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 prost = { workspace = true }
 rustix = { workspace = true }
 security-framework = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-steamroom = { workspace = true }
+sha1 = { workspace = true }
+steamroom = { workspace = true, features = ["serde"] }
 steamroom-client = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+reqwest = { workspace = true }
 rpassword = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+# `cargo test` otherwise skips an example's own tests.
+[[example]]
+name = "depot_spike"
+test = true
 
 [lints]
 workspace = true

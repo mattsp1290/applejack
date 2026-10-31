@@ -40,7 +40,107 @@ pub enum Error {
     /// A stored token is not UTF-8.
     #[error("keychain: stored token is not valid UTF-8")]
     KeychainEncoding,
-    /// A login, refresh, or license-list step failed.
+    /// A login step or a call on a logged-in session failed. A CDN rate limit
+    /// arrives here as [`AuthError::RateLimited`].
     #[error(transparent)]
     Auth(#[from] AuthError),
+    /// The account does not own this app.
+    #[error("app {appid} is not in this account's library")]
+    AppNotOwned { appid: u32 },
+    /// The app ships no Windows depot; `platforms` is what it does list.
+    #[error("app {appid} has no Windows depot; it lists: {}", if platforms.is_empty() { "no platforms".to_owned() } else { platforms.join(", ") })]
+    NoWindowsDepot { appid: u32, platforms: Vec<String> },
+    /// No depot this app would install has a manifest on the branch, or the
+    /// branch has no build id.
+    #[error("app {appid} has no installable depot on branch `{branch}`")]
+    NoManifestForBranch { appid: u32, branch: String },
+    /// The account licenses none of the depots this app would install.
+    #[error("app {appid}: this account licenses none of its Windows depots ({})", depots.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))]
+    NoLicensedDepot { appid: u32, depots: Vec<u32> },
+    /// A licensed depot lives in another app, whose product info does not
+    /// give it a manifest. Installing without it would call a title complete
+    /// with content missing.
+    #[error("app {appid} depot {depot_id} comes from app {from_app}, which has no manifest for it")]
+    UnresolvedSharedDepot {
+        appid: u32,
+        depot_id: u32,
+        from_app: u32,
+    },
+    /// A name from Steam would land outside the install directory.
+    #[error("refusing unsafe path from Steam: `{path}`")]
+    UnsafePath { path: String },
+    /// A path runs through a symlink that leaves the install directory, or
+    /// the install directory of a title with no `.acf` is itself a symlink.
+    #[error("refusing to write through `{}`: it is a symlink to `{}`, outside the install", link.display(), target.display())]
+    LinkOutOfInstall { link: PathBuf, target: PathBuf },
+    /// A Steam client runs in a prefix that maps this library, so the
+    /// library is read-only.
+    #[error("a Steam client is running against this library; app {appid} was not written")]
+    ClientRunning { appid: u32 },
+    /// The `.acf` reports something other than fully installed, so the
+    /// Steam client owns the title's update.
+    #[error("app {appid} has StateFlags {state_flags}; `applejack runtime steam` owns its update")]
+    ClientOwned { appid: u32, state_flags: u32 },
+    /// There is no `.acf` for this app.
+    #[error("app {appid} is not installed")]
+    NotInstalled { appid: u32 },
+    /// The title is already fully installed; update or verify it instead.
+    #[error("app {appid} is already installed; update or verify it instead")]
+    AlreadyInstalled { appid: u32 },
+    /// The manifest was gone, and so was the one a fresh read of the product
+    /// info named.
+    #[error(
+        "app {appid} depot {depot_id}: manifest {listed} changed to {current} and could not be fetched"
+    )]
+    ManifestChanged {
+        appid: u32,
+        depot_id: u32,
+        listed: u64,
+        current: u64,
+    },
+    /// Steam still lists this manifest and will not serve it, which is how a
+    /// request code of 0 reads: the depot is not available to this account.
+    #[error(
+        "app {appid} depot {depot_id}: Steam lists manifest {manifest_id} but will not serve it"
+    )]
+    ManifestNotServed {
+        appid: u32,
+        depot_id: u32,
+        manifest_id: u64,
+    },
+    /// A stopped run wrote into a depot the plan no longer selects, so
+    /// finishing without it would leave mixed files under a good `.acf`.
+    #[error(
+        "app {appid}: a stopped update touched depot {depot_id}, which this plan leaves out; rerun with a plan that selects it, or if none can, delete {} and verify the title", record.display()
+    )]
+    UnfinishedDepot {
+        appid: u32,
+        depot_id: u32,
+        record: PathBuf,
+    },
+    /// `verify_install` found no stored manifest for an installed depot.
+    #[error("app {appid} depot {depot_id}: manifest {manifest_id} is not stored")]
+    ManifestNotStored {
+        appid: u32,
+        depot_id: u32,
+        manifest_id: u64,
+    },
+    /// A chunk or assembled file failed its hash. Nothing corrupt reached
+    /// the install, and the partial state is kept.
+    #[error("depot {depot_id}: corrupt download: {detail}")]
+    CorruptChunk { depot_id: u32, detail: String },
+    /// The disk filled. The partial state is kept; run the install again
+    /// after freeing space.
+    #[error("disk full while installing app {appid}; partial state kept, last at {}", record.display())]
+    DiskFull { appid: u32, record: PathBuf },
+    /// Any other depot failure.
+    #[error("depot {depot_id}: {message}")]
+    Depot { depot_id: u32, message: String },
+    /// A library file could not be read or written.
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }

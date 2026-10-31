@@ -127,3 +127,35 @@ fn missing_and_malformed_fields_name_their_path() {
     let no_root = AppManifest::parse("\"Other\"\n{\n}\n").unwrap_err();
     assert_eq!(no_root.to_string(), "acf: field `AppState`: missing");
 }
+
+#[test]
+fn merge_keeps_keys_the_writer_does_not_model() {
+    let existing = fixture().replace(
+        "\t\"Universe\"\t\t\"1\"\n",
+        "\t\"Universe\"\t\t\"1\"\n\t\"LauncherPath\"\t\t\"redacted\"\n",
+    );
+    let mut manifest = AppManifest::parse(&existing).unwrap();
+    manifest.buildid = 2;
+    manifest.installed_depots.truncate(1);
+    let merged = AcfWriter::new(&manifest).merge(&existing).unwrap();
+
+    assert!(merged.contains("\"LauncherPath\"\t\t\"redacted\""));
+    assert_eq!(AppManifest::parse(&merged).unwrap(), manifest);
+}
+
+#[test]
+fn merge_adds_a_modelled_key_the_file_lacks_and_refuses_another_root() {
+    let without = fixture().replace("\t\"buildid\"\t\t\"1\"\n", "");
+    assert_ne!(without, fixture());
+    let manifest = AppManifest::parse(&fixture()).unwrap();
+    let merged = AcfWriter::new(&manifest).merge(&without).unwrap();
+    assert_eq!(AppManifest::parse(&merged).unwrap(), manifest);
+
+    assert_eq!(
+        AcfWriter::new(&manifest)
+            .merge("\"Other\"\n{\n}\n")
+            .unwrap_err()
+            .to_string(),
+        "acf: field `AppState`: missing"
+    );
+}
