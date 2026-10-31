@@ -338,10 +338,20 @@ running in any prefix that maps the shared library, where "running" means
 `wineserver_alive(prefix)` from work package 2, not the advisory lock. That
 function lives in `applejack-engine`, which this crate does not depend on, so
 `DepotInstaller::new` takes it as a `client_running` predicate. It is read
-under the locks before the first write, once a second while downloading, and
-again before stale files are removed and the `.acf` written.
-While it is true, the run stops with `Error::ClientRunning`: the record is
-saved, and in-flight writes land only in staging. While a client runs,
+under the locks on entry, again before the first write and before each depot,
+once a second while downloading, and before stale files are removed and the
+`.acf` written.
+While it is true, the run stops with `Error::ClientRunning`. `DepotJob` runs
+each chunk under `tokio::spawn` with no way to cancel them, so a dropped
+download would leave them writing past the locks and, through a shared staging
+inode, into a later run's finished file. The installer never drops it: a stop
+ends every fetch at once, the download joins its chunk tasks and returns, the
+record is saved, and only then do the locks go. A caller that drops the
+install future gets the same stop, and the task that outlives it keeps the
+locks until the last writer has finished. Until `DepotJob` returns, a file
+whose chunks are all on disk needs no fetch and so still lands: a stop takes
+effect at the next chunk that has to be fetched, and everything before it
+happens under the locks. While a client runs,
 applejack treats the library as read-only and re-syncs its `apps` rows from
 the `.acf` files after `wineserver_alive` turns false. An
 `appmanifest` whose `StateFlags` is not `4` (`AppManifest::is_fully_installed`

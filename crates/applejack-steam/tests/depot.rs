@@ -8,7 +8,8 @@ mod support;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use applejack_steam::Error;
@@ -1107,6 +1108,119 @@ async fn a_client_that_starts_mid_download_stops_the_run_with_its_record() {
     bench.session.chunks.clear_faults();
     bench.install(&plan(V1, 11)).await.unwrap();
     assert!(bench.acf().is_fully_installed());
+}
+
+fn staged_bytes(bench: &Bench, name: &str) -> usize {
+    let staged = bench.game().join(".DepotDownloader/staging").join(name);
+    fs::read(staged).map_or(0, |bytes| bytes.iter().filter(|byte| **byte != 0).count())
+}
+
+/// Turns the ownership predicate true after `delay`.
+fn client_starts_after(delay: Duration) -> Arc<AtomicBool> {
+    let running = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&running);
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        flag.store(true, Ordering::Relaxed);
+    });
+    running
+}
+
+// From the install-safety review, probe p15b.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_chunk_task_outlives_a_client_running_stop() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let parts: Vec<Vec<u8>> = (0..6u8).map(|index| vec![b'a' + index; 32]).collect();
+    let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    let big = file(chunks, "big.bin", &parts);
+    for chunk in &big.chunks {
+        chunks.fault(&chunk.id, Fault::Slow(Duration::from_millis(700)));
+    }
+    bench.session.add_manifest(DEPOT, manifest(V1, vec![big]));
+    let running = client_starts_after(Duration::from_millis(100));
+    let predicate = {
+        let running = Arc::clone(&running);
+        move || running.load(Ordering::Relaxed)
+    };
+
+    let result = bench.installer(&predicate).install(&plan(V1, 11)).await;
+    assert!(matches!(result, Err(Error::ClientRunning { .. })));
+
+    let bytes_at_return = staged_bytes(&bench, "big.bin");
+    let fetches_at_return = bench.session.chunks.fetches();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(staged_bytes(&bench, "big.bin"), bytes_at_return);
+    assert_eq!(bench.session.chunks.fetches(), fetches_at_return);
+}
+
+// From the install-safety review, probe p15: the old task used to write V1
+// bytes into the file the second run had finished and hash-checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_run_cannot_reach_the_file_of_a_later_run() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let old = file(chunks, "big.bin", &[b"V1 V1 V1 V1 "]);
+    chunks.fault(&chunk_of(&old, 0), Fault::Slow(Duration::from_millis(1800)));
+    bench.session.add_manifest(DEPOT, manifest(V1, vec![old]));
+    let running = client_starts_after(Duration::from_millis(100));
+    let predicate = {
+        let running = Arc::clone(&running);
+        move || running.load(Ordering::Relaxed)
+    };
+    let result = bench.installer(&predicate).install(&plan(V1, 11)).await;
+    assert!(matches!(result, Err(Error::ClientRunning { .. })));
+
+    let new = file(chunks, "big.bin", &[b"V2 V2 V2 V2 "]);
+    bench.session.add_manifest(DEPOT, manifest(V2, vec![new]));
+    bench.install(&plan(V2, 12)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert_eq!(
+        fs::read(bench.game().join("big.bin")).unwrap(),
+        b"V2 V2 V2 V2 "
+    );
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_the_install_future_stops_its_chunk_tasks() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let big = file(chunks, "big.bin", &[&[7; 32]]);
+    chunks.fault(&chunk_of(&big, 0), Fault::Slow(Duration::from_millis(400)));
+    bench.session.add_manifest(DEPOT, manifest(V1, vec![big]));
+
+    let plan = plan(V1, 11);
+    let installer = bench.installer(&NOT_RUNNING);
+    let install = installer.install(&plan);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), install)
+            .await
+            .is_err()
+    );
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(staged_bytes(&bench, "big.bin"), 0);
+    bench.session.chunks.clear_faults();
+    bench.install(&plan).await.unwrap();
+}
+
+// From the install-safety review, probe p16.
+#[tokio::test]
+async fn a_client_that_starts_while_resolving_gets_no_writes() {
+    let bench = Bench::new();
+    bench.add_v1();
+    let calls = AtomicUsize::new(0);
+    let predicate = || calls.fetch_add(1, Ordering::Relaxed) >= 1;
+    let result = bench.installer(&predicate).install(&plan(V1, 11)).await;
+    assert!(matches!(result, Err(Error::ClientRunning { .. })));
+    assert!(!bench.game().exists());
+    assert_eq!(bench.session.chunks.fetches(), 0);
 }
 
 #[tokio::test]

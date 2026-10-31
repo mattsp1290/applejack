@@ -25,6 +25,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use steamroom::depot::manifest::{DepotManifest, ManifestFile};
@@ -32,16 +33,16 @@ use steamroom::depot::{ChunkId, DepotId, DepotKey};
 use steamroom::enums::DepotFileFlags;
 use steamroom::error::Error as SteamError;
 use steamroom_client::download::{
-    DepotJob, DownloadError, DownloadReport, OldChunkLoc, RetryConfig,
+    BoxError, ChunkFetcher, DepotJob, DownloadError, DownloadReport, OldChunkLoc, RetryConfig,
 };
 use steamroom_client::event::DownloadEvent;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::Error;
 use crate::acf::{AcfWriter, AppManifest, InstalledDepot, app_state};
 use crate::auth::AuthError;
 use crate::library::{DepotFilter, OwnedApp, PlannedDepot};
-use crate::lock::{self, LockDir};
+use crate::lock::{self, HeldLocks, LockDir};
 use crate::session::SteamSession;
 
 /// `DepotJob`'s working directory inside an install; removed on success.
@@ -529,8 +530,9 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
     async fn run(&self, plan: &InstallPlan, kind: RunKind) -> Result<InstallOutcome, Error> {
         let appid = plan.appid;
         let mut locks = LockDir::new(&self.data_dir, "install");
-        let mut app_lock = locks.app(appid, lock::Mode::NonBlocking)?;
-        let _library_lock = app_lock.library(lock::Mode::NonBlocking)?;
+        let held = locks
+            .app(appid, lock::Mode::NonBlocking)?
+            .with_library(lock::Mode::NonBlocking)?;
         self.refuse_while_client_runs(appid)?;
 
         let existing = read_acf(&self.paths, appid)?;
@@ -552,6 +554,7 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
             keys: HashMap::new(),
             refreshed: false,
             unfinished: Unfinished::read(&self.paths.record(appid), appid),
+            locks: Arc::new(held),
         };
         // The files are where the `.acf` says, whatever the product info
         // says now.
@@ -605,6 +608,7 @@ struct Run<'r, 'a, S> {
     keys: HashMap<u32, DepotKey>,
     refreshed: bool,
     unfinished: Option<Unfinished>,
+    locks: Arc<HeldLocks>,
 }
 
 impl<S: SteamSession> Run<'_, '_, S> {
@@ -761,6 +765,8 @@ impl<S: SteamSession> Run<'_, '_, S> {
         let appid = self.plan.appid;
         let record_path = self.paths().record(appid);
         let install_dir = self.paths().install_dir(&self.plan.installdir);
+        // Resolving can take a while on large manifests.
+        self.installer.refuse_while_client_runs(appid)?;
 
         let interrupted = record_path.exists();
         let loaded = DownloadRecord::load(&record_path)
@@ -818,6 +824,7 @@ impl<S: SteamSession> Run<'_, '_, S> {
 
         for (index, (depot, remaining)) in work.iter().zip(queued).enumerate() {
             if !remaining.is_empty() {
+                self.installer.refuse_while_client_runs(appid)?;
                 self.fetch_depot(
                     depot,
                     remaining,
@@ -874,6 +881,12 @@ impl<S: SteamSession> Run<'_, '_, S> {
         let record_path = self.paths().record(appid);
         let key = self.key(depot_id).await?;
         let fetcher = self.installer.session.chunks(appid, depot_id).await?;
+        let (stop, stopped) = watch::channel(false);
+        let stop = StopOnDrop(stop);
+        let fetcher = Arc::new(Stoppable {
+            inner: fetcher,
+            stopped,
+        });
 
         let (sender, mut events) = mpsc::unbounded_channel();
         let mut builder = DepotJob::builder()
@@ -894,15 +907,25 @@ impl<S: SteamSession> Run<'_, '_, S> {
             message: error.to_string(),
         })?;
         let trimmed = DepotManifest::new(remaining);
-        let download = job.download(&trimmed, Arc::clone(&fetcher));
-        tokio::pin!(download);
+        // `DepotJob` runs each chunk under `tokio::spawn` and offers no way
+        // to cancel them, and a dropped `download` leaves them writing. So it
+        // is never dropped: a stop makes the fetcher fail, `download` joins
+        // its tasks and returns, and only then do the locks go, even when the
+        // caller drops this future.
+        let locks = Arc::clone(&self.locks);
+        let mut download = tokio::spawn(async move {
+            let result = job.download(&trimmed, fetcher).await;
+            drop(locks);
+            result
+        });
 
         let mut client_check = tokio::time::interval_at(
             tokio::time::Instant::now() + CLIENT_CHECK_INTERVAL,
             CLIENT_CHECK_INTERVAL,
         );
         let mut unsaved = 0;
-        let result = loop {
+        let mut halted = None;
+        let joined = loop {
             tokio::select! {
                 biased;
                 Some(event) = events.recv() => {
@@ -910,19 +933,20 @@ impl<S: SteamSession> Run<'_, '_, S> {
                         unsaved += 1;
                     }
                     if unsaved >= RECORD_SAVE_EVERY {
-                        record.save(&record_path, appid)?;
+                        if let Err(error) = record.save(&record_path, appid) {
+                            stop.stop();
+                            halted.get_or_insert(error);
+                        }
                         unsaved = 0;
                     }
                 }
-                _ = client_check.tick() => {
+                _ = client_check.tick(), if halted.is_none() => {
                     if (self.installer.client_running)() {
-                        // Writes in flight land in staging, which only the
-                        // dropped future renames into place.
-                        record.save(&record_path, appid)?;
-                        return Err(Error::ClientRunning { appid });
+                        stop.stop();
+                        halted = Some(Error::ClientRunning { appid });
                     }
                 }
-                result = &mut download => break result,
+                joined = &mut download => break joined,
             }
         };
         while let Ok(event) = events.try_recv() {
@@ -931,7 +955,15 @@ impl<S: SteamSession> Run<'_, '_, S> {
         // Saved before classifying so a disk that is too full for this write
         // reports the download's failure, and the last good record stands.
         let saved = record.save(&record_path, appid);
-        result.map_err(|report| classify(&report, appid, depot_id, &record_path))?;
+        if let Some(error) = halted {
+            return Err(error);
+        }
+        joined
+            .map_err(|error| Error::Depot {
+                depot_id,
+                message: error.to_string(),
+            })?
+            .map_err(|report| classify(&report, appid, depot_id, &record_path))?;
         saved
     }
 
@@ -1016,6 +1048,45 @@ impl<S: SteamSession> Run<'_, '_, S> {
         };
         let path = self.paths().acf(appid);
         write_atomic(&path, text.as_bytes()).map_err(|source| io_error(appid, &path, source))
+    }
+}
+
+/// Ends a run's fetches when dropped, so an install future the caller drops
+/// stops them too.
+struct StopOnDrop(watch::Sender<bool>);
+
+impl StopOnDrop {
+    fn stop(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A fetcher that can be told to stop mid-download.
+struct Stoppable<F> {
+    inner: Arc<F>,
+    stopped: watch::Receiver<bool>,
+}
+
+impl<F: ChunkFetcher> ChunkFetcher for Stoppable<F> {
+    async fn fetch_chunk(&self, depot_id: DepotId, chunk_id: &ChunkId) -> Result<Bytes, BoxError> {
+        let mut stopped = self.stopped.clone();
+        let stop = async move {
+            let _ = stopped.wait_for(|stopped| *stopped).await;
+        };
+        tokio::select! {
+            biased;
+            // An `Err` would go through `DepotJob`'s retry backoff, once per
+            // queued chunk. An empty chunk fails its decode at once and
+            // writes nothing.
+            () = stop => Ok(Bytes::new()),
+            fetched = self.inner.fetch_chunk(depot_id, chunk_id) => fetched,
+        }
     }
 }
 

@@ -419,6 +419,27 @@ impl AppLock<'_> {
     }
 }
 
+/// An app lock and its shared library lock as one owned value, for a run
+/// whose background task must keep them until its last writer is gone.
+/// Fields drop in order, so the library lock goes first.
+#[derive(Debug)]
+pub(crate) struct HeldLocks {
+    _library: Lock,
+    _app: Lock,
+}
+
+impl AppLock<'_> {
+    /// Takes the library lock as [`library`](Self::library) does, in the same
+    /// order, and gives up the borrows that enforce it.
+    pub(crate) fn with_library(mut self, mode: Mode) -> Result<HeldLocks, Error> {
+        let library = self.library(mode)?.lock;
+        Ok(HeldLocks {
+            _library: library,
+            _app: self.lock,
+        })
+    }
+}
+
 /// The library lock: shared under an [`AppLock`], exclusive from
 /// [`LockDir::library_exclusive`]. The marker carries the exclusive borrow of
 /// the `AppLock` or `LockDir` without tying the two lifetimes together, which
