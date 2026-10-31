@@ -29,6 +29,10 @@ const LOCKS_DIR: &str = ".locks";
 
 const STAGING_PREFIX: &str = ".staging-";
 
+/// Leaves room for `.staging-discarding-` in the 255 UTF-16 units of an APFS
+/// name. UTF-8 is never shorter than UTF-16, so bytes are the safe measure.
+const MAX_NAME_BYTES: usize = 235;
+
 const RESTORING: &str = "restoring";
 
 const REPLACED: &str = "replaced";
@@ -120,12 +124,16 @@ fn sweep_staging(parent: &Path) {
 
 /// A `replaced` copy with no prefix means a kill fell between the renames of
 /// a restore: it is the whole prefix, so it goes back. In any other state
-/// the copy is finished with.
+/// the copy is finished with. A copy that could not go back is kept for the
+/// next operation to retry.
 fn settle_restore(prefix_dir: &Path) {
     let gone = fs::symlink_metadata(prefix_dir)
         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
-    if gone {
-        let _ = fs::rename(work_dir(prefix_dir, REPLACED), prefix_dir);
+    if gone
+        && fs::rename(work_dir(prefix_dir, REPLACED), prefix_dir)
+            .is_err_and(|error| error.kind() != io::ErrorKind::NotFound)
+    {
+        return;
     }
     let _ = discard_replaced(prefix_dir);
     let _ = crate::bundle::remove_stale(&work_dir(prefix_dir, RESTORING));
@@ -412,6 +420,8 @@ pub fn check_name(name: &str) -> Result<()> {
         Some("must not contain `/`")
     } else if name.contains('\0') {
         Some("must not contain a NUL byte")
+    } else if name.len() > MAX_NAME_BYTES {
+        Some("must be at most 235 bytes")
     } else {
         None
     };

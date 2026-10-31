@@ -506,6 +506,55 @@ fn a_copy_being_discarded_never_comes_back_as_the_prefix() {
     assert_eq!(working_dirs(&core), Vec::<String>::new());
 }
 
+/// A deletion that fails part way must leave nothing under the name that
+/// `settle_restore` puts back.
+#[test]
+fn a_replaced_copy_that_will_not_delete_never_comes_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let root = core.data_dir().join("prefixes");
+    let replaced = root.join(".staging-replaced-p");
+    fs::create_dir_all(replaced.join("a/b")).unwrap();
+    fs::write(replaced.join("a/b/f"), "x").unwrap();
+    fs::set_permissions(replaced.join("a/b"), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let _ = core.prefix_snapshot("p");
+    core.prefix_remove("p").unwrap();
+    assert!(matches!(
+        core.prefix_snapshot("p"),
+        Err(CoreError::UnknownPrefix { .. })
+    ));
+    let ghost = root.join("p").exists();
+    for base in [replaced, root.join(".staging-discarding-p"), root.join("p")] {
+        let _ = fs::set_permissions(base.join("a/b"), fs::Permissions::from_mode(0o755));
+    }
+    assert!(!ghost, "a partly deleted copy came back as the prefix");
+}
+
+/// The longest name keeps every working name legal, including the way back
+/// from a removal; one byte more is refused before any data exists.
+#[test]
+fn a_prefix_name_stops_where_the_working_names_still_fit() {
+    let dir = TempDir::new().unwrap();
+    let mut core = installed(&dir);
+    let longest = "n".repeat(235);
+
+    core.prefix_create(&longest, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
+        .unwrap();
+    let snapshot = core.prefix_snapshot(&longest).unwrap();
+    core.prefix_restore(&longest, &snapshot.timestamp).unwrap();
+    core.prefix_remove(&longest).unwrap();
+    core.prefix_restore(&longest, &snapshot.timestamp).unwrap();
+
+    let too_long = "n".repeat(236);
+    assert!(matches!(
+        core.prefix_create(&too_long, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
+            .unwrap_err(),
+        CoreError::Engine(EngineError::InvalidSnapshotName { .. })
+    ));
+}
+
 /// A disk image of its own, detached on drop.
 struct Volume {
     mount: PathBuf,
@@ -563,6 +612,10 @@ impl Drop for Volume {
 fn a_restore_works_with_the_snapshots_on_another_volume() {
     let dir = TempDir::new().unwrap();
     let Some(volume) = Volume::attach(dir.path()) else {
+        assert!(
+            std::env::var_os("APPLEJACK_ALLOW_NO_DISK_IMAGE").is_some_and(|value| value == "1"),
+            "hdiutil could not attach a disk image; set APPLEJACK_ALLOW_NO_DISK_IMAGE=1 to skip"
+        );
         eprintln!("skipped: hdiutil could not attach a disk image");
         return;
     };

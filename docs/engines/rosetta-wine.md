@@ -580,6 +580,8 @@ D3DMetal is never committed, downloaded, or published.
   exits. A dropped lock is released with an explicit `LOCK_UN`, because a
   child being spawned on another thread holds a copy of the descriptor until
   it execs, and `flock` belongs to the open file, not the descriptor.
+- `check_name` refuses a prefix name over 235 bytes, which leaves room for
+  `.staging-discarding-` in the 255 UTF-16 units of an APFS name.
 - `prune(snapshots_root, name, keep)` removes all but the newest `keep`;
   `DEFAULT_KEEP` is 3.
 
