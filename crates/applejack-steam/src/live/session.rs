@@ -12,7 +12,6 @@
 //! `steamroom-0.3.0/src/client/mod.rs`.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -49,7 +48,7 @@ use super::{CLIENT_OS_WINDOWS_11, LOGIN_ID, map_call_result, map_eresult, map_st
 use crate::auth::{AuthError, License};
 use crate::keychain::RefreshToken;
 use crate::library::DEFAULT_BRANCH;
-use crate::session::{AppInfo, SteamSession};
+use crate::session::{AppInfo, PackageGrants, SteamSession};
 
 const LOGON_TIMEOUT: Duration = Duration::from_secs(30);
 const LICENSE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -441,26 +440,30 @@ fn decode_license_list(body: &[u8]) -> Result<Vec<License>, AuthError> {
 
 /// A package buffer is binary `KeyValues` behind a 4-byte version prefix
 /// (`SteamKit`, `PICSProductInfoCallback`); the bare form is accepted too.
-fn package_appids(buffer: &[u8]) -> Vec<u32> {
+fn add_package_grants(buffer: &[u8], grants: &mut PackageGrants) {
     let parsed = buffer
         .get(4..)
         .and_then(|rest| parse_binary_kv(rest).ok())
         .or_else(|| parse_binary_kv(buffer).ok());
-    let Some(root) = parsed else {
-        return Vec::new();
-    };
+    if let Some(root) = parsed {
+        grants.appids.extend(id_list(&root, "appids"));
+        grants.depot_ids.extend(id_list(&root, "depotids"));
+    }
+}
+
+fn id_list(root: &KeyValue, key: &str) -> Vec<u32> {
     let Some(KeyValue {
-        value: KvValue::Children(appids),
+        value: KvValue::Children(entries),
         ..
-    }) = root.get("appids")
+    }) = root.get(key)
     else {
         return Vec::new();
     };
-    appids
+    entries
         .values()
         .filter_map(|entry| match &entry.value {
-            KvValue::Int32(appid) => u32::try_from(*appid).ok(),
-            KvValue::String(appid) => appid.parse().ok(),
+            KvValue::Int32(id) => u32::try_from(*id).ok(),
+            KvValue::String(id) => id.parse().ok(),
             _ => None,
         })
         .collect()
@@ -603,8 +606,8 @@ impl SteamSession for SteamroomSession {
         }
     }
 
-    async fn package_apps(&self, licenses: &[License]) -> Result<Vec<u32>, AuthError> {
-        let mut appids = BTreeSet::new();
+    async fn package_grants(&self, licenses: &[License]) -> Result<PackageGrants, AuthError> {
+        let mut grants = PackageGrants::default();
         for batch in licenses.chunks(PICS_BATCH) {
             let request = CMsgClientPicsProductInfoRequest {
                 packages: batch
@@ -622,12 +625,12 @@ impl SteamSession for SteamroomSession {
             for part in self.inner.product_info(request).await? {
                 for package in &part.packages {
                     if let Some(buffer) = &package.buffer {
-                        appids.extend(package_appids(buffer));
+                        add_package_grants(buffer, &mut grants);
                     }
                 }
             }
         }
-        Ok(appids.into_iter().collect())
+        Ok(grants)
     }
 
     async fn app_info(&self, appids: &[u32]) -> Result<Vec<AppInfo>, AuthError> {

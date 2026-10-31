@@ -41,7 +41,7 @@ use tokio::sync::{mpsc, watch};
 use crate::Error;
 use crate::acf::{AcfWriter, AppManifest, InstalledDepot, app_state};
 use crate::auth::AuthError;
-use crate::library::{DepotFilter, OwnedApp, PlannedDepot};
+use crate::library::{self, DEFAULT_BRANCH, DepotFilter, OwnedApp, PlannedDepot};
 use crate::lock::{self, HeldLocks, LockDir};
 use crate::session::SteamSession;
 
@@ -121,6 +121,8 @@ pub struct InstallPlan {
     pub branch: String,
     pub buildid: u64,
     pub depots: Vec<PlannedDepot>,
+    /// Depots left out because the account does not license them.
+    pub not_licensed: Vec<u32>,
     /// Bytes across `depots`.
     pub size: u64,
     pub filter: DepotFilter,
@@ -133,11 +135,10 @@ impl InstallPlan {
     ///
     /// # Errors
     ///
-    /// [`Error::NoWindowsDepot`], [`Error::NoManifestForBranch`], or
-    /// [`Error::UnsafePath`] when `installdir` is not one plain directory
-    /// name.
+    /// What [`OwnedApp::windows_depots`] refuses, or [`Error::UnsafePath`]
+    /// when `installdir` is not one plain directory name.
     pub fn new(app: &OwnedApp, branch: &str, filter: &DepotFilter) -> Result<Self, Error> {
-        let depots = app.windows_depots(branch, filter)?;
+        let selection = app.windows_depots(branch, filter)?;
         check_installdir(&app.installdir)?;
         let buildid = branch_build(app, branch)?;
         Ok(Self {
@@ -146,8 +147,9 @@ impl InstallPlan {
             installdir: app.installdir.clone(),
             branch: branch.to_owned(),
             buildid,
-            size: depots.iter().map(|depot| depot.size).sum(),
-            depots,
+            size: selection.depots.iter().map(|depot| depot.size).sum(),
+            depots: selection.depots,
+            not_licensed: selection.not_licensed,
             filter: filter.clone(),
         })
     }
@@ -718,6 +720,21 @@ impl<S: SteamSession> Run<'_, '_, S> {
         &self.installer.paths
     }
 
+    /// The app and branch to name for a depot's manifest and CDN token.
+    fn depot_source(&self, depot_id: u32) -> (u32, &str) {
+        let planned = self.plan.depots.iter().find(|d| d.depot_id == depot_id);
+        let appid = planned.and_then(|depot| depot.source_app);
+        let public = planned.is_some_and(|depot| depot.public_manifest);
+        (
+            appid.unwrap_or(self.plan.appid),
+            if public {
+                DEFAULT_BRANCH
+            } else {
+                &self.plan.branch
+            },
+        )
+    }
+
     async fn key(&mut self, depot_id: u32) -> Result<DepotKey, Error> {
         if let Some(key) = self.keys.get(&depot_id) {
             return Ok(key.clone());
@@ -741,10 +758,11 @@ impl<S: SteamSession> Run<'_, '_, S> {
         if let Some(stored) = load_manifest(&self.paths().manifest(depot_id, manifest_id)) {
             return Ok(Some(stored));
         }
+        let (appid, branch) = self.depot_source(depot_id);
         let fetched = self
             .installer
             .session
-            .manifest(self.plan.appid, depot_id, manifest_id, &self.plan.branch)
+            .manifest(appid, depot_id, manifest_id, branch)
             .await?;
         let Some(mut manifest) = fetched else {
             return Ok(None);
@@ -773,13 +791,12 @@ impl<S: SteamSession> Run<'_, '_, S> {
     /// depot and the build id stay on one build. Happens once per run.
     async fn refresh(&mut self) -> Result<(), Error> {
         let appid = self.plan.appid;
-        let infos = self.installer.session.app_info(&[appid]).await?;
-        let app = infos
-            .iter()
-            .filter(|info| info.appid == appid)
-            .find_map(|info| OwnedApp::parse(info, &self.plan.filter))
+        let app = library::fetch_app(self.installer.session, appid, &self.plan.filter)
+            .await?
             .ok_or(Error::AppNotOwned { appid })?;
-        self.plan.depots = app.windows_depots(&self.plan.branch, &self.plan.filter)?;
+        let selection = app.windows_depots(&self.plan.branch, &self.plan.filter)?;
+        self.plan.depots = selection.depots;
+        self.plan.not_licensed = selection.not_licensed;
         self.plan.buildid = branch_build(&app, &self.plan.branch)?;
         self.refreshed = true;
         Ok(())
@@ -839,6 +856,8 @@ impl<S: SteamSession> Run<'_, '_, S> {
                     depot_id,
                     manifest_id: *installed.get(&depot_id)?,
                     size: 0,
+                    source_app: None,
+                    public_manifest: false,
                 })
             })
             .collect();
@@ -1064,7 +1083,8 @@ impl<S: SteamSession> Run<'_, '_, S> {
         let depot_id = depot.depot_id;
         let record_path = self.paths().record(appid);
         let key = self.key(depot_id).await?;
-        let fetcher = self.installer.session.chunks(appid, depot_id).await?;
+        let (source, _) = self.depot_source(depot_id);
+        let fetcher = self.installer.session.chunks(source, depot_id).await?;
         let (stop, stopped) = watch::channel(false);
         let stop = StopOnDrop(stop);
         let fetcher = Arc::new(Stoppable {

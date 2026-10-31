@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use applejack_steam::auth::{AuthError, License};
-use applejack_steam::session::{AppInfo, SteamSession};
+use applejack_steam::session::{AppInfo, PackageGrants, SteamSession};
 use bytes::Bytes;
 use sha1::{Digest, Sha1};
 use steamroom::crypto::{symmetric_encrypt_cbc, symmetric_encrypt_ecb_nopad};
@@ -132,7 +132,7 @@ pub fn manifest(id: u64, files: Vec<ManifestFile>) -> DepotManifest {
 #[derive(Default)]
 pub struct FakeSession {
     pub licenses: Vec<License>,
-    pub appids: Vec<u32>,
+    pub grants: PackageGrants,
     /// Answers to `app_info`, oldest first; the last one repeats.
     pub app_info: Mutex<VecDeque<Vec<AppInfo>>>,
     pub manifests: Mutex<HashMap<(u32, u64), DepotManifest>>,
@@ -140,6 +140,10 @@ pub struct FakeSession {
     pub manifest_error: Mutex<Option<AuthError>>,
     pub app_info_calls: AtomicUsize,
     pub manifest_calls: AtomicUsize,
+    /// Which app each fetched manifest was asked of, by depot.
+    pub manifest_apps: Mutex<Vec<(u32, u32)>>,
+    /// Which app each `chunks` call named.
+    pub chunk_apps: Mutex<Vec<u32>>,
 }
 
 impl FakeSession {
@@ -163,11 +167,11 @@ impl SteamSession for FakeSession {
         ready(Ok(self.licenses.clone()))
     }
 
-    fn package_apps(
+    fn package_grants(
         &self,
         _licenses: &[License],
-    ) -> impl Future<Output = Result<Vec<u32>, AuthError>> + Send {
-        ready(Ok(self.appids.clone()))
+    ) -> impl Future<Output = Result<PackageGrants, AuthError>> + Send {
+        ready(Ok(self.grants.clone()))
     }
 
     fn app_info(
@@ -194,12 +198,13 @@ impl SteamSession for FakeSession {
 
     fn manifest(
         &self,
-        _appid: u32,
+        appid: u32,
         depot_id: u32,
         manifest_id: u64,
         _branch: &str,
     ) -> impl Future<Output = Result<Option<DepotManifest>, AuthError>> + Send {
         self.manifest_calls.fetch_add(1, Ordering::Relaxed);
+        self.manifest_apps.lock().unwrap().push((depot_id, appid));
         let error = self.manifest_error.lock().unwrap().clone();
         let found = self
             .manifests
@@ -212,9 +217,10 @@ impl SteamSession for FakeSession {
 
     fn chunks(
         &self,
-        _appid: u32,
+        appid: u32,
         _depot_id: u32,
     ) -> impl Future<Output = Result<Arc<FakeChunks>, AuthError>> + Send {
+        self.chunk_apps.lock().unwrap().push(appid);
         ready(Ok(Arc::clone(&self.chunks)))
     }
 }

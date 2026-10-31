@@ -19,9 +19,9 @@ use applejack_steam::depot::{
     DepotInstaller, DownloadRecord, InstallOptions, InstallPlan, InstallProgress, LibraryPaths,
     verify_install,
 };
-use applejack_steam::library::{DepotFilter, OwnedApp};
+use applejack_steam::library::{DepotFilter, Library, OwnedApp};
 use applejack_steam::lock::{LockDir, Mode, app_lock_name};
-use applejack_steam::session::AppInfo;
+use applejack_steam::session::{AppInfo, PackageGrants};
 use steamroom::depot::ChunkId;
 use steamroom::depot::manifest::ManifestFile;
 use steamroom_client::download::RetryConfig;
@@ -34,6 +34,8 @@ const V1: u64 = 1001;
 const V2: u64 = 1002;
 /// A second depot, for titles with more than one.
 const OTHER: u32 = 103;
+/// The app that holds a shared depot.
+const PARENT: u32 = 900;
 const NOT_RUNNING: fn() -> bool = || false;
 
 fn product_info(manifest_id: u64, buildid: u64) -> AppInfo {
@@ -85,8 +87,16 @@ fn product_info(manifest_id: u64, buildid: u64) -> AppInfo {
     }
 }
 
+/// The account in these tests licenses every depot they use.
+fn licensed() -> DepotFilter {
+    DepotFilter {
+        owned_depots: [DEPOT, OTHER].into(),
+        ..DepotFilter::default()
+    }
+}
+
 fn plan(manifest_id: u64, buildid: u64) -> InstallPlan {
-    let filter = DepotFilter::default();
+    let filter = licensed();
     let app = OwnedApp::parse(&product_info(manifest_id, buildid), &filter).unwrap();
     InstallPlan::new(&app, "public", &filter).unwrap()
 }
@@ -500,7 +510,7 @@ async fn update_keeps_a_file_that_moved_to_a_depot_it_did_not_change() {
                 "\"{OTHER}\"\n{{\n\"manifests\"\n{{\n\"public\"\n{{\n\"gid\" \"7\"\n\"size\" \"1\"\n}}\n}}\n}}\n\"branches\""
             ),
         );
-        let filter = DepotFilter::default();
+        let filter = licensed();
         let info = AppInfo {
             text: Some(text),
             ..info
@@ -984,7 +994,7 @@ fn two_depot_plan(first: u64, second: u64, build: u64) -> InstallPlan {
             "\"{OTHER}\"\n{{\n\"manifests\"\n{{\n\"public\"\n{{\n\"gid\" \"{second}\"\n\"size\" \"1\"\n}}\n}}\n}}\n\"branches\""
         ),
     );
-    let filter = DepotFilter::default();
+    let filter = licensed();
     let info = AppInfo {
         text: Some(text),
         ..info
@@ -1810,7 +1820,7 @@ async fn a_refetch_moves_every_depot_to_the_new_build() {
             ..info
         }
     };
-    let filter = DepotFilter::default();
+    let filter = licensed();
     let listed = OwnedApp::parse(&two_depots(V1, 70, 11), &filter).unwrap();
     let listed = InstallPlan::new(&listed, "public", &filter).unwrap();
 
@@ -1893,6 +1903,138 @@ async fn a_manifest_steam_lists_and_will_not_serve_is_not_a_changed_one() {
     );
 }
 
+/// `DEPOT`, plus `OTHER` held by another app.
+fn shared_depot_info() -> AppInfo {
+    let info = product_info(V1, 11);
+    let text = info.text.as_ref().unwrap().replace(
+        "\"branches\"",
+        &format!("\"{OTHER}\"\n{{\n\"depotfromapp\" \"{PARENT}\"\n}}\n\"branches\""),
+    );
+    AppInfo {
+        text: Some(text),
+        ..info
+    }
+}
+
+fn parent_info() -> AppInfo {
+    let text = format!(
+        r#""appinfo"
+{{
+	"depots"
+	{{
+		"{OTHER}"
+		{{
+			"manifests"
+			{{
+				"public"
+				{{
+					"gid"		"70"
+					"size"		"1"
+				}}
+			}}
+		}}
+	}}
+}}
+"#
+    );
+    AppInfo {
+        appid: PARENT,
+        change_number: 1,
+        text: Some(text),
+    }
+}
+
+fn grants() -> PackageGrants {
+    PackageGrants {
+        appids: [APPID].into(),
+        depot_ids: [DEPOT, OTHER].into(),
+    }
+}
+
+#[tokio::test]
+async fn a_shared_depot_installs_through_the_app_that_holds_it() {
+    let library = Library::from_app_info(&grants(), &[shared_depot_info(), parent_info()]);
+    let app = library.windows_app(APPID).unwrap();
+    let plan = InstallPlan::new(app, "public", &library.filter()).unwrap();
+    assert_eq!(plan.depots[1].source_app, Some(PARENT));
+
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"a"])]));
+    bench
+        .session
+        .add_manifest(OTHER, manifest(70, vec![file(chunks, "b.txt", &[b"b"])]));
+    bench.install(&plan).await.unwrap();
+
+    assert_eq!(
+        *bench.session.manifest_apps.lock().unwrap(),
+        [(DEPOT, APPID), (OTHER, PARENT)]
+    );
+    assert_eq!(*bench.session.chunk_apps.lock().unwrap(), [APPID, PARENT]);
+    assert!(bench.game().join("b.txt").exists());
+    assert_eq!(bench.acf().installed_depots.len(), 2);
+    assert!(bench.acf().is_fully_installed());
+}
+
+#[tokio::test]
+async fn a_refetch_resolves_a_shared_depot_again() {
+    let library = Library::from_app_info(&grants(), &[shared_depot_info(), parent_info()]);
+    let app = library.windows_app(APPID).unwrap();
+    let filter = library.filter();
+    let mut plan = InstallPlan::new(app, "public", &filter).unwrap();
+    plan.depots[0].manifest_id = 999;
+
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"a"])]));
+    bench
+        .session
+        .add_manifest(OTHER, manifest(70, vec![file(chunks, "b.txt", &[b"b"])]));
+    {
+        let mut answers = bench.session.app_info.lock().unwrap();
+        answers.push_back(vec![shared_depot_info()]);
+        answers.push_back(vec![parent_info()]);
+    }
+    bench.install(&plan).await.unwrap();
+    assert!(bench.game().join("b.txt").exists());
+}
+
+#[test]
+fn a_shared_depot_with_no_manifest_refuses_the_install() {
+    let library = Library::from_app_info(&grants(), &[shared_depot_info()]);
+    let app = library.windows_app(APPID).unwrap();
+    let error = InstallPlan::new(app, "public", &library.filter()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::UnresolvedSharedDepot {
+                appid: APPID,
+                depot_id: OTHER,
+                from_app: PARENT,
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&OTHER.to_string()));
+    assert!(error.to_string().contains(&PARENT.to_string()));
+}
+
+#[test]
+fn a_plan_reports_the_depots_it_left_out() {
+    let filter = DepotFilter {
+        owned_depots: [DEPOT].into(),
+        ..DepotFilter::default()
+    };
+    let app = OwnedApp::parse(&shared_depot_info(), &filter).unwrap();
+    let plan = InstallPlan::new(&app, "public", &filter).unwrap();
+    assert_eq!(plan.depots.len(), 1);
+    assert_eq!(plan.not_licensed, [OTHER]);
+}
+
 #[tokio::test]
 async fn a_manifest_path_outside_the_install_is_refused() {
     for name in ["..\\..\\escape.txt", "/etc/escape.txt", "a\\..\\..\\b"] {
@@ -1919,7 +2061,7 @@ async fn a_symlink_out_of_the_install_is_refused() {
 
 #[test]
 fn a_branch_without_a_build_id_is_refused() {
-    let filter = DepotFilter::default();
+    let filter = licensed();
     let mut app = OwnedApp::parse(&product_info(V1, 11), &filter).unwrap();
     app.builds.clear();
     assert!(matches!(
@@ -1931,7 +2073,7 @@ fn a_branch_without_a_build_id_is_refused() {
 #[test]
 fn an_installdir_that_is_not_one_name_is_refused() {
     for installdir in ["../escape", "/abs", "a/b", "a\\b", ".."] {
-        let filter = DepotFilter::default();
+        let filter = licensed();
         let mut app = OwnedApp::parse(&product_info(V1, 11), &filter).unwrap();
         app.installdir = installdir.to_owned();
         assert!(

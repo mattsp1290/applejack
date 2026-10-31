@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use steamroom::types::key_value::{KeyValue, KvValue};
 
 use crate::Error;
-use crate::session::{AppInfo, SteamSession};
+use crate::session::{AppInfo, PackageGrants, SteamSession};
 
 /// The `oslist` value for Windows.
 pub const WINDOWS: &str = "windows";
@@ -41,14 +41,33 @@ pub struct DepotInfo {
     pub low_violence: bool,
     /// The DLC that must be owned for this depot to be downloadable.
     pub dlc_appid: Option<u32>,
-    /// Manifests by branch. A depot served from another app
-    /// (`depotfromapp`) has none.
+    /// `depotfromapp`: the app that holds this depot.
+    pub depot_from_app: Option<u32>,
+    /// Manifests by branch. A `depotfromapp` depot may have none of its own,
+    /// and takes the parent app's when the library resolves it.
     pub manifests: BTreeMap<String, ManifestRef>,
+    /// `manifests` came from the parent app.
+    pub linked: bool,
 }
 
 impl DepotInfo {
     fn is_windows(&self) -> bool {
         self.oslist.is_empty() || self.oslist.iter().any(|os| os == WINDOWS)
+    }
+
+    /// A `depotfromapp` depot with no manifests yet.
+    fn awaits_parent(&self) -> bool {
+        self.depot_from_app.is_some() && self.manifests.is_empty()
+    }
+
+    /// The manifest for `branch`. A parent app's depots are usually on
+    /// `public` only, and `DepotDownloader` falls back to it; the flag says so.
+    fn manifest_for(&self, branch: &str) -> Option<(ManifestRef, bool)> {
+        if let Some(manifest) = self.manifests.get(branch) {
+            return Some((*manifest, false));
+        }
+        let fallback = self.manifests.get(DEFAULT_BRANCH).filter(|_| self.linked)?;
+        Some((*fallback, true))
     }
 }
 
@@ -57,6 +76,7 @@ impl DepotInfo {
 pub struct DepotFilter {
     pub language: String,
     pub owned_appids: BTreeSet<u32>,
+    pub owned_depots: BTreeSet<u32>,
 }
 
 impl Default for DepotFilter {
@@ -64,6 +84,7 @@ impl Default for DepotFilter {
         Self {
             language: "english".to_owned(),
             owned_appids: BTreeSet::new(),
+            owned_depots: BTreeSet::new(),
         }
     }
 }
@@ -74,6 +95,21 @@ pub struct PlannedDepot {
     pub depot_id: u32,
     pub manifest_id: u64,
     pub size: u64,
+    /// The app to name for this depot's manifest and CDN token, when it is
+    /// not the one being installed. The depot key still goes by that one.
+    #[serde(default)]
+    pub source_app: Option<u32>,
+    /// The manifest is the parent app's `public`, whatever branch is planned.
+    #[serde(default)]
+    pub public_manifest: bool,
+}
+
+/// What [`OwnedApp::windows_depots`] chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepotSelection {
+    pub depots: Vec<PlannedDepot>,
+    /// Depots that would be fetched if the account licensed them.
+    pub not_licensed: Vec<u32>,
 }
 
 /// One owned app.
@@ -94,6 +130,8 @@ pub struct OwnedApp {
     /// `depots/branches/<branch>/buildid`.
     pub builds: BTreeMap<String, u64>,
     pub change_number: u32,
+    /// `common/freetodownload`: depots need no license.
+    pub free_to_download: bool,
     app_oslist: Vec<String>,
 }
 
@@ -107,13 +145,16 @@ impl OwnedApp {
         let mut depots = Vec::new();
         let mut builds = BTreeMap::new();
         let mut default_branch = DEFAULT_BRANCH.to_owned();
-        if let Some(section) = children(root.get("depots")) {
+        let depots_node = child(&root, "depots");
+        if let Some(section) = children(depots_node) {
             for (key, entry) in section {
                 if let Ok(depot_id) = key.parse() {
                     depots.push(parse_depot(depot_id, entry));
                 }
             }
-            if let Some(branches) = children(root.get("depots").and_then(|d| d.get("branches"))) {
+            // The map's keys are text, so "1000" would sort before "999".
+            depots.sort_by_key(|depot: &DepotInfo| depot.depot_id);
+            if let Some(branches) = children(depots_node.and_then(|d| child(d, "branches"))) {
                 for (branch, entry) in branches {
                     if let Some(build) = text(entry, &["buildid"]).and_then(|id| id.parse().ok()) {
                         builds.insert(branch.clone(), build);
@@ -143,23 +184,71 @@ impl OwnedApp {
             platforms: platforms.into_iter().collect(),
             builds,
             change_number: info.change_number,
+            free_to_download: text(&root, &["common", "freetodownload"])
+                .and_then(|value| value.parse::<i32>().ok())
+                .is_some_and(|value| value != 0),
             app_oslist,
         };
-        app.size = app
-            .windows_depots(&app.default_branch, filter)
-            .map_or(0, |depots| depots.iter().map(|depot| depot.size).sum());
+        app.measure(filter);
         Some(app)
     }
 
+    fn measure(&mut self, filter: &DepotFilter) {
+        self.size = self
+            .windows_depots(&self.default_branch, filter)
+            .map_or(0, |selection| {
+                selection.depots.iter().map(|depot| depot.size).sum()
+            });
+    }
+
+    /// The apps whose product info this one's shared depots need.
+    fn parents(&self) -> impl Iterator<Item = u32> {
+        self.depots
+            .iter()
+            .filter(|depot| depot.awaits_parent())
+            .filter_map(|depot| depot.depot_from_app)
+            .filter(|parent| *parent != self.appid)
+    }
+
+    /// Resolves `depotfromapp` depots one level, as `DepotDownloader` does.
+    /// One the parent cannot supply stays unresolved, and
+    /// [`windows_depots`](Self::windows_depots) refuses it.
+    fn link_shared(&mut self, parents: &BTreeMap<u32, Self>, filter: &DepotFilter) {
+        let appid = self.appid;
+        for depot in &mut self.depots {
+            let source = depot
+                .depot_from_app
+                .filter(|parent| depot.manifests.is_empty() && *parent != appid)
+                .and_then(|parent| parents.get(&parent))
+                .and_then(|parent| parent.depots.iter().find(|d| d.depot_id == depot.depot_id));
+            if let Some(source) = source.filter(|source| !source.manifests.is_empty()) {
+                depot.manifests.clone_from(&source.manifests);
+                depot.linked = true;
+            }
+        }
+        self.measure(filter);
+    }
+
     /// True when the app ships at least one depot that runs on Windows and
-    /// has a manifest of its own.
+    /// has a manifest, its own or a parent app's.
     #[must_use]
     pub fn has_windows_depot(&self) -> bool {
         self.runs_on_windows()
-            && self
-                .depots
-                .iter()
-                .any(|depot| depot.is_windows() && !depot.manifests.is_empty())
+            && self.depots.iter().any(|depot| {
+                depot.is_windows() && (!depot.manifests.is_empty() || depot.awaits_parent())
+            })
+    }
+
+    /// `AccountHasAccess` in `DepotDownloader`: a package lists the depot, or
+    /// the app needs no license. Owning a depot's DLC counts too, and it is
+    /// what a free app's paid DLC still needs.
+    fn is_licensed(&self, depot: &DepotInfo, filter: &DepotFilter) -> bool {
+        let id = depot.depot_id;
+        filter.owned_depots.contains(&id)
+            || filter.owned_appids.contains(&id)
+            || depot.dlc_appid.map_or(self.free_to_download, |dlc| {
+                filter.owned_appids.contains(&dlc)
+            })
     }
 
     fn runs_on_windows(&self) -> bool {
@@ -168,29 +257,36 @@ impl OwnedApp {
 
     /// The depots to fetch for `branch`: Windows, x86-64 plus architecture
     /// neutral, or 32-bit when the app has no x86-64 depot; the filter's
-    /// language or none; no low-violence variants; DLC depots only when the
-    /// DLC is owned. A depot with no manifest on the branch is left out,
-    /// which covers shared redistributables served from another app.
+    /// language or none; no low-violence variants; only what the account
+    /// licenses, with the rest reported. A depot with no manifest on the
+    /// branch is left out, unless it is a `depotfromapp` depot.
     ///
     /// # Errors
     ///
-    /// [`Error::NoWindowsDepot`] naming the platforms the app has, and
-    /// [`Error::NoManifestForBranch`] when no eligible depot is on `branch`.
+    /// [`Error::NoWindowsDepot`] naming the platforms the app has,
+    /// [`Error::NoManifestForBranch`] when no eligible depot is on `branch`,
+    /// [`Error::NoLicensedDepot`] when the account licenses none of them, and
+    /// [`Error::UnresolvedSharedDepot`] for a licensed `depotfromapp` depot
+    /// with no manifest, since installing without it would call a title
+    /// complete with content missing.
     pub fn windows_depots(
         &self,
         branch: &str,
         filter: &DepotFilter,
-    ) -> Result<Vec<PlannedDepot>, Error> {
+    ) -> Result<DepotSelection, Error> {
         if !self.has_windows_depot() {
             return Err(Error::NoWindowsDepot {
                 appid: self.appid,
                 platforms: self.platforms.clone(),
             });
         }
-        let eligible: Vec<&DepotInfo> = self
+        let (licensed, unlicensed): (Vec<&DepotInfo>, Vec<&DepotInfo>) = self
             .depots
             .iter()
-            .filter(|depot| depot.is_windows() && depot.manifests.contains_key(branch))
+            .filter(|depot| {
+                depot.is_windows()
+                    && (depot.manifest_for(branch).is_some() || depot.awaits_parent())
+            })
             .filter(|depot| {
                 depot
                     .language
@@ -198,33 +294,89 @@ impl OwnedApp {
                     .is_none_or(|language| *language == filter.language)
             })
             .filter(|depot| !depot.low_violence)
-            .filter(|depot| {
-                depot
-                    .dlc_appid
-                    .is_none_or(|appid| filter.owned_appids.contains(&appid))
-            })
-            .collect();
-        let has_x86_64 = eligible.iter().any(|depot| depot.osarch == Some(X86_64));
-        let planned: Vec<PlannedDepot> = eligible
+            .partition(|depot| self.is_licensed(depot, filter));
+        let has_x86_64 = licensed.iter().any(|depot| depot.osarch == Some(X86_64));
+        let fits =
+            |depot: &&DepotInfo| !has_x86_64 || depot.osarch.is_none_or(|arch| arch == X86_64);
+        let not_licensed: Vec<u32> = unlicensed
             .into_iter()
-            .filter(|depot| !has_x86_64 || depot.osarch.is_none_or(|arch| arch == X86_64))
-            .filter_map(|depot| {
-                let manifest = depot.manifests.get(branch)?;
-                Some(PlannedDepot {
-                    depot_id: depot.depot_id,
-                    manifest_id: manifest.manifest_id,
-                    size: manifest.size,
-                })
-            })
+            .filter(fits)
+            .map(|depot| depot.depot_id)
             .collect();
-        if planned.is_empty() {
-            return Err(Error::NoManifestForBranch {
-                appid: self.appid,
-                branch: branch.to_owned(),
+        let mut depots = Vec::new();
+        for depot in licensed.into_iter().filter(fits) {
+            depots.push(self.planned(depot, branch)?);
+        }
+        if !depots.is_empty() {
+            return Ok(DepotSelection {
+                depots,
+                not_licensed,
             });
         }
-        Ok(planned)
+        // A depot still waiting on its parent says nothing about the branch.
+        let on_branch = self.depots.iter().any(|depot| {
+            not_licensed.contains(&depot.depot_id) && depot.manifest_for(branch).is_some()
+        });
+        Err(if on_branch {
+            Error::NoLicensedDepot {
+                appid: self.appid,
+                depots: not_licensed,
+            }
+        } else {
+            Error::NoManifestForBranch {
+                appid: self.appid,
+                branch: branch.to_owned(),
+            }
+        })
     }
+
+    fn planned(&self, depot: &DepotInfo, branch: &str) -> Result<PlannedDepot, Error> {
+        let (manifest, public_manifest) =
+            depot
+                .manifest_for(branch)
+                .ok_or_else(|| Error::UnresolvedSharedDepot {
+                    appid: self.appid,
+                    depot_id: depot.depot_id,
+                    from_app: depot.depot_from_app.unwrap_or(self.appid),
+                })?;
+        Ok(PlannedDepot {
+            depot_id: depot.depot_id,
+            manifest_id: manifest.manifest_id,
+            size: manifest.size,
+            // `DepotDownloader` names the launching app for a free title.
+            source_app: depot.depot_from_app.filter(|_| !self.free_to_download),
+            public_manifest,
+        })
+    }
+}
+
+/// One app's fresh product info, with its shared depots resolved. `None` when
+/// Steam has no usable info for it.
+pub(crate) async fn fetch_app<S: SteamSession>(
+    session: &S,
+    appid: u32,
+    filter: &DepotFilter,
+) -> Result<Option<OwnedApp>, Error> {
+    let infos = session.app_info(&[appid]).await?;
+    let Some(mut app) = infos
+        .iter()
+        .filter(|info| info.appid == appid)
+        .find_map(|info| OwnedApp::parse(info, filter))
+    else {
+        return Ok(None);
+    };
+    let wanted: BTreeSet<u32> = app.parents().collect();
+    if !wanted.is_empty() {
+        let wanted: Vec<u32> = wanted.into_iter().collect();
+        let infos = session.app_info(&wanted).await?;
+        let parents = infos
+            .iter()
+            .filter_map(|info| OwnedApp::parse(info, filter))
+            .map(|parent| (parent.appid, parent))
+            .collect();
+        app.link_shared(&parents, filter);
+    }
+    Ok(Some(app))
 }
 
 /// The owned apps of one account.
@@ -234,6 +386,8 @@ pub struct Library {
     pub apps: Vec<OwnedApp>,
     /// What the licenses grant, including DLC.
     pub owned_appids: BTreeSet<u32>,
+    #[serde(default)]
+    pub owned_depots: BTreeSet<u32>,
     /// Owned apps PICS answered for without usable info.
     pub skipped: Vec<u32>,
 }
@@ -247,28 +401,54 @@ impl Library {
     /// [`Error::Auth`] from the session.
     pub async fn fetch<S: SteamSession>(session: &S) -> Result<Self, Error> {
         let licenses = session.license_list().await?;
-        let appids = session.package_apps(&licenses).await?;
-        let infos = session.app_info(&appids).await?;
-        Ok(Self::from_app_info(&appids, &infos))
+        let grants = session.package_grants(&licenses).await?;
+        let appids: Vec<u32> = grants.appids.iter().copied().collect();
+        let mut infos = session.app_info(&appids).await?;
+        // Parents are often not owned: 228980 holds the redistributables.
+        let library = Self::from_app_info(&grants, &infos);
+        let described: BTreeSet<u32> = infos.iter().map(|info| info.appid).collect();
+        let parents: BTreeSet<u32> = library
+            .apps
+            .iter()
+            .flat_map(OwnedApp::parents)
+            .filter(|parent| !described.contains(parent))
+            .collect();
+        if parents.is_empty() {
+            return Ok(library);
+        }
+        let parents: Vec<u32> = parents.into_iter().collect();
+        infos.extend(session.app_info(&parents).await?);
+        Ok(Self::from_app_info(&grants, &infos))
     }
 
-    /// Builds a library from answers already in hand.
+    /// Builds a library from answers already in hand. `infos` may hold apps
+    /// the account does not own, which only serve to resolve `depotfromapp`.
     #[must_use]
-    pub fn from_app_info(appids: &[u32], infos: &[AppInfo]) -> Self {
-        let owned_appids: BTreeSet<u32> = appids.iter().copied().collect();
+    pub fn from_app_info(grants: &PackageGrants, infos: &[AppInfo]) -> Self {
         let filter = DepotFilter {
-            owned_appids: owned_appids.clone(),
+            owned_appids: grants.appids.clone(),
+            owned_depots: grants.depot_ids.clone(),
             ..DepotFilter::default()
         };
-        let apps: Vec<OwnedApp> = infos
+        let parsed: BTreeMap<u32, OwnedApp> = infos
             .iter()
             .filter_map(|info| OwnedApp::parse(info, &filter))
+            .map(|app| (app.appid, app))
             .collect();
+        let mut apps: Vec<OwnedApp> = parsed
+            .values()
+            .filter(|app| grants.appids.contains(&app.appid))
+            .cloned()
+            .collect();
+        for app in &mut apps {
+            app.link_shared(&parsed, &filter);
+        }
         let described: BTreeSet<u32> = apps.iter().map(|app| app.appid).collect();
         Self {
-            skipped: owned_appids.difference(&described).copied().collect(),
+            skipped: grants.appids.difference(&described).copied().collect(),
             apps,
-            owned_appids,
+            owned_appids: grants.appids.clone(),
+            owned_depots: grants.depot_ids.clone(),
         }
     }
 
@@ -302,14 +482,27 @@ impl Library {
         Ok(app)
     }
 
-    /// The filter that matches this account: English, and DLC it owns.
+    /// The filter that matches this account: English, and what it licenses.
     #[must_use]
     pub fn filter(&self) -> DepotFilter {
         DepotFilter {
             owned_appids: self.owned_appids.clone(),
+            owned_depots: self.owned_depots.clone(),
             ..DepotFilter::default()
         }
     }
+}
+
+/// `KeyValue::get` with `SteamKit`'s indexer rule: an exact key, or any
+/// spelling of it. Product info keys are not reliably one case, and an absent
+/// `oslist` reads as "every platform".
+fn child<'a>(node: &'a KeyValue, key: &str) -> Option<&'a KeyValue> {
+    node.get(key).or_else(|| {
+        children(Some(node))?
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    })
 }
 
 fn children(node: Option<&KeyValue>) -> Option<&BTreeMap<String, KeyValue>> {
@@ -322,7 +515,7 @@ fn children(node: Option<&KeyValue>) -> Option<&BTreeMap<String, KeyValue>> {
 fn text<'a>(root: &'a KeyValue, path: &[&str]) -> Option<&'a str> {
     let mut node = root;
     for key in path {
-        node = node.get(key)?;
+        node = child(node, key)?;
     }
     node.as_str()
 }
@@ -338,7 +531,7 @@ fn oslist(value: Option<&str>) -> Vec<String> {
 
 fn parse_depot(depot_id: u32, entry: &KeyValue) -> DepotInfo {
     let mut manifests = BTreeMap::new();
-    if let Some(section) = children(entry.get("manifests")) {
+    if let Some(section) = children(child(entry, "manifests")) {
         for (branch, value) in section {
             // Older buffers hold the gid directly; newer ones a map.
             let manifest_id = value.as_str().or_else(|| text(value, &["gid"]));
@@ -365,6 +558,8 @@ fn parse_depot(depot_id: u32, entry: &KeyValue) -> DepotInfo {
             .map(str::to_owned),
         low_violence: text(entry, &["config", "lowviolence"]) == Some("1"),
         dlc_appid: text(entry, &["dlcappid"]).and_then(|appid| appid.parse().ok()),
+        depot_from_app: text(entry, &["depotfromapp"]).and_then(|appid| appid.parse().ok()),
         manifests,
+        linked: false,
     }
 }

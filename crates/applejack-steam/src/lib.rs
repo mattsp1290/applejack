@@ -44,7 +44,9 @@ pub use depot::{
 };
 pub use error::Error;
 pub use keychain::{InMemoryStore, RefreshToken, RefreshTokenStore, SecurityFrameworkStore};
-pub use library::{DepotFilter, DepotInfo, Library, ManifestRef, OwnedApp, PlannedDepot};
+pub use library::{
+    DepotFilter, DepotInfo, DepotSelection, Library, ManifestRef, OwnedApp, PlannedDepot,
+};
 pub use lock::{AppLock, Holder, LibraryLock, Lock, LockDir, Mode};
-pub use session::{AppInfo, SteamSession};
+pub use session::{AppInfo, PackageGrants, SteamSession};
 pub use vdf::{Document, Node, Value};

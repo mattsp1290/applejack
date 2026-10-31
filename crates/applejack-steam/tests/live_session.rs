@@ -373,31 +373,34 @@ async fn app_info_sends_tokens_and_collects_every_response_part() {
     assert!(!apps[0].text.as_ref().unwrap().contains('\0'));
 }
 
-fn package_buffer(package_id: u32, appids: &[i32]) -> Vec<u8> {
+fn package_buffer(package_id: u32, appids: &[i32], depot_ids: &[i32]) -> Vec<u8> {
     let mut kv = 1_u32.to_le_bytes().to_vec();
     kv.push(0);
     kv.extend_from_slice(package_id.to_string().as_bytes());
     kv.push(0);
-    kv.push(0);
-    kv.extend_from_slice(b"appids\0");
-    for (index, appid) in appids.iter().enumerate() {
-        kv.push(2);
-        kv.extend_from_slice(index.to_string().as_bytes());
+    for (key, ids) in [(&b"appids\0"[..], appids), (&b"depotids\0"[..], depot_ids)] {
         kv.push(0);
-        kv.extend_from_slice(&appid.to_le_bytes());
+        kv.extend_from_slice(key);
+        for (index, id) in ids.iter().enumerate() {
+            kv.push(2);
+            kv.extend_from_slice(index.to_string().as_bytes());
+            kv.push(0);
+            kv.extend_from_slice(&id.to_le_bytes());
+        }
+        kv.push(8);
     }
-    kv.extend_from_slice(&[8, 8, 8]);
+    kv.extend_from_slice(&[8, 8]);
     kv
 }
 
 #[tokio::test]
-async fn package_apps_passes_license_tokens_and_reads_the_binary_buffer() {
+async fn package_grants_passes_license_tokens_and_reads_the_binary_buffer() {
     let (session, mut cm) = logged_in(9).await;
     cm.send(license_list(&[10]));
     let licenses = session.license_list().await.unwrap();
     let session = Arc::new(session);
     let caller = Arc::clone(&session);
-    let call = tokio::spawn(async move { caller.package_apps(&licenses).await });
+    let call = tokio::spawn(async move { caller.package_grants(&licenses).await });
 
     let request = cm.recv_past_heartbeats().await;
     let decoded = CMsgClientPicsProductInfoRequest::decode(&*request.body).unwrap();
@@ -407,14 +410,16 @@ async fn package_apps_passes_license_tokens_and_reads_the_binary_buffer() {
     let body = CMsgClientPicsProductInfoResponse {
         packages: vec![c_msg_client_pics_product_info_response::PackageInfo {
             packageid: Some(10),
-            buffer: Some(package_buffer(10, &[30, 20, 30])),
+            buffer: Some(package_buffer(10, &[30, 20, 30], &[31, 21])),
             ..Default::default()
         }],
         ..Default::default()
     }
     .encode_to_vec();
     cm.reply(&request, EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE, &body);
-    assert_eq!(call.await.unwrap().unwrap(), [20, 30]);
+    let grants = call.await.unwrap().unwrap();
+    assert_eq!(grants.appids, [20, 30].into());
+    assert_eq!(grants.depot_ids, [21, 31].into());
 }
 
 #[tokio::test]

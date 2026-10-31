@@ -121,13 +121,14 @@ them. The CM does not report a retry-after, so the value is a fixed 60 s floor.
 
 ## Library
 
-`library::Library::fetch` walks licenses to packages (`package_apps`, a binary
+`library::Library::fetch` walks licenses to packages (`package_grants`, a binary
 `KeyValues` buffer behind a 4-byte prefix) to appids to PICS product info
-(`app_info`, text `KeyValues`, access tokens included). `Library` returns plain
+(`app_info`, text `KeyValues`, access tokens included). Keys match in any case,
+as under `SteamKit`'s indexer. `Library` returns plain
 values; the caller persists them to the `apps` table with `fetched_at`.
 
 `OwnedApp { appid, name, installdir, size, default_branch, depots, drm,
-platforms, builds, change_number }` describes one app. `drm` is always
+platforms, builds, change_number, free_to_download }` describes one app. `drm` is always
 `unknown`: it cannot be inferred from Steam, and the config database overrides
 it. `Library::windows_apps` is the installable list.
 `Library::windows_app(appid)` answers `AppNotOwned`, or `NoWindowsDepot` naming
@@ -135,10 +136,29 @@ the platforms the app lists.
 
 `OwnedApp::windows_depots(branch, filter)` picks what to fetch: depots whose
 `oslist` includes `windows` or is empty, on an app whose own `oslist` allows
-Windows; `osarch` 64 and neutral, or 32 when the app has no 64-bit depot; the
-filter's language (`english` by default) or none; no `lowviolence` depots; a
-`dlcappid` depot only when that DLC is owned. A depot with no manifest on the
-branch is skipped, which also leaves out `depotfromapp` redistributables.
+Windows; `osarch` 64 and neutral, or 32 when the app has no licensed 64-bit
+depot; the filter's language (`english` by default) or none; no `lowviolence`
+depots. A depot with no manifest on the branch is skipped.
+
+What the account may fetch follows `DepotDownloader`'s `AccountHasAccess`:
+`package_grants` reads both `appids` and `depotids` from every licensed
+package, and a depot is available when either lists it, when its `dlcappid` is
+owned, or when the app is `freetodownload` and the depot is not paid DLC. The
+rest are left out and listed in `DepotSelection::not_licensed` and
+`InstallPlan::not_licensed`, and a title with none left is `NoLicensedDepot`.
+`DepotFilter::default()` licenses nothing, so build the filter with
+`Library::filter`.
+
+A `depotfromapp` depot with no manifests of its own lives in another app, often
+one the account does not own, such as 228980 for redistributables. `Library`
+reads that app's product info and takes the depot's manifests from it, one
+level, falling back to `public` as `DepotDownloader` does. Its manifest request
+and CDN token then name the parent, unless the title is free to download; the
+depot key still names the title. Such a depot installs into the title's own
+directory, as under `DepotDownloader`, where the Windows client would use the
+parent's shared directory and list it under `SharedDepots`. A licensed one
+that cannot be resolved refuses the install with `UnresolvedSharedDepot` naming
+both ids, so `StateFlags` 4 never covers missing content.
 
 ## Install, update, verify
 
@@ -447,8 +467,9 @@ writer with whatever keys the client needs.
 - **Power loss.** Resume trusts a recorded file's size. `DepotJob` does not
   fsync before its rename, so after a power cut `verify_install` is the check.
 - **Repair.** `VerifyReport` only reports; `install` refuses an installed title.
-- **`depotfromapp` depots** are skipped. If a title turns out to need one, read
-  the manifest from the other app's product info.
+- **Non-public branches.** A depot of the title's own with no manifest on the
+  planned branch is left out. `DepotDownloader` falls back to `public` for
+  these too, and the Windows client's rule has not been observed.
 - **PICS over HTTP.** A reply can carry `http_host` and omit a large buffer.
   Such an app lands in `Library::skipped`. Whether Steam still does this for
   this request is unknown until a large account runs the spike.

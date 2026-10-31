@@ -54,6 +54,18 @@ pub enum Error {
     /// branch has no build id.
     #[error("app {appid} has no installable depot on branch `{branch}`")]
     NoManifestForBranch { appid: u32, branch: String },
+    /// The account licenses none of the depots this app would install.
+    #[error("app {appid}: this account licenses none of its Windows depots ({})", depots.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))]
+    NoLicensedDepot { appid: u32, depots: Vec<u32> },
+    /// A licensed depot lives in another app, whose product info does not
+    /// give it a manifest. Installing without it would call a title complete
+    /// with content missing.
+    #[error("app {appid} depot {depot_id} comes from app {from_app}, which has no manifest for it")]
+    UnresolvedSharedDepot {
+        appid: u32,
+        depot_id: u32,
+        from_app: u32,
+    },
     /// A name from Steam would land outside the install directory.
     #[error("refusing unsafe path from Steam: `{path}`")]
     UnsafePath { path: String },

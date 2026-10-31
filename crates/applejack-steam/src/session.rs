@@ -2,6 +2,7 @@
 //! keeps the auth flow; `logon` hands back a [`SteamSession`] whose methods
 //! take `&self`, so a keepalive and any number of requests share it.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,14 @@ pub struct AppInfo {
     pub text: Option<String>,
 }
 
+/// What an account's licenses grant, from their packages' `appids` and
+/// `depotids`. A depot is available when either lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageGrants {
+    pub appids: BTreeSet<u32>,
+    pub depot_ids: BTreeSet<u32>,
+}
+
 /// The calls a logged-in session makes. A session stays alive on its own for
 /// as long as it exists: the implementation sends heartbeats while a call is
 /// waiting, so no caller schedules them.
@@ -36,11 +45,11 @@ pub trait SteamSession: Send + Sync {
     /// answers from the latest `CMsgClientLicenseList`.
     fn license_list(&self) -> impl Future<Output = Result<Vec<License>, AuthError>> + Send;
 
-    /// The appids the given licenses grant, sorted and without duplicates.
-    fn package_apps(
+    /// What the given licenses grant.
+    fn package_grants(
         &self,
         licenses: &[License],
-    ) -> impl Future<Output = Result<Vec<u32>, AuthError>> + Send;
+    ) -> impl Future<Output = Result<PackageGrants, AuthError>> + Send;
 
     /// PICS product info for `appids`. Steam omits apps it does not know.
     fn app_info(
