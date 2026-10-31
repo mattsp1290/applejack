@@ -10,11 +10,13 @@ public final class GameDetailViewModel {
     /// even after the dismissal cleared `pendingImport`.
     public struct PendingImport: Equatable, Sendable {
         public var path: String
+        public var presetAppid: UInt32
         public var confirmations: [ImportItem]
         public var rejected: [RejectedItem]
 
-        public init(path: String, confirmations: [ImportItem], rejected: [RejectedItem]) {
+        public init(path: String, presetAppid: UInt32, confirmations: [ImportItem], rejected: [RejectedItem]) {
             self.path = path
+            self.presetAppid = presetAppid
             self.confirmations = confirmations
             self.rejected = rejected
         }
@@ -99,6 +101,12 @@ public final class GameDetailViewModel {
         }
     }
 
+    /// The warning for a preset exported for another title, which is the
+    /// easy way to slip a foreign executable and arguments past the user.
+    public func presetMismatch(presetAppid: UInt32) -> String? {
+        presetAppid == appid ? nil : "This preset was exported for app \(presetAppid), not this game."
+    }
+
     private func runImport(path: String, acceptLaunchOverrides: Bool) async {
         importToken += 1
         let token = importToken
@@ -110,7 +118,8 @@ public final class GameDetailViewModel {
         importState = next
         if case .ready(let result) = next {
             if result.needsConfirmation {
-                pendingImport = PendingImport(path: path, confirmations: result.confirmations, rejected: result.rejected)
+                pendingImport = PendingImport(
+                    path: path, presetAppid: result.presetAppid, confirmations: result.confirmations, rejected: result.rejected)
             } else if result.applied {
                 await load()
             }

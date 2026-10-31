@@ -71,7 +71,8 @@ public struct GameDetailView: View {
     }
 
     private func planSummary(_ pending: GameDetailViewModel.PendingImport) -> String {
-        var lines = pending.confirmations.map { "\($0.field) = \($0.value)" }
+        var lines = model.presetMismatch(presetAppid: pending.presetAppid).map { [$0] } ?? []
+        lines.append(contentsOf: pending.confirmations.map { "\($0.field) = \($0.value)" })
         if !pending.rejected.isEmpty {
             lines.append("")
             lines.append(contentsOf: pending.rejected.map { "Rejected \($0.field): \($0.reason)" })
@@ -102,6 +103,9 @@ public struct GameDetailView: View {
     private var importStatus: some View {
         FlowStateView(model.importState, idle: "") { result in
             VStack(alignment: .leading, spacing: 2) {
+                if let mismatch = model.presetMismatch(presetAppid: result.presetAppid) {
+                    Text(mismatch).foregroundStyle(.orange)
+                }
                 if result.applied {
                     Text("Preset applied: \(result.accepted.count) accepted, \(result.rejected.count) rejected.")
                 } else if !result.confirmations.isEmpty, model.pendingImport == nil {

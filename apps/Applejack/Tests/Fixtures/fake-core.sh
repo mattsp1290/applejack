@@ -144,17 +144,22 @@ implemented() {
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"engine_id":"rosetta-wine","engine_version":"10.0.1","graphics_backend":"dxmt","sync_mode":"esync","hidraw_enabled":false,"steam_input":null,"steam_overlay":true,"rosetta_advertise_avx":null,"extra_env":{"DXMT_LOG":"1"},"launch_mode":"client","launch_exe_override":null,"launch_args_override":null,"direct_verified_at":null,"isolated_prefix":false,"dx12_expectation":null,"notes":"fake"}}'
       ;;
     config.import)
+      # A path containing "foreign" is a preset exported for another title.
+      case "$3" in
+        *foreign*) preset=730 ;;
+        *) preset=220 ;;
+      esac
       case "$3" in
         # A path containing "slow" previews after 400 ms, so a later preset's
         # preview can overtake it (lifted from the round-two review probe).
         *'"accept_launch_overrides":false'*slow*)
-          ( sleep 0.4; write '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":false,"accepted":[],"rejected":[],"confirmations":[{"field":"launch_exe_override","value":"slow.exe"}]}}' ) &
+          ( sleep 0.4; write '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":false,"preset_appid":220,"accepted":[],"rejected":[],"confirmations":[{"field":"launch_exe_override","value":"slow.exe"}]}}' ) &
           ;;
         *'"accept_launch_overrides":true'*)
-          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":true,"accepted":[{"field":"graphics_backend","value":"dxmt"},{"field":"launch_exe_override","value":"bin/game.exe"}],"rejected":[{"field":"extra_env.VK_ICD_FILENAMES","value":"/tmp/x.json","reason":"path outside the engine roots"}],"confirmations":[{"field":"launch_exe_override","value":"bin/game.exe"}]}}'
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":true,"preset_appid":'"$preset"',"accepted":[{"field":"graphics_backend","value":"dxmt"},{"field":"launch_exe_override","value":"bin/game.exe"}],"rejected":[{"field":"extra_env.VK_ICD_FILENAMES","value":"/tmp/x.json","reason":"path outside the engine roots"}],"confirmations":[{"field":"launch_exe_override","value":"bin/game.exe"}]}}'
           ;;
         *)
-          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":false,"accepted":[{"field":"graphics_backend","value":"dxmt"}],"rejected":[{"field":"extra_env.VK_ICD_FILENAMES","value":"/tmp/x.json","reason":"path outside the engine roots"}],"confirmations":[{"field":"launch_exe_override","value":"bin/game.exe"}]}}'
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":false,"preset_appid":'"$preset"',"accepted":[{"field":"graphics_backend","value":"dxmt"}],"rejected":[{"field":"extra_env.VK_ICD_FILENAMES","value":"/tmp/x.json","reason":"path outside the engine roots"}],"confirmations":[{"field":"launch_exe_override","value":"bin/game.exe"}]}}'
           ;;
       esac
       ;;
