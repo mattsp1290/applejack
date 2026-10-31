@@ -53,9 +53,14 @@ pub enum AuthError {
     /// A second factor is needed before the step can complete.
     #[error("Steam Guard {factor:?} required")]
     GuardRequired { factor: GuardFactor },
-    /// Steam rejected the credentials or the token.
+    /// Steam rejected the credentials or the token. Only a login answers
+    /// this; a CLI sends the user to log in again.
     #[error("Steam refused the login")]
     Refused,
+    /// Steam denied one call on a healthy session, such as a depot this
+    /// account cannot reach. Logging in again will not help.
+    #[error("Steam denied {call}: {result}")]
+    CallDenied { call: String, result: String },
     /// The Steam Guard code was wrong; the session is still open.
     #[error("Steam Guard code rejected")]
     InvalidGuardCode,

@@ -2,7 +2,10 @@
 //! the real dispatcher, and a scripted CM on the far side. Nothing opens a
 //! socket. Message bodies are synthetic.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use applejack_steam::auth::AuthError;
@@ -15,6 +18,9 @@ use steamroom::client::SteamClient;
 use steamroom::client::msg::ClientMsg;
 use steamroom::error::{ConnectionError, Error as SteamError};
 use steamroom::generated::{
+    CContentServerDirectoryGetManifestRequestCodeRequest,
+    CContentServerDirectoryGetManifestRequestCodeResponse,
+    CContentServerDirectoryGetServersForSteamPipeResponse, CContentServerDirectoryServerInfo,
     CMsgClientGetDepotDecryptionKeyResponse, CMsgClientLicenseList, CMsgClientLoggedOff,
     CMsgClientLogon, CMsgClientLogonResponse, CMsgClientPicsAccessTokenRequest,
     CMsgClientPicsAccessTokenResponse, CMsgClientPicsProductInfoRequest,
@@ -278,6 +284,7 @@ async fn a_request_that_is_never_answered_times_out_and_the_session_survives() {
     assert!(matches!(
         call.await.unwrap(),
         Err(AuthError::Connection(message)) if message.contains("timed out")
+            && message.contains("depot key")
     ));
 
     // A late reply is dropped, not handed to the next caller.
@@ -520,4 +527,211 @@ async fn a_lost_connection_fails_the_waiter() {
 async fn a_session_prints_no_token() {
     let (session, _cm) = logged_in(9).await;
     assert!(!format!("{session:?}").contains(FIXTURE_TOKEN));
+}
+
+/// A loopback HTTP server that gives every request one status line. No packet
+/// leaves the machine.
+fn http(status: &'static str) -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    (port, hits)
+}
+
+/// `vhost` carries the port, which is what the fixture connects to. `host`
+/// does not resolve, and `optional` HTTPS would fail against a plain server,
+/// so these only pass with `SteamKit`'s rules.
+fn cdn_entry(port: u16, load: f32) -> CContentServerDirectoryServerInfo {
+    CContentServerDirectoryServerInfo {
+        r#type: Some("CDN".to_owned()),
+        host: Some("unresolvable.invalid".to_owned()),
+        vhost: Some(format!("127.0.0.1:{port}")),
+        https_support: Some("optional".to_owned()),
+        weighted_load: Some(load),
+        ..Default::default()
+    }
+}
+
+/// Runs `manifest` against two loopback CDN servers, lowest load first.
+async fn manifest_from(
+    first: &'static str,
+    second: &'static str,
+) -> (Result<bool, AuthError>, usize, usize) {
+    let (session, mut cm) = logged_in(9).await;
+    let session = Arc::new(session);
+    let caller = Arc::clone(&session);
+    let (one, one_hits) = http(first);
+    let (two, two_hits) = http(second);
+    let call = tokio::spawn(async move {
+        caller
+            .manifest(100, 1, 5, "public")
+            .await
+            .map(|manifest| manifest.is_some())
+    });
+    let code = cm.recv_past_heartbeats().await;
+    let body = CContentServerDirectoryGetManifestRequestCodeResponse {
+        manifest_request_code: Some(9),
+    }
+    .encode_to_vec();
+    cm.reply(&code, EMsg::SERVICE_METHOD_RESPONSE, &body);
+    let list = cm.recv_past_heartbeats().await;
+    let body = CContentServerDirectoryGetServersForSteamPipeResponse {
+        servers: vec![cdn_entry(one, 1.0), cdn_entry(two, 2.0)],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    cm.reply(&list, EMsg::SERVICE_METHOD_RESPONSE, &body);
+    let result = call.await.unwrap();
+    (
+        result,
+        one_hits.load(Ordering::SeqCst),
+        two_hits.load(Ordering::SeqCst),
+    )
+}
+
+const UNAVAILABLE: &str = "503 Service Unavailable";
+const NOT_FOUND: &str = "404 Not Found";
+const BROKEN: &str = "500 Internal Server Error";
+
+// From the protocol review's `proof_one_503_stops_the_rotation`.
+#[tokio::test]
+async fn one_busy_cdn_server_does_not_end_a_manifest_fetch() {
+    let (result, first_hits, second_hits) = manifest_from(UNAVAILABLE, NOT_FOUND).await;
+    assert_eq!(first_hits, 1);
+    assert_eq!(second_hits, 1);
+    assert!(matches!(result, Ok(false)), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_rate_limit_is_the_answer_only_when_no_server_answered() {
+    let (result, first_hits, second_hits) = manifest_from(UNAVAILABLE, UNAVAILABLE).await;
+    assert_eq!((first_hits, second_hits), (1, 1));
+    assert!(
+        matches!(result, Err(AuthError::RateLimited { .. })),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn one_404_in_the_pool_reads_as_no_longer_served() {
+    let (result, first_hits, second_hits) = manifest_from(BROKEN, NOT_FOUND).await;
+    assert_eq!((first_hits, second_hits), (1, 1));
+    assert!(matches!(result, Ok(false)), "{result:?}");
+}
+
+#[tokio::test]
+async fn every_cdn_server_failing_ends_the_pass_and_names_the_manifest() {
+    let (result, first_hits, second_hits) = manifest_from(BROKEN, BROKEN).await;
+    assert_eq!((first_hits, second_hits), (1, 1));
+    assert!(
+        matches!(&result, Err(AuthError::Connection(message)) if message.contains("manifest 5")),
+        "{result:?}"
+    );
+}
+
+// From the protocol review's
+// `proof_access_denied_on_a_service_call_reads_as_a_refused_login`.
+#[tokio::test]
+async fn a_denied_service_call_is_not_a_refused_login() {
+    let (session, mut cm) = logged_in(9).await;
+    let session = Arc::new(session);
+    let caller = Arc::clone(&session);
+    let call = tokio::spawn(async move { caller.manifest(100, 1, 5, "beta").await.map(drop) });
+    let request = cm.recv_past_heartbeats().await;
+    let sent =
+        CContentServerDirectoryGetManifestRequestCodeRequest::decode(&*request.body).unwrap();
+    assert_eq!(sent.app_branch.as_deref(), Some("beta"));
+    let mut msg = ClientMsg::new(EMsg::SERVICE_METHOD_RESPONSE);
+    msg.header.jobid_target = request.header.jobid_source;
+    msg.header.eresult = Some(15);
+    cm.send(msg.to_bytes());
+
+    let error = call.await.unwrap().unwrap_err();
+    let AuthError::CallDenied { call, .. } = &error else {
+        panic!("{error}");
+    };
+    assert!(call.contains("GetManifestRequestCode"), "{error}");
+    assert!(!error.to_string().contains("login"), "{error}");
+}
+
+#[tokio::test]
+async fn a_denied_depot_key_is_not_a_refused_login() {
+    let (session, mut cm) = logged_in(9).await;
+    let session = Arc::new(session);
+    let caller = Arc::clone(&session);
+    let call = tokio::spawn(async move { caller.depot_key(100, 7).await });
+    let request = cm.recv_past_heartbeats().await;
+    let body = CMsgClientGetDepotDecryptionKeyResponse {
+        eresult: Some(15),
+        depot_id: Some(7),
+        depot_encryption_key: None,
+    }
+    .encode_to_vec();
+    cm.reply(
+        &request,
+        EMsg::CLIENT_GET_DEPOT_DECRYPTION_KEY_RESPONSE,
+        &body,
+    );
+    assert!(matches!(
+        call.await.unwrap(),
+        Err(AuthError::CallDenied { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_denied_logon_is_still_a_refused_login() {
+    let (session, cm) = connect().await;
+    let body = CMsgClientLogonResponse {
+        eresult: Some(15),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    cm.send(ClientMsg::with_body(EMsg::CLIENT_LOG_ON_RESPONSE, &body).to_bytes());
+    assert!(matches!(session.await.unwrap(), Err(AuthError::Refused)));
+}
+
+#[tokio::test]
+async fn the_public_branch_goes_unnamed_in_a_request_code() {
+    let (session, mut cm) = logged_in(9).await;
+    let session = Arc::new(session);
+    let caller = Arc::clone(&session);
+    let call = tokio::spawn(async move { caller.manifest(100, 1, 5, "public").await.map(drop) });
+    let request = cm.recv_past_heartbeats().await;
+    let sent =
+        CContentServerDirectoryGetManifestRequestCodeRequest::decode(&*request.body).unwrap();
+    assert_eq!(sent.app_branch, None);
+    let body = CContentServerDirectoryGetManifestRequestCodeResponse {
+        manifest_request_code: Some(0),
+    }
+    .encode_to_vec();
+    cm.reply(&request, EMsg::SERVICE_METHOD_RESPONSE, &body);
+    assert!(call.await.unwrap().is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_job_ends_its_call_at_once() {
+    let (session, mut cm) = logged_in(9).await;
+    let session = Arc::new(session);
+    let caller = Arc::clone(&session);
+    let call = tokio::spawn(async move { caller.depot_key(100, 7).await });
+    let request = cm.recv_past_heartbeats().await;
+    let started = tokio::time::Instant::now();
+    cm.reply(&request, EMsg(113), &[]);
+    let error = call.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("could not deliver"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(session.heartbeat_interval().is_some());
 }

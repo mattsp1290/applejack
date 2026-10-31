@@ -11,7 +11,7 @@ mod session;
 
 use std::time::Duration;
 
-use steamroom::client::SteamClient;
+use steamroom::client::{Ready, SteamClient};
 use steamroom::connection::{CmServer, Protocol};
 use steamroom::enums::EResultError;
 use steamroom::error::ConnectionError;
@@ -20,6 +20,7 @@ use steamroom_client::login::{
     ApprovedAuth, CredentialsLoginFlow, GuardChallenge, GuardType, LoginBuilder, LoginError,
     MobileChallenge, QrLoginFlow,
 };
+use tokio::time::timeout;
 
 pub use cdn::LiveChunks;
 pub use session::SteamroomSession;
@@ -46,6 +47,12 @@ const CLIENT_OS_WINDOWS_11: u32 = 20;
 
 /// The CM does not report a retry-after; this is a conservative floor.
 const RATE_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// `TcpTransport::connect` and the encryption handshake set no bound.
+const CM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// CM servers to try before giving up.
+const CM_ATTEMPTS: usize = 3;
 
 enum Stage {
     Idle,
@@ -220,25 +227,39 @@ impl SteamConnection for SteamroomConnection {
         let servers = CmServer::fetch()
             .await
             .unwrap_or_else(|_| CmServer::defaults());
-        let server = servers
+        let tcp = servers
             .iter()
-            .find(|server| server.protocol == Protocol::Tcp)
-            .ok_or_else(|| AuthError::Connection("no TCP CM server available".to_owned()))?;
-        let transport = TcpTransport::connect(server)
-            .await
-            .map_err(map_steamroom_error)?;
-        let (client, _rx) = SteamClient::connect(transport)
-            .await
-            .map_err(map_steamroom_error)?;
-        let client = client
-            .encrypt()
-            .await
-            .map_err(map_steamroom_error)?
-            .prepare()
-            .await
-            .map_err(map_steamroom_error)?;
-        SteamroomSession::start(client, account_name, refresh_token).await
+            .filter(|server| server.protocol == Protocol::Tcp);
+        let mut failure = AuthError::Connection("no TCP CM server available".to_owned());
+        for server in tcp.take(CM_ATTEMPTS) {
+            match timeout(CM_CONNECT_TIMEOUT, connect_ready(server)).await {
+                Ok(Ok(client)) => {
+                    return SteamroomSession::start(client, account_name, refresh_token).await;
+                }
+                Ok(Err(error)) => failure = error,
+                Err(_elapsed) => {
+                    failure = AuthError::Connection("timed out connecting to a CM".to_owned());
+                }
+            }
+        }
+        Err(failure)
     }
+}
+
+async fn connect_ready(server: &CmServer) -> Result<SteamClient<Ready>, AuthError> {
+    let transport = TcpTransport::connect(server)
+        .await
+        .map_err(map_steamroom_error)?;
+    let (client, _rx) = SteamClient::connect(transport)
+        .await
+        .map_err(map_steamroom_error)?;
+    client
+        .encrypt()
+        .await
+        .map_err(map_steamroom_error)?
+        .prepare()
+        .await
+        .map_err(map_steamroom_error)
 }
 
 fn guard_factor(kinds: &[GuardType]) -> GuardFactor {
@@ -292,6 +313,18 @@ fn map_eresult(result: EResultError) -> AuthError {
         | EResultError::Revoked
         | EResultError::Banned => AuthError::Refused,
         other => AuthError::Connection(format!("Steam EResult {other}")),
+    }
+}
+
+/// [`map_eresult`] for a call on a logged-in session. The login stands, so an
+/// answer that means "refused" there means "denied this call" here.
+fn map_call_result(call: &str, result: EResultError) -> AuthError {
+    match map_eresult(result) {
+        AuthError::Refused => AuthError::CallDenied {
+            call: call.to_owned(),
+            result: result.to_string(),
+        },
+        other => other,
     }
 }
 

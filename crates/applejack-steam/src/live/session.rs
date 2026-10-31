@@ -45,9 +45,10 @@ use tokio::task::AbortHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use super::cdn::{LiveChunks, ServerEntry, cdn_server, token_query};
-use super::{CLIENT_OS_WINDOWS_11, LOGIN_ID, map_eresult, map_steamroom_error};
+use super::{CLIENT_OS_WINDOWS_11, LOGIN_ID, map_call_result, map_eresult, map_steamroom_error};
 use crate::auth::{AuthError, License};
 use crate::keychain::RefreshToken;
+use crate::library::DEFAULT_BRANCH;
 use crate::session::{AppInfo, SteamSession};
 
 const LOGON_TIMEOUT: Duration = Duration::from_secs(30);
@@ -66,6 +67,9 @@ const MAX_MULTI_DEPTH: usize = 4;
 const SERVERS_METHOD: &str = "ContentServerDirectory.GetServersForSteamPipe#1";
 const REQUEST_CODE_METHOD: &str = "ContentServerDirectory.GetManifestRequestCode#1";
 const CDN_TOKEN_METHOD: &str = "ContentServerDirectory.GetCDNAuthToken#1";
+
+/// Names the job a CM could not deliver. `steamroom` names no constant for it.
+const DEST_JOB_FAILED: EMsg = EMsg(113);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -125,6 +129,7 @@ impl Inner {
     /// Sends a request and returns the waiter its replies arrive on.
     async fn request(
         &self,
+        what: &'static str,
         emsg: EMsg,
         method: Option<&str>,
         body: &[u8],
@@ -138,6 +143,7 @@ impl Inner {
         lock(&self.waiters).insert(job, Waiter { reply, sender });
         let exchange = Exchange {
             inner: self,
+            what,
             job,
             receiver,
         };
@@ -157,9 +163,10 @@ impl Inner {
         Ok(exchange)
     }
 
-    async fn call(&self, method: &str, body: &[u8]) -> Result<Vec<u8>, AuthError> {
+    async fn call(&self, method: &'static str, body: &[u8]) -> Result<Vec<u8>, AuthError> {
         let mut exchange = self
             .request(
+                method,
                 EMsg::SERVICE_METHOD_CALL_FROM_CLIENT,
                 Some(method),
                 body,
@@ -168,7 +175,7 @@ impl Inner {
             .await?;
         let reply = exchange.next().await?;
         if let Some(code) = reply.header.eresult {
-            steamroom::enums::eresult(code).map_err(map_eresult)?;
+            steamroom::enums::eresult(code).map_err(|result| map_call_result(method, result))?;
         }
         Ok(reply.body.to_vec())
     }
@@ -180,6 +187,7 @@ impl Inner {
         let body = request.encode_to_vec();
         let mut exchange = self
             .request(
+                "PICS product info",
                 EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST,
                 None,
                 &body,
@@ -253,6 +261,7 @@ impl Inner {
 /// arrives after a timeout is ignored.
 struct Exchange<'a> {
     inner: &'a Inner,
+    what: &'static str,
     job: u64,
     receiver: mpsc::UnboundedReceiver<IncomingMsg>,
 }
@@ -261,13 +270,14 @@ impl Exchange<'_> {
     async fn next(&mut self) -> Result<IncomingMsg, AuthError> {
         match timeout(REQUEST_TIMEOUT, self.receiver.recv()).await {
             Ok(Some(reply)) => Ok(reply),
-            Ok(None) => Err(self
-                .inner
-                .closed()
-                .unwrap_or_else(|| AuthError::Connection("session closed".to_owned()))),
-            Err(_elapsed) => Err(AuthError::Connection(
-                "timed out waiting for a reply from Steam".to_owned(),
-            )),
+            // Only a close or a failed job drops the sender.
+            Ok(None) => Err(self.inner.closed().unwrap_or_else(|| {
+                AuthError::Connection(format!("the CM could not deliver {}", self.what))
+            })),
+            Err(_elapsed) => Err(AuthError::Connection(format!(
+                "timed out waiting for {} from Steam",
+                self.what
+            ))),
         }
     }
 }
@@ -319,6 +329,12 @@ fn route(inner: &Inner, incoming: IncomingMsg, depth: usize) -> Result<(), AuthE
             Err(AuthError::Connection(format!(
                 "Steam logged the session off (EResult {code})"
             )))
+        }
+        DEST_JOB_FAILED => {
+            if let Some(job) = incoming.header.jobid_target {
+                lock(&inner.waiters).remove(&job);
+            }
+            Ok(())
         }
         emsg => {
             let waiters = lock(&inner.waiters);
@@ -393,6 +409,7 @@ fn parse_packet(data: &[u8]) -> Result<IncomingMsg, AuthError> {
             header: CMsgProtoBufHeader {
                 steamid: Some(header.steam_id),
                 client_sessionid: Some(header.session_id),
+                jobid_target: Some(header.target_job_id),
                 ..CMsgProtoBufHeader::default()
             },
             body,
@@ -407,7 +424,8 @@ fn decode<M: Message + Default>(body: &[u8]) -> Result<M, AuthError> {
 fn decode_license_list(body: &[u8]) -> Result<Vec<License>, AuthError> {
     let list = decode::<CMsgClientLicenseList>(body)?;
     // The proto default for a missing eresult is 2 (Fail).
-    steamroom::enums::eresult(list.eresult.unwrap_or(2)).map_err(map_eresult)?;
+    steamroom::enums::eresult(list.eresult.unwrap_or(2))
+        .map_err(|result| map_call_result("the license list", result))?;
     Ok(list
         .licenses
         .iter()
@@ -623,6 +641,7 @@ impl SteamSession for SteamroomSession {
             let mut exchange = self
                 .inner
                 .request(
+                    "PICS access tokens",
                     EMsg::CLIENT_PICS_ACCESS_TOKEN_REQUEST,
                     None,
                     &body,
@@ -676,6 +695,7 @@ impl SteamSession for SteamroomSession {
         let mut exchange = self
             .inner
             .request(
+                "a depot key",
                 EMsg::CLIENT_GET_DEPOT_DECRYPTION_KEY,
                 None,
                 &body,
@@ -684,7 +704,15 @@ impl SteamSession for SteamroomSession {
             .await?;
         let reply = exchange.next().await?;
         let response = CMsgClientGetDepotDecryptionKeyResponse::decode_checked(&reply.body)
-            .map_err(map_steamroom_error)?;
+            .map_err(|error| match error {
+                steamroom::Error::Connection(ConnectionError::DepotAccessDenied(_)) => {
+                    AuthError::CallDenied {
+                        call: format!("the key for depot {depot_id}"),
+                        result: "access denied".to_owned(),
+                    }
+                }
+                other => map_steamroom_error(other),
+            })?;
         // A key for another depot would pass as a run of corrupt chunks.
         if response.depot_id.is_some_and(|id| id != depot_id) {
             return Err(AuthError::Connection(format!(
@@ -710,7 +738,8 @@ impl SteamSession for SteamroomSession {
             app_id: Some(appid),
             depot_id: Some(depot_id),
             manifest_id: Some(manifest_id),
-            app_branch: Some(branch.to_owned()),
+            // SteamKit sends no branch for `public`.
+            app_branch: (!branch.eq_ignore_ascii_case(DEFAULT_BRANCH)).then(|| branch.to_owned()),
             branch_password_hash: None,
         }
         .encode_to_vec();

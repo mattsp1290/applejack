@@ -1871,6 +1871,29 @@ async fn a_manifest_that_is_gone_after_the_refetch_fails_with_both_ids() {
 }
 
 #[tokio::test]
+async fn a_manifest_steam_lists_and_will_not_serve_is_not_a_changed_one() {
+    let bench = Bench::new();
+    bench
+        .session
+        .app_info
+        .lock()
+        .unwrap()
+        .push_back(vec![product_info(V1, 11)]);
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::ManifestNotServed {
+                appid: APPID,
+                depot_id: DEPOT,
+                manifest_id: V1,
+            }
+        ),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn a_manifest_path_outside_the_install_is_refused() {
     for name in ["..\\..\\escape.txt", "/etc/escape.txt", "a\\..\\..\\b"] {
         let bench = Bench::new();

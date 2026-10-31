@@ -86,6 +86,16 @@ pub enum Error {
         listed: u64,
         current: u64,
     },
+    /// Steam still lists this manifest and will not serve it, which is how a
+    /// request code of 0 reads: the depot is not available to this account.
+    #[error(
+        "app {appid} depot {depot_id}: Steam lists manifest {manifest_id} but will not serve it"
+    )]
+    ManifestNotServed {
+        appid: u32,
+        depot_id: u32,
+        manifest_id: u64,
+    },
     /// A stopped run wrote into a depot the plan no longer selects, so
     /// finishing without it would leave mixed files under a good `.acf`.
     #[error(

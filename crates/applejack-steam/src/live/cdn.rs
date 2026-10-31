@@ -45,35 +45,44 @@ const SERVICE_UNAVAILABLE: u16 = 503;
 #[derive(Debug, Clone)]
 pub(super) struct ServerEntry {
     server: CdnServer,
+    /// `host` as listed, which names the server to `GetCDNAuthToken`.
+    token_host: String,
     allowed_appids: Vec<u32>,
 }
 
 /// `CdnServer` is `#[non_exhaustive]` and only `SteamClient<LoggedIn>` builds
 /// one, so this goes through its `serde` form.
+///
+/// This follows `SteamKit`, not `get_cdn_servers`: requests go to `vhost`, over
+/// HTTPS only when it is mandatory, because a listed `host` may not resolve
+/// publicly or carry a certificate for itself. `host` is for the token alone.
 pub(super) fn cdn_server(info: &CContentServerDirectoryServerInfo) -> Option<ServerEntry> {
     let kind = info.r#type.as_deref()?;
     if kind != "SteamCache" && kind != "CDN" {
         return None;
     }
     let listed = info.host.as_deref()?;
-    let https = matches!(
-        info.https_support.as_deref(),
-        Some("mandatory" | "optional")
-    );
+    let https = info.https_support.as_deref() == Some("mandatory");
     let default_port = if https { 443 } else { 80 };
-    let (host, port) = match listed.rsplit_once(':') {
+    let connect = info
+        .vhost
+        .as_deref()
+        .filter(|vhost| !vhost.is_empty())
+        .unwrap_or(listed);
+    let (host, port) = match connect.rsplit_once(':') {
         Some((host, port)) => (host, port.parse().unwrap_or(default_port)),
-        None => (listed, default_port),
+        None => (connect, default_port),
     };
     let server = serde_json::from_value(json!({
         "host": host,
         "port": port,
         "https": https,
-        "vhost": info.vhost.clone().unwrap_or_default(),
+        "vhost": host,
     }))
     .ok()?;
     Some(ServerEntry {
         server,
+        token_host: listed.to_owned(),
         allowed_appids: info.allowed_app_ids.clone(),
     })
 }
@@ -95,14 +104,15 @@ pub(super) fn without_url(error: SteamError) -> SteamError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CachedToken {
     value: String,
     fetched_at: Instant,
 }
 
 /// What to do after a 403.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 enum OnForbidden {
     /// Another task already replaced the token that failed.
     RetryWith(String),
@@ -127,6 +137,8 @@ pub struct LiveChunks {
     appid: u32,
     cdn: CdnClient,
     pool: CdnServerPool,
+    /// `CdnServer::host` to [`ServerEntry::token_host`].
+    token_hosts: HashMap<String, String>,
     tokens: Mutex<HashMap<(u32, String), CachedToken>>,
 }
 
@@ -144,12 +156,11 @@ impl LiveChunks {
         appid: u32,
         servers: &[ServerEntry],
     ) -> Result<Self, AuthError> {
-        let usable: Vec<CdnServer> = servers
+        let usable: Vec<&ServerEntry> = servers
             .iter()
             .filter(|entry| {
                 entry.allowed_appids.is_empty() || entry.allowed_appids.contains(&appid)
             })
-            .map(|entry| entry.server.clone())
             .collect();
         if usable.is_empty() {
             return Err(AuthError::Connection(format!(
@@ -162,9 +173,19 @@ impl LiveChunks {
             cdn: CdnClient::new().map_err(|error| {
                 AuthError::Connection(format!("CDN client: {}", without_url(error)))
             })?,
-            pool: CdnServerPool::new(usable),
+            token_hosts: usable
+                .iter()
+                .map(|entry| (entry.server.host.clone(), entry.token_host.clone()))
+                .collect(),
+            pool: CdnServerPool::new(usable.iter().map(|e| e.server.clone()).collect()),
             tokens: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn token_host<'s>(&'s self, server: &'s CdnServer) -> &'s str {
+        self.token_hosts
+            .get(&server.host)
+            .map_or(&server.host, String::as_str)
     }
 
     fn cached_token(&self, depot_id: u32, host: &str) -> Option<CachedToken> {
@@ -187,9 +208,8 @@ impl LiveChunks {
         F: Fn(Option<String>) -> Fut + Send,
         Fut: Future<Output = Result<Bytes, SteamError>> + Send,
     {
-        let used = self
-            .cached_token(depot_id, &server.host)
-            .map(|token| token.value);
+        let host = self.token_host(server);
+        let used = self.cached_token(depot_id, host).map(|token| token.value);
         let outcome = bounded(fetch(used.clone())).await;
         let is_forbidden = matches!(
             &outcome,
@@ -198,23 +218,19 @@ impl LiveChunks {
         if !is_forbidden {
             return outcome;
         }
-        let cached = self.cached_token(depot_id, &server.host);
+        let cached = self.cached_token(depot_id, host);
         let token = match on_forbidden(used.as_deref(), cached.as_ref()) {
             OnForbidden::RetryWith(token) => token,
             OnForbidden::GiveUp => return outcome,
             OnForbidden::Refresh => {
-                let Ok(token) = self
-                    .inner
-                    .cdn_auth_token(self.appid, depot_id, &server.host)
-                    .await
-                else {
+                let Ok(token) = self.inner.cdn_auth_token(self.appid, depot_id, host).await else {
                     return outcome;
                 };
                 self.tokens
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .insert(
-                        (depot_id, server.host.clone()),
+                        (depot_id, host.to_owned()),
                         CachedToken {
                             value: token.clone(),
                             fetched_at: Instant::now(),
@@ -226,15 +242,19 @@ impl LiveChunks {
         bounded(fetch(Some(token))).await
     }
 
-    /// Fetches and parses a manifest, rotating through the pool. `Ok(None)`
-    /// when every server answered 404.
+    /// Fetches and parses a manifest, one pass over the pool. One cache's 503
+    /// says nothing about the others, so a rate limit is the answer only when
+    /// no server had the manifest. `Ok(None)` when a server answered 404 and
+    /// none served it: a dead host must not keep the plan from re-reading the
+    /// product info.
     pub(super) async fn manifest(
         &self,
         depot_id: u32,
         manifest_id: u64,
         request_code: u64,
     ) -> Result<Option<DepotManifest>, AuthError> {
-        let mut not_found = 0;
+        let mut not_found = false;
+        let mut limited = None;
         let mut last_error = None;
         for _ in 0..self.pool.len() {
             let (server, wait) = self.pool.pick();
@@ -266,12 +286,12 @@ impl LiveChunks {
                             retry_after,
                         } => {
                             match status.as_u16() {
-                                NOT_FOUND => not_found += 1,
+                                NOT_FOUND => not_found = true,
                                 TOO_MANY_REQUESTS | SERVICE_UNAVAILABLE => {
-                                    return Err(AuthError::RateLimited {
-                                        retry_after: retry_after
+                                    limited = Some(
+                                        retry_after
                                             .map_or(RATE_LIMIT_RETRY_AFTER, Duration::from_secs),
-                                    });
+                                    );
                                 }
                                 _ => {}
                             }
@@ -284,8 +304,11 @@ impl LiveChunks {
                 }
             }
         }
-        if not_found == self.pool.len() {
+        if not_found {
             return Ok(None);
+        }
+        if let Some(retry_after) = limited {
+            return Err(AuthError::RateLimited { retry_after });
         }
         Err(AuthError::Connection(format!(
             "no CDN server returned depot {depot_id} manifest {manifest_id}: {}",
@@ -415,18 +438,27 @@ mod tests {
                 https_support: Some(https.to_owned()),
                 ..Default::default()
             };
-        let cdn = cdn_server(&info("CDN", Some("cdn.fixture:8080"), "unavailable")).unwrap();
+        let cdn = cdn_server(&info("CDN", Some("internal.valve.fixture"), "unavailable")).unwrap();
         assert_eq!(cdn.server.host, "cdn.fixture");
-        assert_eq!(cdn.server.port, 8080);
+        assert_eq!(cdn.server.port, 80);
         assert!(!cdn.server.https);
-        assert_eq!(
-            cdn_server(&info("SteamCache", Some("cache.fixture"), "mandatory"))
-                .unwrap()
-                .server
-                .port,
-            443
-        );
+        assert_eq!(cdn.token_host, "internal.valve.fixture");
+        let mandatory = cdn_server(&info("SteamCache", Some("cache.fixture"), "mandatory"));
+        let mandatory = mandatory.unwrap().server;
+        assert!(mandatory.https);
+        assert_eq!(mandatory.port, 443);
+        let optional = cdn_server(&info("CDN", Some("x"), "optional"))
+            .unwrap()
+            .server;
+        assert!(!optional.https);
+        assert_eq!(optional.port, 80);
         assert!(cdn_server(&info("OpenCache", Some("x"), "optional")).is_none());
         assert!(cdn_server(&info("CDN", None, "optional")).is_none());
+
+        let bare = CContentServerDirectoryServerInfo {
+            vhost: Some(String::new()),
+            ..info("CDN", Some("host.fixture"), "unavailable")
+        };
+        assert_eq!(cdn_server(&bare).unwrap().server.host, "host.fixture");
     }
 }

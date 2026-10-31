@@ -60,7 +60,9 @@ the only implementations that open a socket.
   the token, so the host persists it next to its other metadata (the `meta`
   table in work package 6). `AuthError::NoStoredToken` means the user must
   log in; `AuthError::Refused` means the token was rejected and the CLI
-  exits 3.
+  exits 3. Only a login answers `Refused`. A call denied on a healthy session
+  is `AuthError::CallDenied { call, result }`, and sending that user back to
+  log in would not help.
 - **Logout.** `logout()` deletes the Keychain item. Clearing cached library
   rows is the host's job.
 
@@ -106,9 +108,16 @@ them. The CM does not report a retry-after, so the value is a fixed 60 s floor.
   `CdnClient` with a 120 s bound per request. It replaces
   `steamroom_client::download::CdnChunkFetcher` because a CDN auth token sits
   in the URL and `reqwest::Error` prints the URL, so HTTP errors leave through
-  `without_url`; and because a token is per depot and host, requested the
-  when a host answers 403, whether it never had one or its token expired, and
-  at most once in 30 s per depot and host.
+  `without_url`; and because a token is per depot and host, requested when a
+  host answers 403, whether it never had one or its token expired, and at most
+  once in 30 s per depot and host. Server entries follow `SteamKit` rather than
+  `steamroom`'s `get_cdn_servers`: requests go to `vhost`, over HTTPS only when
+  `https_support` is `mandatory`, on port 443 or 80, and the listed `host` is
+  used only to name the server to `GetCDNAuthToken`. A manifest fetch makes one
+  pass over the pool: a 429 or 503 cools that server and moves on, and the rate
+  limit is the answer only if no server had the manifest. A 404 from any server
+  with none serving it reads as no longer served. The pool's cooldown is the
+  only wait, and nothing loops.
 
 ## Library
 
@@ -224,7 +233,9 @@ a manifest trimmed to the files that still need writing.
 - **Errors.** A manifest Steam no longer serves triggers one re-read of the
   product info, which moves every depot and the build id to the new build so
   the install is never mixed; if a manifest still cannot be fetched, the run
-  fails with `ManifestChanged` carrying both ids. Rate limits from the CM or
+  fails with `ManifestChanged` carrying both ids, or with `ManifestNotServed`
+  when the fresh read names the same id, which is also how a request code of 0
+  ends. Rate limits from the CM or
   the CDN are `AuthError::RateLimited`; `DepotJob` retries a failed chunk fetch
   a bounded number of times and nothing here loops. `DiskFull` keeps the
   partial state; run the install again after freeing space.
@@ -543,28 +554,10 @@ never prints the token.
   accepted the logon but answered `CMsgClientLicenseList` with a non-OK
   `eresult`. Red for the decode path; record the EResult in the table.
 - `refresh logon ok` followed by `timed out waiting for CLIENT_LICENSE_LIST`:
-  **not red**. This is the known MULTI-drain behaviour of
-  `SteamClient<Ready>::login` (`steamroom-0.3.0/src/client/mod.rs:286-350`):
-  it returns on the first `CLIENT_LOG_ON_RESPONSE`, discards every other
-  message in the same `MULTI`, and the `Receiver` from `SteamClient::connect`
-  is dead on arrival (`mod.rs:97-118`). The CM normally sends the logon
-  response as its own packet and the license list in a later `MULTI`, which
-  `license_list` unpacks, but that is server behaviour, not a contract.
-  Fallback order:
-  1. For the spike: a hand-rolled logon on `SteamClient<Ready>` with
-     `send_msg(ClientMsg::with_body(EMsg::CLIENT_LOGON, ..))` and a
-     `recv_msg` loop that unpacks `MULTI` and captures both
-     `CLIENT_LOG_ON_RESPONSE` (check `CMsgClientLogonResponse.eresult`, read
-     `steamid`/`client_sessionid` from the header) and `CLIENT_LICENSE_LIST`.
-     That proves the decode and keeps the Rust path green. Its limit: it never
-     yields `SteamClient<LoggedIn>`, so `pics_get_*` (all on `LoggedIn`,
-     `mod.rs:578-731`) are unavailable on that connection.
-  2. The durable fix is upstream: a `login` variant that returns the drained
-     sibling messages (or a receive buffer in `ClientInner`), applied through
-     `[patch.crates-io]` on a fork. A second connection per run is the only
-     alternative and doubles Steam Guard and rate-limit exposure.
-  3. `steam-vent` becomes relevant only if the hand-rolled loop also never
-     sees `CLIENT_LICENSE_LIST`.
+  red. It meant something else when this spike used `SteamClient<Ready>::login`,
+  which discards the other messages in the logon `MULTI`. `live/session.rs` now
+  owns the receive side and routes them, so the list was either never sent or
+  not decoded.
 
 Record the outcome here:
 
@@ -592,7 +585,7 @@ real ones are listed in the unit report's DEVIATIONS.
 | Steam Guard submit | `SteamClient<Ready>::submit_steam_guard_code` | `steamroom-0.3.0/src/client/mod.rs:499` |
 | (wrapper used) | `GuardChallenge::submit_code`, `MobileChallenge::wait_for_confirmation` | `steamroom-client-0.3.0/src/login/credentials.rs:167,207` |
 | tokens after approval | `ApprovedAuth::tokens` → `steamroom::auth::AuthTokens { access_token, refresh_token, account_name }` | `steamroom-client-0.3.0/src/login/terminal.rs:83`, `steamroom-0.3.0/src/auth/mod.rs:23` (line 22 is its `#[non_exhaustive]`) |
-| refresh-token logon | `SteamClient<Ready>::login(ClientMsg)` with `CMsgClientLogon { account_name, access_token, obfuscated_private_ip, .. }` | `steamroom-0.3.0/src/client/mod.rs:286`; proto `steammessages_clientserver_login.proto` (`account_name`=50, `access_token`=108, `obfuscated_private_ip`=11) |
+| refresh-token logon | `SteamClient<Ready>::send_msg` with `CMsgClientLogon { account_name, access_token, obfuscated_private_ip, .. }`, the reply routed by the session's receive loop (`login` drops `MULTI` siblings) | `steamroom-0.3.0/src/client/mod.rs:362`; proto `steammessages_clientserver_login.proto` (`account_name`=50, `access_token`=108, `obfuscated_private_ip`=11) |
 | (reference) | `TokenLogin::login` builds the same message without a logon id and without `supports_rate_limit_response`, both of which applejack adds | `steamroom-client-0.3.0/src/login/terminal.rs:55` |
 | logon response | `CMsgClientLogonResponse { eresult, heartbeat_seconds, .. }` from the `IncomingMsg` that `login` returns; `SteamClient<LoggedIn>::send_heartbeat` | proto `steammessages_clientserver_login.proto:97`; `steamroom-0.3.0/src/client/mod.rs:289,537` |
 | license-list result | `CMsgClientLicenseList.eresult` (`optional int32`, default 2) checked through `steamroom::enums::eresult` | `steamroom-0.3.0/proto/steam/steammessages_clientserver.proto:188`; `src/enums/mod.rs:79` |

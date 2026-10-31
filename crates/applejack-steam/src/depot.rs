@@ -797,14 +797,23 @@ impl<S: SteamSession> Run<'_, '_, S> {
             match self.resolve_pass(installed).await? {
                 Ok(work) => return Ok(work),
                 Err(depot) if self.refreshed => {
-                    return Err(Error::ManifestChanged {
-                        appid: self.plan.appid,
-                        depot_id: depot.depot_id,
-                        listed: listed
-                            .get(&depot.depot_id)
-                            .copied()
-                            .unwrap_or(depot.manifest_id),
-                        current: depot.manifest_id,
+                    let appid = self.plan.appid;
+                    let depot_id = depot.depot_id;
+                    let current = depot.manifest_id;
+                    let listed = listed.get(&depot_id).copied().unwrap_or(current);
+                    return Err(if listed == current {
+                        Error::ManifestNotServed {
+                            appid,
+                            depot_id,
+                            manifest_id: current,
+                        }
+                    } else {
+                        Error::ManifestChanged {
+                            appid,
+                            depot_id,
+                            listed,
+                            current,
+                        }
                     });
                 }
                 Err(_) => self.refresh().await?,
