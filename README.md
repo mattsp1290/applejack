@@ -39,9 +39,9 @@ identities.
 ## Verification
 
 `cargo xtask check` runs `cargo fmt --all --check`, Clippy with `-D warnings`
-and the workspace lints, `cargo test --workspace`, the unsigned-install tests
-of `applejack-core` under `--release`, rustdoc with
-`RUSTDOCFLAGS=-D warnings`, `cargo xtask manifest-verify` on
+and the workspace lints, `cargo test --workspace`, the library tests of
+`applejack-core` under `--release`, which hold the unsigned-install refusal,
+rustdoc with `RUSTDOCFLAGS=-D warnings`, `cargo xtask manifest-verify` on
 `engines/manifest.toml`, then the Swift package build and tests with
 `APPLEJACK_CORE_BIN` pointing at the freshly built core binary. It stops at
 the first failure. CI runs the same

@@ -60,21 +60,10 @@ const CHECK_STEPS: &[Step] = &[
     },
     Step {
         // `cargo test` above is a debug build, which is the one build that
-        // honors the unsigned-install variable.
-        name: "release-unsigned",
-        command: |root| {
-            cargo(
-                root,
-                [
-                    "test",
-                    "-p",
-                    "applejack-core",
-                    "--release",
-                    "--lib",
-                    "unsigned",
-                ],
-            )
-        },
+        // honors the unsigned-install variable. No name filter: `cargo test`
+        // passes when a filter matches nothing, so a rename would empty it.
+        name: "release-lib",
+        command: |root| cargo(root, ["test", "-p", "applejack-core", "--release", "--lib"]),
         precondition: None,
     },
     Step {
