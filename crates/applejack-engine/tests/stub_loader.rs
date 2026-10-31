@@ -24,8 +24,9 @@ use common::{fake_installed, layout, rosetta, version};
 /// The stub loader. `$1` is the Wine command (`wineboot`, `reg`, or the
 /// executable). It appends to `<bundle>/calls.log`, dumps its environment
 /// to `<bundle>/env-<name>.txt`, writes its pid to `<bundle>/pid-<name>`,
-/// obeys `<bundle>/mode-<name>` (`fail` or `hang`), and for `wineboot`
-/// creates the directories a real boot would.
+/// obeys `<bundle>/mode-<name>` (`fail`, `hang`, or `complain`: exit 0 with
+/// the line `reg import` prints for a key it cannot import), and for
+/// `wineboot` creates the directories a real boot would.
 const WINE: &str = r#"#!/bin/sh
 D=$(cd "$(dirname "$0")/../.." && pwd)
 name=$(basename "$1")
@@ -36,6 +37,7 @@ mode=$(cat "$D/mode-$name" 2>/dev/null)
 case "$mode" in
   fail) echo "stub: $name failed" >&2; exit 3 ;;
   hang) exec sleep 100007 ;;
+  complain) echo "reg: Unable to import the registry key 'HKXX\\Bad'"; exit 0 ;;
 esac
 if [ "$name" = wineboot ]; then
   mkdir -p "$WINEPREFIX/dosdevices" "$WINEPREFIX/drive_c/windows/system32" "$WINEPREFIX/drive_c/windows/syswow64"
@@ -187,12 +189,13 @@ fn wineboot_past_its_bound_is_killed_and_the_prefix_removed() {
     let Error::WineCommandFailed { status, log, .. } = &err else {
         panic!("{err:?}")
     };
-    assert_eq!(status, "timed out after 1s");
+    assert!(status.starts_with("timed out after 1s (pid "), "{status}");
     assert!(log.is_file() && log.starts_with(dir.path().join("logs")));
     assert!(!prefix_dir.exists(), "prefix removed");
-    assert!(
-        calls(&engine).contains("wineserver -k "),
-        "{}",
+    assert_eq!(
+        calls(&engine).matches("wineserver -k ").count(),
+        1,
+        "the server is killed once, by the failed create:\n{}",
         calls(&engine)
     );
     let pid = fs::read_to_string(engine.root.join("pid-wineboot")).unwrap();
@@ -248,18 +251,34 @@ fn failed_seed_import_keeps_the_record_naming_the_dlls_on_disk() {
         ],
         "the record names what is on disk, not what the seed step reached"
     );
+    // The registry-backed settings were never seeded, so the record (and
+    // `open_prefix`) keep saying what the registry holds (review of
+    // 8b5bfd9).
+    assert_eq!(record.hidraw, HidrawMode::Enabled);
+    assert_eq!(record.sync_mode, SyncMode::Esync);
+    let reopened = RosettaWine.open_prefix(&prefix_dir).unwrap();
+    assert_eq!(reopened.hidraw, HidrawMode::Enabled);
+    assert_eq!(reopened.sync_mode, SyncMode::Esync);
+    assert_eq!(reopened.backend, GraphicsBackend::Vkd3dProton);
+    assert!(
+        calls(&engine).contains("wineserver -k "),
+        "a failed seed stops the prefix's server:\n{}",
+        calls(&engine)
+    );
 
     fs::remove_file(engine.root.join("mode-reg")).unwrap();
     let restored = RosettaWine
         .apply_overrides(
             &engine,
-            &RosettaWine.open_prefix(&prefix_dir).unwrap(),
+            &reopened,
             GraphicsBackend::Dxmt,
-            SyncMode::Esync,
-            HidrawMode::Enabled,
+            SyncMode::None,
+            HidrawMode::Disabled,
         )
         .unwrap();
     assert_eq!(restored.backend, GraphicsBackend::Dxmt);
+    assert_eq!(restored.hidraw, HidrawMode::Disabled);
+    assert_eq!(restored.sync_mode, SyncMode::None);
     assert_eq!(
         listing(&system32),
         ["d3d10core.dll", "d3d11.dll", "dxgi.dll"],
@@ -267,6 +286,71 @@ fn failed_seed_import_keeps_the_record_naming_the_dlls_on_disk() {
     );
     assert_eq!(listing(&syswow64), ["d3d11.dll"]);
     assert_eq!(RosettaWine.open_prefix(&prefix_dir).unwrap(), restored);
+}
+
+/// From the process-and-prefix review of 8b5bfd9: `reg import` exits 0 for
+/// a well-formed file holding a key it cannot import and only prints
+/// `reg: Unable to import the registry key '...'`; that line fails the
+/// seed, and only the current run's part of the log is read.
+#[test]
+fn a_reg_import_that_reports_a_key_failure_fails_the_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = stub_engine(dir.path());
+    let prefix_dir = dir.path().join("prefix");
+    let prefix = RosettaWine
+        .create_prefix(
+            &engine,
+            &prefix_dir,
+            &spec(dir.path(), GraphicsBackend::Dxmt),
+        )
+        .unwrap();
+
+    fs::write(engine.root.join("mode-reg"), "complain").unwrap();
+    let err = RosettaWine
+        .apply_overrides(
+            &engine,
+            &prefix,
+            GraphicsBackend::Vkd3dProton,
+            SyncMode::None,
+            HidrawMode::Disabled,
+        )
+        .unwrap_err();
+    let Error::WineCommandFailed {
+        command,
+        status,
+        log,
+    } = &err
+    else {
+        panic!("{err:?}")
+    };
+    assert!(command.ends_with(" reg import seeds.reg"), "{command}");
+    assert_eq!(status, "reg: Unable to import the registry key 'HKXX\\Bad'");
+    assert_eq!(log, &prefix_dir.join("applejack/reg-import.log"));
+    assert!(err.to_string().contains("Unable to import"), "{err}");
+    let record = PrefixRecord::read(&prefix_dir).unwrap();
+    assert_eq!(record.backend, GraphicsBackend::Vkd3dProton);
+    assert_eq!(record.hidraw, HidrawMode::Enabled);
+    assert_eq!(record.sync_mode, SyncMode::Esync);
+
+    // The line stays in the log; the next apply reads only its own run.
+    fs::remove_file(engine.root.join("mode-reg")).unwrap();
+    let applied = RosettaWine
+        .apply_overrides(
+            &engine,
+            &RosettaWine.open_prefix(&prefix_dir).unwrap(),
+            GraphicsBackend::Vkd3dProton,
+            SyncMode::None,
+            HidrawMode::Disabled,
+        )
+        .unwrap();
+    assert!(
+        fs::read_to_string(log)
+            .unwrap()
+            .contains("Unable to import")
+    );
+    assert_eq!(applied.hidraw, HidrawMode::Disabled);
+    assert_eq!(applied.sync_mode, SyncMode::None);
+    assert_eq!(RosettaWine.open_prefix(&prefix_dir).unwrap(), applied);
 }
 
 /// From the process-and-prefix review of 4719a27: a game extra must not

@@ -5,7 +5,9 @@ mod common;
 use std::fs;
 use std::time::SystemTime;
 
-use applejack_engine::bundle::{self, ArchiveSource, BundleToml, Capabilities, InstallRequest};
+use applejack_engine::bundle::{
+    self, ArchiveSource, BundleToml, Capabilities, InstallRequest, split_registry_value,
+};
 use applejack_engine::{Arch, Error, GraphicsBackend, InstalledEngine, Progress, SyncMode};
 use common::{
     BUNDLE_TOML, fake_installed, fixture_archive, install_local, layout, rosetta, version,
@@ -118,6 +120,71 @@ fn validation_rejects_parent_component() {
 fn validation_rejects_unknown_field() {
     let error = validate_variant("[registry]", "[registry]\nfoo = 1").unwrap_err();
     assert!(matches!(error, Error::Toml(_)), "{error}");
+}
+
+/// From the process-and-prefix review of 8b5bfd9: `reg import` applies a
+/// well-formed file with an unknown root as a silent no-op, so the root of
+/// `hidraw_key` is checked with the bundle.
+#[test]
+fn validation_rejects_a_hidraw_key_without_a_known_root() {
+    let error = validate_variant("\"HKLM\\\\System", "\"HKXX\\\\System").unwrap_err();
+    assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
+    assert!(
+        error.to_string().contains("registry.hidraw_key")
+            && error.to_string().contains("HKXX")
+            && error.to_string().contains("HKCC"),
+        "{error}"
+    );
+    let error = validate_variant(
+        "\"HKLM\\\\System\\\\CurrentControlSet\\\\Services\\\\winebus\\\\Parameters\\\\DisableHidraw\"",
+        "\"HKLM\\\\DisableHidraw\"",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("registry.hidraw_key"), "{error}");
+
+    let bundle = validate_variant("\"HKLM\\\\System", "\"HKEY_LOCAL_MACHINE\\\\System").unwrap();
+    assert_eq!(
+        bundle.registry.unwrap().hidraw_value(),
+        Some((
+            "HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\winebus\\Parameters"
+                .to_owned(),
+            "DisableHidraw"
+        ))
+    );
+    let fixture = validate_variant("", "").unwrap();
+    assert_eq!(
+        fixture.registry.unwrap().hidraw_value().map(|(key, _)| key),
+        Some(
+            "HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\winebus\\Parameters"
+                .to_owned()
+        )
+    );
+
+    assert_eq!(
+        split_registry_value("hkcu\\Software\\Wine\\Value"),
+        Some(("HKEY_CURRENT_USER\\Software\\Wine".to_owned(), "Value"))
+    );
+    for (short, long) in bundle::REGISTRY_ROOTS {
+        assert_eq!(
+            split_registry_value(&format!("{short}\\Key\\Value")),
+            Some((format!("{long}\\Key"), "Value"))
+        );
+        assert_eq!(
+            split_registry_value(&format!("{long}\\Key\\Value")),
+            Some((format!("{long}\\Key"), "Value"))
+        );
+    }
+    for bad in [
+        "HKXX\\System\\Foo\\DisableHidraw",
+        "HKLM\\DisableHidraw",
+        "HKLM\\\\DisableHidraw",
+        "HKLM\\System\\",
+        "HKLM\\\\Key\\Value",
+        "DisableHidraw",
+        "",
+    ] {
+        assert_eq!(split_registry_value(bad), None, "{bad:?}");
+    }
 }
 
 #[test]

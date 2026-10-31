@@ -5,15 +5,15 @@
 //! `reg-import.log`.
 
 use std::fmt::Write as _;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bundle::DllOverrides;
+use crate::bundle::{DllOverrides, Registry};
 use crate::{
     BundleToml, EngineId, Error, GraphicsBackend, HidrawMode, InstalledEngine, Prefix, PrefixSpec,
     Result, SyncMode, Version,
@@ -125,18 +125,22 @@ impl PrefixRecord {
             .map_err(|error| invalid(format!("`{}` does not parse: {error}", path.display())))
     }
 
-    /// Writes the record.
+    /// Writes the record through `prefix.toml.tmp` and a rename, so a
+    /// reader sees either the previous record or this one, never a
+    /// truncated file.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`].
+    /// Returns [`Error::Io`]; the previous record is then still in place.
     pub fn write(&self, prefix_dir: &Path) -> Result<()> {
         let dir = prefix_dir.join(STATE_DIR);
         fs::create_dir_all(&dir).map_err(|error| Error::io(&dir, error))?;
         let path = dir.join(RECORD_FILE);
+        let staging = dir.join(format!("{RECORD_FILE}.tmp"));
         let text =
             toml::to_string(self).map_err(|error| Error::io(&path, io::Error::other(error)))?;
-        fs::write(&path, text).map_err(|error| Error::io(&path, error))
+        fs::write(&staging, text).map_err(|error| Error::io(&staging, error))?;
+        fs::rename(&staging, &path).map_err(|error| Error::io(&path, error))
     }
 
     /// The [`Prefix`] the record describes.
@@ -244,7 +248,8 @@ fn all_stems(bundle: &BundleToml) -> Vec<String> {
 /// Renders the `REGEDIT4` file `reg import` loads: the crash dialog off,
 /// `HKCU\Software\Wine\DllOverrides` set to `native,builtin` for the
 /// backend's DLLs and deleted for every other backend's, and the HID toggle
-/// at the bundle's `hidraw_key` (its last component is the value name).
+/// at the bundle's `hidraw_key` (its last component is the value name; the
+/// key is validated with the bundle, see `Registry::hidraw_value`).
 #[must_use]
 pub fn render_registry_seeds(
     bundle: &BundleToml,
@@ -262,11 +267,7 @@ pub fn render_registry_seeds(
             let _ = writeln!(out, "\"{stem}\"=-");
         }
     }
-    if let Some((key, value)) = bundle
-        .registry
-        .as_ref()
-        .and_then(|registry| split_registry_value(&registry.hidraw_key))
-    {
+    if let Some((key, value)) = bundle.registry.as_ref().and_then(Registry::hidraw_value) {
         let disabled = match hidraw {
             HidrawMode::Enabled => 0,
             HidrawMode::Disabled => 1,
@@ -274,27 +275,6 @@ pub fn render_registry_seeds(
         let _ = write!(out, "\n[{key}]\n\"{value}\"=dword:{disabled:08x}\n");
     }
     out
-}
-
-/// Splits `HKLM\Path\To\Key\Value` into the full key name and the value
-/// name, expanding the root abbreviation.
-fn split_registry_value(spec: &str) -> Option<(String, &str)> {
-    let (key, value) = spec.rsplit_once('\\')?;
-    let (root, rest) = key.split_once('\\').unwrap_or((key, ""));
-    let root = match root.to_ascii_uppercase().as_str() {
-        "HKLM" => "HKEY_LOCAL_MACHINE",
-        "HKCU" => "HKEY_CURRENT_USER",
-        "HKCR" => "HKEY_CLASSES_ROOT",
-        "HKU" => "HKEY_USERS",
-        "HKCC" => "HKEY_CURRENT_CONFIG",
-        _ => root,
-    };
-    let key = if rest.is_empty() {
-        root.to_owned()
-    } else {
-        format!("{root}\\{rest}")
-    };
-    Some((key, value))
 }
 
 /// The backend's DLLs as `(source in the bundle, destination relative to
@@ -358,7 +338,8 @@ fn swap_overrides(
 }
 
 /// Creates the prefix. See [`PREFIX_STEPS`] for the order. When any step
-/// fails the prefix's server is stopped, the directory is removed (or, when
+/// fails the prefix's server is stopped (once, here: the steps themselves
+/// only kill their own loader process), the directory is removed (or, when
 /// the caller supplied an existing empty directory, emptied), and
 /// `wineboot`'s log under `<spec.log_dir>/<session>/` survives.
 pub(crate) fn create(
@@ -408,7 +389,6 @@ fn build(
     let log = log_dir.join(WINEBOOT_LOG);
     run_loader(
         installed,
-        prefix_dir,
         &["wineboot", "--init"],
         &env,
         prefix_dir,
@@ -443,7 +423,11 @@ fn build(
 
 /// Re-applies overrides to an existing prefix of this engine. The record
 /// is rewritten as the DLLs change and before the registry is seeded, so a
-/// failed import leaves a record that still names every DLL on disk.
+/// failed import leaves a record that still names every DLL on disk; the
+/// registry-backed settings (`hidraw`, `sync_mode`) keep their previous
+/// values in it until the seed has landed, so the record never claims a
+/// setting the registry does not hold. A failed seed also stops the
+/// prefix's server, so nothing of the apply outlives the call.
 pub(crate) fn apply(
     installed: &InstalledEngine,
     prefix: &Prefix,
@@ -466,14 +450,14 @@ pub(crate) fn apply(
         engine: installed.id,
         engine_version: installed.version.clone(),
         backend,
-        sync_mode,
-        hidraw,
+        sync_mode: previous.sync_mode,
+        hidraw: previous.hidraw,
         copied_dlls: Vec::new(),
     };
     swap_overrides(installed, &prefix.dir, &mut record, &previous.copied_dlls)?;
     let session = new_session_id("apply");
     let state_dir = prefix.dir.join(STATE_DIR);
-    seed_registry(
+    let seeded = seed_registry(
         installed,
         &prefix.dir,
         backend,
@@ -481,15 +465,36 @@ pub(crate) fn apply(
         sync_mode,
         &session,
         &state_dir,
-    )?;
+    );
+    if let Err(error) = seeded {
+        let _ = kill_prefix_server(installed, &prefix.dir, &state_dir.join(IMPORT_LOG));
+        return Err(error);
+    }
+    record.sync_mode = sync_mode;
+    record.hidraw = hidraw;
+    record.write(&prefix.dir)?;
     Ok(record.to_prefix(&prefix.dir))
+}
+
+/// The first line of `reg import`'s output that reports a failure. `reg`
+/// exits 1 for a missing or malformed file (where `regedit /S` exits 0),
+/// but exits 0 for a well-formed file holding a key it cannot import and
+/// only prints `reg: Unable to import the registry key '...'`, so the
+/// output of each import is checked for such a line as well.
+#[must_use]
+pub fn reg_error_line(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .map(str::trim_end)
+        .find(|line| line.starts_with("reg: "))
 }
 
 /// Writes `seeds.reg` into `work_dir` and imports it with `reg import`
 /// from that directory (a relative file name needs no path translation),
-/// logging to `work_dir/reg-import.log`. `reg import` exits 1 for a
-/// missing or malformed file where `regedit /S` exits 0, so a failed seed
-/// is reported.
+/// logging to `work_dir/reg-import.log`. The import fails when `reg` exits
+/// non-zero or when this run's part of the log holds a line
+/// [`reg_error_line`] recognises; the error carries that line as the
+/// status.
 fn seed_registry(
     installed: &InstalledEngine,
     prefix_dir: &Path,
@@ -509,16 +514,40 @@ fn seed_registry(
     let rows = engine_rows(installed, prefix_dir, session, backend, sync_mode, false);
     let (env, _dropped) = assemble_env(installed, prefix_dir, &[], &rows)?;
     let log = work_dir.join(IMPORT_LOG);
+    // The log is appended to across applies; only this run's part counts.
+    let start = fs::metadata(&log).map_or(0, |meta| meta.len());
     run_loader(
         installed,
-        prefix_dir,
         &["reg", "import", SEEDS_FILE],
         &env,
         work_dir,
         &log,
         SERVER_WAIT,
     )?;
-    wait_for_server(installed, prefix_dir, &log, SERVER_WAIT)
+    wait_for_server(installed, prefix_dir, &log, SERVER_WAIT)?;
+    let output = read_from(&log, start)?;
+    if let Some(line) = reg_error_line(&output) {
+        return Err(Error::WineCommandFailed {
+            command: format!(
+                "{} reg import {SEEDS_FILE}",
+                installed.root.join(&installed.bundle.wine.loader).display()
+            ),
+            status: line.to_owned(),
+            log,
+        });
+    }
+    Ok(())
+}
+
+/// `log` from byte `start` on, lossily decoded.
+fn read_from(log: &Path, start: u64) -> Result<String> {
+    let mut file = File::open(log).map_err(|error| Error::io(log, error))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| Error::io(log, error))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| Error::io(log, error))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The library directory must exist and be absolute: a relative target

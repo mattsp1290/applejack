@@ -82,7 +82,7 @@ and may not contain `..`; absolute paths are rejected.
 | `[overrides.dxmt] x86_64`, `i386`; same for `[overrides.vkd3d]` and `[overrides.d3dmetal]` | lists of paths | DLLs a backend copies into the prefix and overrides, per Windows architecture (rules below) |
 | `[d3dmetal] overlay_dir` | path | where the user-supplied payload goes, relative to the `<version>.user/` overlay root; required when `[overrides.d3dmetal]` lists any DLL |
 | `[probes] cpuid`, `dx11_sample`, `xinput_check` | path | diagnostic executables in the bundle |
-| `[registry] hidraw_key` | string | the `winebus.sys` key that toggles raw HID access in the pinned Wine |
+| `[registry] hidraw_key` | string | the `winebus.sys` value that toggles raw HID access in the pinned Wine, as `<root>\<key>\...\<value>`; validation requires the root to be `HKLM`, `HKCU`, `HKCR`, `HKU`, `HKCC` or its long form and at least one key component before the value name, because `reg import` applies a well-formed file with an unknown root as a silent no-op |
 | `[entitlements]` | table of executable path to list of strings | code-signing entitlements each executable needs |
 
 The entitlements table is written as a table with quoted keys, one per
@@ -299,13 +299,14 @@ steps of `rosetta_wine::prefix::PREFIX_STEPS`, in this order:
 
 | Step | What happens |
 | --- | --- |
-| `wineboot` | `<loader> wineboot --init` with the environment below, cwd the prefix, stdout and stderr to `<spec.log_dir>/<session>/wineboot.log`, bounded by `spec.boot_timeout` (default `WINEBOOT_TIMEOUT`, 300 s: on expiry the loader is killed and reaped, the server killed with `-k`, and the step fails); then `<server> -w`, bounded by `SERVER_WAIT` (180 s), after which the server is killed with `-k` and the step fails |
+| `wineboot` | `<loader> wineboot --init` with the environment below, cwd the prefix, stdout and stderr to `<spec.log_dir>/<session>/wineboot.log`, bounded by `spec.boot_timeout` (default `WINEBOOT_TIMEOUT`, 300 s: on expiry the loader is killed and reaped and the step fails with `timed out after Ns (pid P killed)`); then `<server> -w`, bounded by `SERVER_WAIT` (180 s), after which the step fails the same way. The failure path below stops the server, once |
 | `dll-overrides` | the backend's DLLs from `[overrides.<backend>]` copied into `drive_c/windows/system32` (`x86_64` list) and `drive_c/windows/syswow64` (`i386` list). The record is written before the copy, naming the old and the new files, and again after it, naming the new ones, so whatever fails next the record names every DLL on disk |
-| `registry-seeds` | a `REGEDIT4` file imported with `<loader> reg import seeds.reg` from the directory holding it (a relative file name needs no path translation), bounded by `SERVER_WAIT`, then `<server> -w`: `HKCU\Software\Wine\WineDbg\ShowCrashDialog = 0`, `HKCU\Software\Wine\DllOverrides\<dll> = "native,builtin"` for the backend's DLLs and the value deleted (`=-`) for every other backend's, and the HID toggle at the bundle's `[registry] hidraw_key` (the last path component is the value name; `HKLM`/`HKCU` are expanded): `DisableHidraw = 1` for `hidraw = disabled`, `0` for `enabled`. `reg import` rather than `regedit /S` because `regedit /S` exits 0 for a missing or malformed file while `reg import` exits 1 (checked on the real payload) |
+| `registry-seeds` | a `REGEDIT4` file imported with `<loader> reg import seeds.reg` from the directory holding it (a relative file name needs no path translation), bounded by `SERVER_WAIT`, then `<server> -w`: `HKCU\Software\Wine\WineDbg\ShowCrashDialog = 0`, `HKCU\Software\Wine\DllOverrides\<dll> = "native,builtin"` for the backend's DLLs and the value deleted (`=-`) for every other backend's, and the HID toggle at the bundle's `[registry] hidraw_key` (the last path component is the value name; the root is expanded to its long form): `DisableHidraw = 1` for `hidraw = disabled`, `0` for `enabled`. `reg import` rather than `regedit /S` because `regedit /S` exits 0 for a missing or malformed file while `reg import` exits 1; but `reg import` exits 0 for a well-formed file holding a key it cannot import (an unknown root) and only prints `reg: Unable to import the registry key '...'`, so this run's part of `reg-import.log` is read back afterwards and a line starting `reg: ` fails the step with that line as the status (both checked on the real payload) |
 | `library-drive` | `dosdevices/s:` symlinked to `spec.library_dir` when set |
 
-A failure in any step stops the prefix's server (`-k` first: once the
-directory is gone the server cannot be reached by prefix), removes the
+A failure in any step stops the prefix's server once (`-k` first: once the
+directory is gone the server cannot be reached by prefix; the steps
+themselves only kill their own loader process on a timeout), removes the
 prefix directory (or empties it, when the caller supplied an existing empty
 directory), and returns the error with the log path
 (`Error::WineCommandFailed { command, status, log }`); the `wineboot.log`
@@ -319,8 +320,10 @@ the timeout. Prefix creation is a session like a launch:
 The engine's own state in a prefix lives under `<prefix>/applejack/`:
 `prefix.toml` (`PrefixRecord`: engine, engine version, backend, sync mode,
 hidraw, the copied DLL paths; unknown fields are kept so an older engine can
-open a prefix a newer one annotated), the last `seeds.reg`, and the
-`reg-import.log` of the last `apply_overrides`. `RosettaWine::open_prefix(dir)`
+open a prefix a newer one annotated; written through `prefix.toml.tmp` and a
+rename, so a reader sees the previous record or the new one and never a
+truncated file), the last `seeds.reg`, and the `reg-import.log` the applies
+append to. `RosettaWine::open_prefix(dir)`
 reads the record back into a `Prefix`; a record naming another engine is
 refused. `apply_overrides(installed, prefix, backend, sync_mode, hidraw)`
 re-runs the `dll-overrides` and `registry-seeds` steps (removing the
@@ -329,7 +332,10 @@ previously copied DLLs first, so a switch from DXMT to vkd3d-proton leaves no
 before the registry is seeded: a failed `reg import` leaves the new backend's
 DLLs on disk and a record that names them, so the next apply removes them
 (before this fix a stale `d3d12.dll` survived a switch back to DXMT for
-good). It never re-runs `wineboot`. Wine runs its own prefix update when a
+good). The record's `hidraw` and `sync_mode` keep their previous values
+until the seed has landed, so after a failed import `open_prefix` still
+reports what the registry holds, and a failed seed stops the prefix's
+server. It never re-runs `wineboot`. Wine runs its own prefix update when a
 newer Wine opens an older prefix; taking a snapshot before that (the plan's
 "snapshot before an engine-version change") is the core's call, through the
 snapshot API below, since the engine does not know the snapshot root.
@@ -399,9 +405,10 @@ The `Session` owns the child handle and offers:
   bounded by `KILL_WAIT` (30 s; `-k` escalates to `SIGKILL` on its own after
   about ten seconds, so a longer wait means a server started again in the
   meantime), then the loader is reaped: it exits on its own once the server
-  is gone and is killed after five seconds otherwise. Returns once the
-  server and every process of the prefix are gone, or with an error naming
-  the wait.
+  is gone and is killed after five seconds otherwise, also when the server
+  wait failed. Returns once the server and every process of the prefix are
+  gone, or with an error naming the wait; either way no process of the
+  call outlives it.
 - `processes()`: same-uid processes carrying the session id (below).
 - `wineserver_alive()`: whether a server listens for the prefix.
 
@@ -422,12 +429,15 @@ crate would be out of scope. `rosetta_wine::process::find_session(id)`
 refreshes every process's user, exe, cmd, and environ through it, keeps the
 ones owned by the current uid (`rustix::process::getuid`) whose environment
 holds the exact `APPLEJACK_SESSION=<id>` entry, and reports
-`Process { pid, exe, session_id }`. `exe` is the last argv entry naming a
-`.exe`, reduced to its file name (`steam.exe`, `steamwebhelper.exe`, the
-game); Wine rewrites argv in place so argv[0] is the Windows executable, and
-`KERN_PROCARGS2` reads the live argument area, so `ps` and this agree. The
-matching is `match_record`, unit-tested over a captured record.
-`ps -E` remains the debugging fallback.
+`Process { pid, exe, session_id }`. `exe` is argv[0]'s file name when it
+names a `.exe` other than `start.exe` (Wine rewrites argv in place so
+argv[0] is the process's own image, and `KERN_PROCARGS2` reads the live
+argument area, so `ps` and this agree: `launcher.exe --run patcher.exe` is
+`launcher.exe`), else the last argv entry naming a `.exe` (the Unix form
+`wine Z:\g\game.exe` before the rewrite, and `start.exe /exec title.exe`,
+whose process is about to become `title.exe`), else argv[0]. The matching
+is `match_record`, unit-tested over a captured record. `ps -E` remains the
+debugging fallback.
 
 Wine rewrites each Windows process's argv in place: the Windows command
 line, then an empty slot the kernel's argument count still covers, then the
@@ -437,8 +447,14 @@ game, `steamwebhelper.exe`, `explorer.exe`, `services.exe`) it reports the
 first environment entry as the last `cmd` entry and leaves it out of
 `environ`; `std::process::Command` sorts the environment, and
 `APPLEJACK_SESSION` sorts first among the allowlisted names, so that entry
-is the session variable. `match_record` accepts the exact entry in either
-place and cuts argv at it before deriving `exe`. The loader process itself
+is the session variable. `match_record` accepts the exact entry in
+`environ` or as the last `APPLEJACK_SESSION=` entry of `cmd` (the fold
+always follows the Windows arguments, so an earlier such entry is an
+argument the program was given, and a literal of another session's id in a
+game's argv does not attribute the process) and cuts argv at it before
+deriving `exe`. A same-uid process outside Wine whose own arguments carry
+the entry (`pgrep -f APPLEJACK_SESSION=<id>`) is reported; nothing in the
+record tells it apart. The loader process itself
 (`session.pid`) keeps its Unix argv for the first moments, until Wine
 rewrites it too (to the title's Windows command line, or to
 `start.exe /exec <exe>` when Wine routes the launch through `start.exe`),
@@ -452,10 +468,18 @@ as it runs, including through later sessions in the same prefix.
 
 `wineserver_alive(prefix_dir)` derives the server's socket as Wine does,
 `/tmp/.wine-<uid>/server-<dev>-<inode>/socket` with the prefix directory's
-device and inode in hex, and connects to it: a connect succeeds only while
-the server is alive, so a stale socket left by a killed server reads as not
-alive, and the server drops the unused connection. A prefix directory that
-no longer exists reads as not alive.
+device and inode in hex (`server_socket_in(base, prefix_dir)` takes the
+base in place of `/tmp`, for tests), and connects to it: a connect succeeds
+only while the server is alive, so a stale socket left by a killed server
+reads as not alive, and the server drops the unused connection. A prefix
+directory that no longer exists reads as not alive. Wine creates
+`/tmp/.wine-<uid>` and each server directory itself, with mode 0700, and
+refuses to start (`wineserver: ... must not be accessible by other users`)
+when either has group or other bits; the engine never creates them, and
+the tests that stand a socket up there create the directories 0700 and
+remove what they created. A host where something else made
+`/tmp/.wine-<uid>` with another mode is repaired with
+`chmod 700 /tmp/.wine-$(id -u)`.
 
 ## D3DMetal overlay import
 
@@ -514,7 +538,12 @@ D3DMetal is never committed, downloaded, or published.
   Wine keys the server socket on the inode, so a running session would keep
   writing its registry into the unlinked directory and the next launch
   would start a second server. Cancel the session first. `create` is a
-  read-only clone and stays allowed.
+  read-only clone and stays allowed; taken while a server runs it is
+  file-consistent, not registry-consistent: Wine writes each registry file
+  through a temporary file and a rename, so the clone holds whole files,
+  but `system.reg` and `user.reg` may come from different saves. The check
+  is a point in time, not a lock: a launch between it and the rename is
+  not prevented, which is why the core serializes prefix operations.
 - `prune(snapshots_root, name, keep)` removes all but the newest `keep`;
   `DEFAULT_KEEP` is 3.
 

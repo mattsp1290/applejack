@@ -5,7 +5,8 @@
 mod common;
 
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, DirBuilder};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
@@ -18,8 +19,8 @@ use applejack_engine::rosetta_wine::prefix::{
     render_registry_seeds,
 };
 use applejack_engine::rosetta_wine::process::{
-    Process, ProcessRecord, SESSION_VARIABLE, executable_name, match_record, server_socket,
-    wineserver_alive,
+    Process, ProcessRecord, SERVER_BASE, SESSION_VARIABLE, executable_name, match_record,
+    server_socket, server_socket_in, wineserver_alive, wineserver_alive_in,
 };
 use applejack_engine::rosetta_wine::{CpuidFeatures, CpuidProbe, cpuid, d3dmetal, snapshot};
 use applejack_engine::{
@@ -236,6 +237,38 @@ fn prefix_record_round_trips_and_open_prefix_reads_it() {
         RosettaWine.open_prefix(dir.path()).unwrap_err(),
         Error::InvalidPrefix { .. }
     ));
+
+    // The write goes through `prefix.toml.tmp` and a rename: a stray
+    // staging file is ignored by `read` and replaced by the next write, and
+    // a write that cannot complete (the state directory made read-only
+    // stands in for an interruption before the rename) leaves the previous
+    // record in place.
+    let state = prefix_dir.join(STATE_DIR);
+    let staging = state.join("prefix.toml.tmp");
+    fs::write(&staging, "not toml").unwrap();
+    assert_eq!(PrefixRecord::read(&prefix_dir).unwrap(), record);
+    record.write(&prefix_dir).unwrap();
+    assert!(!staging.exists(), "the staging file is renamed into place");
+    let changed = PrefixRecord {
+        hidraw: HidrawMode::Enabled,
+        ..record.clone()
+    };
+    if !rustix::process::getuid().is_root() {
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+        let err = changed.write(&prefix_dir).unwrap_err();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(&err, Error::Io { path, .. } if *path == staging),
+            "{err:?}"
+        );
+        assert_eq!(
+            PrefixRecord::read(&prefix_dir).unwrap(),
+            record,
+            "the previous record survives an interrupted write"
+        );
+    }
+    changed.write(&prefix_dir).unwrap();
+    assert_eq!(PrefixRecord::read(&prefix_dir).unwrap(), changed);
     fs::write(
         prefix_dir.join(STATE_DIR).join("prefix.toml"),
         "engine = \"native-arm64\"\nengine_version = \"1\"\nbackend = \"dxmt\"\nsync_mode = \"none\"\nhidraw = \"enabled\"\n",
@@ -598,10 +631,38 @@ fn process_discovery_accepts_the_session_entry_wine_folds_into_argv() {
         match_record(&captured_record(&cmd, &environ), id, 501),
         None
     );
+
+    // Only the last `APPLEJACK_SESSION=` entry of argv is the fold (review
+    // of 8b5bfd9: `cmd /c ... & rem APPLEJACK_SESSION=<other>` was reported
+    // under the other id). A literal of this id among another session's
+    // arguments does not attribute that process; a literal among this
+    // session's own arguments is an argument and stays in argv.
+    let cmd = os(&[
+        "C:\\windows\\system32\\cmd.exe",
+        "/c",
+        "rem",
+        &folded,
+        "APPLEJACK_SESSION=launch-other",
+    ]);
+    let environ = os(&["PATH=/usr/bin"]);
+    assert_eq!(
+        match_record(&captured_record(&cmd, &environ), id, 501),
+        None,
+        "a literal of this id in another session's argv"
+    );
+    assert_eq!(
+        match_record(&captured_record(&cmd, &environ), "launch-other", 501).map(|p| p.exe),
+        Some("cmd.exe".to_owned())
+    );
+    let cmd = os(&["Z:\\games\\Game.exe", "--session", &folded, &folded]);
+    assert_eq!(
+        match_record(&captured_record(&cmd, &environ), id, 501).map(|p| p.exe),
+        Some("Game.exe".to_owned())
+    );
 }
 
 #[test]
-fn executable_name_prefers_the_last_exe_in_argv() {
+fn executable_name_is_argv0_when_it_names_an_exe_else_the_last_exe() {
     assert_eq!(
         executable_name(
             &os(&["C:\\Program Files\\Steam\\steam.exe", "-applaunch", "10"]),
@@ -612,6 +673,34 @@ fn executable_name_prefers_the_last_exe_in_argv() {
     assert_eq!(
         executable_name(&os(&["steamwebhelper.exe", "--type=renderer"]), None),
         "steamwebhelper.exe"
+    );
+    // After Wine's rewrite argv[0] is the process's own image, so an exe
+    // given as an argument is not the name (review of 8b5bfd9).
+    assert_eq!(
+        executable_name(
+            &os(&["Z:\\g\\launcher.exe", "--run", "C:\\g\\patcher.exe"]),
+            None
+        ),
+        "launcher.exe"
+    );
+    // `start.exe` is about to become the exe it was given.
+    assert_eq!(
+        executable_name(
+            &os(&[
+                "C:\\windows\\system32\\start.exe",
+                "/exec",
+                "Z:\\g\\title.exe"
+            ]),
+            None
+        ),
+        "title.exe"
+    );
+    assert_eq!(
+        executable_name(
+            &os(&["/payload/wine/bin/wine", "start", "/exec", "C:/g/title.exe"]),
+            None
+        ),
+        "title.exe"
     );
     assert_eq!(
         executable_name(&os(&["/payload/wine/bin/wine", "/games/Game.EXE"]), None),
@@ -759,8 +848,136 @@ fn snapshot_names_are_validated_and_same_second_suffixes_sort() {
     assert_eq!(snapshot::list(&root, "steam").unwrap(), [first, second]);
 }
 
-/// A listener on the socket path Wine would use for the prefix stands in
-/// for a running `wineserver`.
+/// A listener at the socket path Wine would use for `prefix` under `base`,
+/// standing in for a running `wineserver`. The directories are created the
+/// way Wine creates them (mode 0700; Wine refuses to start when
+/// `/tmp/.wine-<uid>` or the server directory has group or other bits) and
+/// whatever was created is removed on drop, so a panic leaves nothing
+/// behind and the real `/tmp/.wine-<uid>` is made only when it did not
+/// exist, as Wine would have made it.
+struct StubServer {
+    socket: PathBuf,
+    /// Directories this stub created, deepest first.
+    created: Vec<PathBuf>,
+    listener: Option<UnixListener>,
+}
+
+impl StubServer {
+    fn bind(base: &Path, prefix: &Path) -> Self {
+        let socket = server_socket_in(base, prefix).unwrap();
+        let server_dir = socket.parent().unwrap();
+        let mut created = Vec::new();
+        let mut dir = server_dir;
+        while !dir.exists() {
+            created.push(dir.to_path_buf());
+            dir = dir.parent().unwrap();
+        }
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(server_dir)
+            .unwrap();
+        for dir in &created {
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} is created 0700, as Wine insists",
+                dir.display()
+            );
+        }
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        Self {
+            socket,
+            created,
+            listener: Some(listener),
+        }
+    }
+
+    /// Stops listening but leaves the socket file, as a killed server does.
+    fn stop(&mut self) {
+        self.listener = None;
+    }
+}
+
+impl Drop for StubServer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket);
+        for dir in &self.created {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+fn mode_of(path: &Path) -> Option<u32> {
+    fs::metadata(path)
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o777)
+}
+
+/// The socket formula and the liveness check against a base directory of
+/// the test's own, so Wine's real `/tmp/.wine-<uid>` is not touched here.
+#[test]
+fn wineserver_liveness_follows_the_socket_under_a_base_directory() {
+    // A Unix socket path is limited to 104 bytes on macOS and `$TMPDIR`
+    // alone takes about fifty, so the base lives directly under `/tmp`.
+    let base = tempfile::Builder::new()
+        .prefix("aj")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("prefix");
+    fs::create_dir_all(&prefix).unwrap();
+    let meta = fs::metadata(&prefix).unwrap();
+    let socket = server_socket_in(base.path(), &prefix).unwrap();
+    assert_eq!(
+        socket,
+        base.path().join(format!(
+            ".wine-{}/server-{:x}-{:x}/socket",
+            rustix::process::getuid().as_raw(),
+            meta.dev(),
+            meta.ino()
+        ))
+    );
+    assert_eq!(
+        server_socket(&prefix)
+            .unwrap()
+            .strip_prefix(SERVER_BASE)
+            .unwrap(),
+        socket.strip_prefix(base.path()).unwrap(),
+        "the real socket is the same path under {SERVER_BASE}"
+    );
+    assert!(!wineserver_alive_in(base.path(), &prefix).unwrap());
+
+    let mut stub = StubServer::bind(base.path(), &prefix);
+    let server_dir = socket.parent().unwrap().to_path_buf();
+    assert_eq!(
+        stub.created,
+        [
+            server_dir.clone(),
+            server_dir.parent().unwrap().to_path_buf()
+        ],
+        "both levels were created, each 0700"
+    );
+    assert!(wineserver_alive_in(base.path(), &prefix).unwrap());
+    stub.stop();
+    assert!(socket.exists());
+    assert!(
+        !wineserver_alive_in(base.path(), &prefix).unwrap(),
+        "a stale socket reads as dead"
+    );
+    drop(stub);
+    assert!(
+        !server_dir.exists() && !server_dir.parent().unwrap().exists(),
+        "the stub removed what it created"
+    );
+    fs::remove_dir_all(&prefix).unwrap();
+    assert!(!wineserver_alive_in(base.path(), &prefix).unwrap());
+}
+
+/// `restore` and `reset` consult Wine's real base directory, so the stand-in
+/// server lives there, through the guard: 0700 like Wine's own, removed
+/// afterwards, and `/tmp/.wine-<uid>` left exactly as it was found.
 #[test]
 fn snapshot_restore_and_reset_refuse_a_prefix_with_a_live_wineserver() {
     let dir = tempfile::tempdir().unwrap();
@@ -771,10 +988,13 @@ fn snapshot_restore_and_reset_refuse_a_prefix_with_a_live_wineserver() {
     let snap = snapshot::create(&prefix, &root, "steam").unwrap();
     fs::write(prefix.join("system.reg"), "v2").unwrap();
 
-    let socket = server_socket(&prefix).unwrap();
-    fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    let _ = fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket).unwrap();
+    let wine_base =
+        Path::new(SERVER_BASE).join(format!(".wine-{}", rustix::process::getuid().as_raw()));
+    let base_before = mode_of(&wine_base);
+    let mut stub = StubServer::bind(Path::new(SERVER_BASE), &prefix);
+    let socket = stub.socket.clone();
+    let server_dir = socket.parent().unwrap().to_path_buf();
+    assert_eq!(mode_of(&server_dir), Some(0o700));
     assert!(wineserver_alive(&prefix).unwrap());
 
     let refused = snapshot::restore(&prefix, &root, "steam", &snap.timestamp).unwrap_err();
@@ -800,13 +1020,19 @@ fn snapshot_restore_and_reset_refuse_a_prefix_with_a_live_wineserver() {
 
     // A stale socket file (the server is gone) reads as dead, and the
     // operations go through.
-    drop(listener);
+    stub.stop();
     assert!(socket.exists());
     assert!(!wineserver_alive(&prefix).unwrap());
     snapshot::restore(&prefix, &root, "steam", &snap.timestamp).unwrap();
     assert_eq!(fs::read_to_string(prefix.join("system.reg")).unwrap(), "v1");
-    let _ = fs::remove_file(&socket);
-    let _ = fs::remove_dir(socket.parent().unwrap());
+    drop(stub);
+    assert!(!server_dir.exists(), "the stub's server directory is gone");
+    assert_eq!(
+        mode_of(&wine_base),
+        base_before,
+        "{} is as the test found it (absent, or with its mode unchanged)",
+        wine_base.display()
+    );
 
     // A prefix directory that no longer exists has no server.
     fs::remove_dir_all(&prefix).unwrap();
@@ -938,7 +1164,7 @@ fn d3dmetal_import_names_the_missing_readme_or_payload() {
         matches!(
             &error,
             Error::D3DMetalSource { reason, .. }
-                if reason.contains("names `lib/external` instead") && reason.contains("README.md")
+                if reason.contains("mentions `lib/external`") && reason.contains("README.md")
         ),
         "{error}"
     );
@@ -946,6 +1172,13 @@ fn d3dmetal_import_names_the_missing_readme_or_payload() {
         d3dmetal::named_payload_location("payload under redist/lib/external/."),
         None,
         "the expected location is not another location"
+    );
+    assert_eq!(
+        d3dmetal::named_payload_location(
+            "copy `redist/lib/external/D3DMetal.framework` and `redist/lib/external/libd3dshared.dylib`"
+        ),
+        None,
+        "files listed under the expected directory are not another location"
     );
     assert_eq!(
         d3dmetal::named_payload_location("see (redist64/lib/external), then"),

@@ -108,7 +108,12 @@ pub fn import(
                         readme.display()
                     )
                 },
-                |location| format!("`{}` names `{location}` instead", readme.display()),
+                |location| {
+                    format!(
+                        "`{}` mentions `{location}`, which may be where this version keeps it",
+                        readme.display()
+                    )
+                },
             );
             return Err(Error::D3DMetalSource {
                 path: payload.join(entry),
@@ -176,8 +181,10 @@ pub fn gptk_version(readme: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// A path in the README that names a `lib/external` location other than
-/// [`PAYLOAD_DIR`], when the README says the payload moved.
+/// A `lib/external` path in the README outside [`PAYLOAD_DIR`], as a hint
+/// that the payload moved. A file listed under the expected directory is
+/// not another location, and the README cannot say whether a path is the
+/// volume's or the Wine-side destination, so callers word it as a hint.
 #[must_use]
 pub fn named_payload_location(readme: &str) -> Option<&str> {
     readme
@@ -189,5 +196,5 @@ pub fn named_payload_location(readme: &str) -> Option<&str> {
                 })
                 .trim_end_matches(['/', '.'])
         })
-        .find(|token| token.contains("lib/external") && *token != PAYLOAD_DIR)
+        .find(|token| token.contains("lib/external") && !token.starts_with(PAYLOAD_DIR))
 }

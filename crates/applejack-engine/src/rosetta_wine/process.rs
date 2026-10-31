@@ -17,8 +17,10 @@
 //! from `environ`. `std::process::Command` sorts the environment it passes,
 //! and `APPLEJACK_SESSION` sorts first among the allowlisted names, so that
 //! entry is exactly the session variable. [`match_record`] therefore accepts
-//! the exact `NAME=value` entry in either place and cuts argv at it before
-//! deriving the executable name.
+//! the exact `NAME=value` entry in `environ` or as the last
+//! `APPLEJACK_SESSION=` entry of `cmd` (the fold always follows the Windows
+//! arguments, so an earlier one is an argument the program was given) and
+//! cuts argv at it before deriving the executable name.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -108,9 +110,13 @@ pub fn find_session(session_id: &str) -> Vec<Process> {
 
 /// The [`Process`] for `record` when it is owned by `uid` and carries the
 /// exact `APPLEJACK_SESSION=<session_id>` entry, in `environ` or (after
-/// Wine's argv rewrite, see the module doc) among the trailing `cmd`
-/// entries; `None` otherwise. Entries from the session variable on are not
-/// arguments and take no part in the executable name.
+/// Wine's argv rewrite, see the module doc) as the last `APPLEJACK_SESSION=`
+/// entry of `cmd`; `None` otherwise. Entries from that one on are not
+/// arguments and take no part in the executable name. A process of another
+/// session that was given this id as a literal argument is not matched: its
+/// own folded entry comes last. A same-uid process outside Wine that names
+/// the entry in its own arguments (`pgrep -f APPLEJACK_SESSION=<id>`) is,
+/// since nothing else tells it apart.
 #[must_use]
 pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> Option<Process> {
     if record.uid != Some(uid) {
@@ -121,7 +127,15 @@ pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> O
     wanted.push(b'=');
     wanted.extend_from_slice(session_id.as_bytes());
     let is_session = |entry: &OsString| entry.as_bytes() == wanted.as_slice();
-    let folded = record.cmd.iter().position(is_session);
+    let folded = record
+        .cmd
+        .iter()
+        .rposition(|entry| {
+            entry
+                .as_bytes()
+                .starts_with(&wanted[..=SESSION_VARIABLE.len()])
+        })
+        .filter(|&at| is_session(&record.cmd[at]));
     if folded.is_none() && !record.environ.iter().any(is_session) {
         return None;
     }
@@ -133,19 +147,24 @@ pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> O
     })
 }
 
-/// The last argv entry that names a `.exe`, reduced to its file name (Wine
-/// accepts both `\` and `/` separators); else argv\[0\]'s file name; else
-/// the exec path's file name.
+/// The Windows executable's file name (Wine accepts both `\` and `/`
+/// separators): argv\[0\] when it names a `.exe` other than `start.exe`
+/// (after Wine's rewrite argv\[0\] is the process's own image, so
+/// `launcher.exe --run patcher.exe` is `launcher.exe`); else the last argv
+/// entry naming a `.exe` (`wine Z:\g\game.exe` before the rewrite, and
+/// `start.exe /exec title.exe`, which is about to become `title.exe`); else
+/// argv\[0\]'s file name; else the exec path's file name.
 #[must_use]
 pub fn executable_name(cmd: &[OsString], exe: Option<&Path>) -> String {
     let is_exe = |arg: &OsString| {
         let bytes = arg.as_bytes();
         bytes.len() > 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe")
     };
-    let chosen = cmd
-        .iter()
-        .rev()
-        .find(|arg| is_exe(arg))
+    let own_image = cmd
+        .first()
+        .filter(|arg| is_exe(arg) && !windows_file_name(arg).eq_ignore_ascii_case("start.exe"));
+    let chosen = own_image
+        .or_else(|| cmd.iter().rev().find(|arg| is_exe(arg)))
         .or_else(|| cmd.first())
         .map(|arg| windows_file_name(arg.as_os_str()))
         .or_else(|| {
@@ -164,18 +183,36 @@ fn windows_file_name(arg: &OsStr) -> String {
     String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
+/// Where Wine keeps its server directories: `<SERVER_BASE>/.wine-<uid>/`.
+/// Wine hard-codes `/tmp`, creates both that directory and each
+/// `server-<dev>-<inode>` below it with mode 0700, and refuses to start
+/// when either is accessible to the group or others. The engine never
+/// creates them; a host where something else made `/tmp/.wine-<uid>` with
+/// another mode is repaired with `chmod 700 /tmp/.wine-$(id -u)`.
+pub const SERVER_BASE: &str = "/tmp";
+
 /// Where the `wineserver` for `prefix_dir` listens:
-/// `/tmp/.wine-<uid>/server-<dev>-<inode>/socket`, with the prefix
-/// directory's device and inode in hex, as Wine derives it.
+/// [`SERVER_BASE`]`/.wine-<uid>/server-<dev>-<inode>/socket`, with the
+/// prefix directory's device and inode in hex, as Wine derives it.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Io`] when the prefix directory cannot be stat'ed.
 pub fn server_socket(prefix_dir: &Path) -> Result<PathBuf> {
+    server_socket_in(Path::new(SERVER_BASE), prefix_dir)
+}
+
+/// [`server_socket`] with `base` in place of [`SERVER_BASE`], so a test
+/// can stand a listener up under a directory of its own instead of Wine's.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the prefix directory cannot be stat'ed.
+pub fn server_socket_in(base: &Path, prefix_dir: &Path) -> Result<PathBuf> {
     let meta = fs::metadata(prefix_dir).map_err(|error| Error::io(prefix_dir, error))?;
     let uid = rustix::process::getuid().as_raw();
-    Ok(PathBuf::from(format!(
-        "/tmp/.wine-{uid}/server-{:x}-{:x}/socket",
+    Ok(base.join(format!(
+        ".wine-{uid}/server-{:x}-{:x}/socket",
         meta.dev(),
         meta.ino()
     )))
@@ -193,7 +230,18 @@ pub fn server_socket(prefix_dir: &Path) -> Result<PathBuf> {
 /// Returns [`Error::Io`] when the prefix directory exists but cannot be
 /// stat'ed.
 pub fn wineserver_alive(prefix_dir: &Path) -> Result<bool> {
-    let socket = match server_socket(prefix_dir) {
+    wineserver_alive_in(Path::new(SERVER_BASE), prefix_dir)
+}
+
+/// [`wineserver_alive`] against the socket under `base` (see
+/// [`server_socket_in`]).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the prefix directory exists but cannot be
+/// stat'ed.
+pub fn wineserver_alive_in(base: &Path, prefix_dir: &Path) -> Result<bool> {
+    let socket = match server_socket_in(base, prefix_dir) {
         Ok(socket) => socket,
         Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
             return Ok(false);

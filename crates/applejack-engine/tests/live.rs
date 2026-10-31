@@ -5,17 +5,21 @@
 //!
 //! `dx11-sample.exe` creates a Metal device and a window, which needs a
 //! logged-in GUI session: from a context without display access it exits
-//! with `D3D11CreateDeviceAndSwapChain failed: 0x80004005`. Set
-//! `APPLEJACK_LIVE_HEADLESS=1` to have that reported rather than fail the
-//! test; process discovery then runs over `cmd /c ping` instead.
+//! with `dx11-sample: D3D11CreateDeviceAndSwapChain failed: 0x80004005`.
+//! Set `APPLEJACK_LIVE_HEADLESS=1` to have exactly that early exit (the
+//! session log carries [`HEADLESS_EXCUSE`]) reported rather than fail the
+//! test; process discovery then runs over `cmd /c ping` instead. Any other
+//! early exit (a missing executable, a DLL that does not load, a crash)
+//! fails the test with or without the flag.
 
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Output};
 use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::launch::{MONO_GECKO_OVERRIDE, child_path};
+use applejack_engine::rosetta_wine::prefix::reg_error_line;
 use applejack_engine::rosetta_wine::{Process, snapshot};
 use applejack_engine::{
     BundleToml, Engine, EngineId, Error, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec,
@@ -29,6 +33,10 @@ fn enabled() -> bool {
 fn headless() -> bool {
     std::env::var_os("APPLEJACK_LIVE_HEADLESS").is_some_and(|value| value == "1")
 }
+
+/// What `dx11-sample` prints (`dx11-sample: %s failed: 0x%08lx`) when it
+/// cannot create a device; the one early exit the headless flag excuses.
+const HEADLESS_EXCUSE: &str = "D3D11CreateDeviceAndSwapChain failed";
 
 const FIXTURE_PAYLOAD: &str = "fixtures/payloads/rosetta-wine-11.0";
 
@@ -147,8 +155,8 @@ fn setup(backend: GraphicsBackend) -> Live {
 }
 
 /// `<loader> args` in `cwd` with the engine's `PATH`, the prefix, and the
-/// Mono/Gecko override, as a plain status check outside `launch`.
-fn loader_status(live: &Live, args: &[&str], cwd: &Path) -> ExitStatus {
+/// Mono/Gecko override, as a plain run outside `launch`.
+fn loader_output(live: &Live, args: &[&str], cwd: &Path) -> Output {
     Command::new(live.engine.root.join(&live.engine.bundle.wine.loader))
         .args(args)
         .env_clear()
@@ -157,8 +165,12 @@ fn loader_status(live: &Live, args: &[&str], cwd: &Path) -> ExitStatus {
         .env("WINEDLLOVERRIDES", MONO_GECKO_OVERRIDE)
         .env("WINEDEBUG", "-all")
         .current_dir(cwd)
-        .status()
+        .output()
         .unwrap()
+}
+
+fn loader_status(live: &Live, args: &[&str], cwd: &Path) -> ExitStatus {
+    loader_output(live, args, cwd).status
 }
 
 /// Launches `spec` and polls `Session::processes()` until, at least 2 s
@@ -334,11 +346,45 @@ fn prefix_hello32_dx11_sample_and_cpuid() {
         !import.success(),
         "reg import must fail on a malformed file"
     );
+    // A well-formed file with a key under an unknown root: `reg import`
+    // exits 0, imports the rest, and prints the line the engine scans for
+    // (review of 8b5bfd9), which is why `hidraw_key`'s root is validated
+    // with the bundle and the seed log is checked after every import.
+    fs::write(
+        scratch.join("mixed.reg"),
+        "REGEDIT4\n\n[HKEY_CURRENT_USER\\Software\\ApplejackLiveProbe]\n\"ok\"=dword:00000001\n\n[HKXX\\Bad]\n\"x\"=dword:00000001\n",
+    )
+    .unwrap();
+    let mixed = loader_output(&live, &["reg", "import", "mixed.reg"], &scratch);
+    let mixed_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&mixed.stdout),
+        String::from_utf8_lossy(&mixed.stderr)
+    );
+    let reg_line = reg_error_line(&mixed_text);
+    eprintln!(
+        "[live] mixed.reg: reg import {}; reg line {reg_line:?}",
+        mixed.status
+    );
+    assert!(
+        mixed.status.success(),
+        "reg import exits 0 for a mixed file; the engine scans its output for the reason"
+    );
+    assert!(
+        reg_line.is_some_and(|line| line.contains("Unable to import the registry key 'HKXX\\Bad'")),
+        "{mixed_text}"
+    );
 
     // Make the liveness check about the next session: stop the server the
     // earlier sessions started (it lingers a few seconds on its own).
     live.server_kill();
     assert!(!applejack_engine::rosetta_wine::process::wineserver_alive(&prefix.dir).unwrap());
+    assert!(
+        fs::read_to_string(prefix.dir.join("user.reg"))
+            .unwrap()
+            .contains("ApplejackLiveProbe"),
+        "the importable key of the mixed file landed"
+    );
 
     // dx11-sample: a Windows process found by session id, this session's
     // server up, restore refused meanwhile, cancel, server gone, loader
@@ -349,9 +395,9 @@ fn prefix_hello32_dx11_sample_and_cpuid() {
     let sample_spec = launch_spec(&live, sample, &["--frames", "100000"]);
     let (mut session, found) = match launch_and_discover(&live, &sample_spec, "dx11-sample.exe") {
         Ok(found) => found,
-        Err((status, log)) if headless() => {
+        Err((status, log)) if headless() && log.contains(HEADLESS_EXCUSE) => {
             eprintln!(
-                "[live] dx11-sample exited early with {status} (APPLEJACK_LIVE_HEADLESS=1, reported, not a failure):\n{log}"
+                "[live] dx11-sample could not create a device, status {status} (APPLEJACK_LIVE_HEADLESS=1 and the log says `{HEADLESS_EXCUSE}`: reported, not a failure):\n{log}"
             );
             live.server_kill();
             let ping = launch_spec(&live, PathBuf::from("cmd"), &["/c", "ping -n 60 127.0.0.1"]);

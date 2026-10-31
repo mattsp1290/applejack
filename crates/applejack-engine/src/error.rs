@@ -169,7 +169,7 @@ pub enum Error {
 
     /// The directory to map as drive `S:` is not an existing absolute
     /// directory.
-    #[error("cannot map the game library `{}` as drive S:: {reason}", path.display())]
+    #[error("cannot map the game library `{}` as drive S: because {reason}", path.display())]
     LibraryDirUnusable {
         /// The library directory as given.
         path: PathBuf,

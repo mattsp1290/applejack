@@ -230,22 +230,24 @@ pub(crate) fn wait_bounded(
     }
 }
 
-fn timed_out(command: String, timeout: Duration, log: &Path) -> Error {
+/// The error for a process [`wait_bounded`] killed; the pid tells a user
+/// what to look for in `ps` when the kill was not enough.
+fn timed_out(command: String, timeout: Duration, log: &Path, pid: u32) -> Error {
     Error::WineCommandFailed {
         command,
-        status: format!("timed out after {}s", timeout.as_secs()),
+        status: format!("timed out after {}s (pid {pid} killed)", timeout.as_secs()),
         log: log.to_path_buf(),
     }
 }
 
-/// Runs `<loader> args` for `prefix_dir` to completion with `env`, stdout
-/// and stderr appended to `log`, bounded by `timeout`. On expiry the loader
-/// process is killed and reaped, the prefix's server is killed with `-k`,
-/// and the step is reported as failed with the log path; a Wine dialog can
-/// therefore not block the caller for longer than `timeout`.
+/// Runs `<loader> args` in `cwd` to completion with `env`, stdout and
+/// stderr appended to `log`, bounded by `timeout`. On expiry the loader
+/// process is killed and reaped and the step is reported as failed with the
+/// log path, so a Wine dialog cannot block the caller for longer than
+/// `timeout`; stopping the prefix's server is the caller's step, so that a
+/// failed prefix operation kills it once.
 pub(crate) fn run_loader(
     installed: &InstalledEngine,
-    prefix_dir: &Path,
     args: &[&str],
     env: &[EnvPair],
     cwd: &Path,
@@ -255,9 +257,9 @@ pub(crate) fn run_loader(
     let loader = installed.root.join(&installed.bundle.wine.loader);
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
     let mut child = spawn_logged(&loader, &args, env, cwd, log, &[])?;
+    let pid = child.id();
     let Some(status) = wait_bounded(&mut child, &loader, timeout)? else {
-        let _ = kill_prefix_server(installed, prefix_dir, log);
-        return Err(timed_out(render(&loader, &args), timeout, log));
+        return Err(timed_out(render(&loader, &args), timeout, log, pid));
     };
     if status.success() {
         Ok(())
@@ -270,8 +272,8 @@ pub(crate) fn run_loader(
     }
 }
 
-/// `<server> -w` for `prefix_dir`, bounded by `timeout`: on expiry the
-/// server is killed with `-k` and the wait reported as failed.
+/// `<server> -w` for `prefix_dir`, bounded by `timeout`: on expiry the wait
+/// is reported as failed; the caller stops the server.
 pub(crate) fn wait_for_server(
     installed: &InstalledEngine,
     prefix_dir: &Path,
@@ -281,9 +283,14 @@ pub(crate) fn wait_for_server(
     let server = installed.root.join(&installed.bundle.wine.server);
     let path = child_path(installed);
     let mut child = server_command(&server, &path, prefix_dir, "-w", log)?;
+    let pid = child.id();
     let Some(status) = wait_bounded(&mut child, &server, timeout)? else {
-        kill_server(&server, &path, prefix_dir, log)?;
-        return Err(timed_out(format!("{} -w", server.display()), timeout, log));
+        return Err(timed_out(
+            format!("{} -w", server.display()),
+            timeout,
+            log,
+            pid,
+        ));
     };
     if status.success() {
         Ok(())
@@ -321,12 +328,14 @@ fn kill_server(server: &Path, path: &OsStr, prefix_dir: &Path, log: &Path) -> Re
     // `-k` exits non-zero when no server runs, which is the state wanted.
     let _ = server_command(server, path, prefix_dir, "-k", log)?.wait();
     let mut child = server_command(server, path, prefix_dir, "-w", log)?;
+    let pid = child.id();
     match wait_bounded(&mut child, server, KILL_WAIT)? {
         Some(_) => Ok(()),
         None => Err(timed_out(
             format!("{} -w", server.display()),
             KILL_WAIT,
             log,
+            pid,
         )),
     }
 }
@@ -440,16 +449,17 @@ impl Session {
     /// Kills everything in the prefix with `<server> -k`, waits for the
     /// server to be gone (bounded by [`KILL_WAIT`]), and reaps the loader:
     /// it normally exits on its own once the server is gone, and is killed
-    /// after [`LOADER_EXIT_WAIT`] otherwise, so no zombie outlives the call.
+    /// after [`LOADER_EXIT_WAIT`] otherwise. The loader is reaped even when
+    /// the server wait fails, so no process of the call outlives it.
     ///
     /// # Errors
     ///
     /// Returns the spawn or wait failure, or [`Error::WineCommandFailed`]
     /// when a server is still running after the bound.
     pub fn cancel(&mut self) -> Result<()> {
-        kill_server(&self.server, &self.path, &self.prefix_dir, &self.log_path)?;
+        let server = kill_server(&self.server, &self.path, &self.prefix_dir, &self.log_path);
         wait_bounded(&mut self.child, &self.log_path, LOADER_EXIT_WAIT)?;
-        Ok(())
+        server
     }
 
     /// Same-uid processes carrying this session's id, by pid.
