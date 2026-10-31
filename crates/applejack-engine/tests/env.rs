@@ -117,6 +117,7 @@ fn allowlist_matches_the_plan() {
             "WINEDLLOVERRIDES",
             "WINEMSYNC",
             "WINEESYNC",
+            "ROSETTA_ADVERTISE_AVX",
             "APPLEJACK_SESSION",
         ]
     );
@@ -704,4 +705,36 @@ fn allowed_roots_rejects_empty_relative_root_and_symlinks() {
     assert_eq!(roots.prefix_dir(), Path::new(PREFIX_DIR));
     assert_eq!(roots.engine_dir(), Path::new(ENGINE_DIR));
     assert_eq!(roots.overlay_dir(), Path::new(OVERLAY_DIR));
+}
+
+/// `ROSETTA_ADVERTISE_AVX` is engine-owned: the engine sets it only from the
+/// recorded CPUID probe, so neither the user's shell nor a game preset can
+/// advertise AVX on their own.
+#[test]
+fn advertise_avx_comes_only_from_the_engine() {
+    let base = [pair("ROSETTA_ADVERTISE_AVX", "1")];
+    let extras = [pair("ROSETTA_ADVERTISE_AVX", "1")];
+    let engine = [
+        pair("APPLEJACK_SESSION", "real"),
+        pair("WINEPREFIX", PREFIX_DIR),
+    ];
+    let (env, dropped) = assemble(&base, &extras, &engine, &roots()).unwrap();
+    assert!(
+        env.iter().all(|(name, _)| name != "ROSETTA_ADVERTISE_AVX"),
+        "{env:?}"
+    );
+    assert_eq!(
+        dropped,
+        [
+            drop_of("ROSETTA_ADVERTISE_AVX", DropReason::NotOwner, Owner::Host),
+            drop_of("ROSETTA_ADVERTISE_AVX", DropReason::NotOwner, Owner::Game),
+        ]
+    );
+    let engine = [
+        pair("APPLEJACK_SESSION", "real"),
+        pair("WINEPREFIX", PREFIX_DIR),
+        pair("ROSETTA_ADVERTISE_AVX", "1"),
+    ];
+    let (env, _) = assemble(&base, &extras, &engine, &roots()).unwrap();
+    assert!(env.contains(&pair("ROSETTA_ADVERTISE_AVX", "1")));
 }

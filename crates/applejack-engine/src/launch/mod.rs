@@ -1,11 +1,13 @@
-//! Launch inputs and outputs. Process spawning, log capture, and process
-//! discovery by session id are implemented by the `rosetta-wine` unit;
-//! [`mod@env`] holds the environment allowlist every engine applies.
+//! Launch inputs and outputs. [`mod@env`] holds the environment allowlist
+//! every engine applies; spawning, log capture, cancellation, and process
+//! discovery are implemented by [`crate::rosetta_wine`], which gives
+//! [`Session`] its methods.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Child;
 
-use crate::EnvPair;
+use crate::{CpuidProbe, EnvPair};
 
 pub mod env;
 
@@ -21,14 +23,23 @@ pub struct LaunchSpec {
     pub env_extras: Vec<EnvPair>,
     /// Working directory of the loader process.
     pub cwd: PathBuf,
-    /// Directory that receives `wine.log` for the session.
+    /// Log root: the session writes `<log_dir>/<session-id>/wine.log`. The
+    /// launcher's root is `~/Library/Logs/applejack`; tests pass a temporary
+    /// directory.
     pub log_dir: PathBuf,
+    /// The game configuration asks for `ROSETTA_ADVERTISE_AVX=1`. It is set
+    /// only when `cpuid_probe` recorded that the variable changes the
+    /// advertised feature bits on this host.
+    pub advertise_avx: bool,
+    /// The host's recorded CPUID probe (`RosettaWine::probe_cpuid`), when
+    /// one has been run; `None` means AVX is never advertised.
+    pub cpuid_probe: Option<CpuidProbe>,
 }
 
-/// A running launch. `processes()` and cancellation arrive with the
-/// `rosetta-wine` unit; cancellation runs `<server> -k` against
-/// `prefix_dir`, so the session carries both.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A running launch. Owns the loader's child handle, so it is neither
+/// cloned nor compared; the plain fields describe the launch for logging
+/// and for the core's session row.
+#[derive(Debug)]
 pub struct Session {
     /// Value of `APPLEJACK_SESSION` in every process of the launch.
     pub id: String,
@@ -39,6 +50,9 @@ pub struct Session {
     pub server: PathBuf,
     /// The `WINEPREFIX` the launch used; `<server> -k` must target it.
     pub prefix_dir: PathBuf,
-    /// `<log_dir>/wine.log` for this session.
+    /// `<log_dir>/<session-id>/wine.log` for this session.
     pub log_path: PathBuf,
+    /// `PATH` the children see; `wineserver -k` runs with the same one.
+    pub(crate) path: OsString,
+    pub(crate) child: Child,
 }

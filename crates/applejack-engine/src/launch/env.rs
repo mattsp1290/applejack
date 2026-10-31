@@ -127,7 +127,8 @@ const fn plain(name: &'static str, owner: Owner) -> Entry {
 /// | `WINEDLLOVERRIDES`, `WINEMSYNC`, `WINEESYNC` | engine | any value | | |
 /// | `DXMT_CONFIG` | game | any value (inline `key=value;` options) | | |
 /// | `DXMT_CONFIG_FILE` | game | one absolute path | engine, overlay, prefix | |
-/// | `DXMT_LOG_LEVEL`, `MTL_HUD_ENABLED`, `ROSETTA_ADVERTISE_AVX` | game | any value | | |
+/// | `DXMT_LOG_LEVEL`, `MTL_HUD_ENABLED` | game | any value | | |
+/// | `ROSETTA_ADVERTISE_AVX` | engine | any value; set only from the recorded CPUID probe | | |
 /// | `GST_PLUGIN_PATH` | game | colon-separated absolute paths | engine, overlay, prefix | |
 /// | `APPLEJACK_SESSION` | engine | any non-empty value | | yes |
 /// | `VK_ICD_FILENAMES` | game | colon-separated absolute paths | engine, overlay, prefix | |
@@ -163,7 +164,9 @@ pub const ALLOWLIST: &[Entry] = &[
     },
     plain("DXMT_LOG_LEVEL", Owner::Game),
     plain("MTL_HUD_ENABLED", Owner::Game),
-    plain("ROSETTA_ADVERTISE_AVX", Owner::Game),
+    // Engine-owned: a game preset or the user's shell must not advertise
+    // AVX when the recorded probe says the variable changes nothing.
+    plain("ROSETTA_ADVERTISE_AVX", Owner::Engine),
     Entry {
         name: "GST_PLUGIN_PATH",
         kind: Kind::PathList,

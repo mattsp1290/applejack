@@ -6,8 +6,11 @@ license.workspace = true
 
 [dependencies]
 applejack-manifest = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
+sysinfo = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
