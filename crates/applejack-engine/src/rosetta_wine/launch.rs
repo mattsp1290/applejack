@@ -548,7 +548,8 @@ const BUILTIN_MARKER_OFFSET: usize = 0x40;
 /// still carries Wine's builtin marker. Wine takes such a copy for a
 /// placeholder and quietly loads its own, so the title would otherwise fail in
 /// `D3D11CreateDeviceAndSwapChain` with nothing naming the cause. A file that
-/// cannot be read passes: the launch reports its own error.
+/// cannot be read passes, since this check is about stale copies only; Wine then
+/// uses its builtin `d3d11`, with no error of its own.
 ///
 /// # Errors
 ///

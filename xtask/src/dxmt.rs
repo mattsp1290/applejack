@@ -100,7 +100,7 @@ pub fn violations(payload: &Path) -> Result<Vec<Violation>, String> {
             &mut violations,
         )?;
     }
-    if !payload.join(WINEMETAL_SO).is_file() {
+    if !fs::metadata(payload.join(WINEMETAL_SO)).is_ok_and(|so| so.is_file() && so.len() > 0) {
         violations.push(Violation {
             binary: WINEMETAL_SO.to_owned(),
             reference: WINEMETAL.to_owned(),
@@ -120,13 +120,16 @@ pub fn violations(payload: &Path) -> Result<Vec<Violation>, String> {
     Ok(violations)
 }
 
-/// Whether the file carries the marker, or `None` when it is not there.
+/// Whether the file carries the marker, or `None` when no PE image is there.
 fn marked(payload: &Path, relative: &str) -> Result<Option<bool>, String> {
     let path = payload.join(relative);
     if !path.is_file() {
         return Ok(None);
     }
     let image = fs::read(&path).map_err(|error| format!("{relative}: {error}"))?;
+    if !image.starts_with(b"MZ") {
+        return Ok(None);
+    }
     Ok(Some(has_marker(&image)))
 }
 
@@ -134,7 +137,7 @@ fn missing_dll(relative: String) -> Violation {
     Violation {
         reference: relative.rsplit('/').next().unwrap_or_default().to_owned(),
         binary: relative,
-        reason: "missing (xtask engine-payload --place-dxmt)".to_owned(),
+        reason: "missing or not a PE image (xtask engine-payload --place-dxmt)".to_owned(),
     }
 }
 
@@ -228,7 +231,7 @@ mod tests {
         fs::create_dir_all(loader.parent().expect("parent")).expect("bin");
         fs::write(loader, b"").expect("loader");
         winemac(payload, EXPORTED);
-        fs::write(payload.join(WINEMETAL_SO), b"").expect("winemetal.so");
+        fs::write(payload.join(WINEMETAL_SO), b"Mach-O").expect("winemetal.so");
     }
 
     fn unplaced_without_wine(payload: &Path) {
@@ -346,11 +349,36 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_byte_dll_is_a_violation_for_either_architecture() {
+        let payload = scratch("empty-dll");
+        unplaced(&payload);
+        place(&payload).expect("place");
+        for arch in ARCH_DIRS {
+            for name in ["d3d11.dll", "dxgi.dll", "d3d10core.dll", WINEMETAL] {
+                let relative = format!("dxmt/{arch}/{name}");
+                let path = payload.join(&relative);
+                let image = fs::read(&path).expect("dll");
+                fs::write(&path, b"").expect("empty");
+                assert_eq!(reported(&payload), std::slice::from_ref(&relative));
+                fs::write(&path, image).expect("restore");
+            }
+            let relative = format!("wine/lib/wine/{arch}/{WINEMETAL}");
+            let path = payload.join(&relative);
+            let image = fs::read(&path).expect("dll");
+            fs::write(&path, b"").expect("empty");
+            assert_eq!(reported(&payload), std::slice::from_ref(&relative));
+            fs::write(&path, image).expect("restore");
+        }
+        let _ = fs::remove_dir_all(&payload);
+    }
+
+    #[test]
     fn every_winemetal_must_keep_its_marker() {
         let payload = scratch("unmarked");
         unplaced(&payload);
         place(&payload).expect("place");
-        let unmarked = vec![0_u8; 0x100];
+        let mut unmarked = marked_dll();
+        unmarked[MARKER_OFFSET] = 0;
         for arch in ARCH_DIRS {
             for dir in ["dxmt", "wine/lib/wine"] {
                 let relative = format!("{dir}/{arch}/{WINEMETAL}");
@@ -368,6 +396,16 @@ mod tests {
         unplaced(&payload);
         place(&payload).expect("place");
         fs::remove_file(payload.join(WINEMETAL_SO)).expect("remove");
+        assert_eq!(reported(&payload), [WINEMETAL_SO]);
+        let _ = fs::remove_dir_all(&payload);
+    }
+
+    #[test]
+    fn a_zero_byte_winemetal_so_is_a_violation() {
+        let payload = scratch("empty-so");
+        unplaced(&payload);
+        place(&payload).expect("place");
+        fs::write(payload.join(WINEMETAL_SO), b"").expect("empty");
         assert_eq!(reported(&payload), [WINEMETAL_SO]);
         let _ = fs::remove_dir_all(&payload);
     }
