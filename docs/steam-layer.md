@@ -505,6 +505,14 @@ to file; the local copies in `live.rs` stay until they land:
 8. `pics_get_package_info` hard-codes `access_token: 0`
    (`steamroom-0.3.0/src/client/mod.rs:731`) and every PICS call ignores
    `response_pending`.
+9. `DepotJob` spawns its chunk tasks with no way to cancel them and no check
+   between files, so applejack ends them by failing every fetch, and a file
+   that needs no fetch still lands after a stop.
+10. `get_cdn_servers` builds URLs on `host` and takes HTTPS for `optional`,
+    where `SteamKit` uses `vhost` and HTTPS only for `mandatory`.
+11. `parse_incoming` drops the job ids of a non-protobuf header, so a top-level
+    `DestJobFailed` in that form cannot be routed and its call waits out the
+    60 s bound. One inside a `MULTI` is parsed here and routed.
 
 ## Legal note
 
@@ -528,7 +536,10 @@ APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \
 
 Spacewar (480) is a small free title; add it to the account first, or use any
 small Windows title the account owns. `--dir` is the library root, and it also
-holds `locks/`. The spike reads the account name from stdin and the password
+holds `locks/`. A directory that holds anything else and no applejack record
+for that app is refused before login, so a mistyped path cannot land on
+someone's files; `--force` installs over it. The spike reads the account name
+from stdin and the password
 from the terminal without echo. When Steam asks for a code, enter the code and
 do not also approve in the mobile app; doing both fails with
 `DuplicateRequest`. It holds the refresh token in memory only and never prints
@@ -537,7 +548,9 @@ maps the directory first.
 
 Green is `logon ok`, a plausible `owned apps with a Windows depot` count, and
 with `--install`, `verify: N files, 0 mismatched, 0 missing` and `depot spike:
-green`. Interrupt an install and run it again to see `resumed: true`.
+green`. Interrupt an install and run it again to see `resumed: true`. Every
+Steam call prints a `call:` line first, so on a failure the last one names the
+call. The skipped apps and the depots not licensed print by id.
 
 ## Running the G2 spike
 

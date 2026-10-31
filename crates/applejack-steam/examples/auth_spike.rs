@@ -82,7 +82,7 @@ async fn run(mode: AuthMode) -> Result<(), Box<dyn std::error::Error>> {
             };
         }
     };
-    println!("login ok for account `{account_name}`; refresh token held in memory");
+    println!("login ok for account `{account_name}`; its credential is held in memory");
 
     let session = Authenticator::new(&mut connection, &store)
         .refresh(&account_name)

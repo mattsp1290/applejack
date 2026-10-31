@@ -23,5 +23,10 @@ rpassword = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
+# `cargo test` otherwise skips an example's own tests.
+[[example]]
+name = "depot_spike"
+test = true
+
 [lints]
 workspace = true

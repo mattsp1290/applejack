@@ -2,17 +2,23 @@
 //! `APPLEJACK_LIVE_STEAM=1`; see `docs/steam-layer.md` under "Running the
 //! depot spike".
 
+use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use applejack_steam::auth::{
-    AuthMode, Authenticator, Credentials, GuardFactor, LoginStep, Password,
+    AuthError, AuthMode, Authenticator, Credentials, GuardFactor, License, LoginStep, Password,
 };
 use applejack_steam::depot::{DepotInstaller, InstallPlan, LibraryPaths, verify_install};
 use applejack_steam::keychain::InMemoryStore;
 use applejack_steam::library::{DEFAULT_BRANCH, Library};
-use applejack_steam::live::{SteamroomConnection, SteamroomSession};
+use applejack_steam::live::{LiveChunks, SteamroomConnection, SteamroomSession};
+use applejack_steam::session::{AppInfo, PackageGrants, SteamSession};
+use steamroom::depot::DepotKey;
+use steamroom::depot::manifest::DepotManifest;
 
 const USAGE: &str = "\
 depot_spike: live check of the Steam library and depot code (not run; nothing was contacted).
@@ -26,7 +32,9 @@ Run with your own Steam account:
 The first form logs in and prints how many owned apps have a Windows depot. The
 second also installs that app into <dir>/steamapps/common and verifies it. Use a
 small title your account owns; Spacewar (480) is the usual one once it is on the
-account.
+account. A <dir> that holds anything else and no applejack record for that app
+is refused before login; --force installs over it. Each Steam call is printed
+before it is made, so the last line before a failure names the call that failed.
 
 The spike logs in with your account name and password, read from the terminal
 without echo. When Steam asks for a Steam Guard code, enter the code here and do
@@ -36,11 +44,13 @@ Quit any Steam client that maps <dir> first.";
 
 struct Args {
     install: Option<(u32, PathBuf)>,
+    force: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut appid = None;
     let mut dir = None;
+    let mut force = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -49,14 +59,19 @@ fn parse_args() -> Result<Args, String> {
                 appid = Some(value.parse::<u32>().map_err(|_| "appid is not a number")?);
             }
             "--dir" => dir = Some(PathBuf::from(args.next().ok_or("--dir needs a path")?)),
+            "--force" => force = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
     match (appid, dir) {
         (Some(appid), Some(dir)) => Ok(Args {
             install: Some((appid, dir)),
+            force,
         }),
-        (None, None) => Ok(Args { install: None }),
+        (None, None) => Ok(Args {
+            install: None,
+            force,
+        }),
         _ => Err("--install and --dir go together".to_owned()),
     }
 }
@@ -80,6 +95,73 @@ async fn main() -> ExitCode {
             eprintln!("depot_spike: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// A mistyped `--dir` must not land on someone's files. A record means this
+/// directory holds a partial install of this app.
+fn check_target(dir: &Path, record: &Path, force: bool) -> Result<(), String> {
+    let occupied = fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+    if occupied && !force && !record.exists() {
+        return Err(format!(
+            "{} is not empty and holds no applejack record for this app; use a new --dir, or --force to install over it",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn step(call: &str) {
+    println!("call: {call}");
+}
+
+/// Names each Steam call before making it. No argument is printed that a
+/// session would treat as secret: only ids.
+struct Traced<'a>(&'a SteamroomSession);
+
+impl SteamSession for Traced<'_> {
+    type Chunks = LiveChunks;
+
+    fn heartbeat_interval(&self) -> Option<Duration> {
+        self.0.heartbeat_interval()
+    }
+
+    async fn license_list(&self) -> Result<Vec<License>, AuthError> {
+        step("license list");
+        self.0.license_list().await
+    }
+
+    async fn package_grants(&self, licenses: &[License]) -> Result<PackageGrants, AuthError> {
+        step(&format!("package info for {} licenses", licenses.len()));
+        self.0.package_grants(licenses).await
+    }
+
+    async fn app_info(&self, appids: &[u32]) -> Result<Vec<AppInfo>, AuthError> {
+        step(&format!("product info for {} apps", appids.len()));
+        self.0.app_info(appids).await
+    }
+
+    async fn depot_key(&self, appid: u32, depot_id: u32) -> Result<DepotKey, AuthError> {
+        step(&format!("decryption key for app {appid} depot {depot_id}"));
+        self.0.depot_key(appid, depot_id).await
+    }
+
+    async fn manifest(
+        &self,
+        appid: u32,
+        depot_id: u32,
+        manifest_id: u64,
+        branch: &str,
+    ) -> Result<Option<DepotManifest>, AuthError> {
+        step(&format!(
+            "manifest {manifest_id} of app {appid} depot {depot_id} on {branch}"
+        ));
+        self.0.manifest(appid, depot_id, manifest_id, branch).await
+    }
+
+    async fn chunks(&self, appid: u32, depot_id: u32) -> Result<Arc<LiveChunks>, AuthError> {
+        step(&format!("chunk source for app {appid} depot {depot_id}"));
+        self.0.chunks(appid, depot_id).await
     }
 }
 
@@ -114,15 +196,20 @@ async fn login() -> Result<SteamroomSession, Box<dyn std::error::Error>> {
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some((appid, dir)) = &args.install {
+        check_target(dir, &LibraryPaths::new(dir).record(*appid), args.force)?;
+    }
+    step("auth login and CM logon");
     let session = login().await?;
     println!("logon ok");
+    let session = Traced(&session);
 
     let library = Library::fetch(&session).await?;
     println!(
-        "owned apps with a Windows depot: {} ({} described, {} skipped)",
+        "owned apps with a Windows depot: {} ({} described, skipped: {:?})",
         library.windows_apps().count(),
         library.apps.len(),
-        library.skipped.len()
+        library.skipped
     );
 
     let Some((appid, dir)) = args.install else {
@@ -131,10 +218,11 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let app = library.windows_app(appid)?;
     let plan = InstallPlan::new(app, DEFAULT_BRANCH, &library.filter())?;
     println!(
-        "installing {} ({} depots, {} bytes)",
+        "installing {} ({} depots, {} bytes, not licensed: {:?})",
         plan.name,
         plan.depots.len(),
-        plan.size
+        plan.size,
+        plan.not_licensed
     );
 
     let paths = LibraryPaths::new(&dir);
@@ -176,4 +264,28 @@ fn prompt_line(prompt: &str) -> io::Result<String> {
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line)?;
     Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_directory_with_other_files_is_refused_unless_forced_or_resuming() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LibraryPaths::new(dir.path());
+        let record = paths.record(480);
+
+        assert!(check_target(dir.path(), &record, false).is_ok());
+        assert!(check_target(&dir.path().join("new"), &record, false).is_ok());
+
+        fs::write(dir.path().join("thesis.doc"), b"mine").unwrap();
+        let refused = check_target(dir.path(), &record, false).unwrap_err();
+        assert!(refused.contains("--force"), "{refused}");
+        assert!(check_target(dir.path(), &record, true).is_ok());
+
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, b"{}").unwrap();
+        assert!(check_target(dir.path(), &record, false).is_ok());
+    }
 }
