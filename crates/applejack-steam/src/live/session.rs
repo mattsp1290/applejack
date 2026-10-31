@@ -291,12 +291,25 @@ async fn receive_loop(inner: Arc<Inner>) {
     loop {
         let routed = match inner.client.recv_msg().await {
             Ok(incoming) => route(&inner, incoming, 0),
-            Err(error) => Err(map_steamroom_error(error)),
+            Err(error) => Err(lost_connection(&inner, error)),
         };
         if let Err(error) = routed {
             inner.close(error);
             return;
         }
+    }
+}
+
+/// A CM that drops the socket before answering the logon has said nothing
+/// about the account, so another may take it. `CLIENT_LOGGED_OFF` comes through
+/// [`route`] instead and stays final.
+fn lost_connection(inner: &Inner, error: steamroom::Error) -> AuthError {
+    let logging_on = lock(&inner.logon).is_some();
+    match error {
+        steamroom::Error::Connection(ConnectionError::Disconnected) if logging_on => {
+            AuthError::CmUnavailable("the CM closed the connection during logon".to_owned())
+        }
+        other => map_steamroom_error(other),
     }
 }
 
@@ -503,8 +516,9 @@ impl SteamroomSession {
     /// # Errors
     ///
     /// The mapped `CMsgClientLogonResponse` result,
-    /// [`AuthError::Connection`] on a transport failure, or
-    /// [`AuthError::CmUnavailable`] when no reply comes in time.
+    /// [`AuthError::CmUnavailable`] when the logon cannot be sent, the CM hangs
+    /// up before answering, or no reply comes in time, or
+    /// [`AuthError::Connection`] on another transport failure.
     pub async fn start(
         client: SteamClient<Ready>,
         account_name: &str,
@@ -545,11 +559,13 @@ impl SteamroomSession {
         let body = logon.encode_to_vec();
         let mut msg = ClientMsg::with_body(EMsg::CLIENT_LOGON, &body);
         msg.header = inner.header();
+        // Any failure here: TCP reports a write to a closed socket as `Io`, not
+        // `Disconnected`, and nothing has reached Steam to answer for the account.
         inner
             .client
             .send_msg(&msg)
             .await
-            .map_err(map_steamroom_error)?;
+            .map_err(|error| AuthError::CmUnavailable(map_steamroom_error(error).to_string()))?;
 
         let reply = timeout(LOGON_TIMEOUT, logon_receiver)
             .await

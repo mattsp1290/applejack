@@ -28,9 +28,9 @@ All flows go through `auth::Authenticator`, which drives a `SteamConnection`
 and a `RefreshTokenStore`. `SteamConnection` covers the auth flow only;
 `logon` returns a `SteamSession`, described under "Session". It tries up to
 three TCP CMs in turn, moving on when one will not connect, answers
-`TryAnotherCM` (`EResult` 48), or does not answer the logon in 30 s; a refusal,
-a rate limit, a Guard error, or a hang-up ends it there. Unit tests use
-scripted fakes; `live::SteamroomConnection` and `live::SteamroomSession` are
+`TryAnotherCM` (`EResult` 48), hangs up before answering the logon, or does not
+answer it in 30 s; a refusal, a rate limit, a Guard error, or
+`CLIENT_LOGGED_OFF` ends it there. Unit tests use scripted fakes; `live::SteamroomConnection` and `live::SteamroomSession` are
 the only implementations that open a socket.
 
 - **QR login.** `begin(AuthMode::Qr)` calls `BeginAuthSessionViaQR` and returns

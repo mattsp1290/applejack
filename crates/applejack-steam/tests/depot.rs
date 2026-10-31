@@ -7,6 +7,7 @@ mod support;
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1388,6 +1389,73 @@ async fn a_link_entry_with_no_target_does_not_claim_a_users_file() {
     assert_eq!(fs::read(&mine).unwrap(), b"user mod");
 }
 
+// From the install-safety review round three, probe s4: an error reading a
+// file proves nothing about whose it is.
+#[tokio::test]
+async fn an_abandoned_file_that_cannot_be_read_stays() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"one"])]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+
+    let failing = file(chunks, "zz.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    stop_update_to_v2(
+        &bench,
+        vec![
+            file(chunks, "a.txt", &[b"one"]),
+            file(chunks, "x.pak", &[b"only in v2"]),
+            failing,
+        ],
+    )
+    .await;
+    let path = bench.game().join("x.pak");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(fs::File::open(&path).is_err(), "needs a non-root run");
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert!(path.exists());
+}
+
+// From the install-safety review round three, probe s19.
+#[tokio::test]
+async fn a_users_file_at_an_abandoned_directory_entry_stays() {
+    const DIRECTORY: u32 = 64;
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"one"])]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let mine = bench.game().join("dirent");
+    fs::write(&mine, b"mine").unwrap();
+
+    let failing = file(chunks, "0fail.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    stop_update_to_v2(
+        &bench,
+        vec![
+            failing,
+            file(chunks, "a.txt", &[b"one"]),
+            flagged(ManifestFile::new("dirent".to_owned(), 0), DIRECTORY),
+        ],
+    )
+    .await;
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&mine).unwrap(), b"mine");
+}
+
 // From the install-safety review round two, probe r5e: the disk a moved game
 // sits on is not mounted. A record would gate a title nothing was written to.
 #[tokio::test]
@@ -2131,6 +2199,41 @@ async fn a_client_that_starts_while_resolving_gets_no_writes() {
     assert!(matches!(result, Err(Error::ClientRunning { .. })));
     assert!(!bench.game().exists());
     assert_eq!(bench.session.chunks.fetches(), 0);
+}
+
+// From the install-safety review round three, S3: `running` turns true after
+// the two checks ahead of the hashing in `download`, as a client started during
+// it would.
+#[tokio::test]
+async fn a_client_that_starts_while_hashing_keeps_its_blockers() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![
+                file(chunks, "x", &[b"file"]),
+                file(chunks, "g.exe", &[b"1"]),
+            ],
+        ),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V2,
+            vec![
+                file(chunks, "g.exe", &[b"2"]),
+                file(chunks, "x\\y", &[b"now a dir"]),
+            ],
+        ),
+    );
+    let calls = AtomicUsize::new(0);
+    let running = || calls.fetch_add(1, Ordering::Relaxed) >= 2;
+    let result = bench.installer(&running).update(&plan(V2, 12)).await;
+    assert!(matches!(result, Err(Error::ClientRunning { .. })));
+    assert_eq!(fs::read(bench.game().join("x")).unwrap(), b"file");
 }
 
 #[tokio::test]

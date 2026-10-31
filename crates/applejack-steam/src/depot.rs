@@ -1050,6 +1050,8 @@ impl<S: SteamSession> Run<'_, '_, S> {
         } else {
             BTreeSet::new()
         };
+        // Hashing since the last check can take a while on a large delta.
+        self.installer.refuse_while_client_runs(appid)?;
         let mut files_removed = remove_entries(&install_dir, &blockers(&stale, &queued), &current);
 
         for (index, (depot, remaining)) in work.iter().zip(queued).enumerate() {

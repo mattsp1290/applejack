@@ -84,7 +84,8 @@ pub enum AuthError {
     #[error("connection: {0}")]
     Connection(String),
     /// This CM could not take the logon: it would not connect, answered
-    /// `TryAnotherCM`, or never answered. Another may, so `logon` moves on.
+    /// `TryAnotherCM`, hung up before answering, or never answered. Another
+    /// may, so `logon` moves on.
     #[error("{0}")]
     CmUnavailable(String),
 }

@@ -14,8 +14,8 @@ use applejack_steam::live::SteamroomSession;
 use applejack_steam::session::SteamSession;
 use bytes::Bytes;
 use prost::Message;
-use steamroom::client::SteamClient;
 use steamroom::client::msg::ClientMsg;
+use steamroom::client::{Ready, SteamClient};
 use steamroom::error::{ConnectionError, Error as SteamError};
 use steamroom::generated::{
     CContentServerDirectoryGetManifestRequestCodeRequest,
@@ -157,8 +157,8 @@ fn multi(packets: &[Vec<u8>]) -> Vec<u8> {
     ClientMsg::with_body(EMsg::MULTI, &body).to_bytes()
 }
 
-/// Starts a session and hands back the CM once `CLIENT_LOGON` has arrived.
-async fn connect() -> (JoinHandle<Result<SteamroomSession, AuthError>>, Cm) {
+/// A client that has said hello, and the CM it said it to.
+async fn prepared() -> (SteamClient<Ready>, Cm) {
     let (client_sender, client_receiver) = mpsc::unbounded_channel();
     let (server_sender, server_receiver) = mpsc::unbounded_channel();
     let transport = MemoryTransport {
@@ -172,6 +172,12 @@ async fn connect() -> (JoinHandle<Result<SteamroomSession, AuthError>>, Cm) {
         from_client: server_receiver,
     };
     assert_eq!(cm.recv().await.emsg, EMsg::CLIENT_HELLO);
+    (client, cm)
+}
+
+/// Starts a session and hands back the CM once `CLIENT_LOGON` has arrived.
+async fn connect() -> (JoinHandle<Result<SteamroomSession, AuthError>>, Cm) {
+    let (client, mut cm) = prepared().await;
     let session = tokio::spawn(async move {
         SteamroomSession::start(client, "redacted", &RefreshToken::new(FIXTURE_TOKEN)).await
     });
@@ -502,14 +508,41 @@ async fn a_cm_that_never_answers_the_logon_is_typed_for_the_failover() {
     ));
 }
 
+// From the protocol review round three, finding 1.
 #[tokio::test]
-async fn a_cm_that_hangs_up_during_logon_is_not_a_failover() {
+async fn a_cm_that_hangs_up_during_logon_is_typed_for_the_failover() {
     let (session, cm) = connect().await;
     drop(cm);
     assert!(matches!(
         session.await.unwrap(),
-        Err(AuthError::Connection(_))
+        Err(AuthError::CmUnavailable(message)) if message.contains("during logon")
     ));
+}
+
+#[tokio::test]
+async fn a_logged_off_then_a_hang_up_during_logon_stays_final() {
+    let (session, cm) = connect().await;
+    let body = CMsgClientLoggedOff { eresult: Some(5) }.encode_to_vec();
+    cm.send(ClientMsg::with_body(EMsg::CLIENT_LOGGED_OFF, &body).to_bytes());
+    drop(cm);
+    assert!(matches!(
+        session.await.unwrap(),
+        Err(AuthError::Connection(message)) if message.contains("EResult 5")
+    ));
+}
+
+#[tokio::test]
+async fn a_logon_that_cannot_be_sent_is_typed_for_the_failover() {
+    let (client, cm) = prepared().await;
+    // The read side stays open, so only the send can fail this.
+    let Cm {
+        to_client: _open,
+        from_client,
+    } = cm;
+    drop(from_client);
+    let result =
+        SteamroomSession::start(client, "redacted", &RefreshToken::new(FIXTURE_TOKEN)).await;
+    assert!(matches!(result, Err(AuthError::CmUnavailable(_))));
 }
 
 #[tokio::test]
