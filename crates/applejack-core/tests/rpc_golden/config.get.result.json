@@ -1,0 +1,22 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "direct_verified_at": null,
+    "dx12_expectation": null,
+    "engine_id": null,
+    "engine_version": null,
+    "extra_env": {},
+    "graphics_backend": "dxmt",
+    "hidraw_enabled": true,
+    "isolated_prefix": null,
+    "launch_args_override": null,
+    "launch_exe_override": null,
+    "launch_mode": null,
+    "notes": null,
+    "rosetta_advertise_avx": null,
+    "steam_input": null,
+    "steam_overlay": null,
+    "sync_mode": "none"
+  }
+}

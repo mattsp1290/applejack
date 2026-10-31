@@ -7,10 +7,18 @@ pub mod jobs;
 pub mod methods;
 pub mod wire;
 
+use crate::config::DataDirError;
+use crate::engines::describe_progress;
+use crate::error::CoreError;
+use crate::game_config::config_value_text;
 use crate::host::HostFacts;
-use methods::{HelloResult, Method, MethodStatus};
+use crate::state::Core;
+use jobs::Notifier;
+use methods::{ConfigExportResult, EmptyResult, HelloResult, Method, MethodStatus};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
+use std::sync::mpsc::Receiver;
+use std::thread;
 use wire::{Body, ErrorCode, Id, Request, Response, RpcError};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -40,15 +48,14 @@ impl ExitStatus {
 
 /// Answers parsed requests. The loop owns framing, `hello`, and the version
 /// check; the handler sees `hello` only once those passed.
-///
-/// The `engine.install` unit, which runs jobs on threads, will add a way to
-/// emit notifications to `handle` and change [`serve`]'s `writer` into a
-/// shared, locked one; both have one implementor and one caller today.
 pub trait Handler {
+    /// Must return promptly: the loop reads the next request only after
+    /// this does. Long work goes through [`Notifier::start_job`].
+    ///
     /// # Errors
     ///
     /// The error becomes the response's `error` member.
-    fn handle(&mut self, method: &Method) -> Result<Value, RpcError>;
+    fn handle(&mut self, method: &Method, notifier: &Notifier) -> Result<Value, RpcError>;
 
     /// Told about an error response the loop produced without calling
     /// `handle` (a parse, envelope, method, params, or `hello` problem).
@@ -59,19 +66,119 @@ pub trait Handler {
     }
 }
 
-/// The real core: `hello` and `host.doctor` now, `NotImplemented` for the
-/// rest until their work packages land.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CoreHandler;
+/// The real core. Methods whose work package has not landed answer
+/// `NotImplemented`.
+#[derive(Debug)]
+pub struct CoreHandler {
+    /// An unusable data directory fails the methods that need one, not
+    /// `hello` or `host.doctor`.
+    core: Result<Core, DataDirError>,
+}
+
+impl CoreHandler {
+    #[must_use]
+    pub fn new(core: Core) -> Self {
+        Self { core: Ok(core) }
+    }
+
+    /// The handler this process's environment describes.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            core: Core::from_env(),
+        }
+    }
+
+    fn core(&mut self) -> Result<&mut Core, RpcError> {
+        self.core
+            .as_mut()
+            .map_err(|error| CoreError::DataDir(error.clone()).into())
+    }
+}
 
 impl Handler for CoreHandler {
-    fn handle(&mut self, method: &Method) -> Result<Value, RpcError> {
+    fn handle(&mut self, method: &Method, notifier: &Notifier) -> Result<Value, RpcError> {
         match method {
             Method::Hello(_) => to_result(&HelloResult {
                 protocol_version: PROTOCOL_VERSION,
                 core_version: env!("CARGO_PKG_VERSION").to_owned(),
             }),
             Method::HostDoctor(_) => to_result(&HostFacts::gather()),
+            Method::EngineList(_) => to_result(&self.core()?.engine_list()?),
+            Method::EngineInstall(params) => {
+                let install = self
+                    .core()?
+                    .plan_install(&params.engine_id, params.from.as_deref())?;
+                to_result(&notifier.start_job(move |job| {
+                    let installed = install.run(&mut |progress| {
+                        let (phase, done, total, message) = describe_progress(progress);
+                        job.progress(phase, done, total, message);
+                    })?;
+                    job.progress(
+                        "installed",
+                        None,
+                        None,
+                        format!("{} {}", installed.id, installed.version),
+                    );
+                    Ok(())
+                })?)
+            }
+            Method::EngineUse(params) => {
+                self.core()?
+                    .engine_use(&params.engine_id, &params.version)?;
+                to_result(&EmptyResult {})
+            }
+            Method::EngineDoctor(_) => to_result(&self.core()?.engine_doctor()?),
+            Method::EngineProbeCpuid(_) => to_result(&self.core()?.engine_probe_cpuid()?),
+            Method::EngineD3dmetalImport(params) => to_result(
+                &self
+                    .core()?
+                    .engine_d3dmetal_import(&params.path, params.license_acknowledged)?,
+            ),
+            Method::EngineD3dmetalRemove(_) => {
+                self.core()?.engine_d3dmetal_remove()?;
+                to_result(&EmptyResult {})
+            }
+            Method::ConfigGet(params) => to_result(&self.core()?.config_get(params.appid)?),
+            Method::ConfigSet(params) => {
+                let value = config_value_text(&params.value);
+                self.core()?.config_set(params.appid, &params.key, &value)?;
+                to_result(&EmptyResult {})
+            }
+            Method::ConfigExport(params) => {
+                self.core()?.config_export(params.appid, &params.path)?;
+                to_result(&ConfigExportResult {
+                    path: params.path.clone(),
+                })
+            }
+            Method::ConfigImport(params) => to_result(&self.core()?.config_import(
+                params.appid,
+                &params.path,
+                params.accept_launch_overrides,
+            )?),
+            Method::PrefixSnapshot(params) => {
+                to_result(&self.core()?.prefix_snapshot(&params.prefix)?)
+            }
+            Method::PrefixRestore(params) => to_result(
+                &self
+                    .core()?
+                    .prefix_restore(&params.prefix, &params.timestamp)?,
+            ),
+            Method::PrefixReset(params) => {
+                let mut core = self.core()?.detached();
+                let (name, keep) = (params.prefix.clone(), params.keep_user_data);
+                to_result(&notifier.start_job(move |job| {
+                    job.progress("reset", None, None, format!("rebuilding prefix {name}"));
+                    let safety = core.prefix_reset(&name, keep)?;
+                    job.progress(
+                        "reset",
+                        None,
+                        None,
+                        format!("safety snapshot {}", safety.timestamp),
+                    );
+                    Ok(())
+                })?)
+            }
             pending => Err(not_implemented(pending)),
         }
     }
@@ -148,11 +255,11 @@ impl<H, W> Logged<H, W> {
 }
 
 impl<H: Handler, W: Write> Handler for Logged<H, W> {
-    fn handle(&mut self, method: &Method) -> Result<Value, RpcError> {
+    fn handle(&mut self, method: &Method, notifier: &Notifier) -> Result<Value, RpcError> {
         let name = method.name();
         let params = redact(name, &method.params());
         let _ = writeln!(self.sink, "-> {name} {params}");
-        let outcome = self.inner.handle(method);
+        let outcome = self.inner.handle(method, notifier);
         let _ = match &outcome {
             Ok(result) => writeln!(self.sink, "<- {name} ok {}", redact(name, result)),
             // A login error's message or data may echo the account; only the
@@ -195,16 +302,56 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// A line that is not UTF-8 or not JSON answers `ParseError` with a null id;
 /// valid JSON that is not a request (including a non-object or a line
 /// longer than [`MAX_LINE_BYTES`]) answers `InvalidRequest`; both continue
-/// the loop. Empty lines are skipped. Every response is flushed before the
-/// next line is read.
+/// the loop. Empty lines are skipped. Every message is flushed as one line
+/// by a writer thread, in the order queued, so a job's notifications never
+/// break a line. Before returning, the loop waits for running jobs to send
+/// their final notification.
 ///
 /// # Errors
 ///
 /// Only I/O errors on `reader` or `writer`; protocol problems are answered
 /// on the wire instead.
 pub fn serve<H: Handler + ?Sized>(
+    reader: impl BufRead,
+    writer: impl Write + Send,
+    handler: &mut H,
+) -> io::Result<ExitStatus> {
+    let (notifier, lines) = Notifier::channel();
+    thread::scope(|scope| {
+        let output = scope.spawn(move || write_lines(writer, &lines));
+        let outcome = read_requests(reader, &notifier, handler);
+        // The writer ends when the last sender does: this one, then the
+        // clones held by job threads.
+        drop(notifier);
+        let written = output
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the writer thread panicked")));
+        // A failed writer also fails the loop's next send; its error is the
+        // cause.
+        written.and(outcome)
+    })
+}
+
+fn write_lines(mut writer: impl Write, lines: &Receiver<String>) -> io::Result<()> {
+    for mut line in lines {
+        line.push('\n');
+        writer.write_all(line.as_bytes())?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn respond(notifier: &Notifier, response: &Response) -> io::Result<()> {
+    if notifier.respond(response) {
+        Ok(())
+    } else {
+        Err(io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+fn read_requests<H: Handler + ?Sized>(
     mut reader: impl BufRead,
-    mut writer: impl Write,
+    notifier: &Notifier,
     handler: &mut H,
 ) -> io::Result<ExitStatus> {
     let mut greeted = false;
@@ -225,13 +372,13 @@ pub fn serve<H: Handler + ?Sized>(
                 format!("request line exceeds {MAX_LINE_BYTES} bytes"),
             );
             handler.refused(None, &error);
-            respond(&mut writer, &Response::error(None, error))?;
+            respond(notifier, &Response::error(None, error))?;
             continue;
         }
         let Ok(text) = std::str::from_utf8(&line) else {
             let error = RpcError::new(ErrorCode::ParseError, "line is not UTF-8");
             handler.refused(None, &error);
-            respond(&mut writer, &Response::error(None, error))?;
+            respond(notifier, &Response::error(None, error))?;
             continue;
         };
         let text = text.trim();
@@ -244,12 +391,12 @@ pub fn serve<H: Handler + ?Sized>(
                 if let Body::Error(error) = &response.body {
                     handler.refused(method.as_deref(), error);
                 }
-                respond(&mut writer, &response)?;
+                respond(notifier, &response)?;
                 continue;
             }
         };
-        let (response, exit) = dispatch(request, &mut greeted, handler);
-        respond(&mut writer, &response)?;
+        let (response, exit) = dispatch(request, &mut greeted, handler, notifier);
+        respond(notifier, &response)?;
         if let Some(exit) = exit {
             return Ok(exit);
         }
@@ -313,6 +460,7 @@ fn dispatch<H: Handler + ?Sized>(
     request: Request,
     greeted: &mut bool,
     handler: &mut H,
+    notifier: &Notifier,
 ) -> (Response, Option<ExitStatus>) {
     let Request {
         id, method, params, ..
@@ -353,7 +501,7 @@ fn dispatch<H: Handler + ?Sized>(
             Some(ExitStatus::ProtocolMismatch),
         );
     }
-    let response = match handler.handle(&method) {
+    let response = match handler.handle(&method, notifier) {
         // Belt and braces for a handler that bypasses `to_result`.
         Ok(result) if result.is_null() => Response::result(id, json!({})),
         Ok(result) => Response::result(id, result),
@@ -363,12 +511,4 @@ fn dispatch<H: Handler + ?Sized>(
         *greeted = true;
     }
     (response, None)
-}
-
-fn respond(writer: &mut impl Write, response: &Response) -> io::Result<()> {
-    // A response is built from the wire types; it always encodes.
-    let text = serde_json::to_string(response)?;
-    writer.write_all(text.as_bytes())?;
-    writer.write_all(b"\n")?;
-    writer.flush()
 }

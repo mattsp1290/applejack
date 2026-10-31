@@ -1,0 +1,7 @@
+{
+  "jsonrpc": "2.0",
+  "method": "job.done",
+  "params": {
+    "job_id": 7
+  }
+}

@@ -1,12 +1,18 @@
 {
+  "ChecksumMismatch": 1006,
+  "DiskFull": 1008,
+  "DownloadFailed": 1009,
+  "EngineNotInstalled": 1005,
   "HelloRequired": 1001,
   "Internal": 1003,
   "InternalError": -32603,
+  "InvalidBundle": 1007,
   "InvalidParams": -32602,
   "InvalidRequest": -32600,
   "JobFailed": 1004,
   "MethodNotFound": -32601,
   "NotImplemented": 1002,
   "ParseError": -32700,
-  "ProtocolMismatch": 1000
+  "ProtocolMismatch": 1000,
+  "UnsignedEngineRefused": 1010
 }

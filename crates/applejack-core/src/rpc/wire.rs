@@ -198,14 +198,24 @@ pub enum ErrorCode {
     NotImplemented,
     /// The method's own work failed (I/O, database, child process).
     Internal,
-    /// A `job.failed` notification's typed code. A placeholder: the
-    /// `engine.install` unit adds one reason code per failure kind (download,
-    /// checksum, disk) to this enum rather than a parallel one.
+    /// A `job.failed` whose failure has no reason code of its own.
     JobFailed,
+    /// The method needs an engine and none is installed or active.
+    EngineNotInstalled,
+    /// An archive does not hash to the digest it must have.
+    ChecksumMismatch,
+    /// An archive or its `BUNDLE.toml` breaks a bundle rule.
+    InvalidBundle,
+    /// The disk filled up.
+    DiskFull,
+    /// No published version exists, or this build cannot fetch it.
+    DownloadFailed,
+    /// A local bundle was requested without `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`.
+    UnsignedEngineRefused,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 16] = [
         Self::ParseError,
         Self::InvalidRequest,
         Self::MethodNotFound,
@@ -216,6 +226,12 @@ impl ErrorCode {
         Self::NotImplemented,
         Self::Internal,
         Self::JobFailed,
+        Self::EngineNotInstalled,
+        Self::ChecksumMismatch,
+        Self::InvalidBundle,
+        Self::DiskFull,
+        Self::DownloadFailed,
+        Self::UnsignedEngineRefused,
     ];
 
     #[must_use]
@@ -231,6 +247,12 @@ impl ErrorCode {
             Self::NotImplemented => 1002,
             Self::Internal => 1003,
             Self::JobFailed => 1004,
+            Self::EngineNotInstalled => 1005,
+            Self::ChecksumMismatch => 1006,
+            Self::InvalidBundle => 1007,
+            Self::DiskFull => 1008,
+            Self::DownloadFailed => 1009,
+            Self::UnsignedEngineRefused => 1010,
         }
     }
 
@@ -254,6 +276,12 @@ impl ErrorCode {
             Self::NotImplemented => "NotImplemented",
             Self::Internal => "Internal",
             Self::JobFailed => "JobFailed",
+            Self::EngineNotInstalled => "EngineNotInstalled",
+            Self::ChecksumMismatch => "ChecksumMismatch",
+            Self::InvalidBundle => "InvalidBundle",
+            Self::DiskFull => "DiskFull",
+            Self::DownloadFailed => "DownloadFailed",
+            Self::UnsignedEngineRefused => "UnsignedEngineRefused",
         }
     }
 
@@ -278,8 +306,16 @@ impl ErrorCode {
                 "The method is in the table, but its work package has not landed. `data.method` names it."
             }
             Self::Internal => "The method's own work failed (I/O, database, child process).",
-            Self::JobFailed => {
-                "The typed code carried by a `job.failed` notification. A placeholder until `engine.install` adds reason codes."
+            Self::JobFailed => "A `job.failed` whose failure has no reason code of its own.",
+            Self::EngineNotInstalled => {
+                "The method needs an engine and none is installed or active."
+            }
+            Self::ChecksumMismatch => "An archive does not hash to the digest it must have.",
+            Self::InvalidBundle => "An archive or its `BUNDLE.toml` breaks a bundle rule.",
+            Self::DiskFull => "The disk filled up.",
+            Self::DownloadFailed => "No published version exists, or this build cannot fetch it.",
+            Self::UnsignedEngineRefused => {
+                "A local bundle was requested without `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`."
             }
         }
     }

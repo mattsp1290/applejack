@@ -2,6 +2,8 @@
 //! `run` function returning the process exit code.
 
 pub mod config;
+pub mod engine;
+pub mod prefix;
 pub mod serve;
 
 use std::io::{self, Write};

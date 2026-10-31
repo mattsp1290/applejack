@@ -33,7 +33,7 @@ struct Pending {
 #[derive(Subcommand)]
 enum Command {
     /// Install, inspect, and roll back engines
-    Engine(Pending),
+    Engine(cmd::engine::EngineArgs),
     /// Sign in to Steam and list the owned library
     Steam(Pending),
     /// Download a title's Windows depot
@@ -43,7 +43,7 @@ enum Command {
     /// Read and write per-game configuration
     Config(cmd::config::ConfigArgs),
     /// Create, snapshot, and reset Wine prefixes
-    Prefix(Pending),
+    Prefix(cmd::prefix::PrefixArgs),
     /// Manage the shared Steam client prefix
     Runtime(Pending),
     /// Serve JSON-RPC over stdio for the app shell
@@ -77,6 +77,8 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Doctor { json } => doctor(json),
         Command::Config(args) => cmd::config::run(args),
+        Command::Engine(args) => cmd::engine::run(args),
+        Command::Prefix(args) => cmd::prefix::run(args),
         Command::Serve(args) => cmd::serve::run(args),
         stub => not_implemented(stub.name()),
     }

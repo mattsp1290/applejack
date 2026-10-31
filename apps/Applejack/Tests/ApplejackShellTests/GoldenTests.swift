@@ -44,7 +44,12 @@ final class GoldenTests: XCTestCase {
         let results = try goldens(suffix: ".result.json")
         XCTAssertEqual(
             results.map(\.lastPathComponent),
-            ["empty.result.json", "hello.result.json", "host.doctor.result.json"]
+            [
+                "config.export.result.json", "config.get.result.json", "config.import.result.json",
+                "empty.result.json", "engine.d3dmetal.import.result.json", "engine.doctor.result.json",
+                "engine.install.result.json", "engine.list.result.json", "engine.probe_cpuid.result.json",
+                "hello.result.json", "host.doctor.result.json", "prefix.snapshot.result.json",
+            ]
         )
         for file in results {
             let response = try RpcCoding.decoder().decode(RpcResponse.self, from: Data(contentsOf: file))
@@ -98,6 +103,41 @@ final class GoldenTests: XCTestCase {
     func testResponseWithAnotherJsonrpcVersionIsRejected() {
         let line = Data(#"{"jsonrpc":"1.0","id":1,"result":{}}"#.utf8)
         XCTAssertThrowsError(try RpcCoding.decoder().decode(RpcResponse.self, from: line))
+    }
+
+    private func decodeNotification<Params: Decodable>(_ method: String, as _: Params.Type) throws -> Params {
+        let data = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent("\(method).notification.json"))
+        let notification = try RpcCoding.decoder().decode(RpcNotification.self, from: data)
+        XCTAssertEqual(notification.method, method)
+        let params = try RpcCoding.encoder().encode(notification.params)
+        return try RpcCoding.decoder().decode(Params.self, from: params)
+    }
+
+    /// The mirrors the views decode read the core's real result shapes.
+    func testResultMirrorsDecodeTheResultGoldens() throws {
+        let engines = try typedResult("engine.list.result.json", as: EngineListResult.self)
+        XCTAssertEqual(engines.engines.first?.id, "rosetta-wine@11.0-1")
+        XCTAssertEqual(engines.engines.first?.active, true)
+        _ = try typedResult("engine.install.result.json", as: JobStarted.self)
+        let doctor = try typedResult("engine.doctor.result.json", as: DoctorReport.self)
+        XCTAssertEqual(doctor.findings.first?.severity, .error)
+        let configData = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent("config.get.result.json"))
+        let config = try XCTUnwrap(RpcCoding.decoder().decode(RpcTypedResponse<GameConfig>.self, from: configData).result)
+        XCTAssertEqual(config.graphicsBackend, .dxmt)
+        XCTAssertEqual(config.syncMode, .disabled)
+        XCTAssertEqual(config.hidrawEnabled, true)
+        let plan = try typedResult("config.import.result.json", as: ConfigImportResult.self)
+        XCTAssertTrue(plan.needsConfirmation)
+        XCTAssertEqual(plan.rejected.first?.field, "extra_env.PATH")
+    }
+
+    func testJobMirrorsDecodeTheNotificationGoldens() throws {
+        let progress = try decodeNotification(JobProgress.method, as: JobProgress.self)
+        XCTAssertEqual(progress.doneBytes, 1024)
+        XCTAssertNil(progress.totalBytes)
+        _ = try decodeNotification(JobDone.method, as: JobDone.self)
+        let failed = try decodeNotification(JobFailed.method, as: JobFailed.self)
+        XCTAssertEqual(RpcErrorCode(rawValue: failed.code), .checksumMismatch)
     }
 
     func testErrorCodesGoldenMatchesTheSwiftEnum() throws {

@@ -9,9 +9,11 @@ database, controller handling, and the signing and notarization pipeline.
 
 ## Status
 
-Scaffold only. The Cargo workspace, the CLI surface, and the quality gate
-exist; nothing runs games yet. Every subcommand except `doctor` exits with
-code 69 (`EX_UNAVAILABLE`) until its work package lands.
+The engine half works: `applejack engine` and `applejack prefix` install a
+local Rosetta engine bundle, build prefixes, and run Windows executables in
+them, and `applejack serve --stdio` answers the same operations for the shell.
+No game runs yet. `steam`, `install`, `run`, and `runtime` exit with code 69
+(`EX_UNAVAILABLE`) until their work packages land.
 
 ## Requirements
 

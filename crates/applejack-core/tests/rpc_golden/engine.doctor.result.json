@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "findings": [
+      {
+        "message": "engine rosetta-wine is not installed",
+        "severity": "error"
+      }
+    ],
+    "runnable": false
+  }
+}

@@ -44,7 +44,7 @@ Response, success or failure:
 
 ```json
 {"jsonrpc":"2.0","id":1,"result":{"protocol_version":1,"core_version":"0.1.0"}}
-{"jsonrpc":"2.0","id":2,"error":{"code":1002,"message":"`engine.list` is pending (work package 2)","data":{"method":"engine.list"}}}
+{"jsonrpc":"2.0","id":2,"error":{"code":1002,"message":"`app.run` is pending (work package 5)","data":{"method":"app.run"}}}
 ```
 
 A success never carries `"result": null`. A method with nothing to return
@@ -97,13 +97,19 @@ Swift case; do not edit the table by hand.
 | 1001 | `HelloRequired` | A request arrived before a successful `hello`. |
 | 1002 | `NotImplemented` | The method is in the table, but its work package has not landed. `data.method` names it. |
 | 1003 | `Internal` | The method's own work failed (I/O, database, child process). |
-| 1004 | `JobFailed` | The typed code carried by a `job.failed` notification. A placeholder until `engine.install` adds reason codes. |
+| 1004 | `JobFailed` | A `job.failed` whose failure has no reason code of its own. |
+| 1005 | `EngineNotInstalled` | The method needs an engine and none is installed or active. |
+| 1006 | `ChecksumMismatch` | An archive does not hash to the digest it must have. |
+| 1007 | `InvalidBundle` | An archive or its `BUNDLE.toml` breaks a bundle rule. |
+| 1008 | `DiskFull` | The disk filled up. |
+| 1009 | `DownloadFailed` | No published version exists, or this build cannot fetch it. |
+| 1010 | `UnsignedEngineRefused` | A local bundle was requested without `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`. |
 <!-- error-table:end -->
 
-`JobFailed` is a placeholder. The `engine.install` unit adds one reason code
-per failure kind (download, checksum, disk full) to `ErrorCode`, so a
-`job.failed` says why, and the lever above carries them to the docs and to
-Swift.
+A `job.failed` carries the reason code of its failure when it has one
+(`ChecksumMismatch`, `InvalidBundle`, `DiskFull`, ...) and `JobFailed`
+otherwise; a request refused before its job starts answers with the same
+codes as an error response.
 
 ## Methods
 
@@ -122,13 +128,13 @@ by hand.
 |---|---|
 | `hello` | implemented |
 | `host.doctor` | implemented |
-| `engine.list` | pending (work package 2) |
-| `engine.install` | pending (work package 2) |
-| `engine.use` | pending (work package 2) |
-| `engine.doctor` | pending (work package 2) |
-| `engine.probe_cpuid` | pending (work package 2) |
-| `engine.d3dmetal.import` | pending (work package 2) |
-| `engine.d3dmetal.remove` | pending (work package 2) |
+| `engine.list` | implemented |
+| `engine.install` | implemented |
+| `engine.use` | implemented |
+| `engine.doctor` | implemented |
+| `engine.probe_cpuid` | implemented |
+| `engine.d3dmetal.import` | implemented |
+| `engine.d3dmetal.remove` | implemented |
 | `steam.login.start` | pending (work package 4) |
 | `steam.login.complete` | pending (work package 4) |
 | `steam.logout` | pending (work package 4) |
@@ -140,28 +146,55 @@ by hand.
 | `runtime.steam.update` | pending (work package 5) |
 | `runtime.steam.repair` | pending (work package 5) |
 | `runtime.steam.stop` | pending (work package 5) |
-| `config.get` | pending (work package 6a) |
-| `config.set` | pending (work package 6a) |
-| `config.export` | pending (work package 6a) |
-| `config.import` | pending (work package 6a) |
-| `prefix.snapshot` | pending (work package 2) |
-| `prefix.restore` | pending (work package 2) |
-| `prefix.reset` | pending (work package 2) |
+| `config.get` | implemented |
+| `config.set` | implemented |
+| `config.export` | implemented |
+| `config.import` | implemented |
+| `prefix.snapshot` | implemented |
+| `prefix.restore` | implemented |
+| `prefix.reset` | implemented |
 | `session.list` | pending (work package 5) |
 <!-- method-table:end -->
 
 A pending method still validates its params. Bad params get `InvalidParams`;
 good params get `NotImplemented`.
 
-`config.import` (work package 6a): the shell (`apps/Applejack`,
-`ConfigImportResult`) expects a result, not an error, when the plan needs the
-launch-override confirmation: `{"applied": false, "accepted": [...],
-"rejected": [...], "confirmations": [...]}` with `accept_launch_overrides:
-false`, and the same shape with `"applied": true` once the request carries
-`true`. `ImportPlan::apply` signals this as `Error::ConfirmationRequired`
-today; the RPC handler should render it as that result (or, if it keeps an
-error, carry the plan in `data.confirmations` and the shell will be extended
-to open the dialog from it).
+### Results
+
+The Rust types in `crates/applejack-core/src/{engines,prefixes,game_config}.rs`
+define the results, and `tests/rpc_golden/<method>.result.json` carries one
+example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
+
+| Method | Result |
+|---|---|
+| `engine.list` | `{"engines": [{engine_id, version, installed, active}]}`: versions on disk and in the manifest, oldest first |
+| `engine.install` | `JobStarted`; see [Jobs](#jobs) |
+| `engine.use` | `{}` |
+| `engine.doctor` | `{runnable, findings: [{severity, message}]}`. No engine is a finding whose last entry is the fix, not an error |
+| `engine.probe_cpuid` | `{plain, advertised, changes_bits}`; also stored in `meta.cpuid_probe` |
+| `engine.d3dmetal.import` | `{engine_version, overlay_dir, imported_from, gptk_version, accepted_at}` |
+| `engine.d3dmetal.remove` | `{}` |
+| `prefix.snapshot` | `{prefix, timestamp, dir}` |
+| `prefix.restore` | The same shape, naming the safety snapshot of the replaced state |
+| `prefix.reset` | `JobStarted`. A `job.progress` message names the safety snapshot |
+| `config.get` | `GameConfig`; every member `null` for an appid with no row |
+| `config.set` | `{}`. `value` is a string, a boolean, a number, an object for `extra_env`, or `null` to clear |
+| `config.export` | `{path}` |
+| `config.import` | `{applied, preset_appid, accepted, rejected, confirmations}` |
+
+`engine.install` takes an optional `from`, a bundle directory or `.tar.zst` on
+this Mac. It needs the core to run with `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`,
+which a release build ignores; without `from` the embedded manifest decides,
+and an empty one answers `DownloadFailed` naming `--from`.
+
+`config.import` answers a result, not an error, when the plan needs the
+launch-override confirmation: `applied` is false and `confirmations` lists what
+to confirm, and the request is repeated with `accept_launch_overrides: true`.
+The request's `appid` wins over the file's, which comes back as `preset_appid`.
+
+The other engine and config methods run on the request loop, so a `hello` sent
+behind one waits for it. `prefix.snapshot` and `prefix.restore` wait up to ten
+seconds for a `wineserver` that outlives the prefix's last process.
 
 ## Jobs
 
@@ -173,18 +206,19 @@ then emits notifications for that id:
 - Exactly one final `job.done` `{job_id}` or `job.failed`
   `{job_id, code, message}`, where `code` is an integer from the table above.
 
-No method runs as a job yet. The first job methods (`engine.install`,
-`app.install`) land with their work packages. When they do, job threads and
-the request loop must write through one shared, locked writer so a
-notification and a response never interleave on stdout; the handler API for
-emitting notifications is that unit's to define.
+`engine.install` and `prefix.reset` run as jobs. Every message, from the
+request loop or a job thread, goes as one whole line through one channel to
+one writer thread, so a notification and a response never interleave on stdout
+and a job never holds up the loop (`rpc::jobs::Notifier`). A handler gets the
+notifier with each call and starts work with `Notifier::start_job`. A job that
+panics ends in `job.failed` with `InternalError`.
 
-What that unit reshapes in `rpc/mod.rs`: `serve` takes `writer` by value
-today, so it becomes a shared, locked writer (an `Arc<Mutex<_>>` built inside
-`serve`, or passed in) that job threads clone; `Handler::handle` is
-synchronous and cannot emit, so it gains a parameter for notifications. Each
-has one implementor and one caller; the method table, `Logged`, and the tests
-are unaffected.
+EOF on stdin stops reading, and the core exits once running jobs have sent
+their final notification. `CoreClient.shutdown()` does not wait that long; a
+core terminated during an install leaves no `<version>/`, and the next install
+replaces the partial state. Only one install of an engine runs at a time, across
+processes (`engines/<id>/.install.lock`); a second one ends in `job.failed`
+saying so.
 
 Children the core spawns (wine, wineserver, Steam) must not inherit the
 core's stdout: give them `Stdio::null()` or a pipe. An inherited stdout would

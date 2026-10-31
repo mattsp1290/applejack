@@ -580,20 +580,44 @@ backends and sync modes, and whether the D3DMetal overlay is imported.
 `rosetta_present` is `Some(false)` and otherwise delegates to
 `bundle::install`.
 
-## What the CLI unit will expose
+## The commands
 
-The commands in the plan map onto this crate as follows; none exist yet.
+`applejack-core` owns these as methods on `Core`; the CLI and the RPC handler
+call the same ones. The `meta` and `engine_versions` writes are the core's.
 
 | Command | Calls |
 | --- | --- |
-| `applejack engine doctor` | `RosettaWine::doctor` with the core's `Host` |
-| `applejack engine install rosetta-wine` | `RosettaWine::install` with an `InstallRequest` |
-| `applejack engine probe-cpuid` | `RosettaWine::probe_cpuid`, stored in `meta` |
+| `applejack engine install <id> --from <dir-or-archive>` | `LocalBundle::prepare`, then `RosettaWine::install`; needs `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`, in a debug build. The first version installed turns active |
+| `applejack engine install <id>` | The manifest decides; while it is empty, an error naming `--from` |
+| `applejack engine use <id> <version>` | Sets `engine_versions.active` |
+| `applejack engine list` | `versions::list`, the manifest, `engine_versions` |
+| `applejack engine doctor` | `RosettaWine::doctor` with the core's `Host`; no engine is a finding with the fix |
+| `applejack engine probe-cpuid` | `RosettaWine::probe_cpuid`, stored in `meta.cpuid_probe` |
 | `applejack engine d3dmetal import <path> [--accept-apple-license]` | `d3dmetal::import`, record stored in `d3dmetal` |
 | `applejack engine d3dmetal remove` | `d3dmetal::remove`, record cleared |
-| `applejack prefix create <name> --backend <b>` | `RosettaWine::create_prefix` with `log_dir = ~/Library/Logs/applejack` |
-| `applejack prefix snapshot <name>` / `restore` / `reset [--keep-user-data]` / `snapshot prune` | `snapshot::{create, restore, reset, prune}` under `prefixes/.snapshots/` |
+| `applejack prefix create <name> [--backend b] [--sync s] [--hidraw h]` | `RosettaWine::create_prefix`, with drive `S:` on `<data_dir>/library` |
+| `applejack prefix list` | Each `prefixes/<name>/applejack/prefix.toml` |
+| `applejack prefix snapshot <name>` / `restore` / `reset [--keep-user-data]` | `snapshot::{create, restore, reset}` under `prefixes/.snapshots/` |
+| `applejack prefix remove <name>` | Deletes the prefix and Wine's `server-*` directory for it; snapshots stay |
+| `applejack prefix exec <name> -- <exe> [args]` | `Engine::launch` with the bundle that last touched the prefix; streams the session log and exits with the child's code. Development only |
 | `applejack run <appid>` | `RosettaWine::launch`, then `Session::{wait, cancel, processes, wineserver_alive}` |
+
+A directory passed to `--from` is packed to
+`engines/<id>/<version>.local.tar.zst` first, so it takes the same hashing,
+extraction, and validation path as an archive; the packed file is removed
+afterwards. `engines/<id>/.install.lock` keeps two installs of one engine
+apart across processes.
+
+`snapshot`, `restore`, `reset`, and `remove` wait up to ten seconds
+(`prefixes::SERVER_SETTLE`) for a `wineserver` to leave: it outlives the last
+process by a few seconds and writes the registry on the way out. One that
+stays belongs to something running, and the command is refused.
+
+With `APPLEJACK_DATA_DIR` set, logs go to `<data_dir>/logs` instead of
+`~/Library/Logs/applejack`, so a throwaway data directory leaves nothing
+behind.
+
+`snapshot::prune` and `versions::prune` have no command yet.
 
 ## Known limits
 

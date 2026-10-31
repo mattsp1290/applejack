@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "method": "job.progress",
+  "params": {
+    "done_bytes": 1024,
+    "job_id": 7,
+    "message": "packing the bundle directory",
+    "phase": "pack",
+    "total_bytes": null
+  }
+}

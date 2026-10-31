@@ -1,11 +1,11 @@
 import Foundation
 
 // Params mirrors for the methods the views call. `GoldenTests` pins each one
-// to its request golden. Result mirrors below the params are provisional: the
-// core has no result type for a pending method yet, so these follow the Rust
-// structs the methods will serialize (`GameConfig`, `ImportPlan`, `LoginStep`,
-// `DoctorReport`, `AppRow`, the `sessions` table) and gain goldens when the
-// methods land.
+// to its request golden, and the engine and config results to their result
+// goldens. The remaining result mirrors are provisional: the core has no
+// result type for a pending method yet, so these follow the Rust structs the
+// methods will serialize (`LoginStep`, `AppRow`, the `sessions` table) and
+// gain goldens when the methods land.
 
 public struct SteamLibraryParams: Codable, Equatable, Sendable {
     public var refresh: Bool
@@ -513,9 +513,16 @@ public struct RejectedItem: Codable, Equatable, Sendable, Identifiable {
 /// did not accept launch overrides.
 public struct ConfigImportResult: Codable, Equatable, Sendable {
     public var applied: Bool
+    public var presetAppid: UInt32?
     public var accepted: [ImportItem]
     public var rejected: [RejectedItem]
     public var confirmations: [ImportItem]
+
+    enum CodingKeys: String, CodingKey {
+        case applied
+        case presetAppid = "preset_appid"
+        case accepted, rejected, confirmations
+    }
 
     public var needsConfirmation: Bool { !applied && !confirmations.isEmpty }
 }

@@ -4,23 +4,16 @@
 //! read a missing database as empty, and a `set` or `import` that has nothing
 //! valid to write leaves the data directory as it found it.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use applejack_core::config::{
-    self, ConfigDb, DefaultEnvPolicy, Error, Field, GameConfig, ImportOptions, ImportPlan, Preset,
-};
+use applejack_core::config::{DataDirError, Field, GameConfig};
+use applejack_core::game_config::ConfigImportResult;
+use applejack_core::{Core, CoreError};
 use clap::{Args, Subcommand};
 
 /// `EX_DATAERR` from sysexits(3): the preset holds items the user has not confirmed.
 const EXIT_CONFIRMATION_REQUIRED: u8 = 65;
-
-/// Largest preset file `import` reads. A preset is a few hundred bytes of
-/// settings; anything bigger is read into memory, written into the database,
-/// and echoed back, so the read stops one byte past the cap and the file is
-/// refused.
-const MAX_PRESET_BYTES: u64 = 1 << 20;
 
 #[derive(Args)]
 pub struct ConfigArgs {
@@ -68,17 +61,14 @@ enum Failure {
     ConfirmationRequired,
 }
 
-impl From<Error> for Failure {
-    fn from(error: Error) -> Self {
-        match error {
-            Error::ConfirmationRequired(_) => Self::ConfirmationRequired,
-            other => Self::Message(other.to_string()),
-        }
+impl From<CoreError> for Failure {
+    fn from(error: CoreError) -> Self {
+        Self::Message(error.to_string())
     }
 }
 
-impl From<config::DataDirError> for Failure {
-    fn from(error: config::DataDirError) -> Self {
+impl From<DataDirError> for Failure {
+    fn from(error: DataDirError) -> Self {
         Self::Message(error.to_string())
     }
 }
@@ -95,61 +85,30 @@ pub fn run(args: ConfigArgs) -> ExitCode {
 }
 
 fn execute(args: ConfigArgs) -> Result<String, Failure> {
-    let data_dir = config::data_dir()?;
-    // The home directory is read here and passed down: the config crate never
-    // consults the process environment.
-    let home = config::home_dir_from(|name| std::env::var_os(name));
+    let mut core = Core::from_env()?;
+    let appid = args.appid;
     match args.action {
-        Action::Show { json } => show(&open_existing_or_memory(&data_dir)?, args.appid, json),
+        Action::Show { json } => {
+            let config = core.config_get(appid)?;
+            if json {
+                return serde_json::to_string_pretty(&config)
+                    .map_err(|error| Failure::Message(format!("cannot encode config: {error}")));
+            }
+            Ok(render(&config))
+        }
         Action::Set { key, value } => {
-            // Validate before opening, so a bad key or value never creates the database.
-            let field = Field::parse(&key).ok_or_else(|| Error::UnknownField(key.clone()))?;
-            GameConfig::default().set(field, &value)?;
-            config::open_db(&data_dir)?.set_field(args.appid, &key, &value)?;
+            core.config_set(appid, &key, &value)?;
             Ok(format!("{key} = {value:?}"))
         }
-        Action::Export { file } => export(
-            &open_existing_or_memory(&data_dir)?,
-            args.appid,
-            &data_dir,
-            home.as_deref(),
-            &file,
-        ),
+        Action::Export { file } => {
+            core.config_export(appid, &file)?;
+            Ok(format!("exported appid {appid} to {}", file.display()))
+        }
         Action::Import {
             file,
             accept_launch_overrides,
-        } => import(
-            args.appid,
-            &data_dir,
-            home.as_deref(),
-            &file,
-            accept_launch_overrides,
-        ),
+        } => import(&mut core, appid, &file, accept_launch_overrides),
     }
-}
-
-/// The database when it exists. A missing one holds no rows, so a reader
-/// gets the same answer from an empty in-memory one without creating
-/// `db.sqlite`.
-fn open_existing(data_dir: &Path) -> Result<Option<ConfigDb>, Error> {
-    data_dir
-        .join(config::DB_FILE)
-        .exists()
-        .then(|| config::open_db(data_dir))
-        .transpose()
-}
-
-fn open_existing_or_memory(data_dir: &Path) -> Result<ConfigDb, Error> {
-    open_existing(data_dir)?.map_or_else(ConfigDb::open_in_memory, Ok)
-}
-
-fn show(db: &ConfigDb, appid: u32, json: bool) -> Result<String, Failure> {
-    let config = db.game_config(appid)?.unwrap_or_default();
-    if json {
-        return serde_json::to_string_pretty(&config)
-            .map_err(|error| Failure::Message(format!("cannot encode config: {error}")));
-    }
-    Ok(render(&config))
 }
 
 /// One `field = "value"` line per field, the form `set` echoes and the
@@ -175,75 +134,30 @@ fn render(config: &GameConfig) -> String {
         .join("\n")
 }
 
-fn export(
-    db: &ConfigDb,
-    appid: u32,
-    data_dir: &Path,
-    home: Option<&Path>,
-    file: &Path,
-) -> Result<String, Failure> {
-    let preset = config::presets::export(db, appid, data_dir, home)?;
-    let json = preset.to_json_pretty()?;
-    std::fs::write(file, format!("{json}\n"))
-        .map_err(|error| Failure::Message(format!("cannot write {}: {error}", file.display())))?;
-    Ok(format!("exported appid {appid} to {}", file.display()))
-}
-
 fn import(
+    core: &mut Core,
     appid: u32,
-    data_dir: &Path,
-    home: Option<&Path>,
     file: &Path,
     accept_launch_overrides: bool,
 ) -> Result<String, Failure> {
-    let cannot_read = |error: &dyn std::fmt::Display| {
-        Failure::Message(format!("cannot read {}: {error}", file.display()))
-    };
-    // Bound the read itself: a FIFO or character device reports no size, and
-    // a regular file can grow between a size check and the read. The size is
-    // checked before decoding, so a cut inside a multibyte character still
-    // reports the size, not a UTF-8 error.
-    let mut bytes = Vec::new();
-    std::fs::File::open(file)
-        .map_err(|error| cannot_read(&error))?
-        .take(MAX_PRESET_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| cannot_read(&error))?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PRESET_BYTES {
-        return Err(cannot_read(&format!(
-            "larger than the {MAX_PRESET_BYTES} byte preset limit"
-        )));
-    }
-    let text = String::from_utf8(bytes).map_err(|error| cannot_read(&error))?;
-    let mut preset = Preset::from_json(&text)?;
-    // The CLI's appid wins: a preset exported for one title may be applied to
-    // another entry (a different depot of the same game, for instance). Say
-    // so, because a preset for a different title is the easy way to slip a
-    // foreign executable and arguments past the user.
-    if preset.appid != appid {
+    let outcome = core.config_import(appid, file, accept_launch_overrides)?;
+    // A preset for a different title is the easy way to slip a foreign
+    // executable and arguments past the user, so say so.
+    if outcome.preset_appid != appid {
         eprintln!(
             "applejack config: warning: preset was exported for appid {}, applying to {appid}",
-            preset.appid
+            outcome.preset_appid
         );
-        preset.appid = appid;
     }
-    let policy = DefaultEnvPolicy::new(data_dir);
-    let options = ImportOptions {
-        accept_launch_overrides,
-    };
-    // The plan only reads; `db.sqlite` is created below, once there is
-    // something to write.
-    let existing = open_existing(data_dir)?;
-    let scratch;
-    let plan_db = if let Some(db) = &existing {
-        db
+    let mut lines = render_plan(&outcome);
+    if outcome.applied {
+        lines.push(format!(
+            "applied {} item(s) to appid {appid}",
+            outcome.accepted.len()
+        ));
+    } else if outcome.confirmations.is_empty() {
+        lines.push(format!("nothing to apply to appid {appid}"));
     } else {
-        scratch = ConfigDb::open_in_memory()?;
-        &scratch
-    };
-    let plan = config::presets::import(&preset, &policy, plan_db, data_dir, home, options)?;
-    let mut lines = render_plan(&plan);
-    if plan.needs_confirmation() {
         lines.push(
             "not applied: rerun with --accept-launch-overrides to accept the items above"
                 .to_owned(),
@@ -252,26 +166,12 @@ fn import(
         super::emit("config", &lines.join("\n"));
         return Err(Failure::ConfirmationRequired);
     }
-    if plan.accepted.is_empty() {
-        lines.push(format!("nothing to apply to appid {appid}"));
-        return Ok(lines.join("\n"));
-    }
-    let db = if let Some(db) = existing {
-        db
-    } else {
-        config::open_db(data_dir)?
-    };
-    plan.apply(&db)?;
-    lines.push(format!(
-        "applied {} item(s) to appid {appid}",
-        plan.accepted.len()
-    ));
     Ok(lines.join("\n"))
 }
 
 /// One report line per item. A launch override is listed once, as `confirm`,
 /// although it is also in `accepted` (it is written once confirmed).
-fn render_plan(plan: &ImportPlan) -> Vec<String> {
+fn render_plan(plan: &ConfigImportResult) -> Vec<String> {
     // Values come from an untrusted file; Debug formatting escapes newlines
     // and terminal control sequences so a preset cannot forge report lines.
     let mut out = Vec::new();

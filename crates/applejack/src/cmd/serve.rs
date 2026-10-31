@@ -21,18 +21,20 @@ pub struct ServeArgs {
 }
 
 /// Exit 0 on EOF after a good `hello`, 65 on a protocol mismatch, 2 without
-/// `--stdio`. Nothing but responses is written to stdout.
+/// `--stdio`. Nothing but protocol messages is written to stdout.
 pub fn run(args: ServeArgs) -> ExitCode {
     if !args.stdio {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
     let stdin = io::stdin().lock();
-    let stdout = io::stdout().lock();
+    let stdout = io::stdout();
+    let handler = CoreHandler::from_env();
     let outcome = if args.log {
-        rpc::serve(stdin, stdout, &mut Logged::new(CoreHandler, io::stderr()))
+        rpc::serve(stdin, stdout, &mut Logged::new(handler, io::stderr()))
     } else {
-        rpc::serve(stdin, stdout, &mut CoreHandler)
+        let mut handler = handler;
+        rpc::serve(stdin, stdout, &mut handler)
     };
     match outcome {
         Ok(status) => ExitCode::from(status.code()),

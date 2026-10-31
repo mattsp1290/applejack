@@ -6,6 +6,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use applejack_engine::launch::env::{ALLOWLIST, Entry, Kind, Owner};
+
 pub use applejack_config::presets::{
     self, Accepted, Confirmation, DATA_DIR_PLACEHOLDER, ENGINE_OWNED_NAMES, HOME_PLACEHOLDER,
     HOST_OWNED_NAMES, LOADER_PREFIXES, META_HOST_CHIP, META_MACOS_VERSION, Rejected,
@@ -99,37 +101,37 @@ pub fn open_db(data_dir: &Path) -> Result<ConfigDb, Error> {
     ConfigDb::open(&data_dir.join(DB_FILE))
 }
 
-/// The engine's environment allowlist from plan 02 as an [`EnvPolicy`]. The
-/// engine crate supplies its own table once it lands; this one exists so
-/// preset import works before then.
+/// Set to `1` to allow `engine install --from`: an unsigned local bundle.
+/// Debug builds only; a release build refuses the variable.
+pub const ALLOW_UNSIGNED_ENV: &str = "APPLEJACK_ALLOW_UNSIGNED_ENGINE";
+
+/// Whether this process may install an unsigned local bundle.
+pub fn allow_unsigned_from(env: impl Fn(&str) -> Option<OsString>) -> bool {
+    cfg!(debug_assertions) && env(ALLOW_UNSIGNED_ENV).is_some_and(|value| value == "1")
+}
+
+const LOG_DIR_RELATIVE: &str = "Library/Logs/applejack";
+
+/// The log root. A data directory override moves it to `<data_dir>/logs`,
+/// so a throwaway data directory never writes to the user's real logs.
+#[must_use]
+pub fn log_dir_from(data_dir: &Path, env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let overridden = env(DATA_DIR_ENV).is_some_and(|value| !value.is_empty());
+    if overridden {
+        return data_dir.join("logs");
+    }
+    home_dir_from(env).map_or_else(|| data_dir.join("logs"), |home| home.join(LOG_DIR_RELATIVE))
+}
+
+/// The engine's environment allowlist as an [`EnvPolicy`]: a preset may set
+/// exactly the game-owned rows of [`ALLOWLIST`], with the same value kinds,
+/// so the engine's table is the one list of names.
 #[derive(Debug, Clone)]
 pub struct DefaultEnvPolicy {
     /// Root for ICD, plugin, and DXMT config paths: the engine payloads and
     /// their `<version>.user` overlays both live under `engines/`.
     engines: Vec<PathBuf>,
 }
-
-/// Every name the engine passes through, whoever sets it. The game tier,
-/// which `allows` answers for, is this list minus the engine-owned and
-/// host-owned names.
-const ALLOWED_NAMES: [&str; 16] = [
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "WINEPREFIX",
-    "WINEDEBUG",
-    "WINEDLLOVERRIDES",
-    "WINEMSYNC",
-    "WINEESYNC",
-    "DXMT_CONFIG",
-    "DXMT_CONFIG_FILE",
-    "DXMT_LOG_LEVEL",
-    "MTL_HUD_ENABLED",
-    "ROSETTA_ADVERTISE_AVX",
-    "GST_PLUGIN_PATH",
-    "APPLEJACK_SESSION",
-    "VK_ICD_FILENAMES",
-];
 
 impl DefaultEnvPolicy {
     /// Policy rooted at `data_dir`'s `engines/` directory.
@@ -141,17 +143,19 @@ impl DefaultEnvPolicy {
     }
 }
 
+fn allowlist_row(name: &str) -> Option<&'static Entry> {
+    ALLOWLIST.iter().find(|entry| entry.name == name)
+}
+
 impl EnvPolicy for DefaultEnvPolicy {
     fn allows(&self, name: &str) -> bool {
-        ALLOWED_NAMES.contains(&name)
-            && !ENGINE_OWNED_NAMES.contains(&name)
-            && !HOST_OWNED_NAMES.contains(&name)
+        allowlist_row(name).is_some_and(|entry| entry.owner == Owner::Game)
     }
 
     fn value_check(&self, name: &str) -> ValueCheck<'_> {
-        match name {
-            "DXMT_CONFIG_FILE" => ValueCheck::Path(&self.engines),
-            "VK_ICD_FILENAMES" | "GST_PLUGIN_PATH" => ValueCheck::PathList(&self.engines),
+        match allowlist_row(name).map(|entry| entry.kind) {
+            Some(Kind::Path) => ValueCheck::Path(&self.engines),
+            Some(Kind::PathList) => ValueCheck::PathList(&self.engines),
             _ => ValueCheck::Plain,
         }
     }
@@ -258,6 +262,47 @@ mod tests {
         );
         assert_eq!(home_dir_from(env_of(&[("HOME", "relative")])), None);
         assert_eq!(home_dir_from(env_of(&[])), None);
+    }
+
+    #[test]
+    fn unsigned_installs_need_the_variable_set_to_1() {
+        assert_eq!(
+            allow_unsigned_from(env_of(&[(ALLOW_UNSIGNED_ENV, "1")])),
+            cfg!(debug_assertions),
+            "a release build refuses the variable"
+        );
+        assert!(!allow_unsigned_from(env_of(&[(ALLOW_UNSIGNED_ENV, "0")])));
+        assert!(!allow_unsigned_from(env_of(&[])));
+    }
+
+    #[test]
+    fn a_data_dir_override_keeps_logs_out_of_the_real_log_root() {
+        let data = Path::new("/tmp/aj");
+        let overridden = env_of(&[("APPLEJACK_DATA_DIR", "/tmp/aj"), ("HOME", "/Users/x")]);
+        assert_eq!(log_dir_from(data, overridden), data.join("logs"));
+        assert_eq!(
+            log_dir_from(data, env_of(&[("HOME", "/Users/x")])),
+            Path::new("/Users/x/Library/Logs/applejack")
+        );
+    }
+
+    /// The engine's table is the source: every game row is importable and
+    /// nothing else is, so a new row cannot miss the policy.
+    #[test]
+    fn the_policy_is_the_game_tier_of_the_engine_allowlist() {
+        let policy = DefaultEnvPolicy::new(Path::new("/data"));
+        for entry in ALLOWLIST {
+            assert_eq!(
+                policy.allows(entry.name),
+                entry.owner == Owner::Game,
+                "{}",
+                entry.name
+            );
+            if entry.owner == Owner::Game {
+                assert!(!ENGINE_OWNED_NAMES.contains(&entry.name), "{}", entry.name);
+                assert!(!HOST_OWNED_NAMES.contains(&entry.name), "{}", entry.name);
+            }
+        }
     }
 
     #[test]

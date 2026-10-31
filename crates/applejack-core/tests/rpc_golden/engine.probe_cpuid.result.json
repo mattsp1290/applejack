@@ -1,0 +1,19 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "advertised": {
+      "avx": true,
+      "avx2": false,
+      "osxsave": true,
+      "xcr0_ymm": false
+    },
+    "changes_bits": true,
+    "plain": {
+      "avx": false,
+      "avx2": false,
+      "osxsave": true,
+      "xcr0_ymm": false
+    }
+  }
+}

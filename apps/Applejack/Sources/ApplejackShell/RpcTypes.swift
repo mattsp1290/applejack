@@ -159,6 +159,12 @@ public enum RpcErrorCode: Int, Codable, Sendable, CaseIterable {
     case notImplemented = 1002
     case `internal` = 1003
     case jobFailed = 1004
+    case engineNotInstalled = 1005
+    case checksumMismatch = 1006
+    case invalidBundle = 1007
+    case diskFull = 1008
+    case downloadFailed = 1009
+    case unsignedEngineRefused = 1010
 }
 
 public struct HelloParams: Codable, Equatable, Sendable {

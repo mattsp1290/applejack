@@ -3,7 +3,10 @@
 //! adding one row to `methods!` and one example to [`Method::examples`].
 
 use super::wire::{ErrorCode, RpcError};
+pub use crate::engines::{CpuidProbeResult, D3dmetalImportResult, EngineEntry, EngineListResult};
+pub use crate::game_config::ConfigImportResult;
 use crate::host::HostFacts;
+pub use crate::prefixes::SnapshotResult;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
@@ -53,13 +56,13 @@ const fn pending(work_package: &'static str) -> MethodStatus {
 methods! {
     Hello = "hello": HelloParams => IMPLEMENTED;
     HostDoctor = "host.doctor": HostDoctorParams => IMPLEMENTED;
-    EngineList = "engine.list": EngineListParams => pending("2");
-    EngineInstall = "engine.install": EngineInstallParams => pending("2");
-    EngineUse = "engine.use": EngineUseParams => pending("2");
-    EngineDoctor = "engine.doctor": EngineDoctorParams => pending("2");
-    EngineProbeCpuid = "engine.probe_cpuid": EngineProbeCpuidParams => pending("2");
-    EngineD3dmetalImport = "engine.d3dmetal.import": EngineD3dmetalImportParams => pending("2");
-    EngineD3dmetalRemove = "engine.d3dmetal.remove": EngineD3dmetalRemoveParams => pending("2");
+    EngineList = "engine.list": EngineListParams => IMPLEMENTED;
+    EngineInstall = "engine.install": EngineInstallParams => IMPLEMENTED;
+    EngineUse = "engine.use": EngineUseParams => IMPLEMENTED;
+    EngineDoctor = "engine.doctor": EngineDoctorParams => IMPLEMENTED;
+    EngineProbeCpuid = "engine.probe_cpuid": EngineProbeCpuidParams => IMPLEMENTED;
+    EngineD3dmetalImport = "engine.d3dmetal.import": EngineD3dmetalImportParams => IMPLEMENTED;
+    EngineD3dmetalRemove = "engine.d3dmetal.remove": EngineD3dmetalRemoveParams => IMPLEMENTED;
     SteamLoginStart = "steam.login.start": SteamLoginStartParams => pending("4");
     SteamLoginComplete = "steam.login.complete": SteamLoginCompleteParams => pending("4");
     SteamLogout = "steam.logout": SteamLogoutParams => pending("4");
@@ -71,13 +74,13 @@ methods! {
     RuntimeSteamUpdate = "runtime.steam.update": RuntimeSteamUpdateParams => pending("5");
     RuntimeSteamRepair = "runtime.steam.repair": RuntimeSteamRepairParams => pending("5");
     RuntimeSteamStop = "runtime.steam.stop": RuntimeSteamStopParams => pending("5");
-    ConfigGet = "config.get": ConfigGetParams => pending("6a");
-    ConfigSet = "config.set": ConfigSetParams => pending("6a");
-    ConfigExport = "config.export": ConfigExportParams => pending("6a");
-    ConfigImport = "config.import": ConfigImportParams => pending("6a");
-    PrefixSnapshot = "prefix.snapshot": PrefixSnapshotParams => pending("2");
-    PrefixRestore = "prefix.restore": PrefixRestoreParams => pending("2");
-    PrefixReset = "prefix.reset": PrefixResetParams => pending("2");
+    ConfigGet = "config.get": ConfigGetParams => IMPLEMENTED;
+    ConfigSet = "config.set": ConfigSetParams => IMPLEMENTED;
+    ConfigExport = "config.export": ConfigExportParams => IMPLEMENTED;
+    ConfigImport = "config.import": ConfigImportParams => IMPLEMENTED;
+    PrefixSnapshot = "prefix.snapshot": PrefixSnapshotParams => IMPLEMENTED;
+    PrefixRestore = "prefix.restore": PrefixRestoreParams => IMPLEMENTED;
+    PrefixReset = "prefix.reset": PrefixResetParams => IMPLEMENTED;
     SessionList = "session.list": SessionListParams => pending("5");
 }
 
@@ -130,6 +133,7 @@ impl Method {
             Self::EngineList(EngineListParams {}),
             Self::EngineInstall(EngineInstallParams {
                 engine_id: "rosetta-wine".into(),
+                from: None,
             }),
             Self::EngineUse(EngineUseParams {
                 engine_id: "rosetta-wine".into(),
@@ -213,6 +217,13 @@ pub struct HelloResult {
     pub core_version: String,
 }
 
+/// The result of `config.export`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigExportResult {
+    pub path: PathBuf,
+}
+
 /// The result of a method with nothing to return; encodes as `{}`. A result
 /// is never `null` on the wire (see `to_result`), so the Swift mirror can
 /// decode every success into a typed value.
@@ -234,6 +245,10 @@ pub struct EngineListParams {}
 #[serde(deny_unknown_fields)]
 pub struct EngineInstallParams {
     pub engine_id: String,
+    /// A local bundle directory or `.tar.zst`; needs the core to run with
+    /// `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`. The manifest decides without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

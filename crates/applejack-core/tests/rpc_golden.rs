@@ -2,10 +2,17 @@
 //! `docs/rpc-protocol.md` are generated from the Rust types and must match
 //! what is committed. `APPLEJACK_UPDATE_GOLDENS=1` rewrites both.
 
+use applejack_core::config::{GameConfig, GraphicsBackend, SyncMode};
 use applejack_core::host::{HostFacts, ScreenRecordingState};
 use applejack_core::rpc::PROTOCOL_VERSION;
-use applejack_core::rpc::methods::{EmptyResult, HelloResult, Method, MethodStatus};
-use applejack_core::rpc::wire::{ErrorCode, Id, Request, Response};
+use applejack_core::rpc::jobs::{JobDone, JobFailed, JobId, JobProgress, JobStarted};
+use applejack_core::rpc::methods::{
+    ConfigExportResult, ConfigImportResult, CpuidProbeResult, D3dmetalImportResult, EmptyResult,
+    EngineEntry, EngineListResult, HelloResult, Method, MethodStatus, SnapshotResult,
+};
+use applejack_core::rpc::wire::{ErrorCode, Id, Notification, Request, Response};
+use applejack_engine::rosetta_wine::{CpuidFeatures, CpuidProbe};
+use applejack_engine::{DoctorReport, Finding, Severity};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -75,12 +82,144 @@ fn expected() -> BTreeMap<String, String> {
         serde_json::to_value(EmptyResult {}).expect("encodes"),
     );
     files.insert("empty.result.json".to_owned(), pretty(&empty));
+    results(&mut files);
+    notifications(&mut files);
     let codes: BTreeMap<&str, i64> = ErrorCode::ALL
         .into_iter()
         .map(|code| (code.name(), code.code()))
         .collect();
     files.insert("error_codes.json".to_owned(), pretty(&codes));
     files
+}
+
+fn result_response<T: serde::Serialize>(value: &T) -> Response {
+    Response::result(Id::Number(4), serde_json::to_value(value).expect("encodes"))
+}
+
+/// The results the shell decodes; `GoldenTests` reads the same files.
+fn results(files: &mut BTreeMap<String, String>) {
+    let mut add = |name: &str, response: &Response| {
+        files.insert(format!("{name}.result.json"), pretty(response));
+    };
+    add(
+        "engine.list",
+        &result_response(&EngineListResult {
+            engines: vec![EngineEntry {
+                engine_id: "rosetta-wine".to_owned(),
+                version: "11.0-1".to_owned(),
+                installed: true,
+                active: true,
+            }],
+        }),
+    );
+    add(
+        "engine.install",
+        &result_response(&JobStarted { job_id: JobId(7) }),
+    );
+    add(
+        "engine.doctor",
+        &result_response(&DoctorReport {
+            runnable: false,
+            findings: vec![Finding {
+                severity: Severity::Error,
+                message: "engine rosetta-wine is not installed".to_owned(),
+            }],
+        }),
+    );
+    let features = CpuidFeatures {
+        avx: false,
+        avx2: false,
+        osxsave: true,
+        xcr0_ymm: false,
+    };
+    add(
+        "engine.probe_cpuid",
+        &result_response(&CpuidProbeResult {
+            probe: CpuidProbe {
+                plain: features,
+                advertised: CpuidFeatures {
+                    avx: true,
+                    ..features
+                },
+            },
+            changes_bits: true,
+        }),
+    );
+    add(
+        "engine.d3dmetal.import",
+        &result_response(&D3dmetalImportResult {
+            engine_version: "11.0-1".to_owned(),
+            overlay_dir: PathBuf::from("/data/engines/rosetta-wine/11.0-1.user/wine/lib/external"),
+            imported_from: PathBuf::from("/Volumes/Game Porting Toolkit"),
+            gptk_version: "3.0".to_owned(),
+            accepted_at: "2026-10-31T12:00:00Z".to_owned(),
+        }),
+    );
+    add(
+        "prefix.snapshot",
+        &result_response(&SnapshotResult {
+            prefix: "220".to_owned(),
+            timestamp: "20261031T120000Z".to_owned(),
+            dir: PathBuf::from("/data/prefixes/.snapshots/220/20261031T120000Z"),
+        }),
+    );
+    add(
+        "config.get",
+        &result_response(&GameConfig {
+            graphics_backend: Some(GraphicsBackend::Dxmt),
+            sync_mode: Some(SyncMode::Disabled),
+            hidraw_enabled: Some(true),
+            ..GameConfig::default()
+        }),
+    );
+    add(
+        "config.export",
+        &result_response(&ConfigExportResult {
+            path: PathBuf::from("/tmp/220.preset.json"),
+        }),
+    );
+    add(
+        "config.import",
+        &result_response(&ConfigImportResult {
+            applied: false,
+            preset_appid: 220,
+            accepted: vec![applejack_core::config::Accepted {
+                field: "launch_exe_override".to_owned(),
+                value: "game.exe".to_owned(),
+            }],
+            rejected: vec![applejack_core::config::Rejected {
+                field: "extra_env.PATH".to_owned(),
+                value: "/tmp".to_owned(),
+                reason: "host-owned".to_owned(),
+            }],
+            confirmations: vec![applejack_core::config::Confirmation {
+                field: "launch_exe_override".to_owned(),
+                value: "game.exe".to_owned(),
+            }],
+        }),
+    );
+}
+
+fn notifications(files: &mut BTreeMap<String, String>) {
+    let mut add = |notification: &Notification| {
+        files.insert(
+            format!("{}.notification.json", notification.method),
+            pretty(notification),
+        );
+    };
+    add(&Notification::from(&JobProgress {
+        job_id: JobId(7),
+        phase: "pack".to_owned(),
+        done_bytes: Some(1024),
+        total_bytes: None,
+        message: "packing the bundle directory".to_owned(),
+    }));
+    add(&Notification::from(&JobDone { job_id: JobId(7) }));
+    add(&Notification::from(&JobFailed {
+        job_id: JobId(7),
+        code: ErrorCode::ChecksumMismatch,
+        message: "archive SHA-256 mismatch".to_owned(),
+    }));
 }
 
 fn committed(dir: &Path) -> BTreeMap<String, String> {
@@ -274,6 +413,34 @@ fn result_goldens_decode_into_their_types() {
     };
     assert_eq!(value, serde_json::json!({}));
     let _: EmptyResult = serde_json::from_value(value).unwrap();
+}
+
+fn result_value(name: &str) -> serde_json::Value {
+    let path = golden_dir().join(format!("{name}.result.json"));
+    let response: Response = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    match response.body {
+        applejack_core::rpc::wire::Body::Result(value) => value,
+        applejack_core::rpc::wire::Body::Error(error) => panic!("{name}: {error}"),
+    }
+}
+
+#[test]
+fn result_goldens_for_engine_and_config_methods_decode() {
+    let list: EngineListResult = serde_json::from_value(result_value("engine.list")).unwrap();
+    assert!(list.engines[0].active);
+    let _: JobStarted = serde_json::from_value(result_value("engine.install")).unwrap();
+    let doctor: DoctorReport = serde_json::from_value(result_value("engine.doctor")).unwrap();
+    assert!(!doctor.runnable);
+    let cpuid: CpuidProbeResult =
+        serde_json::from_value(result_value("engine.probe_cpuid")).unwrap();
+    assert!(cpuid.changes_bits);
+    let _: D3dmetalImportResult =
+        serde_json::from_value(result_value("engine.d3dmetal.import")).unwrap();
+    let _: SnapshotResult = serde_json::from_value(result_value("prefix.snapshot")).unwrap();
+    let _: GameConfig = serde_json::from_value(result_value("config.get")).unwrap();
+    let _: ConfigExportResult = serde_json::from_value(result_value("config.export")).unwrap();
+    let import: ConfigImportResult = serde_json::from_value(result_value("config.import")).unwrap();
+    assert!(!import.applied);
 }
 
 #[test]
