@@ -557,7 +557,12 @@ final class ViewModelTests: XCTestCase {
         try FileManager.default.removeItem(at: log)
         try Data("new1\n".utf8).write(to: log)
         try await Task.sleep(for: .milliseconds(150))
-        try Data("new1\nnew2\nnew3\nnew4\n".utf8).write(to: log)
+        // Appends as a log writer does: rewriting in place truncates first, and
+        // a poll in that window rightly starts the file over.
+        let handle = try FileHandle(forWritingTo: log)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("new2\nnew3\nnew4\n".utf8))
+        try handle.close()
         try await Task.sleep(for: .milliseconds(150))
         collector.cancel()
         let lines = await collector.value
