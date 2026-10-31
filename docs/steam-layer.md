@@ -546,7 +546,12 @@ cargo run -p applejack-steam --example depot_spike                 # prints usag
 APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike
 APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \
     --install 480 --dir /tmp/applejack-spike
+APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \
+    --library-out ~/applejack-library.tsv
 ```
+
+`--library-out` writes the owned Windows apps to a new file with mode 0600. It
+combines with `--install`. Keep that file out of the repository.
 
 Spacewar (480) is a small free title; add it to the account first, or use any
 small Windows title the account owns. `--dir` is the library root, and it also

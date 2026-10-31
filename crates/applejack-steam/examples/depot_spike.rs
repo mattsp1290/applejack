@@ -2,8 +2,10 @@
 //! `APPLEJACK_LIVE_STEAM=1`; see `docs/steam-layer.md` under "Running the
 //! depot spike".
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -28,12 +30,16 @@ Run with your own Steam account:
   APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike
   APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \\
       --install 480 --dir /tmp/applejack-spike
+  APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \\
+      --library-out ~/applejack-library.tsv
 
 The first form logs in and prints how many owned apps have a Windows depot. The
 second also installs that app into <dir>/steamapps/common and verifies it. Use a
 small title your account owns; Spacewar (480) is the usual one once it is on the
 account. A <dir> that holds anything else and no applejack record for that app
-is refused before login; --force installs over it. Each Steam call is printed
+is refused before login; --force installs over it. --library-out writes each
+owned Windows app as appid, size, drm, and name to a new file only you can read,
+with or without --install. Each Steam call is printed
 before it is made, so the last line before a failure names the call that failed.
 
 The spike logs in with your account name and password, read from the terminal
@@ -45,12 +51,14 @@ Quit any Steam client that maps <dir> first.";
 struct Args {
     install: Option<(u32, PathBuf)>,
     force: bool,
+    library_out: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut appid = None;
     let mut dir = None;
     let mut force = false;
+    let mut library_out = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -60,6 +68,11 @@ fn parse_args() -> Result<Args, String> {
             }
             "--dir" => dir = Some(PathBuf::from(args.next().ok_or("--dir needs a path")?)),
             "--force" => force = true,
+            "--library-out" => {
+                library_out = Some(PathBuf::from(
+                    args.next().ok_or("--library-out needs a path")?,
+                ));
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -67,10 +80,12 @@ fn parse_args() -> Result<Args, String> {
         (Some(appid), Some(dir)) => Ok(Args {
             install: Some((appid, dir)),
             force,
+            library_out,
         }),
         (None, None) => Ok(Args {
             install: None,
             force,
+            library_out,
         }),
         _ => Err("--install and --dir go together".to_owned()),
     }
@@ -109,6 +124,17 @@ fn check_target(dir: &Path, record: &Path, force: bool) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The owned titles name the account's history, so the file is the owner's
+/// alone and never replaces an earlier one.
+fn write_private(path: &Path, text: &str) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(text.as_bytes())
 }
 
 fn step(call: &str) {
@@ -199,6 +225,9 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Some((appid, dir)) = &args.install {
         check_target(dir, &LibraryPaths::new(dir).record(*appid), args.force)?;
     }
+    if let Some(path) = args.library_out.as_deref().filter(|path| path.exists()) {
+        return Err(format!("{} already exists", path.display()).into());
+    }
     step("auth login and CM logon");
     let session = login().await?;
     println!("logon ok");
@@ -211,6 +240,16 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         library.apps.len(),
         library.skipped
     );
+
+    if let Some(path) = &args.library_out {
+        let mut rows = String::new();
+        for app in library.windows_apps() {
+            let name = app.name.replace(char::is_control, " ");
+            writeln!(rows, "{}\t{}\t{}\t{name}", app.appid, app.size, app.drm)?;
+        }
+        write_private(path, &rows)?;
+        println!("library written to {}", path.display());
+    }
 
     let Some((appid, dir)) = args.install else {
         return Ok(());
@@ -269,6 +308,19 @@ fn prompt_line(prompt: &str) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_library_file_is_private_and_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.tsv");
+        write_private(&path, "first").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(write_private(&path, "second").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+    }
 
     #[test]
     fn a_directory_with_other_files_is_refused_unless_forced_or_resuming() {
