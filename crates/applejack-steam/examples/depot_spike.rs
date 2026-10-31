@@ -34,8 +34,9 @@ Run with your own Steam account:
       --library-out ~/applejack-library.tsv
 
 The first form logs in and prints how many owned apps have a Windows depot. The
-second also installs that app into <dir>/steamapps/common and verifies it. Use a
-small title your account owns; Spacewar (480) is the usual one once it is on the
+second also installs that app into <dir>/steamapps/common and verifies it.
+--install repeats, to install several apps on one login; one that fails does not
+stop the rest. Use a small title your account owns; Spacewar (480) is the usual one once it is on the
 account. A <dir> that holds anything else and no applejack record for that app
 is refused before login; --force installs over it. --library-out writes each
 owned Windows app as appid, size, drm, and name to a new file only you can read,
@@ -49,13 +50,13 @@ DuplicateRequest. It holds the refresh token in memory only and never prints it.
 Quit any Steam client that maps <dir> first.";
 
 struct Args {
-    install: Option<(u32, PathBuf)>,
+    install: Option<(Vec<u32>, PathBuf)>,
     force: bool,
     library_out: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut appid = None;
+    let mut appids = Vec::new();
     let mut dir = None;
     let mut force = false;
     let mut library_out = None;
@@ -64,7 +65,7 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--install" => {
                 let value = args.next().ok_or("--install needs an appid")?;
-                appid = Some(value.parse::<u32>().map_err(|_| "appid is not a number")?);
+                appids.push(value.parse::<u32>().map_err(|_| "appid is not a number")?);
             }
             "--dir" => dir = Some(PathBuf::from(args.next().ok_or("--dir needs a path")?)),
             "--force" => force = true,
@@ -76,13 +77,13 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    match (appid, dir) {
-        (Some(appid), Some(dir)) => Ok(Args {
-            install: Some((appid, dir)),
+    match (appids.is_empty(), dir) {
+        (false, Some(dir)) => Ok(Args {
+            install: Some((appids, dir)),
             force,
             library_out,
         }),
-        (None, None) => Ok(Args {
+        (true, None) => Ok(Args {
             install: None,
             force,
             library_out,
@@ -222,8 +223,10 @@ async fn login() -> Result<SteamroomSession, Box<dyn std::error::Error>> {
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some((appid, dir)) = &args.install {
-        check_target(dir, &LibraryPaths::new(dir).record(*appid), args.force)?;
+    if let Some((appids, dir)) = &args.install {
+        for appid in appids {
+            check_target(dir, &LibraryPaths::new(dir).record(*appid), args.force)?;
+        }
     }
     if let Some(path) = args.library_out.as_deref().filter(|path| path.exists()) {
         return Err(format!("{} already exists", path.display()).into());
@@ -251,9 +254,29 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("library written to {}", path.display());
     }
 
-    let Some((appid, dir)) = args.install else {
+    let Some((appids, dir)) = args.install else {
         return Ok(());
     };
+    let mut failed = Vec::new();
+    for appid in appids {
+        if let Err(error) = install_and_verify(&session, &library, appid, &dir).await {
+            eprintln!("app {appid}: {error}");
+            failed.push(appid);
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!("failed: {failed:?}").into());
+    }
+    println!("depot spike: green");
+    Ok(())
+}
+
+async fn install_and_verify(
+    session: &Traced<'_>,
+    library: &Library,
+    appid: u32,
+    dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let app = library.windows_app(appid)?;
     let plan = InstallPlan::new(app, DEFAULT_BRANCH, &library.filter())?;
     println!(
@@ -264,7 +287,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         plan.not_licensed
     );
 
-    let paths = LibraryPaths::new(&dir);
+    let paths = LibraryPaths::new(dir);
     let client_running = || false;
     let progress = |report: &applejack_steam::InstallProgress| {
         println!(
@@ -272,7 +295,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             report.depot_id, report.completed_files, report.total_files, report.completed_bytes
         );
     };
-    let outcome = DepotInstaller::new(&session, paths.clone(), &dir, &client_running)
+    let outcome = DepotInstaller::new(session, paths.clone(), dir, &client_running)
         .with_progress(&progress)
         .install(&plan)
         .await?;
@@ -281,7 +304,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         outcome.files_written, outcome.resumed
     );
 
-    let verify_dir = dir.clone();
+    let verify_dir = dir.to_owned();
     let report =
         tokio::task::spawn_blocking(move || verify_install(&paths, &verify_dir, appid)).await??;
     println!(
@@ -293,7 +316,6 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if !report.is_clean() {
         return Err("verify found differences".into());
     }
-    println!("depot spike: green");
     Ok(())
 }
 

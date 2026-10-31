@@ -536,6 +536,13 @@ have been tolerated for years. The plan records this as a legal risk the user
 accepts. This layer acts on the user's own account for the user's own
 purchases only and does not bypass DRM.
 
+## Live result
+
+On 2026-10-31 `depot_spike` passed against a real account at e615214: device-code
+login, CM logon, license and product info, then Spacewar (480) from two depots,
+one of them shared from app 228980. It wrote 12 files and 85,850,313 bytes and
+verified them with no mismatches.
+
 ## Running the depot spike
 
 `examples/depot_spike.rs` is the live check of this code. Without
@@ -549,6 +556,9 @@ APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \
 APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \
     --library-out ~/applejack-library.tsv
 ```
+
+Repeat `--install` to install several apps on one login. A later run over the
+same `--dir` needs `--force`, because the other apps' files are there.
 
 `--library-out` writes the owned Windows apps to a new file with mode 0600. It
 combines with `--install`. Keep that file out of the repository.
