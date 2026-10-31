@@ -697,6 +697,27 @@ async fn a_denied_depot_key_is_not_a_refused_login() {
 }
 
 #[tokio::test]
+async fn a_busy_depot_key_reply_is_not_a_denial() {
+    let (session, mut cm) = logged_in(9).await;
+    let session = Arc::new(session);
+    let caller = Arc::clone(&session);
+    let call = tokio::spawn(async move { caller.depot_key(100, 7).await });
+    let request = cm.recv_past_heartbeats().await;
+    let body = CMsgClientGetDepotDecryptionKeyResponse {
+        eresult: Some(10),
+        depot_id: Some(7),
+        depot_encryption_key: None,
+    }
+    .encode_to_vec();
+    cm.reply(
+        &request,
+        EMsg::CLIENT_GET_DEPOT_DECRYPTION_KEY_RESPONSE,
+        &body,
+    );
+    assert!(matches!(call.await.unwrap(), Err(AuthError::Connection(_))));
+}
+
+#[tokio::test]
 async fn a_denied_logon_is_still_a_refused_login() {
     let (session, cm) = connect().await;
     let body = CMsgClientLogonResponse {

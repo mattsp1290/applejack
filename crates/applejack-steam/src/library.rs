@@ -46,8 +46,6 @@ pub struct DepotInfo {
     /// Manifests by branch. A `depotfromapp` depot may have none of its own,
     /// and takes the parent app's when the library resolves it.
     pub manifests: BTreeMap<String, ManifestRef>,
-    /// `manifests` came from the parent app.
-    pub linked: bool,
 }
 
 impl DepotInfo {
@@ -60,13 +58,17 @@ impl DepotInfo {
         self.depot_from_app.is_some() && self.manifests.is_empty()
     }
 
-    /// The manifest for `branch`. A parent app's depots are usually on
-    /// `public` only, and `DepotDownloader` falls back to it; the flag says so.
-    fn manifest_for(&self, branch: &str) -> Option<(ManifestRef, bool)> {
+    /// The manifest for `branch`. A depot need not be on every branch, and a
+    /// parent app's rarely is, so a branch the app has falls back to `public`
+    /// as `DepotDownloader` does; the flag says so.
+    fn manifest_for(&self, branch: &str, branch_exists: bool) -> Option<(ManifestRef, bool)> {
         if let Some(manifest) = self.manifests.get(branch) {
             return Some((*manifest, false));
         }
-        let fallback = self.manifests.get(DEFAULT_BRANCH).filter(|_| self.linked)?;
+        let fallback = self
+            .manifests
+            .get(DEFAULT_BRANCH)
+            .filter(|_| branch_exists)?;
         Some((*fallback, true))
     }
 }
@@ -223,7 +225,6 @@ impl OwnedApp {
                 .and_then(|parent| parent.depots.iter().find(|d| d.depot_id == depot.depot_id));
             if let Some(source) = source.filter(|source| !source.manifests.is_empty()) {
                 depot.manifests.clone_from(&source.manifests);
-                depot.linked = true;
             }
         }
         self.measure(filter);
@@ -258,8 +259,8 @@ impl OwnedApp {
     /// The depots to fetch for `branch`: Windows, x86-64 plus architecture
     /// neutral, or 32-bit when the app has no x86-64 depot; the filter's
     /// language or none; no low-violence variants; only what the account
-    /// licenses, with the rest reported. A depot with no manifest on the
-    /// branch is left out, unless it is a `depotfromapp` depot.
+    /// licenses, with the rest reported. A depot with no manifest on a branch
+    /// the app has takes its `public` one.
     ///
     /// # Errors
     ///
@@ -280,12 +281,14 @@ impl OwnedApp {
                 platforms: self.platforms.clone(),
             });
         }
+        let branch_exists = self.builds.contains_key(branch);
         let (licensed, unlicensed): (Vec<&DepotInfo>, Vec<&DepotInfo>) = self
             .depots
             .iter()
             .filter(|depot| {
                 depot.is_windows()
-                    && (depot.manifest_for(branch).is_some() || depot.awaits_parent())
+                    && (depot.manifest_for(branch, branch_exists).is_some()
+                        || depot.awaits_parent())
             })
             .filter(|depot| {
                 depot
@@ -295,7 +298,12 @@ impl OwnedApp {
             })
             .filter(|depot| !depot.low_violence)
             .partition(|depot| self.is_licensed(depot, filter));
-        let has_x86_64 = licensed.iter().any(|depot| depot.osarch == Some(X86_64));
+        // Over both lists: 32-bit is for an app that ships only that, not a
+        // stand-in for an x86-64 depot this account lacks.
+        let has_x86_64 = licensed
+            .iter()
+            .chain(&unlicensed)
+            .any(|depot| depot.osarch == Some(X86_64));
         let fits =
             |depot: &&DepotInfo| !has_x86_64 || depot.osarch.is_none_or(|arch| arch == X86_64);
         let not_licensed: Vec<u32> = unlicensed
@@ -314,10 +322,12 @@ impl OwnedApp {
             });
         }
         // A depot still waiting on its parent says nothing about the branch.
-        let on_branch = self.depots.iter().any(|depot| {
-            not_licensed.contains(&depot.depot_id) && depot.manifest_for(branch).is_some()
-        });
-        Err(if on_branch {
+        let on_branch = branch_exists
+            || self.depots.iter().any(|depot| {
+                not_licensed.contains(&depot.depot_id)
+                    && depot.manifest_for(branch, false).is_some()
+            });
+        Err(if on_branch && !not_licensed.is_empty() {
             Error::NoLicensedDepot {
                 appid: self.appid,
                 depots: not_licensed,
@@ -331,14 +341,13 @@ impl OwnedApp {
     }
 
     fn planned(&self, depot: &DepotInfo, branch: &str) -> Result<PlannedDepot, Error> {
-        let (manifest, public_manifest) =
-            depot
-                .manifest_for(branch)
-                .ok_or_else(|| Error::UnresolvedSharedDepot {
-                    appid: self.appid,
-                    depot_id: depot.depot_id,
-                    from_app: depot.depot_from_app.unwrap_or(self.appid),
-                })?;
+        let branch_exists = self.builds.contains_key(branch);
+        let found = depot.manifest_for(branch, branch_exists);
+        let (manifest, public_manifest) = found.ok_or(Error::UnresolvedSharedDepot {
+            appid: self.appid,
+            depot_id: depot.depot_id,
+            from_app: depot.depot_from_app.unwrap_or(self.appid),
+        })?;
         Ok(PlannedDepot {
             depot_id: depot.depot_id,
             manifest_id: manifest.manifest_id,
@@ -560,6 +569,5 @@ fn parse_depot(depot_id: u32, entry: &KeyValue) -> DepotInfo {
         dlc_appid: text(entry, &["dlcappid"]).and_then(|appid| appid.parse().ok()),
         depot_from_app: text(entry, &["depotfromapp"]).and_then(|appid| appid.parse().ok()),
         manifests,
-        linked: false,
     }
 }

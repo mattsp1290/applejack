@@ -243,10 +243,10 @@ impl LiveChunks {
     }
 
     /// Fetches and parses a manifest, one pass over the pool. One cache's 503
-    /// says nothing about the others, so a rate limit is the answer only when
-    /// no server had the manifest. `Ok(None)` when a server answered 404 and
-    /// none served it: a dead host must not keep the plan from re-reading the
-    /// product info.
+    /// says nothing about the others, so the rest are tried. `Ok(None)` when
+    /// a server answered 404 and none served it, as `DepotDownloader` stops
+    /// on a 404: a dead host must not keep the plan from re-reading the
+    /// product info. A rate limit is the answer when no server said either.
     pub(super) async fn manifest(
         &self,
         depot_id: u32,

@@ -19,7 +19,7 @@ use std::time::Duration;
 use prost::Message;
 use steamroom::client::msg::ClientMsg;
 use steamroom::client::multi::unpack_multi;
-use steamroom::client::{HasEResult, IncomingMsg, PROTOCOL_VERSION, Ready, SteamClient};
+use steamroom::client::{IncomingMsg, PROTOCOL_VERSION, Ready, SteamClient};
 use steamroom::depot::DepotKey;
 use steamroom::depot::manifest::DepotManifest;
 use steamroom::error::ConnectionError;
@@ -706,16 +706,11 @@ impl SteamSession for SteamroomSession {
             )
             .await?;
         let reply = exchange.next().await?;
-        let response = CMsgClientGetDepotDecryptionKeyResponse::decode_checked(&reply.body)
-            .map_err(|error| match error {
-                steamroom::Error::Connection(ConnectionError::DepotAccessDenied(_)) => {
-                    AuthError::CallDenied {
-                        call: format!("the key for depot {depot_id}"),
-                        result: "access denied".to_owned(),
-                    }
-                }
-                other => map_steamroom_error(other),
-            })?;
+        // Not `decode_checked`, which reads every failure as access denied.
+        let response = decode::<CMsgClientGetDepotDecryptionKeyResponse>(&reply.body)?;
+        let code = response.eresult.ok_or(AuthError::MissingField("eresult"))?;
+        steamroom::enums::eresult(code)
+            .map_err(|result| map_call_result("the depot key", result))?;
         // A key for another depot would pass as a run of corrupt chunks.
         if response.depot_id.is_some_and(|id| id != depot_id) {
             return Err(AuthError::Connection(format!(

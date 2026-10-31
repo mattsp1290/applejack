@@ -272,11 +272,13 @@ fn selection_honours_language_owned_dlc_and_branch() {
     };
     assert_eq!(ids(&app, "public", &with_dlc), [101, 103, 107]);
 
-    assert_eq!(ids(&app, "beta", &licensed()), [101]);
-    assert_eq!(
-        app.windows_depots("beta", &licensed()).unwrap().depots[0].manifest_id,
-        1002
-    );
+    let beta = app.windows_depots("beta", &licensed()).unwrap().depots;
+    assert_eq!(beta.len(), 2);
+    assert_eq!(beta[0].manifest_id, 1002);
+    assert!(!beta[0].public_manifest);
+    assert_eq!(beta[1].depot_id, 103);
+    assert_eq!(beta[1].manifest_id, 3001, "not on beta, so its public one");
+    assert!(beta[1].public_manifest);
     assert!(matches!(
         app.windows_depots("nightly", &licensed()),
         Err(Error::NoManifestForBranch { .. })
@@ -362,6 +364,19 @@ fn a_package_appid_grants_a_depot_of_that_id_as_depotdownloader_reads_it() {
         ..DepotFilter::default()
     };
     assert_eq!(ids(&app, "public", &filter), [301]);
+}
+
+#[test]
+fn a_32_bit_depot_does_not_stand_in_for_an_unlicensed_x86_64_one() {
+    let app = parse(100, GAME);
+    let filter = DepotFilter {
+        owned_depots: [102, 103].into(),
+        ..DepotFilter::default()
+    };
+    let selection = app.windows_depots("public", &filter).unwrap();
+    assert_eq!(selection.depots.len(), 1);
+    assert_eq!(selection.depots[0].depot_id, 103);
+    assert!(selection.not_licensed.contains(&101));
 }
 
 #[test]

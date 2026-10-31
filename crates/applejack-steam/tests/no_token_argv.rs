@@ -26,13 +26,24 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-const PRINTS: &[&str] = &["println!", "print!", "dbg!", "tracing::"];
+const PRINTS: &[&str] = &[
+    "println!",
+    "print!",
+    "dbg!",
+    "panic!",
+    "write!",
+    "writeln!",
+    "tracing::",
+];
 
 const SECRET_NAMES: &[&str] = &[
     "expose",
     "key",
+    "credentials",
     "password",
+    "secret",
     "token",
+    "tokens",
     "value",
     "access_token",
     "cdn_token",
@@ -41,11 +52,19 @@ const SECRET_NAMES: &[&str] = &[
 ];
 
 /// Every print call in `text`, parentheses balanced, so a call split across
-/// lines is seen whole.
+/// lines is seen whole. Panics on a call it cannot read, such as a brace form
+/// or a raw string holding a quote, so that nothing goes unscanned quietly.
 fn print_calls(text: &str) -> Vec<&str> {
     let mut calls = Vec::new();
     for print in PRINTS {
         for (start, _) in text.match_indices(print) {
+            let after = &text[start + print.len()..];
+            assert!(
+                *print == "tracing::" || after.starts_with('('),
+                "unreadable call: {}",
+                &text[start..]
+            );
+            let found = calls.len();
             let mut depth = 0;
             let mut quoted = false;
             let mut escaped = false;
@@ -65,6 +84,12 @@ fn print_calls(text: &str) -> Vec<&str> {
                     _ => {}
                 }
             }
+            assert_eq!(
+                calls.len(),
+                found + 1,
+                "unreadable call: {}",
+                &text[start..]
+            );
         }
     }
     calls
@@ -73,7 +98,7 @@ fn print_calls(text: &str) -> Vec<&str> {
 /// The first secret name a call mentions, in its code or as a `{name:?}`.
 fn secret_in(call: &str) -> Option<&str> {
     call.split(|character: char| !character.is_alphanumeric() && character != '_')
-        .find(|word| SECRET_NAMES.contains(word))
+        .find(|word| SECRET_NAMES.contains(&word.to_lowercase().as_str()))
 }
 
 #[test]
@@ -90,6 +115,23 @@ fn the_print_scan_sees_split_calls_and_inline_captures() {
 
     let clean = r#"println!("installed: {} files", outcome.files_written);"#;
     assert_eq!(secret_in(print_calls(clean)[0]), None);
+
+    assert_eq!(
+        secret_in("println!(\"{:?}\", Credentials)"),
+        Some("Credentials")
+    );
+}
+
+#[test]
+#[should_panic(expected = "unreadable call")]
+fn the_print_scan_refuses_a_call_it_cannot_read() {
+    print_calls("println!{\"{}\", token};");
+}
+
+#[test]
+#[should_panic(expected = "unreadable call")]
+fn the_print_scan_refuses_a_raw_string_with_a_quote() {
+    print_calls("println!(r#\"a \" b\"#, token); let a = 1;");
 }
 
 #[test]
