@@ -296,6 +296,165 @@ final class CoreClientTests: XCTestCase {
         await client.shutdown()
     }
 
+    func testJobNotificationsReachTheirHandleOnly() async throws {
+        let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1"])
+        let events = await client.events()
+        async let first = client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        async let second = client.startJob("app.install", params: AppInstallParams(appid: 220))
+        let (engine, app) = try await (first, second)
+        XCTAssertEqual(engine.jobId, JobId(rawValue: 7))
+        XCTAssertEqual(app.jobId, JobId(rawValue: 8))
+
+        var engineEvents: [JobEvent] = []
+        for try await event in engine.events {
+            engineEvents.append(event)
+        }
+        XCTAssertEqual(engineEvents.count, 3)
+        XCTAssertTrue(engineEvents.allSatisfy { $0.jobId == engine.jobId })
+        XCTAssertEqual(engineEvents.last, .done(JobDone(jobId: engine.jobId)))
+        var appEvents: [JobEvent] = []
+        for try await event in app.events {
+            appEvents.append(event)
+        }
+        XCTAssertEqual(appEvents.map(\.jobId), Array(repeating: app.jobId, count: 3))
+
+        // The unfiltered stream saw all six, interleaved or not.
+        var all: [CoreEvent] = []
+        for await event in events {
+            all.append(event)
+            if all.count == 6 { break }
+        }
+        XCTAssertEqual(all.filter { if case .job = $0 { true } else { false } }.count, 6)
+        await client.shutdown()
+    }
+
+    func testJobStreamThrowsWhenTheCoreExits() async throws {
+        // One answer (hello), then the job start; the next request kills the fake.
+        let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1", "FAKE_CORE_CRASH_AFTER": "2", "FAKE_CORE_JOB_OUTCOME": "never"])
+        let handle = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        await assertCoreExited(client)
+        do {
+            for try await _ in handle.events {}
+            XCTFail("the job stream must end with the exit")
+        } catch CoreClientError.coreExited(let status) {
+            XCTAssertEqual(status, 1)
+        }
+        await client.shutdown()
+    }
+
+    func testAnEarlyNotificationBeatsTheResponseAndStillReachesItsHandle() async throws {
+        // The fake writes a progress line for job 7, and one for a job 99
+        // nobody started, before the `{"job_id":7}` response.
+        let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1", "FAKE_CORE_NOTIFY_FIRST": "1"])
+        let handle = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        var events: [JobEvent] = []
+        for try await event in handle.events {
+            events.append(event)
+        }
+        guard case .progress(let early)? = events.first else {
+            return XCTFail("expected the early progress first, got \(events)")
+        }
+        XCTAssertEqual(early.phase, "early")
+        XCTAssertEqual(events.count, 4)
+        XCTAssertTrue(events.allSatisfy { $0.jobId == handle.jobId }, "job 99's notification must not reach this handle")
+        XCTAssertEqual(events.last, .done(JobDone(jobId: handle.jobId)))
+        await client.shutdown()
+    }
+
+    func testAWriteToADeadCoreEndsJobStreamsAndAnnouncesTheExit() async throws {
+        // `fake.die` exits 3 and leaves a grandchild holding stdout for 3 s,
+        // so for `exitDrainGrace` the client still has a process. The next
+        // write hits EPIPE and the teardown runs from `writeFailed`, not from
+        // `coreExited`. Regression for the review of 747fac1 (probe P2/P2c).
+        // Every stream read is bounded so a regression fails instead of
+        // hanging `cargo xtask check`, and the exits are counted past the
+        // grandchild's hold so a second announcement would show.
+        let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1", "FAKE_CORE_JOB_OUTCOME": "never", "FAKE_CORE_DIE_HOLD": "1"])
+        _ = try await client.hello()
+        let events = await client.events()
+        let exits = Task {
+            var exits: [Int32] = []
+            for await event in events {
+                if case .exited(let status) = event { exits.append(status) }
+            }
+            return exits
+        }
+        let stale = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        let died = ContinuousClock.now
+        let die = Task { try await client.call("fake.die", params: EmptyParams()) as EmptyResult }
+        try await Task.sleep(for: .milliseconds(100))
+        do {
+            _ = try await client.hostDoctor()
+            XCTFail("the write to the dead core must fail")
+        } catch CoreClientError.coreExited(let status) {
+            XCTAssertEqual(status, 3)
+        }
+        _ = try? await die.value
+
+        do {
+            try await withTimeout(.seconds(5)) { for try await _ in stale.events {} }
+            XCTFail("the job stream must end with the exit")
+        } catch CoreClientError.coreExited(let status) {
+            XCTAssertEqual(status, 3)
+        }
+
+        // The respawned core reuses job id 7; its events belong to the new
+        // handle alone, and the stale one is already finished.
+        let fresh = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        XCTAssertEqual(fresh.jobId, stale.jobId)
+        let restarts = await client.restarts
+        XCTAssertEqual(restarts, 1)
+        let freshEvents = try await withTimeout(.seconds(5)) {
+            var seen: [JobEvent] = []
+            for try await event in fresh.events {
+                seen.append(event)
+                if seen.count == 2 { break }
+            }
+            return seen
+        }
+        XCTAssertEqual(freshEvents.map(\.jobId), [fresh.jobId, fresh.jobId])
+        let staleAfterRespawn = try await withTimeout(.seconds(5)) {
+            var count = 0
+            for try await _ in stale.events { count += 1 }
+            return count
+        }
+        XCTAssertEqual(staleAfterRespawn, 0, "a finished handle must not adopt the new core's job")
+
+        // Past the hold, the old generation's exit callback has run.
+        try await Task.sleep(until: died + .milliseconds(3500), clock: .continuous)
+        await client.shutdown()
+        let seen = try await withTimeout(.seconds(5)) { await exits.value }
+        XCTAssertEqual(seen, [3], "the exit is announced exactly once")
+    }
+
+    struct TimedOut: Error {}
+
+    /// `body`, or `TimedOut` after `limit`: a stream that never ends fails
+    /// the test instead of hanging it.
+    func withTimeout<T: Sendable>(_ limit: Duration, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(for: limit)
+                throw TimedOut()
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
+    }
+
+    func testEventsStreamEndsOnShutdown() async throws {
+        let client = makeClient()
+        _ = try await client.hello()
+        let events = await client.events()
+        await client.shutdown()
+        var count = 0
+        for await _ in events {
+            count += 1
+        }
+        XCTAssertEqual(count, 0)
+    }
+
     /// The process's `ps` state, or `nil` once it is gone. A zombie answers
     /// `kill(pid, 0)` and shows as `Z`, so the state is what the tests check.
     private func processState(_ pid: Int32) -> String? {

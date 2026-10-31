@@ -153,6 +153,16 @@ by hand.
 A pending method still validates its params. Bad params get `InvalidParams`;
 good params get `NotImplemented`.
 
+`config.import` (work package 6a): the shell (`apps/Applejack`,
+`ConfigImportResult`) expects a result, not an error, when the plan needs the
+launch-override confirmation: `{"applied": false, "accepted": [...],
+"rejected": [...], "confirmations": [...]}` with `accept_launch_overrides:
+false`, and the same shape with `"applied": true` once the request carries
+`true`. `ImportPlan::apply` signals this as `Error::ConfirmationRequired`
+today; the RPC handler should render it as that result (or, if it keeps an
+error, carry the plan in `data.confirmations` and the shell will be extended
+to open the dialog from it).
+
 ## Jobs
 
 A long operation answers right away with `{"job_id": <u64>}` (`JobStarted`),

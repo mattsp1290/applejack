@@ -107,6 +107,35 @@ final class GoldenTests: XCTestCase {
         XCTAssertEqual(Set(RpcErrorCode.allCases.map(\.rawValue)), Set(golden.values))
     }
 
+    /// Every params mirror the views send re-encodes to its request golden's
+    /// `params`, so a renamed Rust field fails here before a view sends it.
+    func testParamsMirrorsMatchTheRequestGoldens() throws {
+        func check<Params: Codable & Equatable>(_ method: String, _: Params.Type, file: StaticString = #filePath, line: UInt = #line) throws {
+            let data = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent("\(method).request.json"))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any], method)
+            let golden = try JSONSerialization.data(withJSONObject: try XCTUnwrap(object["params"], method), options: [.sortedKeys, .withoutEscapingSlashes])
+            let decoded = try RpcCoding.decoder().decode(Params.self, from: golden)
+            XCTAssertEqual(try RpcCoding.encoder().encode(decoded), golden, "\(method): the params mirror drops or adds a field", file: file, line: line)
+        }
+        try check("steam.library", SteamLibraryParams.self)
+        try check("app.install", AppInstallParams.self)
+        try check("app.run", AppRunParams.self)
+        try check("config.get", ConfigGetParams.self)
+        try check("config.set", ConfigSetParams.self)
+        try check("config.import", ConfigImportParams.self)
+        try check("engine.install", EngineInstallParams.self)
+        try check("engine.use", EngineUseParams.self)
+        try check("engine.d3dmetal.import", EngineD3dmetalImportParams.self)
+        try check("steam.login.start", SteamLoginStartParams.self)
+        try check("steam.login.complete", SteamLoginCompleteParams.self)
+        try check("session.list", SessionListParams.self)
+        for method in ["engine.list", "engine.doctor", "engine.probe_cpuid", "steam.logout", "host.doctor"] {
+            try check(method, EmptyParams.self)
+        }
+        let credentials = try RpcCoding.encoder().encode(SteamLoginStartParams(mode: .credentials(accountName: "a", password: "p")))
+        XCTAssertEqual(String(decoding: credentials, as: UTF8.self), #"{"mode":{"account_name":"a","kind":"credentials","password":"p"}}"#)
+    }
+
     func testHelloRequestMatchesWhatTheClientSends() throws {
         let data = try Data(contentsOf: Self.goldenDirectory.appendingPathComponent("hello.request.json"))
         let request = try RpcCoding.decoder().decode(RpcRequest.self, from: data)
