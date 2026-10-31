@@ -13,7 +13,8 @@
 # and .patches-applied, which build/wine/fetch.sh removes when it re-extracts.
 # The second line of .patches-applied is the digest of the set the tree carries;
 # a different set in build/wine/patches stops here, since patches only go on
-# pristine source.
+# pristine source. .stage-patches is its copy for what build/work/wine/stage
+# holds, written once the stage is installed, for build/assemble.sh.
 set -eu
 . "$(dirname "$0")/../lib.sh"
 
@@ -35,6 +36,7 @@ X86_BREW=/usr/local/bin/brew
 LOG="$WORK/wine/build.log"
 MSYNC_STAMP="$WORK/wine/.msync-applied"
 PATCHES_STAMP="$WORK/wine/.patches-applied"
+STAGE_STAMP="$WORK/wine/.stage-patches"
 # The devel package supplies headers and .pc files to configure; the staged,
 # thinned libraries are what the link references point at, so the closure
 # step rewrites them to what ships.
@@ -361,7 +363,9 @@ echo "configure: $* (log: $LOG)"
 logged "$WINE_SRC/configure" "$@" CC="$HOST_CC" CXX="$HOST_CXX" BISON="$BISON" FLEX="$FLEX" GSTREAMER_CFLAGS="$GSTREAMER_CFLAGS" GSTREAMER_LIBS="$GSTREAMER_LIBS"
 logged make -j"$JOBS"
 # The stage is replaced only after make succeeded, so a failed rerun keeps the last good one.
+rm -f "$STAGE_STAMP"
 rm -rf "$STAGE"
 logged make install-lib
+cp "$PATCHES_STAMP" "$STAGE_STAMP"
 echo "wine installed into $STAGE"
 echo "next: sh build/assemble.sh copies it into $PAYLOAD/wine and strips it"

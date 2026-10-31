@@ -421,7 +421,10 @@ Environment knobs:
    only rerun after editing the spec. An optional last argument names the
    revision of `build/wine/patches/` the notices link; `assemble.sh` passes the
    last commit that touched it, refuses uncommitted patches, and refuses a
-   stage built from a different set, while the checked-in fixtures carry `main`.
+   stage unless `build/work/wine/.stage-patches`, which `build.sh` writes after
+   `make install-lib`, names the set in `build/wine/patches`, so a failed build
+   cannot ship the last good stage under new notices. The checked-in fixtures
+   carry `main`.
    Any change to what ships bumps `version`: `engine install` refuses a version
    already installed, so a rebuilt payload under the old version cannot reach
    a data dir that holds it. The engine crate's reader parses the

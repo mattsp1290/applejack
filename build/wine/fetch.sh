@@ -22,13 +22,15 @@ if [ -d "$WINE_SRC" ]; then
   reset=$(find "$WINE_SRC" -type f -newer "$since")
 fi
 extract "$archive" "$SRC"
+# Before the refresh, so a refreshed file stays newer than the stamp and a second
+# fetch before the build lists it again.
+touch "$EXTRACTED"
 if [ -n "$reset" ]; then
   printf '%s\n' "$reset" | while IFS= read -r file; do
     [ ! -f "$file" ] || touch "$file"
   done
   echo "wine source: $(printf '%s\n' "$reset" | wc -l | tr -d ' ') file(s) restored from the archive will rebuild"
 fi
-touch "$EXTRACTED"
 [ -f "$WINE_SRC/configure.ac" ] || { echo "wine source not at $WINE_SRC" >&2; exit 1; }
 
 msync=$(fetch_pin wine-msync)
