@@ -12,7 +12,7 @@ use std::process::{Command, ExitCode};
 
 use sha2::{Digest, Sha256};
 
-use crate::bundle_toml::BundleSpec;
+use crate::bundle_toml::{BundleSpec, SHIPPED_ELSEWHERE, elsewhere_matches};
 use crate::closure;
 use crate::denylist::{Denylist, Hit};
 use crate::pins::{Pin, Pins};
@@ -479,7 +479,8 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
         .canonicalize()
         .map_err(|error| format!("{}: {error}", payload.display()))?;
     let denylist = load_denylist(root)?;
-    let declared = declared_executables(&payload)?;
+    let spec = read_spec(&payload)?;
+    let declared = declared_executables(&spec);
     // Canonical like `payload`, so a checkout reached through a symlink still
     // reports "links into the build directory" rather than the generic reason.
     let build_dir = root.join(WORK_DIR);
@@ -549,6 +550,7 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
         ));
     }
     violations.extend(duplicate_install_names(&machos));
+    violations.extend(shipped_elsewhere_violations(&spec, &machos));
     let resolves = |candidate: &Path| {
         fs::canonicalize(payload.join(candidate))
             .is_ok_and(|real| real.starts_with(&payload) && real.is_file())
@@ -593,12 +595,9 @@ fn duplicate_install_names(machos: &[MachO]) -> Vec<Violation> {
 
 pub(crate) const BUNDLE_FILE: &str = "BUNDLE.toml";
 
-/// The executables `BUNDLE.toml` declares, bundle-relative: the loader, the
-/// server, the preloader when present, and the probes. Together with the
-/// executables under `wine/` these are the load chains that exist at run
-/// time; an executable elsewhere (one of the tools a component ships, say)
-/// loads nothing of the payload.
-fn declared_executables(payload: &Path) -> Result<Vec<String>, String> {
+/// The payload's `BUNDLE.toml`, which `--check` reads for the declared
+/// executables and the library rows.
+fn read_spec(payload: &Path) -> Result<BundleSpec, String> {
     let path = payload.join(BUNDLE_FILE);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -610,15 +609,53 @@ fn declared_executables(payload: &Path) -> Result<Vec<String>, String> {
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    let spec = BundleSpec::parse(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut declared = vec![spec.wine.loader, spec.wine.server];
-    declared.extend(spec.wine.preloader);
+    BundleSpec::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The executables `BUNDLE.toml` declares, bundle-relative: the loader, the
+/// server, the preloader when present, and the probes. Together with the
+/// executables under `wine/` these are the load chains that exist at run
+/// time; an executable elsewhere (one of the tools a component ships, say)
+/// loads nothing of the payload.
+fn declared_executables(spec: &BundleSpec) -> Vec<String> {
+    let mut declared = vec![spec.wine.loader.clone(), spec.wine.server.clone()];
+    declared.extend(spec.wine.preloader.clone());
     declared.extend([
-        spec.probes.cpuid,
-        spec.probes.dx11_sample,
-        spec.probes.xinput_check,
+        spec.probes.cpuid.clone(),
+        spec.probes.dx11_sample.clone(),
+        spec.probes.xinput_check.clone(),
     ]);
-    Ok(declared)
+    declared
+}
+
+/// Each library row `BUNDLE.toml` carries for a file inside another
+/// component's tree names a regular Mach-O of the tree whose `LC_ID_DYLIB`
+/// current version is the one `SHIPPED_ELSEWHERE` records: the comparison
+/// `--close` makes before its first round, so a row left stale by a pin
+/// bump is a violation here too.
+fn shipped_elsewhere_violations(spec: &BundleSpec, machos: &[MachO]) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for elsewhere in SHIPPED_ELSEWHERE {
+        if !spec.components.libraries.contains_key(elsewhere.key) {
+            continue;
+        }
+        let reason = match machos.iter().find(|macho| macho.relative == elsewhere.file) {
+            Some(macho) => match elsewhere_matches(elsewhere, &macho.load_commands) {
+                Ok(()) => continue,
+                Err(reason) => reason,
+            },
+            None => format!(
+                "{}: not a regular Mach-O file of the payload, which the row describes",
+                elsewhere.file
+            ),
+        };
+        violations.push(Violation {
+            binary: BUNDLE_FILE.to_owned(),
+            reference: format!("[components.{}]", elsewhere.key),
+            reason,
+        });
+    }
+    violations
 }
 
 struct DeclaredTargets {
@@ -898,6 +935,9 @@ fn write_bundle_toml(spec: &Path, out: &Path) -> Result<(), String> {
     let rendered = parsed
         .to_toml()
         .map_err(|error| format!("{}: {error}", spec.display()))?;
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
     fs::write(out, rendered).map_err(|error| format!("{}: {error}", out.display()))?;
     println!("[xtask] wrote {}", out.display());
     let notices = out.with_file_name(NOTICES_FILE);
@@ -1097,13 +1137,43 @@ mod tests {
         inspect, is_macho, list_archive, load_denylist, pkg_boms, reject_denylisted,
         resolve_along_chains,
     };
+    use crate::bundle_toml::{BundleSpec, SHIPPED_ELSEWHERE};
 
     /// The committed rendering of `build/bundle-spec.toml`: every `--check`
     /// reads the declared executables from it.
     const BUNDLE_TOML: &str = include_str!("../tests/fixtures/BUNDLE.toml");
 
+    /// The fixture without the rows for the two framework libraries: these
+    /// trees ship no framework, and a row whose file is absent is a
+    /// violation of its own (`a_framework_row_without_its_file_is_a_violation`).
     fn write_bundle_fixture(payload: &Path) {
+        let mut spec = BundleSpec::parse(BUNDLE_TOML).expect("the fixture parses");
+        for elsewhere in SHIPPED_ELSEWHERE {
+            spec.components.libraries.remove(elsewhere.key);
+        }
+        fs::write(payload.join(BUNDLE_FILE), spec.to_toml().expect("renders"))
+            .expect("BUNDLE.toml");
+    }
+
+    /// The provenance reviewer's `clone-ver` in miniature: a tree whose
+    /// `BUNDLE.toml` carries the two framework rows but holds neither file
+    /// reports each row, naming the file.
+    #[test]
+    fn a_framework_row_without_its_file_is_a_violation() {
+        let dir = scratch("framework-rows");
+        let payload = dir.join("payload");
+        fs::create_dir_all(payload.join("wine/lib")).expect("payload");
         fs::write(payload.join(BUNDLE_FILE), BUNDLE_TOML).expect("BUNDLE.toml");
+        let report = inspect(&root(), &payload).expect("report");
+        let violations: Vec<String> = report.violations.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            violations,
+            [
+                "BUNDLE.toml: [components.freetype] (wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib: not a regular Mach-O file of the payload, which the row describes)",
+                "BUNDLE.toml: [components.proxy-libintl] (wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib: not a regular Mach-O file of the payload, which the row describes)",
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn root() -> PathBuf {

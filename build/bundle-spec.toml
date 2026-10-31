@@ -39,13 +39,14 @@ osslsigncode = { version = "2.14", license = "GPL-3.0-or-later" }
 # The closure refuses to copy a file whose Cellar path
 # (/usr/local/Cellar/<formula>/<version>/) has no row with that version, so
 # the Cellar is the source of these versions. Each license is the shipped
-# library's own: gnutls and gettext ship GPL-3.0 tools that are not copied;
-# libidn2's formula expression also lists GPL-3.0-or-later (the idn2 tool,
-# not copied), LGPL-2.1-or-later (gnulib sources, subsumed by the LGPL-3.0
+# library's own: gnutls ships GPL-3.0 tools that are not copied; libidn2's
+# formula expression also lists GPL-3.0-or-later (the idn2 tool, not
+# copied), LGPL-2.1-or-later (gnulib sources, subsumed by the LGPL-3.0
 # option exercised here), Unicode-TOU and FSFAP (not distribution terms).
 # Where a license is an `OR` expression the notices state the option this
 # bundle exercises, LGPL-3.0-or-later (`EXERCISED_OPTION` in
-# xtask/src/bundle_toml.rs), which every such row must offer.
+# xtask/src/bundle_toml.rs), which every such row must offer; the operator
+# elected that option on 2026-10-30.
 #   gnutls:       libgnutls.30.dylib (Wine dlopens it: bcrypt, crypt32, secur32)
 #   p11-kit:      libp11-kit.0.dylib (gnutls)
 #   libidn2:      libidn2.0.dylib (gnutls)
@@ -57,8 +58,10 @@ osslsigncode = { version = "2.14", license = "GPL-3.0-or-later" }
 # Not copied, because the payload already ships them and dyld keeps one image
 # per install name, but rows all the same, since each is a library under its
 # own license that Wine or a copied library binds to (SHIPPED_ELSEWHERE in
-# xtask/src/bundle_toml.rs renders their real location and credit, and the
-# closure's SONAME_POLICY names the same files):
+# xtask/src/bundle_toml.rs renders their real location and credit, records
+# the version each row must state and the file's LC_ID_DYLIB current
+# version, which `--close` refuses and `--check` reports a payload whose
+# file differs from, and the closure's SONAME_POLICY names the same files):
 #   freetype:      the GStreamer framework's libfreetype.6.dylib is FreeType
 #                  2.13.3 (LC_ID_DYLIB current version 26.2.20), under the
 #                  FTL, whose binary redistribution requires the FreeType

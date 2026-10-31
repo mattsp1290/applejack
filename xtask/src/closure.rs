@@ -45,7 +45,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::bundle_toml::{BundleSpec, is_formula_name, named_row, shipped_elsewhere};
+use crate::bundle_toml::{
+    BundleSpec, SHIPPED_ELSEWHERE, elsewhere_matches, is_formula_name, named_row, shipped_elsewhere,
+};
 use crate::denylist::Denylist;
 use crate::engine_payload::{BUNDLE_FILE, check, is_macho, load_denylist, otool, walk};
 use crate::self_contained::{
@@ -994,6 +996,7 @@ pub fn close(root: &Path, payload: &Path) -> Result<(), String> {
         CONFIG_H,
         sonames.join(" ")
     );
+    check_shipped_elsewhere(&spec, &payload)?;
 
     let source = |reference: &str| -> Result<PathBuf, String> {
         let path = if reference.starts_with('/') {
@@ -1043,6 +1046,32 @@ pub fn close(root: &Path, payload: &Path) -> Result<(), String> {
         },
     );
     check(root, &payload)
+}
+
+/// Before any round: each library the notices describe inside another
+/// component's tree has its `[components]` row and is a regular Mach-O
+/// whose `LC_ID_DYLIB` current version is the one `SHIPPED_ELSEWHERE`
+/// records, so a `GStreamer` pin bump cannot leave the notices crediting the
+/// old release. The copy gate does the same for copied libraries.
+fn check_shipped_elsewhere(spec: &BundleSpec, payload: &Path) -> Result<(), String> {
+    for elsewhere in SHIPPED_ELSEWHERE {
+        if !spec.components.libraries.contains_key(elsewhere.key) {
+            return Err(format!(
+                "{BUNDLE_FILE} has no [components.{}] row for {}, which the notices must list",
+                elsewhere.key, elsewhere.file
+            ));
+        }
+        let file = payload.join(elsewhere.file);
+        let regular = fs::symlink_metadata(&file).is_ok_and(|meta| meta.is_file());
+        if !regular || !is_macho(&file)? {
+            return Err(format!(
+                "{}: [components.{}] describes it, but it is not a regular Mach-O file of the payload",
+                elsewhere.file, elsewhere.key
+            ));
+        }
+        elsewhere_matches(elsewhere, &otool(&file, "-l")?)?;
+    }
+    Ok(())
 }
 
 /// What [`settle`] did to the tree.
@@ -3741,6 +3770,50 @@ mod tests {
             "{}",
             p.errors[0]
         );
+    }
+
+    /// Before the first round, each framework library the notices describe
+    /// must be there as a regular Mach-O, with its row: a missing file, a
+    /// link in its place, and a missing row are each refused naming the
+    /// row and the file. (The version comparison itself runs on real
+    /// bytes; `elsewhere_matches` is tested on `otool -l` text.)
+    #[test]
+    fn the_closure_refuses_a_framework_row_whose_file_is_missing_or_a_link() {
+        let dir = scratch("elsewhere");
+        let payload = dir.join("payload");
+        let spec = fixture_spec();
+        let freetype = &SHIPPED_ELSEWHERE[0];
+        assert_eq!(freetype.key, "freetype");
+        fs::create_dir_all(payload.join(GST_LIB)).expect("framework dir");
+        let error = super::check_shipped_elsewhere(&spec, &payload).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "{}: [components.freetype] describes it, but it is not a regular Mach-O file of the payload",
+                freetype.file
+            )
+        );
+        fake_macho(&payload.join("vulkan/libMoltenVK.dylib"), b"pin");
+        symlink(
+            "../../../../../../vulkan/libMoltenVK.dylib",
+            payload.join(freetype.file),
+        )
+        .expect("link in the file's place");
+        assert!(payload.join(freetype.file).is_file());
+        let error = super::check_shipped_elsewhere(&spec, &payload).unwrap_err();
+        assert!(
+            error.contains("[components.freetype] describes it, but it is not a regular Mach-O"),
+            "{error}"
+        );
+        let mut without_row = fixture_spec();
+        without_row.components.libraries.remove("freetype");
+        let error = super::check_shipped_elsewhere(&without_row, &payload).unwrap_err();
+        assert!(
+            error.contains("has no [components.freetype] row for")
+                && error.contains("libfreetype.6.dylib"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Every policy file in another component's tree has the notices row

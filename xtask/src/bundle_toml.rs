@@ -62,11 +62,12 @@ pub enum Wow64 {
 /// The named rows are the pinned components; every other row is an x86-64
 /// Homebrew library family the dylib closure copies into `wine/lib/`, keyed
 /// by formula name, or one of the [`SHIPPED_ELSEWHERE`] libraries Wine
-/// binds to inside another component's tree. serde rejects
-/// `deny_unknown_fields` together with `flatten` on the same struct, so
-/// [`Components::validate`] is the strictness instead: a key that spells a
-/// named row (`kosmic_krisp`, `MoltenVK`) or is no Homebrew formula name
-/// fails the parse.
+/// binds to inside another component's tree. serde accepts
+/// `deny_unknown_fields` beside a flattened map at compile time, but then
+/// reports every key meant for the map as unknown (the first library row
+/// would fail the parse), so [`Components::validate`] is the strictness
+/// instead: a key that spells a named row (`kosmic_krisp`, `MoltenVK`) or
+/// is no Homebrew formula name fails the parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Components {
     pub dxmt: Component,
@@ -393,7 +394,10 @@ impl Components {
             .collect();
         rows.extend(self.libraries.iter().map(|(formula, component)| {
             let location = match shipped_elsewhere(formula) {
-                Some(elsewhere) => format!("`{}` ({})", elsewhere.file, elsewhere.why),
+                Some(elsewhere) => format!(
+                    "`{}` (`LC_ID_DYLIB` current version {}; {})",
+                    elsewhere.file, elsewhere.current_version, elsewhere.why
+                ),
                 None => format!(
                     "`wine/lib/` (x86-64 Homebrew formula `{formula}`, copied by the dylib closure)"
                 ),
@@ -415,9 +419,12 @@ impl Components {
     }
 
     /// Library rows are keyed by Homebrew formula name; a key that spells a
-    /// named row is a typo of a pinned component. Every license parses as an
-    /// SPDX expression, and every `OR` in it must list [`EXERCISED_OPTION`],
-    /// the one the notices say the bundle takes, as one of its operands.
+    /// named row is a typo of a pinned component. A row for a library
+    /// [`SHIPPED_ELSEWHERE`] describes records the version the table does,
+    /// so the table is the one place the version lives. Every license
+    /// parses as an SPDX expression, and every `OR` in it must list
+    /// [`EXERCISED_OPTION`], the one the notices say the bundle takes, as
+    /// one of its operands, in its canonical spelling.
     fn validate(&self) -> Result<(), Error> {
         for (formula, component) in &self.libraries {
             if let Some(row) = named_row(formula) {
@@ -440,6 +447,14 @@ impl Components {
                     )));
                 }
             }
+            if let Some(elsewhere) = shipped_elsewhere(formula)
+                && component.version != elsewhere.version
+            {
+                return Err(Error::Invalid(format!(
+                    "`components.{formula}.version` is `{}`, but SHIPPED_ELSEWHERE records {} for `{}` (`LC_ID_DYLIB` current version {}); update the table, the row, and the credit together",
+                    component.version, elsewhere.version, elsewhere.file, elsewhere.current_version
+                )));
+            }
         }
         for (name, component, _) in self.rows() {
             let expression = Spdx::parse(&component.license).map_err(|reason| {
@@ -449,8 +464,13 @@ impl Components {
                 ))
             })?;
             if !expression.every_choice_offers(EXERCISED_OPTION) {
+                let spelled = expression
+                    .spelled_in_another_case(EXERCISED_OPTION)
+                    .map_or_else(String::new, |spelled| {
+                        format!("; `{spelled}` is that option in another case, and only the canonical SPDX spelling counts")
+                    });
                 return Err(Error::Invalid(format!(
-                    "the `{name}` license `{}` offers a choice without {EXERCISED_OPTION}, the option the notices state",
+                    "the `{name}` license `{}` offers a choice without {EXERCISED_OPTION}, the option the notices state{spelled}",
                     component.license
                 )));
             }
@@ -497,6 +517,12 @@ pub(crate) struct Elsewhere {
     pub(crate) key: &'static str,
     /// The payload-relative file.
     pub(crate) file: &'static str,
+    /// The release the row records; the spec's row must say the same.
+    pub(crate) version: &'static str,
+    /// The file's `LC_ID_DYLIB` current version. `--close` refuses a
+    /// payload whose file reports another and `--check` reports it, so the
+    /// row cannot outlive the bytes a `GStreamer` pin bump replaces.
+    pub(crate) current_version: &'static str,
     /// What the file is and who binds to it.
     pub(crate) why: &'static str,
     /// Text the license requires in the distribution's documentation.
@@ -507,7 +533,11 @@ pub(crate) const SHIPPED_ELSEWHERE: &[Elsewhere] = &[
     Elsewhere {
         key: "freetype",
         file: "wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib",
-        why: "FreeType as the GStreamer framework ships it (`LC_ID_DYLIB` current version 26.2.20); Wine's font engine, which `win32u` and `dwrite` load by name through the link `wine/lib/libfreetype.6.dylib`",
+        // FreeType's docs/VERSIONS.TXT maps release 2.13.3 to libtool
+        // 26.2.20; FT_Library_Version on the file reports 2.13.3.
+        version: "2.13.3",
+        current_version: "26.2.20",
+        why: "FreeType as the GStreamer framework ships it; Wine's font engine, which `win32u` and `dwrite` load by name through the link `wine/lib/libfreetype.6.dylib`",
         // The FTL's redistribution clause asks for a statement that the
         // software is based in part on the FreeType Team's work, and its
         // suggested wording names the year of the release used (2.13.3 is
@@ -522,7 +552,11 @@ pub(crate) const SHIPPED_ELSEWHERE: &[Elsewhere] = &[
     Elsewhere {
         key: "proxy-libintl",
         file: "wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib",
-        why: "proxy-libintl as the GStreamer framework ships it (`LC_ID_DYLIB` current version 10.5.0), a stub gettext runtime whose `dgettext` returns the message untranslated; the copied gnutls and libidn2 bind to it, so their messages are English",
+        // frida/proxy-libintl's meson.build: `version : '1'` and
+        // `darwin_versions : ['10', '10.5']`.
+        version: "1",
+        current_version: "10.5.0",
+        why: "proxy-libintl as the GStreamer framework ships it, a stub gettext runtime whose `dgettext` returns the message untranslated; the copied gnutls and libidn2 bind to it, so their messages are English",
         credit: None,
     },
 ];
@@ -534,12 +568,36 @@ pub(crate) fn shipped_elsewhere(key: &str) -> Option<&'static Elsewhere> {
         .find(|elsewhere| elsewhere.key == key)
 }
 
+/// The entry against its file's `otool -l` output: the `LC_ID_DYLIB`
+/// current version must be the one the entry records. `--close` fails on
+/// the error and `--check` reports it as a violation.
+pub(crate) fn elsewhere_matches(elsewhere: &Elsewhere, load_commands: &str) -> Result<(), String> {
+    let current = crate::self_contained::dylib_commands(load_commands)
+        .into_iter()
+        .find(|command| command.command == "LC_ID_DYLIB")
+        .map(|command| command.current.to_owned());
+    match current {
+        Some(current) if current == elsewhere.current_version => Ok(()),
+        Some(current) => Err(format!(
+            "{}: LC_ID_DYLIB current version is {current}, not the {} that [components.{}] ({}) and SHIPPED_ELSEWHERE describe; update the table, the row, and the credit together",
+            elsewhere.file, elsewhere.current_version, elsewhere.key, elsewhere.version
+        )),
+        None => Err(format!(
+            "{}: no LC_ID_DYLIB, but [components.{}] describes a dylib at current version {}",
+            elsewhere.file, elsewhere.key, elsewhere.current_version
+        )),
+    }
+}
+
 /// The option this bundle exercises where a component's license is an `OR`
 /// expression: the LGPL beside Wine's own LGPL-2.1-or-later.
 pub const EXERCISED_OPTION: &str = "LGPL-3.0-or-later";
 
 /// An SPDX license expression, as far as the notices need it: `AND` binds
-/// tighter than `OR`, parentheses group, and `WITH` qualifies one license.
+/// tighter than `OR`, parentheses group, `WITH` qualifies one license, and
+/// a nested `OR` (or `AND`) is one operator, as SPDX's associativity says.
+/// Identifiers are kept as spelled: the notices quote them, and
+/// [`EXERCISED_OPTION`] is compared in its canonical case.
 #[derive(Debug, PartialEq, Eq)]
 enum Spdx {
     License(String),
@@ -552,19 +610,16 @@ impl Spdx {
         let mut tokens: Vec<&str> = Vec::new();
         for word in text.split_whitespace() {
             let mut rest = word;
-            while let Some(after) = rest.strip_prefix('(') {
-                tokens.push("(");
-                rest = after;
+            while !rest.is_empty() {
+                let paren = rest.find(['(', ')']).unwrap_or(rest.len());
+                if paren == 0 {
+                    tokens.push(&rest[..1]);
+                    rest = &rest[1..];
+                } else {
+                    tokens.push(&rest[..paren]);
+                    rest = &rest[paren..];
+                }
             }
-            let mut closing = 0;
-            while let Some(before) = rest.strip_suffix(')') {
-                closing += 1;
-                rest = before;
-            }
-            if !rest.is_empty() {
-                tokens.push(rest);
-            }
-            tokens.extend(std::iter::repeat_n(")", closing));
         }
         let mut cursor = 0;
         let expression = Self::disjunction(&tokens, &mut cursor)?;
@@ -592,11 +647,21 @@ impl Spdx {
         Ok(Self::group(operands, Self::And))
     }
 
-    fn group(mut operands: Vec<Self>, make: fn(Vec<Self>) -> Self) -> Self {
-        if operands.len() == 1 {
-            operands.remove(0)
+    fn group(operands: Vec<Self>, make: fn(Vec<Self>) -> Self) -> Self {
+        let probe = make(Vec::new());
+        let mut flat = Vec::with_capacity(operands.len());
+        for operand in operands {
+            match (&probe, operand) {
+                (Self::Or(_), Self::Or(inner)) | (Self::And(_), Self::And(inner)) => {
+                    flat.extend(inner);
+                }
+                (_, operand) => flat.push(operand),
+            }
+        }
+        if flat.len() == 1 {
+            flat.remove(0)
         } else {
-            make(operands)
+            make(flat)
         }
     }
 
@@ -635,6 +700,19 @@ impl Spdx {
             Self::License(_) => false,
             Self::And(operands) => operands.iter().any(Self::has_choice),
             Self::Or(_) => true,
+        }
+    }
+
+    /// A license in the expression that is `option` in another case, if
+    /// any: the refusal then says so rather than that the option is absent.
+    fn spelled_in_another_case(&self, option: &str) -> Option<&str> {
+        match self {
+            Self::License(license) => {
+                (license != option && license.eq_ignore_ascii_case(option)).then_some(license)
+            }
+            Self::And(operands) | Self::Or(operands) => operands
+                .iter()
+                .find_map(|operand| operand.spelled_in_another_case(option)),
         }
     }
 
@@ -1005,6 +1083,16 @@ mod tests {
         ] {
             with(real).unwrap_or_else(|error| panic!("{real}: {error}"));
         }
+        // SPDX's `OR` is associative: a parenthesized `OR` inside an `OR`
+        // is the same choice, and the option may sit in either part.
+        for real in [
+            "(MIT OR LGPL-3.0-or-later) OR Apache-2.0",
+            "MIT OR (LGPL-3.0-or-later OR Apache-2.0)",
+            "((GPL-2.0-or-later OR LGPL-3.0-or-later))",
+            "(MIT AND GPL-2.0-only) OR LGPL-3.0-or-later",
+        ] {
+            with(real).unwrap_or_else(|error| panic!("{real}: {error}"));
+        }
         for bad in [
             "LGPL-3.0-or-later AND (MIT OR Apache-2.0)",
             "GPL-2.0-only OR (MIT AND LGPL-3.0-or-later)",
@@ -1017,12 +1105,26 @@ mod tests {
                 "{bad}: {error}"
             );
         }
+        // Another case of the option is refused, and the message says why.
+        let error = with("lgpl-3.0-or-later OR MIT").unwrap_err().to_string();
+        assert!(
+            error.contains("offers a choice without LGPL-3.0-or-later")
+                && error.contains("`lgpl-3.0-or-later` is that option in another case"),
+            "{error}"
+        );
+        assert!(
+            !with("MIT OR GPL-2.0-only")
+                .unwrap_err()
+                .to_string()
+                .contains("another case")
+        );
         for malformed in [
             "(MIT",
             "MIT OR",
             "MIT AND OR GPL-2.0-only",
             "MIT WITH",
             "MIT) OR LGPL-3.0-or-later",
+            "()",
         ] {
             let error = with(malformed).unwrap_err();
             assert!(
@@ -1030,6 +1132,17 @@ mod tests {
                 "{malformed}: {error}"
             );
         }
+        // A `)` inside a word closes the group there: the expression reads
+        // as written rather than failing as "a `(` without its `)`", and a
+        // stray `)` is what is unexpected.
+        with("(GPL-2.0-or-later OR LGPL-3.0-or-later)AND MIT").expect("parses");
+        let error = with("LGPL-3.0-or-later OR MIT)AND GPL-2.0-only")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not an SPDX expression: unexpected `)`"),
+            "{error}"
+        );
         let mut nested = spec();
         nested.components.libraries.insert(
             "a".into(),
@@ -1063,13 +1176,13 @@ mod tests {
         let notices = elsewhere.to_notices().expect("renders");
         assert!(
             notices.contains(
-                "| freetype | 2.13.3 | FTL | `wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib` (FreeType as the GStreamer framework ships it"
+                "| freetype | 2.13.3 | FTL | `wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib` (`LC_ID_DYLIB` current version 26.2.20; FreeType as the GStreamer framework ships it"
             ),
             "{notices}"
         );
         assert!(
             notices.contains(
-                "| proxy-libintl | 1 | LGPL-2.0-or-later | `wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib` (proxy-libintl as the GStreamer framework ships it"
+                "| proxy-libintl | 1 | LGPL-2.0-or-later | `wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib` (`LC_ID_DYLIB` current version 10.5.0; proxy-libintl as the GStreamer framework ships it"
             ),
             "{notices}"
         );
@@ -1079,6 +1192,54 @@ mod tests {
         );
         assert!(!notices.contains("copied by the dylib closure)\n| freetype"));
         assert!(!spec().to_notices().expect("renders").contains("FreeType"));
+
+        // The row's version is the table's: a bumped row with the table
+        // unchanged is refused, naming both.
+        elsewhere
+            .components
+            .libraries
+            .insert("freetype".into(), component("2.14.0", "FTL"));
+        let error = elsewhere.to_notices().unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "`components.freetype.version` is `2.14.0`, but SHIPPED_ELSEWHERE records 2.13.3"
+            ) && error.contains("26.2.20"),
+            "{error}"
+        );
+    }
+
+    /// The entry against the file's load commands: the `LC_ID_DYLIB`
+    /// current version the table records, or an error naming the row, the
+    /// file, and both numbers (the provenance reviewer's `clone-ver`, the
+    /// framework freetype patched to 26.3.20).
+    #[test]
+    fn a_shipped_elsewhere_entry_matches_its_files_current_version_or_names_both() {
+        let sample = |id: &str, current: &str| {
+            format!(
+                "Load command 2\n          cmd LC_ID_DYLIB\n      cmdsize 48\n         name {id} (offset 24)\n   time stamp 1 Wed Dec 31 18:00:01 1969\n      current version {current}\ncompatibility version 10.0.0\nLoad command 3\n          cmd LC_LOAD_DYLIB\n      cmdsize 56\n         name /usr/lib/libSystem.B.dylib (offset 24)\n   time stamp 2 Wed Dec 31 18:00:02 1969\n      current version 1356.0.0\ncompatibility version 1.0.0\n"
+            )
+        };
+        let intl = super::shipped_elsewhere("proxy-libintl").expect("entry");
+        let freetype = super::shipped_elsewhere("freetype").expect("entry");
+        super::elsewhere_matches(intl, &sample("@rpath/libintl.8.dylib", "10.5.0"))
+            .expect("the framework's proxy-libintl");
+        super::elsewhere_matches(freetype, &sample("@rpath/libfreetype.6.dylib", "26.2.20"))
+            .expect("the framework's freetype");
+        let error =
+            super::elsewhere_matches(freetype, &sample("@rpath/libfreetype.6.dylib", "26.3.20"))
+                .unwrap_err();
+        assert_eq!(
+            error,
+            "wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib: LC_ID_DYLIB current version is 26.3.20, not the 26.2.20 that [components.freetype] (2.13.3) and SHIPPED_ELSEWHERE describe; update the table, the row, and the credit together"
+        );
+        let error = super::elsewhere_matches(intl, "Load command 0\n          cmd LC_SEGMENT_64\n")
+            .unwrap_err();
+        assert!(
+            error.starts_with(
+                "wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib: no LC_ID_DYLIB, but [components.proxy-libintl]"
+            ),
+            "{error}"
+        );
     }
 
     #[test]

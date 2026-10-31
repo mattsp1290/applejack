@@ -346,8 +346,16 @@ Environment knobs:
      the `FTL`, whose binary redistribution requires the FreeType credit
      the notices carry) and `proxy-libintl` (LGPL-2.0-or-later); the
      GStreamer row's LGPL-2.1-or-later is GStreamer's own and covers
-     neither. A run that copied anything reports a library row no copy
-     came from, so a stale row cannot sit in the notices unnoticed.
+     neither. Those two rows are tied to the bytes: `SHIPPED_ELSEWHERE`
+     records each row's version and the file's `LC_ID_DYLIB` current
+     version (26.2.20 and 10.5.0), the spec parser refuses a row stating
+     another version, `--close` refuses a payload whose file is missing,
+     is a link, or reports another current version before its first
+     round, and `--check` reports the same as a violation, so a GStreamer
+     pin bump that replaces the file fails until the table, the row, and
+     the credit are updated together. A run that copied anything reports
+     a library row no copy came from, so a stale row cannot sit in the
+     notices unnoticed.
      Anything the closure cannot resolve fails the run with the binary
      and the reference named, and nothing of that round is applied. A
      tool failure part-way through a round (`install_name_tool`,
