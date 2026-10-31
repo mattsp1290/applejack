@@ -31,6 +31,8 @@ const APPID: u32 = 100;
 const DEPOT: u32 = 101;
 const V1: u64 = 1001;
 const V2: u64 = 1002;
+/// A second depot, for titles with more than one.
+const OTHER: u32 = 103;
 const NOT_RUNNING: fn() -> bool = || false;
 
 fn product_info(manifest_id: u64, buildid: u64) -> AppInfo {
@@ -489,7 +491,6 @@ async fn update_touches_only_changed_files() {
 
 #[tokio::test]
 async fn update_keeps_a_file_that_moved_to_a_depot_it_did_not_change() {
-    const OTHER: u32 = 103;
     let plan_with = |first: u64, build: u64| {
         let info = product_info(first, build);
         let text = info.text.as_ref().unwrap().replace(
@@ -668,6 +669,275 @@ async fn a_stopped_rescan_stays_a_rescan_when_resumed() {
         .await
         .unwrap();
     assert_eq!(fs::read(bench.game().join("a.txt")).unwrap(), b"original");
+}
+
+fn fail_on(bench: &Bench, entry: &ManifestFile) {
+    bench.session.chunks.fault(
+        &chunk_of(entry, 0),
+        Fault::Fail(io::ErrorKind::ConnectionReset),
+    );
+}
+
+fn two_depot_plan(first: u64, second: u64, build: u64) -> InstallPlan {
+    let info = product_info(first, build);
+    let text = info.text.as_ref().unwrap().replace(
+        "\"branches\"",
+        &format!(
+            "\"{OTHER}\"\n{{\n\"manifests\"\n{{\n\"public\"\n{{\n\"gid\" \"{second}\"\n\"size\" \"1\"\n}}\n}}\n}}\n\"branches\""
+        ),
+    );
+    let filter = DepotFilter::default();
+    let info = AppInfo {
+        text: Some(text),
+        ..info
+    };
+    let app = OwnedApp::parse(&info, &filter).unwrap();
+    InstallPlan::new(&app, "public", &filter).unwrap()
+}
+
+// From the install-safety review, probe p1: the stopped update never moved
+// the `.acf`, so a target equal to it used to look like nothing to do.
+#[tokio::test]
+async fn a_rollback_after_a_stopped_update_repairs_the_files() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![
+                file(chunks, "a.txt", &[b"original"]),
+                file(chunks, "b.txt", &[b"other"]),
+            ],
+        ),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let failing = file(chunks, "b.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V2, vec![file(chunks, "a.txt", &[b"interim!"]), failing]),
+    );
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V2, 12))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(bench.game().join("a.txt")).unwrap(), b"interim!");
+
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.changed_depots, [DEPOT]);
+    assert_eq!(fs::read(bench.game().join("a.txt")).unwrap(), b"original");
+    assert!(!bench.paths().record(APPID).exists());
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+    // The manifest the run just installed survives the end-of-run cleanup,
+    // and the abandoned target's goes.
+    assert!(bench.paths().manifest(DEPOT, V1).exists());
+    assert!(!bench.paths().manifest(DEPOT, V2).exists());
+}
+
+// From the install-safety review, probe p2.
+#[tokio::test]
+async fn a_depot_back_at_its_acf_manifest_is_repaired_with_the_rest() {
+    const V3: u64 = 1003;
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "a.txt", &[b"a one"])]),
+    );
+    bench.session.add_manifest(
+        OTHER,
+        manifest(
+            70,
+            vec![
+                file(chunks, "b1.txt", &[b"b1 old"]),
+                file(chunks, "b2.txt", &[b"b2 old"]),
+            ],
+        ),
+    );
+    bench.install(&two_depot_plan(V1, 70, 11)).await.unwrap();
+
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V2, vec![file(chunks, "a.txt", &[b"a two"])]),
+    );
+    let failing = file(chunks, "b2.txt", &[b"b2 mid"]);
+    fail_on(&bench, &failing);
+    bench.session.add_manifest(
+        OTHER,
+        manifest(71, vec![file(chunks, "b1.txt", &[b"b1 mid"]), failing]),
+    );
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&two_depot_plan(V2, 71, 12))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(bench.game().join("b1.txt")).unwrap(), b"b1 mid");
+
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V3, vec![file(chunks, "a.txt", &[b"a three"])]),
+    );
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&two_depot_plan(V3, 70, 13))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.changed_depots, [DEPOT, OTHER]);
+    assert_eq!(fs::read(bench.game().join("b1.txt")).unwrap(), b"b1 old");
+    assert!(!bench.paths().record(APPID).exists());
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn a_recorded_depot_the_plan_dropped_is_refused_and_the_record_kept() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "a.txt", &[b"a one"])]),
+    );
+    bench.session.add_manifest(
+        OTHER,
+        manifest(70, vec![file(chunks, "b.txt", &[b"b old"])]),
+    );
+    bench.install(&two_depot_plan(V1, 70, 11)).await.unwrap();
+    let failing = file(chunks, "b.txt", &[b"b mid"]);
+    fail_on(&bench, &failing);
+    bench
+        .session
+        .add_manifest(OTHER, manifest(71, vec![failing]));
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&two_depot_plan(V1, 71, 12))
+            .await
+            .is_err()
+    );
+
+    let error = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::UnfinishedDepot {
+                appid: APPID,
+                depot_id: OTHER,
+            }
+        ),
+        "{error}"
+    );
+    assert!(bench.paths().record(APPID).exists());
+}
+
+#[tokio::test]
+async fn an_unreadable_record_rechecks_every_depot() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    fs::write(bench.game().join("data/level.pak"), b"LEVEL DATA").unwrap();
+    let path = bench.paths().record(APPID);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"not json").unwrap();
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+
+    assert!(!path.exists());
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+// From the install-safety review, probe p6: a file only the abandoned target
+// had, which no later manifest would ever name again.
+#[tokio::test]
+async fn files_of_abandoned_targets_are_removed() {
+    const V3: u64 = 1003;
+    const V4: u64 = 1004;
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"one"])]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+
+    let failing = file(chunks, "z.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V2,
+            vec![
+                file(chunks, "a.txt", &[b"one"]),
+                file(chunks, "hijack.dll", &[b"interim dll"]),
+                failing,
+            ],
+        ),
+    );
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V2, 12))
+            .await
+            .is_err()
+    );
+    assert!(bench.game().join("hijack.dll").exists());
+
+    // A second stop must not forget the first target's files.
+    let failing = file(chunks, "y.txt", &[b"fails too"]);
+    fail_on(&bench, &failing);
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V3, vec![failing]));
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V3, 13))
+            .await
+            .is_err()
+    );
+
+    bench.session.chunks.clear_faults();
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V4, vec![file(chunks, "a.txt", &[b"four"])]));
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V4, 14))
+        .await
+        .unwrap();
+
+    assert!(!bench.game().join("hijack.dll").exists());
+    assert!(!bench.paths().manifest(DEPOT, V2).exists());
+    assert!(!bench.paths().manifest(DEPOT, V3).exists());
 }
 
 #[tokio::test]
@@ -859,7 +1129,6 @@ async fn a_changed_manifest_is_refetched_once() {
 
 #[tokio::test]
 async fn a_refetch_moves_every_depot_to_the_new_build() {
-    const OTHER: u32 = 103;
     let two_depots = |first: u64, second: u64, build: u64| {
         let info = product_info(first, build);
         let text = info.text.as_ref().unwrap().replace(

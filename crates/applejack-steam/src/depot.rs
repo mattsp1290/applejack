@@ -249,6 +249,9 @@ pub struct RecordDepot {
     pub complete: bool,
     /// Manifest file names already in place.
     pub files: BTreeSet<String>,
+    /// Targets of earlier stopped runs, whose files may still be on disk.
+    #[serde(default)]
+    pub abandoned: BTreeSet<u64>,
 }
 
 impl DownloadRecord {
@@ -300,13 +303,62 @@ impl DownloadRecord {
     }
 }
 
-/// One depot this run has to bring up to date.
+/// A record left by a run that stopped. The `.acf` is exactly what that run
+/// did not move, so a title with one is not known to be good whatever the
+/// `.acf` says. `record` is `None` when the file cannot be read, and then
+/// every depot counts as touched.
+struct Unfinished {
+    record: Option<DownloadRecord>,
+}
+
+impl Unfinished {
+    fn read(path: &Path, appid: u32) -> Option<Self> {
+        path.exists().then(|| Self {
+            record: DownloadRecord::load(path)
+                .filter(|record| record.appid == appid && !record.depots.is_empty()),
+        })
+    }
+
+    fn touched(&self, depot_id: u32) -> bool {
+        self.record
+            .as_ref()
+            .is_none_or(|record| record.depots.iter().any(|depot| depot.depot_id == depot_id))
+    }
+
+    /// Every earlier target of a depot other than the two this run deals in.
+    fn abandoned(&self, depot_id: u32, target: u64, previous: Option<u64>) -> BTreeSet<u64> {
+        self.record
+            .iter()
+            .flat_map(|record| &record.depots)
+            .filter(|depot| depot.depot_id == depot_id)
+            .flat_map(|depot| depot.abandoned.iter().chain([&depot.manifest_id]))
+            .copied()
+            .filter(|id| *id != target && Some(*id) != previous)
+            .collect()
+    }
+
+    /// A recorded depot the plan no longer selects, which this run would
+    /// leave mixed.
+    fn unplanned(&self, planned: &[PlannedDepot]) -> Option<u32> {
+        self.record
+            .iter()
+            .flat_map(|record| &record.depots)
+            .map(|depot| depot.depot_id)
+            .find(|id| planned.iter().all(|depot| depot.depot_id != *id))
+    }
+}
+
+/// One depot this run has to bring up to date. `previous_id` equals
+/// `manifest_id` for a depot back at its `.acf` manifest after a stopped run.
 struct WorkDepot {
     depot_id: u32,
     manifest_id: u64,
     manifest: DepotManifest,
     previous_id: Option<u64>,
     previous: Option<DepotManifest>,
+    abandoned_ids: BTreeSet<u64>,
+    /// The stored manifests of `abandoned_ids`.
+    abandoned: Vec<DepotManifest>,
 }
 
 impl WorkDepot {
@@ -467,8 +519,9 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
     /// # Errors
     ///
     /// [`Error::NotInstalled`] without an `.acf`, [`Error::ClientOwned`]
-    /// when it reports anything but fully installed, and the errors of
-    /// [`install`](Self::install).
+    /// when it reports anything but fully installed,
+    /// [`Error::UnfinishedDepot`] when a stopped run touched a depot this plan
+    /// does not select, and the errors of [`install`](Self::install).
     pub async fn update(&self, plan: &InstallPlan) -> Result<InstallOutcome, Error> {
         self.run(plan, RunKind::Update).await
     }
@@ -498,6 +551,7 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
             plan: plan.clone(),
             keys: HashMap::new(),
             refreshed: false,
+            unfinished: Unfinished::read(&self.paths.record(appid), appid),
         };
         // The files are where the `.acf` says, whatever the product info
         // says now.
@@ -511,6 +565,16 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
             .map(|depot| (depot.depot_id, depot.manifest_id))
             .collect();
         let work = run.resolve(&installed).await?;
+        // Without an `.acf` every planned file is checked and nothing claims
+        // the title is whole, so only an installed title can be left mixed.
+        if let Some(depot_id) = run
+            .unfinished
+            .as_ref()
+            .filter(|_| existing.is_some())
+            .and_then(|unfinished| unfinished.unplanned(&run.plan.depots))
+        {
+            return Err(Error::UnfinishedDepot { appid, depot_id });
+        }
         if work.is_empty() {
             return Ok(InstallOutcome {
                 appid,
@@ -540,6 +604,7 @@ struct Run<'r, 'a, S> {
     plan: InstallPlan,
     keys: HashMap<u32, DepotKey>,
     refreshed: bool,
+    unfinished: Option<Unfinished>,
 }
 
 impl<S: SteamSession> Run<'_, '_, S> {
@@ -652,7 +717,11 @@ impl<S: SteamSession> Run<'_, '_, S> {
             let depot_id = planned.depot_id;
             let manifest_id = planned.manifest_id;
             let previous_id = installed.get(&depot_id).copied();
-            if previous_id == Some(manifest_id) {
+            let forced = self
+                .unfinished
+                .as_ref()
+                .is_some_and(|unfinished| unfinished.touched(depot_id));
+            if previous_id == Some(manifest_id) && !forced {
                 continue;
             }
             let Some(manifest) = self.manifest(depot_id, manifest_id).await? else {
@@ -662,12 +731,23 @@ impl<S: SteamSession> Run<'_, '_, S> {
                 Some(id) => self.manifest(depot_id, id).await?,
                 None => None,
             };
+            let abandoned_ids = self
+                .unfinished
+                .as_ref()
+                .map(|unfinished| unfinished.abandoned(depot_id, manifest_id, previous_id))
+                .unwrap_or_default();
+            let abandoned = abandoned_ids
+                .iter()
+                .filter_map(|id| load_manifest(&self.paths().manifest(depot_id, *id)))
+                .collect();
             work.push(WorkDepot {
                 depot_id,
                 manifest_id,
                 manifest,
                 previous_id,
                 previous,
+                abandoned_ids,
+                abandoned,
             });
         }
         Ok(Ok(work))
@@ -704,6 +784,7 @@ impl<S: SteamSession> Run<'_, '_, S> {
                     previous_manifest_id: depot.previous_id,
                     complete: false,
                     files: BTreeSet::new(),
+                    abandoned: depot.abandoned_ids.clone(),
                 })
                 .collect(),
         });
@@ -759,8 +840,13 @@ impl<S: SteamSession> Run<'_, '_, S> {
         }
         self.write_acf(&work, existing)?;
         for depot in &work {
-            if let Some(previous) = depot.previous_id {
-                let _ = fs::remove_file(self.paths().manifest(depot.depot_id, previous));
+            let superseded = depot
+                .previous_id
+                .iter()
+                .chain(&depot.abandoned_ids)
+                .filter(|id| **id != depot.manifest_id);
+            for id in superseded {
+                let _ = fs::remove_file(self.paths().manifest(depot.depot_id, *id));
             }
         }
         // The install is finished. A record left behind only costs the next
@@ -982,7 +1068,7 @@ fn remove_stale_files(install_dir: &Path, work: &[WorkDepot], kept: &BTreeSet<St
         .collect();
     let mut stale: Vec<String> = work
         .iter()
-        .filter_map(|depot| depot.previous.as_ref())
+        .flat_map(|depot| depot.previous.iter().chain(&depot.abandoned))
         .flat_map(|previous| &previous.files)
         .map(ManifestFile::normalized_path)
         .filter(|path| !current.contains(&path.to_lowercase()))
