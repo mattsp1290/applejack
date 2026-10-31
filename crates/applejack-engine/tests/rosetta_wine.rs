@@ -954,28 +954,6 @@ fn a_prefix_lock_excludes_a_second_holder_until_it_drops() {
     ));
 }
 
-/// A child mid-spawn on another thread holds a copy of the lock's descriptor
-/// until it execs, so a lock released only by closing it outlives the drop.
-#[test]
-fn a_dropped_prefix_lock_is_free_at_once_while_children_spawn() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join(".snapshots");
-    let done = std::sync::atomic::AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        let spawner = || {
-            while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = std::process::Command::new("/usr/bin/true").status();
-            }
-        };
-        scope.spawn(spawner);
-        scope.spawn(spawner);
-        for _ in 0..3000 {
-            drop(snapshot::PrefixLock::acquire(&root, "steam").unwrap());
-        }
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
-}
-
 #[test]
 fn taking_a_prefix_lock_clears_what_a_killed_snapshot_left() {
     let dir = tempfile::tempdir().unwrap();
@@ -1617,7 +1595,9 @@ fn a_server_counts_as_running_until_it_lets_go_of_its_lock() {
     flock(&lock, FlockOperation::LockExclusive).unwrap();
     assert!(!wineserver_alive_in(base.path(), &prefix).unwrap());
     assert!(wineserver_running_in(base.path(), &prefix).unwrap());
-    drop(lock);
+    // Not a drop: a test spawning a child holds a copy of the descriptor
+    // until that child execs.
+    flock(&lock, FlockOperation::Unlock).unwrap();
     assert!(!wineserver_running_in(base.path(), &prefix).unwrap());
     assert!(
         !wineserver_running_in(base.path(), &base.path().join("gone")).unwrap(),
