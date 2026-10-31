@@ -269,6 +269,28 @@ pub enum Error {
         version: Version,
     },
 
+    /// Another operation holds the prefix's lock.
+    #[error("another operation is using prefix {name}")]
+    PrefixBusy {
+        /// The prefix name.
+        name: String,
+    },
+
+    /// A reset failed after it took its safety snapshot, which is what is
+    /// left to restore: the prefix may be gone.
+    #[error(
+        "resetting prefix {name} failed; `applejack prefix restore {name} {timestamp}` brings it back: {source}"
+    )]
+    ResetFailed {
+        /// The prefix name.
+        name: String,
+        /// The safety snapshot's timestamp.
+        timestamp: String,
+        /// What stopped the reset.
+        #[source]
+        source: Box<Error>,
+    },
+
     /// No snapshot `<name>/<timestamp>` exists.
     #[error("snapshot {name}/{timestamp} does not exist")]
     SnapshotNotFound {

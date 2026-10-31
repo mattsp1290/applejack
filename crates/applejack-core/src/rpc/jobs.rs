@@ -110,8 +110,8 @@ impl Notifier {
         serde_json::to_string(response).is_ok_and(|line| self.lines.send(line).is_ok())
     }
 
-    /// Queues a notification. A writer that has gone away ends the session
-    /// through the serve loop; a job has nothing to do about it.
+    /// Queues a notification. With a dead reader the line is dropped and
+    /// the job carries on: `serve` reports the write error once it ends.
     pub fn notify(&self, notification: &Notification) {
         if let Ok(line) = serde_json::to_string(notification) {
             let _ = self.lines.send(line);

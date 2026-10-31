@@ -59,6 +59,25 @@ const CHECK_STEPS: &[Step] = &[
         precondition: None,
     },
     Step {
+        // `cargo test` above is a debug build, which is the one build that
+        // honors the unsigned-install variable.
+        name: "release-unsigned",
+        command: |root| {
+            cargo(
+                root,
+                [
+                    "test",
+                    "-p",
+                    "applejack-core",
+                    "--release",
+                    "--lib",
+                    "unsigned",
+                ],
+            )
+        },
+        precondition: None,
+    },
+    Step {
         name: "doc",
         command: |root| {
             let mut command = cargo(root, ["doc", "--workspace", "--no-deps"]);

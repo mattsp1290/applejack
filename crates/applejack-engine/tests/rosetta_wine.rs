@@ -881,6 +881,152 @@ fn snapshots_create_restore_reset_and_prune() {
 }
 
 #[test]
+fn snapshots_taken_together_get_their_own_names_and_whole_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("prefix");
+    let root = dir.path().join("prefixes/.snapshots");
+    fs::create_dir_all(prefix.join("drive_c/users")).unwrap();
+    fs::write(prefix.join("drive_c/users/save.txt"), "data").unwrap();
+
+    let taken: Vec<_> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| snapshot::create(&prefix, &root, "steam").unwrap()))
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+
+    let mut listed = snapshot::list(&root, "steam").unwrap();
+    assert_eq!(listed.len(), 8, "{listed:?}");
+    for snapshot in &listed {
+        assert_eq!(
+            fs::read_to_string(snapshot.dir.join("drive_c/users/save.txt")).unwrap(),
+            "data",
+            "{snapshot:?} is not a copy of the prefix at its top level"
+        );
+    }
+    let mut taken = taken;
+    taken.sort();
+    listed.sort();
+    assert_eq!(taken, listed);
+    assert_eq!(fs::read_dir(root.join("steam")).unwrap().count(), 8);
+}
+
+#[test]
+fn a_failed_snapshot_touches_no_other_and_is_not_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("prefix");
+    let root = dir.path().join("prefixes/.snapshots");
+    fs::create_dir_all(&prefix).unwrap();
+    fs::write(prefix.join("a.txt"), "a").unwrap();
+    let kept = snapshot::create(&prefix, &root, "steam").unwrap();
+
+    let unreadable = prefix.join("b.txt");
+    fs::write(&unreadable, "b").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let failed = snapshot::create(&prefix, &root, "steam");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(matches!(failed, Err(Error::Io { .. })), "{failed:?}");
+    assert_eq!(
+        snapshot::list(&root, "steam").unwrap(),
+        std::slice::from_ref(&kept)
+    );
+    assert!(kept.dir.join("a.txt").is_file());
+    assert_eq!(fs::read_dir(root.join("steam")).unwrap().count(), 1);
+}
+
+#[test]
+fn a_prefix_lock_excludes_a_second_holder_until_it_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".snapshots");
+    let held = snapshot::PrefixLock::acquire(&root, "steam").unwrap();
+    assert_eq!(held.name(), "steam");
+    assert!(matches!(
+        snapshot::PrefixLock::acquire(&root, "steam").unwrap_err(),
+        Error::PrefixBusy { name } if name == "steam"
+    ));
+    snapshot::PrefixLock::acquire(&root, "other").unwrap();
+    drop(held);
+    snapshot::PrefixLock::acquire(&root, "steam").unwrap();
+    assert!(matches!(
+        snapshot::PrefixLock::acquire(&root, ".locks").unwrap_err(),
+        Error::InvalidSnapshotName { .. }
+    ));
+}
+
+/// A child mid-spawn on another thread holds a copy of the lock's descriptor
+/// until it execs, so a lock released only by closing it outlives the drop.
+#[test]
+fn a_dropped_prefix_lock_is_free_at_once_while_children_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".snapshots");
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let spawner = || {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::process::Command::new("/usr/bin/true").status();
+            }
+        };
+        scope.spawn(spawner);
+        scope.spawn(spawner);
+        for _ in 0..3000 {
+            drop(snapshot::PrefixLock::acquire(&root, "steam").unwrap());
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+#[test]
+fn taking_a_prefix_lock_clears_what_a_killed_snapshot_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("prefix");
+    let root = dir.path().join(".snapshots");
+    fs::create_dir_all(&prefix).unwrap();
+    fs::write(prefix.join("a.txt"), "a").unwrap();
+    let kept = snapshot::create(&prefix, &root, "steam").unwrap();
+    let stale = root.join("steam/.staging-1-0");
+    fs::create_dir_all(stale.join("half")).unwrap();
+    assert_eq!(
+        snapshot::list(&root, "steam").unwrap(),
+        std::slice::from_ref(&kept)
+    );
+
+    let _lock = snapshot::PrefixLock::acquire(&root, "steam").unwrap();
+    assert!(!stale.exists());
+    assert!(kept.dir.is_dir());
+}
+
+#[test]
+fn a_failed_reset_names_the_safety_snapshot_and_restore_needs_no_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = dir.path().join("prefix");
+    let root = dir.path().join(".snapshots");
+    fs::create_dir_all(&prefix).unwrap();
+    fs::write(prefix.join("a.txt"), "a").unwrap();
+
+    let error = snapshot::reset(&prefix, &root, "steam", false, &mut |_| {
+        Err(Error::RosettaMissing)
+    })
+    .unwrap_err();
+    let Error::ResetFailed {
+        name,
+        timestamp,
+        source,
+    } = error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(name, "steam");
+    assert!(matches!(*source, Error::RosettaMissing));
+    assert!(!prefix.exists());
+
+    let restored = snapshot::restore(&prefix, &root, "steam", &timestamp).unwrap();
+    assert_eq!(restored.timestamp, timestamp);
+    assert_eq!(fs::read_to_string(prefix.join("a.txt")).unwrap(), "a");
+    assert_eq!(snapshot::list(&root, "steam").unwrap().len(), 1);
+}
+
+#[test]
 fn snapshot_names_are_validated_and_same_second_suffixes_sort() {
     let dir = tempfile::tempdir().unwrap();
     let prefix = dir.path().join("prefixes/steam");

@@ -534,17 +534,23 @@ D3DMetal is never committed, downloaded, or published.
   zero-padded, when the second is already taken) using `/bin/cp -c -R` (an APFS clone;
   `cp` itself falls back to a byte copy across volumes), and `cp -R` when
   `-c` is refused. Symlinks are copied as links, so `dosdevices/z: -> /` is
-  not followed.
+  not followed. The copy goes to a dot-prefixed `.staging-<pid>-<n>` beside
+  the snapshots and is renamed into place, so a failed or killed copy is
+  never listed and cannot touch another snapshot. A `cp` that reports a full
+  disk stays `ErrorKind::StorageFull`, which the core answers as `DiskFull`.
 - `list(snapshots_root, name)` returns them oldest first.
 - `restore(prefix_dir, snapshots_root, name, timestamp)` takes a safety
   snapshot of the current prefix, copies the chosen one to
   `<prefix_dir>.restoring`, and swaps it in with two renames; an interrupted
   restore leaves the prefix as it was or fully restored. Returns the safety
-  snapshot.
+  snapshot. With `prefix_dir` gone there is nothing to protect: the chosen
+  snapshot is installed the same way and returned.
 - `reset(prefix_dir, snapshots_root, name, keep_user_data, recreate)` takes
   a safety snapshot, removes the prefix, calls `recreate` (the core wraps
   `create_prefix`), and with `keep_user_data` copies `drive_c/users/` back
-  from the safety snapshot.
+  from the safety snapshot. A failure after the safety snapshot is
+  `Error::ResetFailed`, which names it; the prefix may then be gone, and
+  `restore` brings it back.
 - `restore` and `reset` refuse with `Error::PrefixUnusable` while
   `wineserver_alive(prefix_dir)` is true: both give the path a new inode,
   Wine keys the server socket on the inode, so a running session would keep
@@ -555,7 +561,18 @@ D3DMetal is never committed, downloaded, or published.
   through a temporary file and a rename, so the clone holds whole files,
   but `system.reg` and `user.reg` may come from different saves. The check
   is a point in time, not a lock: a launch between it and the rename is
-  not prevented, which is why the core serializes prefix operations.
+  not prevented, which is why the core serializes prefix operations with
+  `PrefixLock`.
+- `PrefixLock::acquire(snapshots_root, name)` takes
+  `<snapshots_root>/.locks/<name>.lock` with `flock` and does not wait: a
+  held lock is `Error::PrefixBusy`. It lives outside the prefix because the
+  operations it guards delete the prefix. Holding it, the caller also knows
+  no snapshot is being copied, so `acquire` clears stale `.staging-*`
+  directories. Every `Core` prefix operation except `list` and
+  `list-snapshots` holds it for its whole length, `exec` until the child
+  exits. A dropped lock is released with an explicit `LOCK_UN`, because a
+  child being spawned on another thread holds a copy of the descriptor until
+  it execs, and `flock` belongs to the open file, not the descriptor.
 - `prune(snapshots_root, name, keep)` removes all but the newest `keep`;
   `DEFAULT_KEEP` is 3.
 
@@ -598,15 +615,17 @@ call the same ones. The `meta` and `engine_versions` writes are the core's.
 | `applejack prefix create <name> [--backend b] [--sync s] [--hidraw h]` | `RosettaWine::create_prefix`, with drive `S:` on `<data_dir>/library` |
 | `applejack prefix list` | Each `prefixes/<name>/applejack/prefix.toml` |
 | `applejack prefix snapshot <name>` / `restore` / `reset [--keep-user-data]` | `snapshot::{create, restore, reset}` under `prefixes/.snapshots/` |
-| `applejack prefix remove <name>` | Deletes the prefix and Wine's `server-*` directory for it; snapshots stay |
+| `applejack prefix list-snapshots <name>` | `snapshot::list`, oldest first. Works for a prefix that is gone |
+| `applejack prefix remove <name>` | Deletes the prefix and Wine's `server-*` directory for it; snapshots stay, and `restore` undoes the removal |
 | `applejack prefix exec <name> -- <exe> [args]` | `Engine::launch` with the bundle that last touched the prefix; streams the session log and exits with the child's code. Development only |
 | `applejack run <appid>` | `RosettaWine::launch`, then `Session::{wait, cancel, processes, wineserver_alive}` |
 
 A directory passed to `--from` is packed to
 `engines/<id>/<version>.local.tar.zst` first, so it takes the same hashing,
 extraction, and validation path as an archive; the packed file is removed
-afterwards. `engines/<id>/.install.lock` keeps two installs of one engine
-apart across processes.
+afterwards, and `InstallLock::acquire` clears one a killed install left.
+`engines/<id>/.install.lock` keeps two installs of one engine apart across
+processes.
 
 `snapshot`, `restore`, `reset`, and `remove` wait up to ten seconds
 (`prefixes::SERVER_SETTLE`) for a `wineserver` to leave: it outlives the last

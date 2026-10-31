@@ -19,17 +19,11 @@ pub enum CoreError {
     #[error(transparent)]
     DataDir(#[from] DataDirError),
     /// A local bundle was requested without the opt-in.
-    #[error(
-        "refusing to install an unsigned local bundle: set {ALLOW_UNSIGNED_ENV}=1 (debug builds only)"
-    )]
+    #[error("{}", unsigned_refused_message())]
     UnsignedRefused,
-    #[error(
-        "no published version of engine {id} exists: {ALLOW_UNSIGNED_ENV}=1 `applejack engine install {id} --from <dir-or-archive>` installs a local bundle"
-    )]
+    #[error("{}", no_published_message(*id))]
     NoPublishedVersion { id: EngineId },
-    #[error(
-        "engine {id} {version} is published but this build cannot download it; use `--from <dir-or-archive>`"
-    )]
+    #[error("{}", download_unavailable_message(*id, version))]
     DownloadUnavailable { id: EngineId, version: String },
     #[error("engine {id} is not available in this build")]
     EngineUnavailable { id: EngineId },
@@ -53,6 +47,50 @@ pub enum CoreError {
     Encode(#[from] serde_json::Error),
     #[error("{0}")]
     Message(String),
+}
+
+/// How to install a local bundle; a release build ignores the variable, so
+/// it has no such advice to give.
+fn local_install(id: EngineId) -> Option<String> {
+    cfg!(debug_assertions).then(|| {
+        format!("{ALLOW_UNSIGNED_ENV}=1 `applejack engine install {id} --from <dir-or-archive>`")
+    })
+}
+
+fn unsigned_refused_message() -> String {
+    let remedy = if cfg!(debug_assertions) {
+        format!("set {ALLOW_UNSIGNED_ENV}=1 (debug builds only)")
+    } else {
+        "a release build installs signed bundles only".to_owned()
+    };
+    format!("refusing to install an unsigned local bundle: {remedy}")
+}
+
+fn no_published_message(id: EngineId) -> String {
+    local_install(id).map_or_else(
+        || format!("no published version of engine {id} exists, and a release build cannot install a local bundle"),
+        |command| format!("no published version of engine {id} exists: {command} installs a local bundle"),
+    )
+}
+
+fn download_unavailable_message(id: EngineId, version: &str) -> String {
+    let advice = if cfg!(debug_assertions) {
+        "; use `--from <dir-or-archive>`"
+    } else {
+        ""
+    };
+    format!("engine {id} {version} is published but this build cannot download it{advice}")
+}
+
+/// What `engine doctor` advises with no version installed and none published.
+pub(crate) fn no_bundle_fix(id: EngineId) -> String {
+    local_install(id).map_or_else(
+        || {
+            "no signed bundle is published yet, and a release build cannot install a local one"
+                .to_owned()
+        },
+        |command| format!("no signed bundle is published yet; run {command}"),
+    )
 }
 
 impl CoreError {
@@ -107,6 +145,8 @@ fn engine_code(error: &EngineError) -> ErrorCode {
         | EngineError::Toml(_) => ErrorCode::InvalidBundle,
         EngineError::NotInstalled { .. } => ErrorCode::EngineNotInstalled,
         EngineError::Io { source, .. } => io_code(source),
+        EngineError::PrefixBusy { .. } => ErrorCode::PrefixBusy,
+        EngineError::ResetFailed { source, .. } => engine_code(source),
         EngineError::UnknownEngineId(_)
         | EngineError::UnknownGraphicsBackend(_)
         | EngineError::UnknownSyncMode(_)
@@ -123,5 +163,44 @@ fn engine_code(error: &EngineError) -> ErrorCode {
 impl From<CoreError> for RpcError {
     fn from(error: CoreError) -> Self {
         Self::new(error.code(), error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs with `--release` in `cargo xtask check`, which is the side that
+    /// matters: a release build ignores the variable.
+    #[test]
+    fn unsigned_advice_follows_the_build() {
+        let id = EngineId::RosettaWine;
+        for text in [
+            CoreError::UnsignedRefused.to_string(),
+            CoreError::NoPublishedVersion { id }.to_string(),
+            CoreError::DownloadUnavailable {
+                id,
+                version: "1".to_owned(),
+            }
+            .to_string(),
+            no_bundle_fix(id),
+        ] {
+            let advises = text.contains(ALLOW_UNSIGNED_ENV) || text.contains("--from");
+            assert_eq!(advises, cfg!(debug_assertions), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_failed_reset_keeps_the_code_of_its_cause() {
+        let full = EngineError::Io {
+            path: PathBuf::from("/x"),
+            source: io::ErrorKind::StorageFull.into(),
+        };
+        let reset = CoreError::from(EngineError::ResetFailed {
+            name: "p".to_owned(),
+            timestamp: "t".to_owned(),
+            source: Box::new(full),
+        });
+        assert_eq!(reset.code(), ErrorCode::DiskFull);
     }
 }

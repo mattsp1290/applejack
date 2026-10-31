@@ -104,6 +104,7 @@ Swift case; do not edit the table by hand.
 | 1008 | `DiskFull` | The disk filled up. |
 | 1009 | `DownloadFailed` | No published version exists, or this build cannot fetch it. |
 | 1010 | `UnsignedEngineRefused` | A local bundle was requested without `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`. |
+| 1011 | `PrefixBusy` | Another operation is using the prefix. |
 <!-- error-table:end -->
 
 A `job.failed` carries the reason code of its failure when it has one
@@ -175,7 +176,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `engine.d3dmetal.import` | `{engine_version, overlay_dir, imported_from, gptk_version, accepted_at}` |
 | `engine.d3dmetal.remove` | `{}` |
 | `prefix.snapshot` | `{prefix, timestamp, dir}` |
-| `prefix.restore` | The same shape, naming the safety snapshot of the replaced state |
+| `prefix.restore` | The same shape, naming the safety snapshot of the replaced state, or the restored snapshot when the prefix was gone and there was nothing to replace |
 | `prefix.reset` | `JobStarted`. A `job.progress` message names the safety snapshot |
 | `config.get` | `GameConfig`; every member `null` for an appid with no row |
 | `config.set` | `{}`. `value` is a string, a boolean, a number, an object for `extra_env`, or `null` to clear |
@@ -185,7 +186,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 `engine.install` takes an optional `from`, a bundle directory or `.tar.zst` on
 this Mac. It needs the core to run with `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`,
 which a release build ignores; without `from` the embedded manifest decides,
-and an empty one answers `DownloadFailed` naming `--from`.
+and an empty one answers `DownloadFailed`, naming `--from` in a debug build.
 
 `config.import` answers a result, not an error, when the plan needs the
 launch-override confirmation: `applied` is false and `confirmations` lists what
@@ -195,6 +196,16 @@ The request's `appid` wins over the file's, which comes back as `preset_appid`.
 The other engine and config methods run on the request loop, so a `hello` sent
 behind one waits for it. `prefix.snapshot` and `prefix.restore` wait up to ten
 seconds for a `wineserver` that outlives the prefix's last process.
+
+One operation at a time runs on a prefix, across jobs and processes, under an
+exclusive lock at `prefixes/.snapshots/.locks/<name>.lock`. The lock covers the
+snapshot, restore, reset, remove, create, and exec operations, so a CLI command
+beside `serve` counts. The loser does not wait: it answers `PrefixBusy`.
+`prefix.reset` takes the lock before it answers, so a busy or unknown prefix is
+an error response, not a job, and the job holds the lock until it ends.
+
+`prefix.restore` also works when the prefix directory is gone, which is the way
+back from a removal or a failed reset. The method needs only the snapshot.
 
 ## Jobs
 
@@ -206,6 +217,9 @@ then emits notifications for that id:
 - Exactly one final `job.done` `{job_id}` or `job.failed`
   `{job_id, code, message}`, where `code` is an integer from the table above.
 
+A `job.failed` for a reset that got past its safety snapshot says which
+snapshot to restore, and carries the code of the underlying failure.
+
 `engine.install` and `prefix.reset` run as jobs. Every message, from the
 request loop or a job thread, goes as one whole line through one channel to
 one writer thread, so a notification and a response never interleave on stdout
@@ -214,11 +228,21 @@ notifier with each call and starts work with `Notifier::start_job`. A job that
 panics ends in `job.failed` with `InternalError`.
 
 EOF on stdin stops reading, and the core exits once running jobs have sent
-their final notification. `CoreClient.shutdown()` does not wait that long; a
-core terminated during an install leaves no `<version>/`, and the next install
-replaces the partial state. Only one install of an engine runs at a time, across
-processes (`engines/<id>/.install.lock`); a second one ends in `job.failed`
-saying so.
+their final notification. A reader that closes stdout does not change that:
+lines for it are dropped, the jobs run to the end, and the core then exits with
+the write error. `CoreClient.shutdown()` does not wait that long; a core
+terminated during an install leaves no `<version>/`, and the next install
+replaces the partial state and clears any packed `<version>.local.tar.zst`. Only
+one install of an engine runs at a time, across processes
+(`engines/<id>/.install.lock`); a second one ends in `job.failed` saying so.
+
+A core terminated during `prefix.reset` can leave the prefix missing or half
+built, and no notification names the safety snapshot. The newest entry of
+`applejack prefix list-snapshots <name>` is that snapshot, and
+`applejack prefix restore <name> <timestamp>` brings the prefix back. There is
+no RPC method for the list yet. Over a half-built prefix the restore takes a
+safety snapshot of it first, as any restore does. The kernel drops the lock with
+the process, so a terminated core leaves nothing locked.
 
 Children the core spawns (wine, wineserver, Steam) must not inherit the
 core's stdout: give them `Stdio::null()` or a pipe. An inherited stdout would

@@ -602,16 +602,20 @@ const MAX_DESCRIPTOR_BYTES: u64 = 1 << 20;
 
 const LOCK_FILE: &str = ".install.lock";
 
+const PACKED_SUFFIX: &str = ".local.tar.zst";
+
 /// Exclusive for one engine id across every applejack process, held from
 /// before a local bundle is packed until the install has been recorded, so
 /// two installs never share a `.partial`. Released on drop.
 #[derive(Debug)]
 pub struct InstallLock {
-    _file: File,
+    file: File,
 }
 
 impl InstallLock {
-    /// Takes `engines/<id>/.install.lock` without waiting.
+    /// Takes `engines/<id>/.install.lock` without waiting, and clears the
+    /// packed archives an interrupted install left, which only the lock's
+    /// holder can be using.
     ///
     /// # Errors
     ///
@@ -628,9 +632,31 @@ impl InstallLock {
             .open(&path)
             .map_err(|error| Error::io(&path, error))?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => {
+                sweep_packed(&root);
+                Ok(Self { file })
+            }
             Err(rustix::io::Errno::WOULDBLOCK) => Err(Error::InstallInProgress { id }),
             Err(error) => Err(Error::io(path, error.into())),
+        }
+    }
+}
+
+impl Drop for InstallLock {
+    /// See [`crate::rosetta_wine::snapshot::PrefixLock`]: a child being
+    /// spawned elsewhere can hold a copy of the descriptor past a close.
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+fn sweep_packed(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().ends_with(PACKED_SUFFIX) {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }
@@ -663,8 +689,9 @@ impl LocalBundle {
     ///
     /// [`Error::BundleIdentityMismatch`] when the bundle names another
     /// engine, [`Error::AlreadyInstalled`] before anything is packed,
-    /// [`Error::InvalidArchive`] for an archive with no root
-    /// `BUNDLE.toml`, the descriptor's load errors, or [`Error::Io`].
+    /// [`Error::InvalidArchive`] for an archive with no root `BUNDLE.toml`,
+    /// [`Error::InvalidBundle`] for a directory with none, the descriptor's
+    /// load errors, or [`Error::Io`].
     pub fn prepare(
         layout: &EngineLayout,
         id: EngineId,
@@ -674,6 +701,12 @@ impl LocalBundle {
         let is_dir = fs::metadata(from)
             .map_err(|error| Error::io(from, error))?
             .is_dir();
+        if is_dir && !from.join(BUNDLE_FILE).is_file() {
+            return Err(Error::InvalidBundle(format!(
+                "`{}` has no {BUNDLE_FILE}",
+                from.display()
+            )));
+        }
         let bundle = if is_dir {
             BundleToml::load(from)?
         } else {
@@ -696,7 +729,7 @@ impl LocalBundle {
         let (archive, packed) = if is_dir {
             let root = layout.engine_root(id);
             fs::create_dir_all(&root).map_err(|error| Error::io(&root, error))?;
-            let archive = root.join(format!("{}.local.tar.zst", bundle.version));
+            let archive = root.join(format!("{}{PACKED_SUFFIX}", bundle.version));
             if let Err(error) = pack_dir(from, &archive, progress) {
                 let _ = fs::remove_file(&archive);
                 return Err(error);
@@ -705,7 +738,11 @@ impl LocalBundle {
         } else {
             (from.to_path_buf(), None)
         };
-        let sha256 = sha256_file(&archive)?;
+        let sha256 = sha256_file(&archive).inspect_err(|_| {
+            if let Some(path) = &packed {
+                let _ = fs::remove_file(path);
+            }
+        })?;
         Ok(Self {
             request: InstallRequest::local(id, bundle.version, archive, sha256),
             packed,

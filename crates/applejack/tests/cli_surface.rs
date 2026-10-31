@@ -104,6 +104,49 @@ fn engine_doctor_without_an_engine_reports_the_fix_and_exits_0() {
 }
 
 #[test]
+fn a_prefix_held_by_another_process_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+    let root = data.path().join("prefixes/.snapshots");
+    let held = applejack_engine::rosetta_wine::snapshot::PrefixLock::acquire(&root, "p").unwrap();
+    for args in [
+        &["prefix", "snapshot", "p"][..],
+        &["prefix", "restore", "p", "19700101T000000Z"],
+        &["prefix", "reset", "p"],
+        &["prefix", "remove", "p"],
+        &["prefix", "exec", "p", "--", "cmd"],
+    ] {
+        let output = with_data(data.path(), args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr_of(&output).contains("another operation is using prefix p"),
+            "{args:?}: {}",
+            stderr_of(&output)
+        );
+    }
+    drop(held);
+    let output = with_data(data.path(), &["prefix", "snapshot", "p"]);
+    assert!(stderr_of(&output).contains("no prefix named"), "{output:?}");
+}
+
+#[test]
+fn list_snapshots_answers_for_a_prefix_that_is_gone() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["prefix", "list-snapshots", "p"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(stdout_of(&output).trim(), "no snapshots of p");
+
+    let snapshots = data.path().join("prefixes/.snapshots/p");
+    std::fs::create_dir_all(snapshots.join("20261031T120000Z")).unwrap();
+    std::fs::create_dir_all(snapshots.join("20261031T120000Z-001")).unwrap();
+    std::fs::create_dir_all(snapshots.join(".staging-1-0")).unwrap();
+    let output = with_data(data.path(), &["prefix", "list-snapshots", "p"]);
+    assert_eq!(
+        stdout_of(&output).trim(),
+        "20261031T120000Z\n20261031T120000Z-001"
+    );
+}
+
+#[test]
 fn engine_install_without_from_names_the_flag_on_an_empty_manifest() {
     let data = tempfile::tempdir().unwrap();
     let output = with_data(data.path(), &["engine", "install", "rosetta-wine"]);
@@ -172,7 +215,6 @@ fn prefix_commands_report_what_is_missing() {
 
     for args in [
         vec!["prefix", "snapshot", "x"],
-        vec!["prefix", "restore", "x", "20261031T000000Z"],
         vec!["prefix", "reset", "x"],
         vec!["prefix", "remove", "x"],
         vec!["prefix", "exec", "x", "--", "cmd"],
@@ -185,6 +227,15 @@ fn prefix_commands_report_what_is_missing() {
             stderr_of(&output)
         );
     }
+
+    // A restore does not need the prefix, only the snapshot.
+    let output = with_data(data.path(), &["prefix", "restore", "x", "20261031T000000Z"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr_of(&output).contains("snapshot x/20261031T000000Z does not exist"),
+        "{}",
+        stderr_of(&output)
+    );
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! The engine half end to end through the binary, against a real payload:
 //! install, list, doctor, a prefix, a 32-bit console probe, the CPUID probe,
-//! snapshots, reset, and the same install over `serve --stdio`. Opt in with
+//! snapshots, reset, a double reset and an install under a dead reader over
+//! `serve --stdio`, and the same install answering while it runs. Opt in with
 //! `APPLEJACK_LIVE_ENGINE=1`. The payload comes from `APPLEJACK_PAYLOAD_DIR`
 //! or `fixtures/payloads/rosetta-wine-11.0` in this checkout or the main
 //! one. Every path lives in a throwaway data directory. No GUI session is
@@ -145,7 +146,121 @@ fn install_doctor_prefix_exec_probe_snapshot_reset() {
     assert!(exec.contains("hello32 ok"), "after reset: {exec}");
     ok(&data, &["prefix", "remove", "test"]);
     assert_eq!(ok(&data, &["prefix", "list"]).trim(), "no prefixes");
+
+    let listed = ok(&data, &["prefix", "list-snapshots", "test"]);
+    assert!(listed.contains(&timestamp), "{listed}");
+    ok(&data, &["prefix", "restore", "test", &timestamp]);
+    let exec = ok(
+        &data,
+        &["prefix", "exec", "test", "--", hello.to_str().unwrap()],
+    );
+    assert!(exec.contains("hello32 ok"), "after a removal: {exec}");
+
+    double_reset(&data);
+    let exec = ok(
+        &data,
+        &["prefix", "exec", "test", "--", hello.to_str().unwrap()],
+    );
+    assert!(exec.contains("hello32 ok"), "after a double reset: {exec}");
+    ok(&data, &["prefix", "remove", "test"]);
     stop_servers(&data);
+}
+
+/// Two `prefix.reset` lines, as a double click sends them, against real Wine:
+/// the second is refused and the user's file lands in the safety snapshot.
+fn double_reset(data: &Path) {
+    let marker = "drive_c/users/save-marker.txt";
+    std::fs::write(data.join("prefixes/test").join(marker), "only copy").unwrap();
+    let mut core = applejack(data)
+        .args(["serve", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = core.stdin.take().unwrap();
+    let hello = json!({"jsonrpc": "2.0", "id": 1, "method": "hello",
+                       "params": {"protocol_version": 1}});
+    writeln!(stdin, "{hello}").unwrap();
+    for id in [2, 3] {
+        let reset = json!({"jsonrpc": "2.0", "id": id, "method": "prefix.reset",
+                           "params": {"prefix": "test"}});
+        writeln!(stdin, "{reset}").unwrap();
+    }
+    drop(stdin);
+    let mut failures = Vec::new();
+    let mut done = 0;
+    let mut second = Value::Null;
+    for line in BufReader::new(core.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        eprintln!("[live] {line}");
+        let message: Value = serde_json::from_str(&line).unwrap();
+        match message["method"].as_str() {
+            Some("job.done") => done += 1,
+            Some("job.failed") => failures.push(message),
+            _ if message["id"] == json!(3) => second = message,
+            _ => {}
+        }
+    }
+    assert!(core.wait().unwrap().success());
+    assert_eq!((done, failures.len()), (1, 0), "{failures:?}");
+    assert_eq!(second["error"]["code"], json!(1011), "{second}");
+    let snapshots = ok(data, &["prefix", "list-snapshots", "test"]);
+    let safety = snapshots.lines().last().unwrap();
+    assert!(
+        data.join("prefixes/.snapshots/test")
+            .join(safety)
+            .join(marker)
+            .is_file(),
+        "{snapshots}"
+    );
+}
+
+#[test]
+fn an_install_finishes_after_both_pipes_close() {
+    if !enabled() {
+        eprintln!("[live] skipped: set APPLEJACK_LIVE_ENGINE=1");
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let data = scratch.path().join("data");
+    let mut core = applejack(&data)
+        .args(["serve", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = core.stdin.take().unwrap();
+    let mut stdout = BufReader::new(core.stdout.take().unwrap());
+    let hello = json!({"jsonrpc": "2.0", "id": 1, "method": "hello",
+                       "params": {"protocol_version": 1}});
+    let install = json!({"jsonrpc": "2.0", "id": 2, "method": "engine.install", "params":
+                         {"engine_id": "rosetta-wine", "from": payload_dir()}});
+    writeln!(stdin, "{hello}\n{install}").unwrap();
+    let mut line = String::new();
+    while !line.contains(r#""phase":"pack""#) {
+        line.clear();
+        assert_ne!(stdout.read_line(&mut line).unwrap(), 0, "core exited");
+    }
+    drop(stdout);
+    drop(stdin);
+    core.wait().unwrap();
+
+    let root = data.join("engines/rosetta-wine");
+    let names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.ends_with(".tar.zst")),
+        "{names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| root.join(name).join("BUNDLE.toml").is_file()),
+        "the install did not finish: {names:?}"
+    );
 }
 
 #[test]

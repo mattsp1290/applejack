@@ -1,4 +1,4 @@
-//! `applejack prefix create|list|snapshot|restore|reset|remove|exec`.
+//! `applejack prefix create|list|snapshot|list-snapshots|restore|reset|remove|exec`.
 
 use std::ffi::OsString;
 use std::io;
@@ -43,7 +43,13 @@ enum Action {
         /// Prefix name
         name: String,
     },
-    /// Swap a snapshot back in, after a safety snapshot
+    /// List a prefix's snapshots, oldest first. Works for a removed prefix
+    ListSnapshots {
+        /// Prefix name
+        name: String,
+    },
+    /// Swap a snapshot back in, after a safety snapshot. A removed prefix
+    /// comes back from it
     Restore {
         /// Prefix name
         name: String,
@@ -119,12 +125,25 @@ fn execute(args: PrefixArgs) -> Result<Outcome, CoreError> {
             let snapshot = core.prefix_snapshot(&name)?;
             format!("snapshot {} {}", snapshot.prefix, snapshot.timestamp)
         }
+        Action::ListSnapshots { name } => {
+            let snapshots = core.prefix_snapshots(&name)?;
+            if snapshots.is_empty() {
+                format!("no snapshots of {name}")
+            } else {
+                let rows: Vec<&str> = snapshots.iter().map(|s| s.timestamp.as_str()).collect();
+                rows.join("\n")
+            }
+        }
         Action::Restore { name, timestamp } => {
-            let safety = core.prefix_restore(&name, &timestamp)?;
-            format!(
-                "restored {name} from {timestamp}; safety snapshot {}",
-                safety.timestamp
-            )
+            let result = core.prefix_restore(&name, &timestamp)?;
+            if result.timestamp == timestamp {
+                format!("restored {name} from {timestamp}")
+            } else {
+                format!(
+                    "restored {name} from {timestamp}; safety snapshot {}",
+                    result.timestamp
+                )
+            }
         }
         Action::Reset {
             name,

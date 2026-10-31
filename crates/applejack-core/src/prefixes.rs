@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::prefix::{LIBRARY_DRIVE, backend_available};
 use applejack_engine::rosetta_wine::process::{server_socket, wineserver_running};
+use applejack_engine::rosetta_wine::snapshot::PrefixLock;
 use applejack_engine::rosetta_wine::{Snapshot, snapshot};
 use applejack_engine::{
     Engine, Error as EngineError, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec, Prefix,
@@ -61,7 +62,8 @@ impl PrefixEntry {
 }
 
 /// The result of `prefix.snapshot` and `prefix.restore`: a snapshot, which
-/// for a restore is the safety snapshot of the replaced state.
+/// for a restore is the safety snapshot of the replaced state, or the
+/// restored snapshot when no prefix was there to replace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotResult {
@@ -92,6 +94,27 @@ impl Core {
     fn prefix_dir(&self, name: &str) -> Result<PathBuf, CoreError> {
         snapshot::check_name(name)?;
         Ok(self.prefixes_root().join(name))
+    }
+
+    /// Taken first by every operation that changes or runs in a prefix,
+    /// before anything looks at the directory: a reset in progress has
+    /// removed it.
+    fn lock_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
+        Ok(PrefixLock::acquire(&self.snapshots_root(), name)?)
+    }
+
+    /// Locks a prefix that exists. The lock travels with the work, so a
+    /// caller that answers before the work runs refuses a busy or unknown
+    /// prefix up front; see [`Core::prefix_reset_claimed`].
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], or a
+    /// prefix that does not open.
+    pub fn claim_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
+        let lock = self.lock_prefix(name)?;
+        self.open_prefix(name)?;
+        Ok(lock)
     }
 
     fn open_prefix(&self, name: &str) -> Result<(PathBuf, Prefix), CoreError> {
@@ -134,8 +157,9 @@ impl Core {
     ///
     /// # Errors
     ///
-    /// [`CoreError::NoActiveEngine`], [`CoreError::SyncUnavailable`], or
-    /// the engine's creation failure; the directory is removed on failure.
+    /// [`EngineError::PrefixBusy`], [`CoreError::NoActiveEngine`],
+    /// [`CoreError::SyncUnavailable`], or the engine's creation failure; the
+    /// directory is removed on failure.
     pub fn prefix_create(
         &mut self,
         name: &str,
@@ -143,6 +167,7 @@ impl Core {
         sync_mode: Option<SyncMode>,
         hidraw: HidrawMode,
     ) -> Result<PrefixEntry, CoreError> {
+        let _lock = self.lock_prefix(name)?;
         let dir = self.prefix_dir(name)?;
         let installed = self.require_active_engine()?;
         let sync_mode = pick_sync(&installed, sync_mode)?;
@@ -210,32 +235,45 @@ impl Core {
         Ok(list)
     }
 
+    /// The snapshots of `name`, oldest first. The prefix need not exist:
+    /// this is how a removed or failed prefix's snapshots are found.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::InvalidSnapshotName`], or a directory that cannot be
+    /// read.
+    pub fn prefix_snapshots(&self, name: &str) -> Result<Vec<SnapshotResult>, CoreError> {
+        let snapshots = snapshot::list(&self.snapshots_root(), name)?;
+        Ok(snapshots.into_iter().map(SnapshotResult::from).collect())
+    }
+
     /// Clones the prefix to a new snapshot once its server has left.
     ///
     /// # Errors
     ///
-    /// [`CoreError::UnknownPrefix`], a server that does not leave, or the
-    /// copy failure.
+    /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], a server
+    /// that does not leave, or the copy failure.
     pub fn prefix_snapshot(&self, name: &str) -> Result<SnapshotResult, CoreError> {
+        let _lock = self.lock_prefix(name)?;
         let (dir, _) = self.open_prefix(name)?;
         Self::settle(&dir)?;
         Ok(snapshot::create(&dir, &self.snapshots_root(), name)?.into())
     }
 
-    /// Swaps a snapshot in and returns the safety snapshot taken first.
+    /// Swaps a snapshot in and returns the safety snapshot taken first. A
+    /// prefix that is gone, after a removal or a failed reset, comes back
+    /// from the snapshot, which is what is returned then.
     ///
     /// # Errors
     ///
-    /// [`CoreError::UnknownPrefix`], [`EngineError::SnapshotNotFound`], a
+    /// [`EngineError::PrefixBusy`], [`EngineError::SnapshotNotFound`], a
     /// server that does not leave, or the copy or swap failure.
     pub fn prefix_restore(&self, name: &str, timestamp: &str) -> Result<SnapshotResult, CoreError> {
+        let _lock = self.lock_prefix(name)?;
         let dir = self.prefix_dir(name)?;
-        if !dir.is_dir() {
-            return Err(CoreError::UnknownPrefix {
-                name: name.to_owned(),
-            });
+        if dir.is_dir() {
+            Self::settle(&dir)?;
         }
-        Self::settle(&dir)?;
         Ok(snapshot::restore(&dir, &self.snapshots_root(), name, timestamp)?.into())
     }
 
@@ -246,12 +284,27 @@ impl Core {
     ///
     /// Refused, with the prefix untouched, when the recorded backend is not
     /// available in the active engine; a failed rebuild leaves the safety
-    /// snapshot as the only copy.
+    /// snapshot as the only copy, and [`EngineError::ResetFailed`] names it.
     pub fn prefix_reset(
         &mut self,
         name: &str,
         keep_user_data: bool,
     ) -> Result<SnapshotResult, CoreError> {
+        let claim = self.claim_prefix(name)?;
+        self.prefix_reset_claimed(&claim, keep_user_data)
+    }
+
+    /// [`Core::prefix_reset`] of the prefix `claim` holds.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Core::prefix_reset`].
+    pub fn prefix_reset_claimed(
+        &mut self,
+        claim: &PrefixLock,
+        keep_user_data: bool,
+    ) -> Result<SnapshotResult, CoreError> {
+        let name = claim.name();
         let (dir, prefix) = self.open_prefix(name)?;
         let installed = self.require_active_engine()?;
         backend_available(&installed, prefix.backend)?;
@@ -282,13 +335,14 @@ impl Core {
     }
 
     /// Deletes the prefix and the server directory Wine left for it.
-    /// Snapshots stay, so a removal can be undone.
+    /// Snapshots stay, so [`Core::prefix_restore`] can undo a removal.
     ///
     /// # Errors
     ///
-    /// [`CoreError::UnknownPrefix`], a server that does not leave, or the
-    /// removal failure.
+    /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], a server
+    /// that does not leave, or the removal failure.
     pub fn prefix_remove(&self, name: &str) -> Result<(), CoreError> {
+        let _lock = self.lock_prefix(name)?;
         let dir = self.prefix_dir(name)?;
         if !dir.is_dir() {
             return Err(CoreError::UnknownPrefix {
@@ -309,11 +363,13 @@ impl Core {
     /// Runs `exe` in the prefix through `Engine::launch`, with the bundle
     /// that last touched the prefix, copies the session log to `out` as it
     /// grows, and returns the exit code (128 plus the signal for a signal).
+    /// The prefix stays locked until the child exits.
     ///
     /// # Errors
     ///
-    /// [`CoreError::PathOutsideData`] for an absolute Unix path outside the
-    /// data directory; the launch failure; a log read failure.
+    /// [`EngineError::PrefixBusy`]; [`CoreError::PathOutsideData`] for an
+    /// absolute Unix path outside the data directory; the launch failure; a
+    /// log read failure.
     pub fn prefix_exec(
         &mut self,
         name: &str,
@@ -321,6 +377,7 @@ impl Core {
         args: &[OsString],
         out: &mut dyn Write,
     ) -> Result<i32, CoreError> {
+        let _lock = self.lock_prefix(name)?;
         let (dir, prefix) = self.open_prefix(name)?;
         self.check_inside_data(exe)?;
         let installed = self.prefix_engine(&prefix)?;

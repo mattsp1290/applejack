@@ -106,6 +106,7 @@ impl EngineInstall {
     /// # Errors
     ///
     /// Returns the first failure; a failed install leaves no `<version>/`.
+    /// One killed partway leaves its packed archive until the next install.
     pub fn run(self, progress: &mut dyn FnMut(Progress)) -> Result<InstalledVersion, CoreError> {
         let _lock = InstallLock::acquire(&self.layout, self.id)?;
         let local = LocalBundle::prepare(&self.layout, self.id, &self.from, progress)?;
@@ -262,10 +263,7 @@ impl Core {
         }
         Ok(match Self::manifest_versions(id)?.pop() {
             Some(_) => format!("run `applejack engine install {id}`"),
-            None => format!(
-                "no signed bundle is published yet; run `{}=1 applejack engine install {id} --from <dir-or-archive>`",
-                crate::config::ALLOW_UNSIGNED_ENV
-            ),
+            None => crate::error::no_bundle_fix(id),
         })
     }
 
