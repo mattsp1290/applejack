@@ -338,14 +338,13 @@ impl Unfinished {
             .collect()
     }
 
-    /// A recorded depot the plan no longer selects, which this run would
-    /// leave mixed.
-    fn unplanned(&self, planned: &[PlannedDepot]) -> Option<u32> {
+    /// Recorded depots the plan does not select.
+    fn unplanned<'u>(&'u self, planned: &'u [PlannedDepot]) -> impl Iterator<Item = u32> + use<'u> {
         self.record
             .iter()
             .flat_map(|record| &record.depots)
             .map(|depot| depot.depot_id)
-            .find(|id| planned.iter().all(|depot| depot.depot_id != *id))
+            .filter(|id| planned.iter().all(|depot| depot.depot_id != *id))
     }
 }
 
@@ -365,26 +364,6 @@ struct WorkDepot {
 impl WorkDepot {
     fn size(&self) -> u64 {
         self.manifest.files.iter().map(|file| file.size).sum()
-    }
-
-    /// The manifest entries that differ from the installed version.
-    fn changed(&self) -> Vec<&ManifestFile> {
-        let Some(previous) = &self.previous else {
-            return self.manifest.files.iter().collect();
-        };
-        let old: HashMap<String, &ManifestFile> = previous
-            .files
-            .iter()
-            .map(|file| (file.normalized_path(), file))
-            .collect();
-        self.manifest
-            .files
-            .iter()
-            .filter(|file| {
-                old.get(&file.normalized_path())
-                    .is_none_or(|before| !same_content(before, file))
-            })
-            .collect()
     }
 
     fn old_layouts(&self) -> Option<HashMap<String, Vec<OldChunkLoc>>> {
@@ -409,6 +388,121 @@ impl WorkDepot {
                 .collect(),
         )
     }
+}
+
+/// An installed depot this run has no reason to write.
+struct KeptDepot {
+    depot_id: u32,
+    manifest_id: u64,
+    manifest: DepotManifest,
+}
+
+impl From<KeptDepot> for WorkDepot {
+    /// A kept depot that came to own a path, with nothing of its own changed.
+    fn from(depot: KeptDepot) -> Self {
+        Self {
+            depot_id: depot.depot_id,
+            manifest_id: depot.manifest_id,
+            previous_id: Some(depot.manifest_id),
+            previous: Some(depot.manifest.clone()),
+            manifest: depot.manifest,
+            abandoned_ids: BTreeSet::new(),
+            abandoned: Vec::new(),
+        }
+    }
+}
+
+/// Which depot's entry applies to each path, keyed as [`path_owners`] keys
+/// them: `current` after this run and `before` as the `.acf` left it.
+struct Layers<'m> {
+    current: HashMap<String, (u32, &'m ManifestFile)>,
+    before: HashMap<String, (u32, &'m ManifestFile)>,
+}
+
+impl<'m> Layers<'m> {
+    fn new(work: &'m [WorkDepot], kept: &'m [KeptDepot]) -> Self {
+        let kept_layers = || kept.iter().map(|depot| (depot.depot_id, &depot.manifest));
+        Self {
+            current: path_owners(
+                work.iter()
+                    .map(|depot| (depot.depot_id, &depot.manifest))
+                    .chain(kept_layers()),
+            ),
+            before: path_owners(
+                work.iter()
+                    .filter_map(|depot| Some((depot.depot_id, depot.previous.as_ref()?)))
+                    .chain(kept_layers()),
+            ),
+        }
+    }
+
+    fn owns(&self, depot_id: u32, file: &ManifestFile) -> bool {
+        self.current
+            .get(&path_key(file))
+            .is_some_and(|(owner, _)| *owner == depot_id)
+    }
+
+    /// The name matters as well as the content: on a case-sensitive volume a
+    /// respelled path is a new file.
+    fn changed(&self, file: &ManifestFile) -> bool {
+        self.before.get(&path_key(file)).is_none_or(|(_, before)| {
+            before.normalized_path() != file.normalized_path() || !same_content(before, file)
+        })
+    }
+
+    /// The entries of `depot` this run has to write.
+    fn to_write(
+        &self,
+        depot: &'m WorkDepot,
+        rescan: bool,
+        install_dir: &Path,
+    ) -> impl Iterator<Item = &'m ManifestFile> {
+        depot
+            .manifest
+            .files
+            .iter()
+            .filter(|file| self.owns(depot.depot_id, file))
+            .filter(move |file| {
+                let changed = self.changed(file);
+                (rescan || changed) && !keeps_user_copy(file, install_dir, changed)
+            })
+    }
+}
+
+/// `path_owners`' key. Depots are built on Windows, where these are one path.
+fn path_key(file: &ManifestFile) -> String {
+    file.normalized_path().to_lowercase()
+}
+
+/// The one rule for overlapping depots: a path is on disk once, and the depot
+/// with the highest id wins.
+fn path_owners<'m>(
+    layers: impl Iterator<Item = (u32, &'m DepotManifest)>,
+) -> HashMap<String, (u32, &'m ManifestFile)> {
+    let mut layers: Vec<_> = layers.collect();
+    layers.sort_by_key(|(depot_id, _)| *depot_id);
+    let mut owners = HashMap::new();
+    for (depot_id, manifest) in layers {
+        for file in &manifest.files {
+            owners.insert(path_key(file), (depot_id, file));
+        }
+    }
+    owners
+}
+
+/// `userconfig` and `versionedconfig` in a depot build script: the game or
+/// the user edits the file, so an update does not replace it and validation
+/// does not flag it.
+fn is_user_config(file: &ManifestFile) -> bool {
+    let flags = DepotFileFlags::from_bits_retain(file.flags);
+    flags.intersects(DepotFileFlags::USER_CONFIG | DepotFileFlags::VERSIONED_USER_CONFIG)
+}
+
+/// A `versionedconfig` file is still replaced when the depot's copy changes.
+fn keeps_user_copy(file: &ManifestFile, install_dir: &Path, changed: bool) -> bool {
+    let flags = DepotFileFlags::from_bits_retain(file.flags);
+    (flags.contains(DepotFileFlags::USER_CONFIG) || (is_user_config(file) && !changed))
+        && fs::symlink_metadata(install_dir.join(file.normalized_path())).is_ok()
 }
 
 /// Where each chunk sits: its recorded offset, or for a manifest that omits
@@ -570,11 +664,16 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
         let work = run.resolve(&installed).await?;
         // Without an `.acf` every planned file is checked and nothing claims
         // the title is whole, so only an installed title can be left mixed.
+        // A depot the `.acf` lists went back to its manifest in `resolve`.
         if let Some(depot_id) = run
             .unfinished
             .as_ref()
             .filter(|_| existing.is_some())
-            .and_then(|unfinished| unfinished.unplanned(&run.plan.depots))
+            .and_then(|unfinished| {
+                unfinished
+                    .unplanned(&run.plan.depots)
+                    .find(|id| !installed.contains_key(id))
+            })
         {
             return Err(Error::UnfinishedDepot { appid, depot_id });
         }
@@ -587,7 +686,8 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
                 resumed: false,
             });
         }
-        let outcome = run.download(work, existing).await?;
+        let kept = run.kept_depots(existing.as_ref(), &work).await?;
+        let outcome = run.download(work, kept, existing).await?;
         Ok(outcome)
     }
 
@@ -717,7 +817,28 @@ impl<S: SteamSession> Run<'_, '_, S> {
         installed: &HashMap<u32, u64>,
     ) -> Result<Result<Vec<WorkDepot>, PlannedDepot>, Error> {
         let mut work = Vec::new();
-        for planned in self.plan.depots.clone() {
+        // A stopped run's depot the plan dropped stays in the `.acf`, so it
+        // goes back to the manifest the `.acf` claims.
+        let carried: Vec<PlannedDepot> = self
+            .unfinished
+            .iter()
+            .flat_map(|unfinished| unfinished.unplanned(&self.plan.depots))
+            .filter_map(|depot_id| {
+                Some(PlannedDepot {
+                    depot_id,
+                    manifest_id: *installed.get(&depot_id)?,
+                    size: 0,
+                })
+            })
+            .collect();
+        for planned in self
+            .plan
+            .depots
+            .iter()
+            .chain(&carried)
+            .copied()
+            .collect::<Vec<_>>()
+        {
             let depot_id = planned.depot_id;
             let manifest_id = planned.manifest_id;
             let previous_id = installed.get(&depot_id).copied();
@@ -757,9 +878,45 @@ impl<S: SteamSession> Run<'_, '_, S> {
         Ok(Ok(work))
     }
 
+    /// The depots the `.acf` lists that are not in `work`, with whatever
+    /// manifests are to be had: a depot the plan does not select is not
+    /// fetched, since the account may no longer reach it.
+    async fn kept_depots(
+        &mut self,
+        existing: Option<&(AppManifest, String)>,
+        work: &[WorkDepot],
+    ) -> Result<Kept, Error> {
+        let mut kept = Kept {
+            depots: Vec::new(),
+            complete: true,
+        };
+        for depot in existing.iter().flat_map(|(acf, _)| &acf.installed_depots) {
+            let (depot_id, manifest_id) = (depot.depot_id, depot.manifest_id);
+            if work.iter().any(|target| target.depot_id == depot_id) {
+                continue;
+            }
+            let planned = self.plan.depots.iter().any(|d| d.depot_id == depot_id);
+            let manifest = if planned {
+                self.manifest(depot_id, manifest_id).await?
+            } else {
+                load_manifest(&self.paths().manifest(depot_id, manifest_id))
+            };
+            match manifest {
+                Some(manifest) => kept.depots.push(KeptDepot {
+                    depot_id,
+                    manifest_id,
+                    manifest,
+                }),
+                None => kept.complete = false,
+            }
+        }
+        Ok(kept)
+    }
+
     async fn download(
         &mut self,
-        work: Vec<WorkDepot>,
+        mut work: Vec<WorkDepot>,
+        kept: Kept,
         existing: Option<(AppManifest, String)>,
     ) -> Result<InstallOutcome, Error> {
         let appid = self.plan.appid;
@@ -767,6 +924,14 @@ impl<S: SteamSession> Run<'_, '_, S> {
         let install_dir = self.paths().install_dir(&self.plan.installdir);
         // Resolving can take a while on large manifests.
         self.installer.refuse_while_client_runs(appid)?;
+
+        let Kept {
+            depots: kept,
+            complete: every_depot_known,
+        } = kept;
+        let kept = promote_heirs(&mut work, kept);
+        work.sort_by_key(|depot| depot.depot_id);
+        let layers = Layers::new(&work, &kept);
 
         let interrupted = record_path.exists();
         let loaded = DownloadRecord::load(&record_path)
@@ -802,16 +967,11 @@ impl<S: SteamSession> Run<'_, '_, S> {
         let mut tally = Tally::default();
         for (index, depot) in work.iter().enumerate() {
             let done = &record.depots[index];
-            let candidates = if record.rescan {
-                depot.manifest.files.iter().collect()
-            } else {
-                depot.changed()
-            };
             let remaining: Vec<ManifestFile> = if done.complete {
                 Vec::new()
             } else {
-                candidates
-                    .into_iter()
+                layers
+                    .to_write(depot, record.rescan, &install_dir)
                     .filter(|file| !done.files.contains(&file.filename))
                     .cloned()
                     .collect()
@@ -839,8 +999,12 @@ impl<S: SteamSession> Run<'_, '_, S> {
         }
 
         self.installer.refuse_while_client_runs(appid)?;
-        let files_removed = kept_files(self.paths(), existing.as_ref(), &work)
-            .map_or(0, |kept| remove_stale_files(&install_dir, &work, &kept));
+        // Without every manifest, nothing can be proved stale.
+        let files_removed = if every_depot_known {
+            remove_stale_files(&install_dir, &work, &kept)
+        } else {
+            0
+        };
         let staging = install_dir.join(STAGING_DIR);
         if staging.exists() {
             fs::remove_dir_all(&staging).map_err(|source| io_error(appid, &staging, source))?;
@@ -1107,40 +1271,55 @@ struct Tally {
     files_written: u64,
 }
 
-/// The paths of installed depots this run leaves alone. `None` when one of
-/// their manifests is not stored, because then nothing can be proved stale.
-fn kept_files(
-    paths: &LibraryPaths,
-    existing: Option<&(AppManifest, String)>,
-    work: &[WorkDepot],
-) -> Option<BTreeSet<String>> {
-    let mut kept = BTreeSet::new();
-    for depot in existing.iter().flat_map(|(acf, _)| &acf.installed_depots) {
-        if work.iter().all(|target| target.depot_id != depot.depot_id) {
-            let manifest = load_manifest(&paths.manifest(depot.depot_id, depot.manifest_id))?;
-            kept.extend(manifest.files.iter().map(ManifestFile::normalized_path));
-        }
-    }
-    Some(kept)
+/// What [`Run::kept_depots`] found. `complete` is false when a depot's
+/// manifest could not be had, so the rest does not describe the whole title.
+struct Kept {
+    depots: Vec<KeptDepot>,
+    complete: bool,
+}
+
+/// Moves into `work` each kept depot that came to own a path, which happens
+/// when a later depot drops an overlay, and returns the rest.
+fn promote_heirs(work: &mut Vec<WorkDepot>, kept: Vec<KeptDepot>) -> Vec<KeptDepot> {
+    let heirs: BTreeSet<u32> = {
+        let layers = Layers::new(work, &kept);
+        kept.iter()
+            .filter(|depot| {
+                depot
+                    .manifest
+                    .files
+                    .iter()
+                    .any(|file| layers.owns(depot.depot_id, file) && layers.changed(file))
+            })
+            .map(|depot| depot.depot_id)
+            .collect()
+    };
+    let (promoted, kept): (Vec<_>, Vec<_>) = kept
+        .into_iter()
+        .partition(|depot| heirs.contains(&depot.depot_id));
+    work.extend(promoted.into_iter().map(WorkDepot::from));
+    kept
 }
 
 /// Deletes files the old manifests had and no current manifest has, then any
 /// directory that leaves empty. A file that will not go is left behind: it
 /// is harmless, and the depot is already correct.
-fn remove_stale_files(install_dir: &Path, work: &[WorkDepot], kept: &BTreeSet<String>) -> u64 {
+fn remove_stale_files(install_dir: &Path, work: &[WorkDepot], kept: &[KeptDepot]) -> u64 {
     // Compared folded: on a case-insensitive volume a file renamed only in
     // case is the same file, and removing the old spelling would delete it.
     let current: BTreeSet<String> = work
         .iter()
-        .flat_map(|depot| &depot.manifest.files)
+        .map(|depot| &depot.manifest)
+        .chain(kept.iter().map(|depot| &depot.manifest))
+        .flat_map(|manifest| &manifest.files)
         .map(ManifestFile::normalized_path)
-        .chain(kept.iter().cloned())
         .map(|path| path.to_lowercase())
         .collect();
     let mut stale: Vec<String> = work
         .iter()
         .flat_map(|depot| depot.previous.iter().chain(&depot.abandoned))
         .flat_map(|previous| &previous.files)
+        .filter(|file| !is_user_config(file))
         .map(ManifestFile::normalized_path)
         .filter(|path| !current.contains(&path.to_lowercase()))
         .collect();
@@ -1332,7 +1511,7 @@ pub fn verify_install(
     let (acf, _) = read_acf(paths, appid)?.ok_or(Error::NotInstalled { appid })?;
     let install_dir = paths.install_dir(&acf.installdir);
 
-    let mut expected: BTreeMap<String, ManifestFile> = BTreeMap::new();
+    let mut manifests = Vec::new();
     for depot in &acf.installed_depots {
         let manifest = load_manifest(&paths.manifest(depot.depot_id, depot.manifest_id)).ok_or(
             Error::ManifestNotStored {
@@ -1341,11 +1520,13 @@ pub fn verify_install(
                 manifest_id: depot.manifest_id,
             },
         )?;
-        // A file in two depots is on disk once; the later depot wins.
-        for file in manifest.files {
-            expected.insert(file.normalized_path(), file);
-        }
+        manifests.push((depot.depot_id, manifest));
     }
+    let owners = path_owners(manifests.iter().map(|(id, manifest)| (*id, manifest)));
+    let expected: BTreeMap<String, &ManifestFile> = owners
+        .into_values()
+        .map(|(_, file)| (file.normalized_path(), file))
+        .collect();
 
     let mut report = VerifyReport {
         appid,
@@ -1375,6 +1556,9 @@ fn check_file(path: &Path, file: &ManifestFile) -> io::Result<bool> {
     let meta = fs::symlink_metadata(path)?;
     if flags.is_directory() {
         return Ok(meta.is_dir());
+    }
+    if is_user_config(file) {
+        return Ok(true);
     }
     if flags.is_symlink() || file.link_target.is_some() {
         let target = fs::read_link(path).ok();

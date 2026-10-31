@@ -810,7 +810,7 @@ async fn a_depot_back_at_its_acf_manifest_is_repaired_with_the_rest() {
 }
 
 #[tokio::test]
-async fn a_recorded_depot_the_plan_dropped_is_refused_and_the_record_kept() {
+async fn a_recorded_depot_the_plan_dropped_goes_back_to_its_acf_manifest() {
     let bench = Bench::new();
     let chunks = &bench.session.chunks;
     bench.session.add_manifest(
@@ -819,18 +819,63 @@ async fn a_recorded_depot_the_plan_dropped_is_refused_and_the_record_kept() {
     );
     bench.session.add_manifest(
         OTHER,
-        manifest(70, vec![file(chunks, "b.txt", &[b"b old"])]),
+        manifest(
+            70,
+            vec![
+                file(chunks, "b.txt", &[b"b old"]),
+                file(chunks, "c.txt", &[b"c old"]),
+            ],
+        ),
     );
     bench.install(&two_depot_plan(V1, 70, 11)).await.unwrap();
-    let failing = file(chunks, "b.txt", &[b"b mid"]);
+    let failing = file(chunks, "c.txt", &[b"c mid"]);
     fail_on(&bench, &failing);
-    bench
-        .session
-        .add_manifest(OTHER, manifest(71, vec![failing]));
+    bench.session.add_manifest(
+        OTHER,
+        manifest(71, vec![file(chunks, "b.txt", &[b"b mid"]), failing]),
+    );
     assert!(
         bench
             .installer(&NOT_RUNNING)
             .update(&two_depot_plan(V1, 71, 12))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(bench.game().join("b.txt")).unwrap(), b"b mid");
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(bench.game().join("b.txt")).unwrap(), b"b old");
+    assert!(!bench.paths().record(APPID).exists());
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn a_recorded_depot_the_acf_does_not_list_is_refused_and_the_record_kept() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "a.txt", &[b"a one"])]),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let failing = file(chunks, "b.txt", &[b"b new"]);
+    fail_on(&bench, &failing);
+    bench
+        .session
+        .add_manifest(OTHER, manifest(70, vec![failing]));
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&two_depot_plan(V1, 70, 12))
             .await
             .is_err()
     );
@@ -851,6 +896,218 @@ async fn a_recorded_depot_the_plan_dropped_is_refused_and_the_record_kept() {
         "{error}"
     );
     assert!(bench.paths().record(APPID).exists());
+}
+
+// From the install-safety review, probe p30.
+#[tokio::test]
+async fn an_update_keeps_a_later_depots_overlay() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![
+                file(chunks, "text.pak", &[b"base one"]),
+                file(chunks, "g.exe", &[b"1"]),
+            ],
+        ),
+    );
+    bench.session.add_manifest(
+        OTHER,
+        manifest(70, vec![file(chunks, "text.pak", &[b"overlay"])]),
+    );
+    bench.install(&two_depot_plan(V1, 70, 11)).await.unwrap();
+    assert_eq!(fs::read(bench.game().join("text.pak")).unwrap(), b"overlay");
+
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V2,
+            vec![
+                file(chunks, "text.pak", &[b"base two"]),
+                file(chunks, "g.exe", &[b"2"]),
+            ],
+        ),
+    );
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&two_depot_plan(V2, 70, 12))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.files_written, 1);
+    assert_eq!(fs::read(bench.game().join("text.pak")).unwrap(), b"overlay");
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_overlay_restores_the_lower_depots_file() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "text.pak", &[b"base"])]),
+    );
+    bench.session.add_manifest(
+        OTHER,
+        manifest(70, vec![file(chunks, "text.pak", &[b"overlay"])]),
+    );
+    bench.install(&two_depot_plan(V1, 70, 11)).await.unwrap();
+
+    bench.session.add_manifest(
+        OTHER,
+        manifest(71, vec![file(chunks, "other.txt", &[b"other"])]),
+    );
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&two_depot_plan(V1, 71, 12))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.changed_depots, [DEPOT, OTHER]);
+    assert_eq!(outcome.files_removed, 0);
+    assert_eq!(fs::read(bench.game().join("text.pak")).unwrap(), b"base");
+    assert!(bench.paths().manifest(DEPOT, V1).exists());
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+const USER_CONFIG: u32 = 1;
+const VERSIONED_USER_CONFIG: u32 = 2;
+
+fn flagged(mut entry: ManifestFile, flags: u32) -> ManifestFile {
+    entry.flags = flags;
+    entry
+}
+
+// From the install-safety review, probe p3.
+#[tokio::test]
+async fn user_config_survives_updates_rescans_and_verify() {
+    const V3: u64 = 1003;
+    const V4: u64 = 1004;
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let exe = |text: &'static [u8]| file(chunks, "game.exe", &[text]);
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![
+                flagged(file(chunks, "settings.ini", &[b"defaults"]), USER_CONFIG),
+                flagged(file(chunks, "profile.cfg", &[b"defaults"]), USER_CONFIG),
+                exe(b"v1"),
+            ],
+        ),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    assert_eq!(
+        fs::read(bench.game().join("settings.ini")).unwrap(),
+        b"defaults"
+    );
+    fs::write(bench.game().join("settings.ini"), b"users keybinds").unwrap();
+    fs::write(bench.game().join("profile.cfg"), b"users profile").unwrap();
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+
+    // The depot's copy changes and profile.cfg leaves the depot.
+    let ini = flagged(
+        file(chunks, "settings.ini", &[b"new defaults"]),
+        USER_CONFIG,
+    );
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V2, vec![ini.clone(), exe(b"v2")]));
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read(bench.game().join("settings.ini")).unwrap(),
+        b"users keybinds"
+    );
+    assert_eq!(
+        fs::read(bench.game().join("profile.cfg")).unwrap(),
+        b"users profile"
+    );
+
+    // A rescan, after a stop, hashes every file.
+    let failing = exe(b"v3");
+    fail_on(&bench, &failing);
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V3, vec![ini.clone(), failing]));
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V3, 13))
+            .await
+            .is_err()
+    );
+    bench.session.chunks.clear_faults();
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V4, vec![ini, exe(b"v4")]));
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V4, 14))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read(bench.game().join("settings.ini")).unwrap(),
+        b"users keybinds"
+    );
+
+    // Gone from disk, it is installed again.
+    fs::remove_file(bench.game().join("settings.ini")).unwrap();
+    let report = verify_install(&bench.paths(), bench.data(), APPID).unwrap();
+    assert_eq!(report.missing, ["settings.ini"]);
+}
+
+#[tokio::test]
+async fn versioned_config_is_replaced_only_when_the_depots_copy_changes() {
+    const V3: u64 = 1003;
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let exe = |text: &'static [u8]| file(chunks, "game.exe", &[text]);
+    let config = flagged(file(chunks, "c.ini", &[b"one"]), VERSIONED_USER_CONFIG);
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![config.clone(), exe(b"v1")]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+    fs::write(bench.game().join("c.ini"), b"users").unwrap();
+
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V2, vec![config, exe(b"v2")]));
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("c.ini")).unwrap(), b"users");
+
+    let config = flagged(file(chunks, "c.ini", &[b"two"]), VERSIONED_USER_CONFIG);
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V3, vec![config, exe(b"v3")]));
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V3, 13))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("c.ini")).unwrap(), b"two");
 }
 
 #[tokio::test]

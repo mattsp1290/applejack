@@ -168,7 +168,8 @@ a manifest trimmed to the files that still need writing.
   fetched. A record for other manifests is replaced, and because that run may
   have left its own files, the new record is marked `rescan`: the whole
   manifest is hashed and anything that differs is rewritten, across stops,
-  until the run finishes. The record outlives
+  until the run finishes, and an unreadable record counts as naming every
+  depot. The record outlives
   `Error::DiskFull`, a CDN failure, and a client starting; it goes only after
   the `.acf` is written.
 - **`update(&plan)`** is `--update`. It re-reads the `.acf` under the lock,
@@ -180,9 +181,29 @@ a manifest trimmed to the files that still need writing.
   unless another installed depot still owns them. Names compare without case,
   since APFS is case-insensitive. Removal is skipped altogether when an
   untouched depot's manifest is not stored, because nothing can then be proved
-  stale. A depot already current is left alone. The rewrite keeps every `.acf` key the writer does not model,
-  and keeps depots the plan did not select. The caller re-syncs its `apps` row
-  from the `.acf` first and afterwards.
+  stale. A depot already current is left alone, unless a stopped run's record
+  names it: such a depot is rechecked in full whatever the `.acf` says, since
+  the `.acf` is what the stopped run did not move. A recorded depot the plan
+  no longer selects goes back to its `.acf` manifest, or is refused with
+  `Error::UnfinishedDepot` when the `.acf` does not list it, and the record
+  stays. Files only an abandoned target had are removed as stale. The rewrite
+  keeps every `.acf` key the writer does not model, and keeps depots the plan
+  did not select. The caller re-syncs its `apps` row from the `.acf` first and
+  afterwards.
+- **Overlapping depots.** A path is on disk once, and the depot with the
+  highest id wins; `path_owners` is the one place that says so, for what to
+  write and for verify. Numeric order is a choice: `KeyValue` keeps children in
+  a map, so the buffer's own order is lost. A delta queues a path only for its
+  owner, so it never overwrites a later depot's overlay, and a depot that drops
+  an overlay brings the lower depot's file back, even when that depot did not
+  change.
+- **Config files.** A manifest entry flagged `USER_CONFIG` (`userconfig` in a
+  depot build script: "modified by the user or game", not overridden by an
+  update, no verification error when it differs) is installed once and never
+  overwritten, deleted as stale, or reported by verify. A
+  `VERSIONED_USER_CONFIG` entry behaves the same except that it is replaced
+  when the depot's own copy changes. Either is reported as missing, and put
+  back by a run that reaches it, when it is gone from disk.
 - **`verify_install(paths, data_dir, appid)`** is `--verify`. It takes the same
   locks, needs no session, re-hashes every file against the stored manifests of
   the depots the `.acf` records, and returns `VerifyReport { files_checked,
