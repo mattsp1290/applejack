@@ -8,7 +8,8 @@ import Observation
 @Observable @MainActor
 public final class AppModel {
     public enum CoreStatus: Equatable, Sendable {
-        /// No `applejack-core` beside the executable and no `APPLEJACK_CORE_BIN`.
+        /// No `applejack-core` beside the executable and no `APPLEJACK_CORE_BIN`
+        /// (a set but unusable path is `stopped(launchFailed)` instead).
         case missing
         case starting
         case running(HelloResult)
@@ -28,6 +29,13 @@ public final class AppModel {
     public let coreLocation: URL?
     public private(set) var coreStatus: CoreStatus
     private var exitObserver: Task<Void, Never>?
+
+    /// The observer holds `client` through `events()` until an event wakes
+    /// it; a model dropped without `shutdown()` while the core idles would
+    /// otherwise keep the client and its process alive.
+    isolated deinit {
+        exitObserver?.cancel()
+    }
 
     public init(client: CoreClient?, coreLocation: URL? = nil) {
         self.client = client
@@ -75,7 +83,14 @@ public final class AppModel {
             coreStatus = .running(try await client.hello())
         } catch is CancellationError {
         } catch let error as CoreClientError {
-            note(error)
+            switch error {
+            case .rpc, .malformedResponse:
+                // A `hello` the client could not read tore the core down;
+                // unlike a flow's rpc error, there is no core behind it.
+                coreStatus = .stopped(error)
+            default:
+                note(error)
+            }
         } catch {
             coreStatus = .failed(.malformedResponse(String(describing: error)))
         }

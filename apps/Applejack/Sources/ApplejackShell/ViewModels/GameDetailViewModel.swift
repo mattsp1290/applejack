@@ -28,6 +28,9 @@ public final class GameDetailViewModel {
     public private(set) var pendingImport: PendingImport?
     public private(set) var runState: FlowState<AppRunResult> = .idle
     private let app: AppModel
+    /// Counts `config.import` previews so a slow one answered after a newer
+    /// preset's preview cannot replace that preset's pending plan.
+    private var importToken = 0
 
     /// The launch overrides waiting for confirmation; empty when none.
     public var pendingConfirmation: [ImportItem] { pendingImport?.confirmations ?? [] }
@@ -76,16 +79,20 @@ public final class GameDetailViewModel {
     }
 
     /// Drops the pending import. Nothing pending means a confirm already
-    /// took it, and the alert's dismissal must not undo that.
+    /// took it, and the alert's dismissal must not undo that. The preview
+    /// stays in `importState` so the accepted and rejected items remain on
+    /// screen; a ready result with confirmations and nothing pending reads
+    /// as declined.
     public func declineLaunchOverrides() {
         guard pendingImport != nil else { return }
         pendingImport = nil
-        importState = .idle
     }
 
-    /// `app.run` for this title. A ready result names the session's log,
+    /// `app.run` for this title, one at a time: a second call while one is
+    /// in flight sends nothing. A ready result names the session's log,
     /// which the view hands to Logs.
     public func run() async {
+        if case .loading = runState { return }
         runState = .loading
         if let next = await app.run({ try await $0.call("app.run", params: AppRunParams(appid: appid)) as AppRunResult }) {
             runState = next
@@ -93,9 +100,13 @@ public final class GameDetailViewModel {
     }
 
     private func runImport(path: String, acceptLaunchOverrides: Bool) async {
+        importToken += 1
+        let token = importToken
         importState = .loading
         let params = ConfigImportParams(appid: appid, path: path, acceptLaunchOverrides: acceptLaunchOverrides)
-        guard let next = await app.run({ try await $0.call("config.import", params: params) as ConfigImportResult }) else { return }
+        guard let next = await app.run({ try await $0.call("config.import", params: params) as ConfigImportResult }),
+            token == importToken
+        else { return }
         importState = next
         if case .ready(let result) = next {
             if result.needsConfirmation {

@@ -457,7 +457,7 @@ public actor CoreClient {
             reader.readabilityHandler = nil
             continuation.finish()
             exitContinuation.finish()
-            throw CoreClientError.launchFailed(String(describing: error))
+            throw CoreClientError.launchFailed("\(executable.path): \(error.localizedDescription)")
         }
         self.process = process
         writer = StdinWriter(

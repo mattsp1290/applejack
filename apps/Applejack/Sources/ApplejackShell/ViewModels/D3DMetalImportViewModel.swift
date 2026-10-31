@@ -11,6 +11,10 @@ public final class D3DMetalImportViewModel {
     /// when the volume changes: a new volume carries its own `License.pdf`.
     public internal(set) var licenseAcknowledged = false
     public private(set) var showingLicense = false
+    /// Whether `License.pdf` exists on the chosen volume: the gate for
+    /// `acknowledgeLicense()`. Refreshed when the volume is chosen and by
+    /// the sheet while it is open, so a volume mounted late still counts.
+    public private(set) var licenseFound = false
     public private(set) var importState: FlowState<JSONValue> = .idle
     private let app: AppModel
 
@@ -28,6 +32,11 @@ public final class D3DMetalImportViewModel {
         guard path != volumePath else { return }
         volumePath = path
         licenseAcknowledged = false
+        refreshLicense()
+    }
+
+    public func refreshLicense() {
+        licenseFound = licenseURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
     }
 
     /// Imports if the license was acknowledged; otherwise shows the dialog.
@@ -40,7 +49,11 @@ public final class D3DMetalImportViewModel {
         await runImport()
     }
 
+    /// Accepts Apple's license, which exists only as the file on the volume:
+    /// without `License.pdf` there is nothing to accept and nothing is sent.
     public func acknowledgeLicense() async {
+        refreshLicense()
+        guard licenseFound else { return }
         licenseAcknowledged = true
         showingLicense = false
         await runImport()

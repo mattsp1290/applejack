@@ -42,21 +42,22 @@ public struct AppRunParams: Codable, Equatable, Sendable {
     }
 }
 
-/// Provisional result of `app.run` (work package 5): the session the launch
-/// started and its log, as `Session` in `applejack-engine` names them. Both
+/// The shell's proposal for the result of `app.run` until work package 5
+/// defines it: the session's `id` and `log_path`, named after the fields of
+/// `Session` in `applejack-engine` (which has no serde form yet). Both
 /// members are optional so the shell decodes whatever the method returns
 /// first and lights up the log tail once `log_path` is there.
 public struct AppRunResult: Codable, Equatable, Sendable {
-    public var sessionId: JSONValue?
+    public var id: JSONValue?
     public var logPath: String?
 
     enum CodingKeys: String, CodingKey {
-        case sessionId = "session_id"
+        case id
         case logPath = "log_path"
     }
 
-    public init(sessionId: JSONValue? = nil, logPath: String? = nil) {
-        self.sessionId = sessionId
+    public init(id: JSONValue? = nil, logPath: String? = nil) {
+        self.id = id
         self.logPath = logPath
     }
 }

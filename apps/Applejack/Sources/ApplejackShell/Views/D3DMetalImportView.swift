@@ -16,10 +16,12 @@ public struct D3DMetalImportView: View {
                 .foregroundStyle(.secondary)
             HStack {
                 Button("Choose volume…") { choosingVolume = true }
+                    .accessibilityIdentifier("d3dmetal.chooseVolume")
                 Text(model.volumePath ?? "No volume chosen").foregroundStyle(.secondary)
             }
             Button("Import D3DMetal") { Task { await model.requestImport() } }
                 .disabled(model.volumePath == nil)
+                .accessibilityIdentifier("d3dmetal.import")
             FlowStateView(model.importState, idle: "") { _ in
                 Label("D3DMetal imported.", systemImage: "checkmark.circle")
             }
@@ -45,9 +47,7 @@ struct LicenseSheet: View {
     let model: D3DMetalImportViewModel
 
     private var licenseURL: URL? { model.licenseURL }
-    private var licenseFound: Bool {
-        licenseURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
-    }
+    private var licenseFound: Bool { model.licenseFound }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -57,6 +57,7 @@ struct LicenseSheet: View {
                 LabeledContent("License", value: licenseURL.path)
                 if licenseFound {
                     Button("Open License.pdf") { NSWorkspace.shared.open(licenseURL) }
+                        .accessibilityIdentifier("d3dmetal.openLicense")
                 } else {
                     Text("License.pdf was not found on this volume. Choose the mounted Game Porting Toolkit image.")
                         .foregroundStyle(.red)
@@ -68,9 +69,17 @@ struct LicenseSheet: View {
                 Button("I accept Apple's license") { Task { await model.acknowledgeLicense() } }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!licenseFound)
+                    .accessibilityIdentifier("d3dmetal.acceptLicense")
             }
         }
         .padding()
         .frame(width: 440)
+        // The volume may be mounted while the sheet is open.
+        .task {
+            while !Task.isCancelled {
+                model.refreshLicense()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
     }
 }

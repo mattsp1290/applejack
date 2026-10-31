@@ -362,14 +362,25 @@ final class CoreClientTests: XCTestCase {
     }
 
     func testAWriteToADeadCoreEndsJobStreamsAndAnnouncesTheExit() async throws {
-        // `fake.die` exits 3 and leaves a grandchild holding stdout, so for
-        // `exitDrainGrace` the client still has a process. The next write
-        // hits EPIPE and the teardown runs from `writeFailed`, not from
+        // `fake.die` exits 3 and leaves a grandchild holding stdout for 3 s,
+        // so for `exitDrainGrace` the client still has a process. The next
+        // write hits EPIPE and the teardown runs from `writeFailed`, not from
         // `coreExited`. Regression for the review of 747fac1 (probe P2/P2c).
+        // Every stream read is bounded so a regression fails instead of
+        // hanging `cargo xtask check`, and the exits are counted past the
+        // grandchild's hold so a second announcement would show.
         let client = makeClient(environment: ["FAKE_CORE_IMPLEMENTED": "1", "FAKE_CORE_JOB_OUTCOME": "never", "FAKE_CORE_DIE_HOLD": "1"])
         _ = try await client.hello()
         let events = await client.events()
+        let exits = Task {
+            var exits: [Int32] = []
+            for await event in events {
+                if case .exited(let status) = event { exits.append(status) }
+            }
+            return exits
+        }
         let stale = try await client.startJob("engine.install", params: EngineInstallParams(engineId: "rosetta-wine"))
+        let died = ContinuousClock.now
         let die = Task { try await client.call("fake.die", params: EmptyParams()) as EmptyResult }
         try await Task.sleep(for: .milliseconds(100))
         do {
@@ -381,19 +392,11 @@ final class CoreClientTests: XCTestCase {
         _ = try? await die.value
 
         do {
-            for try await _ in stale.events {}
+            try await withTimeout(.seconds(5)) { for try await _ in stale.events {} }
             XCTFail("the job stream must end with the exit")
         } catch CoreClientError.coreExited(let status) {
             XCTAssertEqual(status, 3)
         }
-        var exit: CoreEvent?
-        for await event in events {
-            if case .exited = event {
-                exit = event
-                break
-            }
-        }
-        XCTAssertEqual(exit, .exited(3))
 
         // The respawned core reuses job id 7; its events belong to the new
         // handle alone, and the stale one is already finished.
@@ -401,18 +404,43 @@ final class CoreClientTests: XCTestCase {
         XCTAssertEqual(fresh.jobId, stale.jobId)
         let restarts = await client.restarts
         XCTAssertEqual(restarts, 1)
-        var freshEvents: [JobEvent] = []
-        for try await event in fresh.events {
-            freshEvents.append(event)
-            if freshEvents.count == 2 { break }
+        let freshEvents = try await withTimeout(.seconds(5)) {
+            var seen: [JobEvent] = []
+            for try await event in fresh.events {
+                seen.append(event)
+                if seen.count == 2 { break }
+            }
+            return seen
         }
         XCTAssertEqual(freshEvents.map(\.jobId), [fresh.jobId, fresh.jobId])
-        var staleAfterRespawn = 0
-        for try await _ in stale.events {
-            staleAfterRespawn += 1
+        let staleAfterRespawn = try await withTimeout(.seconds(5)) {
+            var count = 0
+            for try await _ in stale.events { count += 1 }
+            return count
         }
         XCTAssertEqual(staleAfterRespawn, 0, "a finished handle must not adopt the new core's job")
+
+        // Past the hold, the old generation's exit callback has run.
+        try await Task.sleep(until: died + .milliseconds(3500), clock: .continuous)
         await client.shutdown()
+        let seen = try await withTimeout(.seconds(5)) { await exits.value }
+        XCTAssertEqual(seen, [3], "the exit is announced exactly once")
+    }
+
+    struct TimedOut: Error {}
+
+    /// `body`, or `TimedOut` after `limit`: a stream that never ends fails
+    /// the test instead of hanging it.
+    func withTimeout<T: Sendable>(_ limit: Duration, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(for: limit)
+                throw TimedOut()
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
     }
 
     func testEventsStreamEndsOnShutdown() async throws {

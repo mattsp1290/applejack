@@ -12,9 +12,12 @@ but the core: every operation is a JSON-RPC call through `CoreClient`
 `CoreLocator` (`Sources/ApplejackShell/CoreLocator.swift`) looks, in order,
 at:
 
-1. `APPLEJACK_CORE_BIN`, for development. The path must be executable.
+1. `APPLEJACK_CORE_BIN`, for development. A set variable is used as given:
+   a path that does not exist or is not executable fails the spawn, and the
+   banner reads `.stopped(launchFailed)` with the path and a Restart, so
+   fixing the file and pressing Restart recovers without a relaunch.
 2. `applejack-core` beside the shell executable, which in the bundle is
-   `Applejack.app/Contents/MacOS/applejack-core`.
+   `Applejack.app/Contents/MacOS/applejack-core`, when it is executable.
 
 With neither, `AppModel.coreStatus` is `.missing` and the banner says so;
 every flow then reads `failed(launchFailed)`.
@@ -43,16 +46,20 @@ are lazy and capped at three, and the model only reads the outcome:
 - `.running(HelloResult)`: no banner.
 - `.exited(status)`: the core died, whether a request was in flight or not.
   The banner's "Restart" calls `hello()` again, which respawns under the cap.
-- `.stopped(error)`: `notRunning`, `launchFailed`, or `handshakeTimedOut`.
-  No core is running and no exit status was seen; under the lazy restart
-  policy the next call respawns it, so the banner offers the same "Restart".
+- `.stopped(error)`: `notRunning`, `launchFailed`, or `handshakeTimedOut`,
+  and a `hello` whose answer could not be read (`malformedResponse`, or an
+  `rpc` error other than the protocol mismatch). No core is running and no
+  exit status was seen; under the lazy restart policy the next call
+  respawns it, so the banner offers the same "Restart".
 - `.failed(error)`: `restartLimit` or `protocolMismatch`. `CoreClient`
   refuses every further call, so the core is unusable until the app is
-  reopened.
+  reopened; nothing clears this state.
 
-Any call that succeeds clears `.exited`, `.stopped`, and `.failed` back to
-`.running`: the respawn it rode on is this spawn's `hello`. An `rpc` error
-never reaches the banner; it belongs to the flow that made the call.
+Any call that succeeds clears `.exited` and `.stopped` back to `.running`:
+the respawn it rode on is this spawn's `hello`. A flow's `rpc` error never
+reaches the banner; it belongs to the flow that made the call. "Restart" in
+the banner greets the core again and, once it is running, reloads the
+selected section, so the view's own failed state clears with the banner.
 
 `CoreClient` announces an exit on `events()` from whichever path dropped the
 process: the exit callback, or a teardown after a failed write (`EPIPE`
@@ -143,20 +150,29 @@ Flows that need an answer before the core sends a request:
   the path from that data. SwiftUI writes `false` to the alert's binding,
   which declines, before the button's task runs, so the confirm must not
   read the path back from the model; `declineLaunchOverrides()` is a no-op
-  once nothing is pending.
+  once nothing is pending. Cancel keeps the preview on screen, marked as
+  declined, so the rejected items stay visible. A preview answered after a
+  newer preset's preview is dropped, so the alert never offers an earlier
+  preset's overrides.
 
-Run with log tail: "Run" in the game detail sends `app.run` (`AppRunResult`,
-a provisional mirror of the engine's `Session`: `session_id`, `log_path`).
-When the result names a `log_path`, the shell switches to Logs and follows
-it. `app.run` is `NotImplemented` until work package 5, so today the action
-renders the unavailable state.
+Run with log tail: "Run" in the game detail sends `app.run` (`AppRunResult`:
+`id` and `log_path`, the shell's proposal until work package 5 defines the
+result, named after the engine's `Session` fields). One run is in flight
+per title at a time; the button is disabled meanwhile. When the result
+names a `log_path` and the user is still on the detail, the shell switches
+to Logs and follows it; the library's navigation path lives in
+`ShellModels`, so returning to Library lands on the same detail. `app.run`
+is `NotImplemented` until work package 5, so today the action renders the
+unavailable state.
 
 Logs: `session.list` names each session's `log_path`; `LogsViewModel`
 follows it with `LogTailer` (a polling file reader, so a log that does not
-exist yet is picked up when the engine creates it, and one that shrank was
-rotated and is read again from the start). Leaving the Logs view suspends
-the poll; coming back resumes it. Controllers come from the GameController
-framework, not the core.
+exist yet is picked up when the engine creates it, and one that shrank or
+changed inode was rotated and is read again from the start). Leaving the
+Logs view suspends the poll; coming back resumes it from the start of the
+file, and lines the old tail had buffered are dropped rather than appended
+to the new one. Controllers come from the GameController framework, not
+the core.
 
 Steam account: there is no `steam.status` method, so before any call the
 view says the sign-in state is unknown rather than "not signed in".
@@ -186,6 +202,11 @@ first), like `build/assemble.sh` does for the engine payload. `--debug`
 builds both sides in debug and writes `build/Applejack-debug.app`; `cargo
 xtask check` runs that and verifies the layout (`CFBundleExecutable`,
 `CFBundleIdentifier`, `LSMinimumSystemVersion` as key and value pairs).
+The step reuses `.build/` and `target/`, so after the `swift-build` and
+`core-build` steps it is a copy, about a second on this host, not a second
+Swift build. `build/` also holds tracked files (`assemble.sh`, `pins.toml`,
+the fetch scripts); never remove the directory to reset the bundle, only
+`build/Applejack*.app`.
 Nothing is signed with an identity: `open build/Applejack.app` works on the
 building machine because the binaries carry the linker's ad-hoc signature
 and no quarantine attribute. That ad-hoc signature names the binaries

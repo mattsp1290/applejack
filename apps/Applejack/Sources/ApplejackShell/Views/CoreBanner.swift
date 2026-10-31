@@ -5,9 +5,12 @@ import SwiftUI
 /// to recover from.
 public struct CoreBanner: View {
     let app: AppModel
+    /// Runs after a Restart that reached `.running`.
+    let afterRestart: @MainActor () async -> Void
 
-    public init(app: AppModel) {
+    public init(app: AppModel, afterRestart: @escaping @MainActor () async -> Void = {}) {
         self.app = app
+        self.afterRestart = afterRestart
     }
 
     public var body: some View {
@@ -24,14 +27,21 @@ public struct CoreBanner: View {
             )
         case .exited(let status):
             banner(systemImage: "bolt.slash", text: "The core exited (status \(status)).", tint: .red) {
-                Button("Restart") { Task { await app.restart() } }
+                Button("Restart") { Task { await restart() } }
             }
         case .stopped(let error):
             banner(systemImage: "bolt.slash", text: describe(error), tint: .orange) {
-                Button("Restart") { Task { await app.restart() } }
+                Button("Restart") { Task { await restart() } }
             }
         case .failed(let error):
             banner(systemImage: "xmark.octagon", text: describe(error), tint: .red)
+        }
+    }
+
+    private func restart() async {
+        await app.restart()
+        if case .running = app.coreStatus {
+            await afterRestart()
         }
     }
 

@@ -11,15 +11,21 @@ public enum LogTailer {
         let reader = Task.detached {
             var offset: UInt64 = 0
             var partial = Data()
+            var identity: ino_t?
             while !Task.isCancelled {
                 if let handle = FileHandle(forReadingAtPath: path) {
                     defer { try? handle.close() }
-                    // A file shorter than what was read was truncated or
-                    // replaced: start over instead of resuming mid-file.
-                    if let size = try? handle.seekToEnd(), size < offset {
+                    // Another inode is a replacement, whatever its size; a
+                    // file shorter than what was read was truncated. Either
+                    // way start over instead of resuming mid-file.
+                    let inode = fileIdentity(handle)
+                    let replaced = identity != nil && inode != nil && inode != identity
+                    let shorter = (try? handle.seekToEnd()).map { $0 < offset } ?? false
+                    if replaced || shorter {
                         offset = 0
                         partial.removeAll()
                     }
+                    identity = inode
                     if (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.readToEnd(), !data.isEmpty {
                         offset += UInt64(data.count)
                         partial.append(data)
@@ -40,5 +46,10 @@ public enum LogTailer {
         }
         continuation.onTermination = { _ in reader.cancel() }
         return stream
+    }
+
+    private static func fileIdentity(_ handle: FileHandle) -> ino_t? {
+        var status = stat()
+        return fstat(handle.fileDescriptor, &status) == 0 ? status.st_ino : nil
     }
 }

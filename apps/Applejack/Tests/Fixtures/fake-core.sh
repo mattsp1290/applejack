@@ -29,6 +29,11 @@
 #                              {"job_id":7} response
 #   FAKE_CORE_DIE_HOLD=1       `fake.die` leaves a `sleep` child holding stdout
 #                              (without it the fake just exits 3 on `fake.die`)
+#   FAKE_CORE_BAD_HELLO=malformed  answer hello with a result HelloResult cannot
+#                                  decode; =error answers it with an Internal
+#                                  rpc error
+#   FAKE_CORE_RUN_DELAY_MS=<n>  answer app.run after n milliseconds, in the
+#                               background
 #   FAKE_CORE_REQUEST_LOG=<path>  append every request line to that file
 #   FAKE_CORE_SESSION_LOG=<path>  the log_path session.list and app.run report
 set -u
@@ -105,7 +110,13 @@ implemented() {
       job 7
       ;;
     app.run)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"fake-session","log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
+      response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":"fake-session","log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
+      if [ -n "${FAKE_CORE_RUN_DELAY_MS:-}" ]; then
+        seconds=$(awk -v ms="$FAKE_CORE_RUN_DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
+        ( sleep "$seconds"; write "$response" ) &
+      else
+        emit "$response"
+      fi
       ;;
     app.install)
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":8}}'
@@ -134,6 +145,11 @@ implemented() {
       ;;
     config.import)
       case "$3" in
+        # A path containing "slow" previews after 400 ms, so a later preset's
+        # preview can overtake it (lifted from the round-two review probe).
+        *'"accept_launch_overrides":false'*slow*)
+          ( sleep 0.4; write '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":false,"accepted":[],"rejected":[],"confirmations":[{"field":"launch_exe_override","value":"slow.exe"}]}}' ) &
+          ;;
         *'"accept_launch_overrides":true'*)
           emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"applied":true,"accepted":[{"field":"graphics_backend","value":"dxmt"},{"field":"launch_exe_override","value":"bin/game.exe"}],"rejected":[{"field":"extra_env.VK_ICD_FILENAMES","value":"/tmp/x.json","reason":"path outside the engine roots"}],"confirmations":[{"field":"launch_exe_override","value":"bin/game.exe"}]}}'
           ;;
@@ -176,6 +192,10 @@ while IFS= read -r line; do
       version=$(printf '%s' "$line" | sed -nE 's/^.*"method":"hello","params":\{"protocol_version":([0-9]+)\}\}$/\1/p')
       if [ -z "$version" ]; then
         emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32602,"message":"fake core cannot read protocol_version"}}'
+      elif [ "${FAKE_CORE_BAD_HELLO:-}" = "malformed" ]; then
+        emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"nope":1}}'
+      elif [ "${FAKE_CORE_BAD_HELLO:-}" = "error" ]; then
+        emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32603,"message":"fake core refuses to be greeted"}}'
       elif [ "$version" = "1" ]; then
         emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol_version":1,"core_version":"fake"}}'
       else

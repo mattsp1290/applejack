@@ -2,6 +2,7 @@ import SwiftUI
 
 public struct LibraryView: View {
     let models: ShellModels
+    @State private var path: [UInt32] = []
     var model: LibraryViewModel { models.library }
 
     public init(models: ShellModels) {
@@ -9,7 +10,7 @@ public struct LibraryView: View {
     }
 
     public var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             FlowStateView(model.library, retry: { Task { await model.load() } }) { library in
                 List(library.apps) { entry in
                     HStack {
@@ -19,6 +20,8 @@ public struct LibraryView: View {
                                 Text("App \(entry.appid) · \(entry.drm.rawValue) DRM").font(.caption).foregroundStyle(.secondary)
                             }
                         }
+                        .accessibilityLabel(entry.title)
+                        .accessibilityIdentifier("library.app.\(entry.appid)")
                         Spacer()
                         installColumn(entry)
                     }
@@ -32,7 +35,13 @@ public struct LibraryView: View {
                 Button("Refresh") { Task { await model.load(refresh: true) } }
             }
         }
-        .task { await model.load() }
+        .task {
+            if path.isEmpty, let detail = models.libraryDetail {
+                path = [detail]
+            }
+            await model.load()
+        }
+        .onChange(of: path) { _, next in models.libraryDetail = next.last }
     }
 
     @ViewBuilder

@@ -5,6 +5,7 @@ public struct GameDetailView: View {
     let models: ShellModels
     @State private var model: GameDetailViewModel
     @State private var choosingPreset = false
+    @State private var isShown = false
 
     public init(models: ShellModels, appid: UInt32) {
         self.models = models
@@ -41,8 +42,11 @@ public struct GameDetailView: View {
         .navigationTitle("App \(model.appid)")
         .toolbar {
             Button("Run") { Task { await runAndFollowLog() } }
+                .disabled(model.runState == .loading)
             Button("Import preset…") { choosingPreset = true }
         }
+        .onAppear { isShown = true }
+        .onDisappear { isShown = false }
         .fileImporter(isPresented: $choosingPreset, allowedContentTypes: [.json]) { result in
             if case .success(let url) = result {
                 Task { await model.importPreset(at: url.path) }
@@ -75,13 +79,13 @@ public struct GameDetailView: View {
         return lines.joined(separator: "\n")
     }
 
-    /// `app.run`, then Logs tails the session's log when the core named one.
+    /// `app.run`, then Logs tails the session's log when the core named one,
+    /// unless the user left this view while the run was in flight.
     private func runAndFollowLog() async {
         await model.run()
-        if let path = model.runState.value?.logPath {
-            models.logs.follow(path)
-            models.section = .logs
-        }
+        guard isShown, let path = model.runState.value?.logPath else { return }
+        models.logs.follow(path)
+        models.section = .logs
     }
 
     @ViewBuilder
@@ -100,6 +104,8 @@ public struct GameDetailView: View {
             VStack(alignment: .leading, spacing: 2) {
                 if result.applied {
                     Text("Preset applied: \(result.accepted.count) accepted, \(result.rejected.count) rejected.")
+                } else if !result.confirmations.isEmpty, model.pendingImport == nil {
+                    Text("Preset not applied: launch overrides declined (\(result.accepted.count) accepted, \(result.rejected.count) rejected).")
                 } else {
                     Text("Preset not applied: \(result.accepted.count) accepted, \(result.rejected.count) rejected, \(result.confirmations.count) awaiting confirmation.")
                 }

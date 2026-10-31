@@ -134,12 +134,34 @@ final class ViewModelTests: XCTestCase {
         XCTAssertTrue(imports[1].contains("\"accept_launch_overrides\":true"))
         XCTAssertEqual(try requests(for: "config.get").count, 1, "an applied import reloads the config")
 
-        // Declining sends nothing.
+        // Declining sends nothing and keeps the preview on screen.
         await detail.importPreset(at: "/tmp/220.preset.json")
         detail.declineLaunchOverrides()
         XCTAssertEqual(try requests(for: "config.import").count, 3)
-        XCTAssertEqual(detail.importState, .idle)
+        XCTAssertEqual(detail.importState.value?.applied, false)
+        XCTAssertEqual(detail.importState.value?.rejected.map(\.field), ["extra_env.VK_ICD_FILENAMES"])
         XCTAssertNil(detail.pendingImport)
+        await app.shutdown()
+    }
+
+    func testALatePreviewDoesNotReplaceTheNewerPendingImport() async throws {
+        // The fake previews a path containing "slow" after 400 ms (lifted
+        // from the round-two review, probe PK).
+        let app = makeApp()
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        let slow = Task { await detail.importPreset(at: "/tmp/slow-A.preset.json") }
+        try await Task.sleep(for: .milliseconds(100))
+        await detail.importPreset(at: "/tmp/B.preset.json")
+        XCTAssertEqual(detail.pendingImport?.path, "/tmp/B.preset.json")
+        await slow.value
+        XCTAssertEqual(detail.pendingImport?.path, "/tmp/B.preset.json", "the earlier preset's late preview must not replace B's plan")
+        XCTAssertEqual(detail.pendingConfirmation.map(\.value), ["bin/game.exe"])
+        XCTAssertEqual(detail.importState.value?.confirmations.map(\.value), ["bin/game.exe"])
+
+        await detail.confirmLaunchOverrides()
+        let imports = try requests(for: "config.import")
+        XCTAssertEqual(imports.count, 3)
+        XCTAssertTrue(imports[2].contains("\"accept_launch_overrides\":true,\"appid\":220,\"path\":\"/tmp/B.preset.json\""), imports[2])
         await app.shutdown()
     }
 
@@ -158,7 +180,7 @@ final class ViewModelTests: XCTestCase {
 
         detail.declineLaunchOverrides()
         XCTAssertNil(detail.pendingImport)
-        XCTAssertEqual(detail.importState, .idle)
+        XCTAssertEqual(detail.importState.value?.applied, false, "a decline keeps the preview")
         await detail.confirmLaunchOverrides(path: presented.path)
         XCTAssertEqual(detail.importState.value?.applied, true)
         let imports = try requests(for: "config.import")
@@ -181,7 +203,7 @@ final class ViewModelTests: XCTestCase {
         let app = makeApp(environment: ["FAKE_CORE_SESSION_LOG": log.path])
         let detail = GameDetailViewModel(app: app, appid: 220)
         await detail.run()
-        XCTAssertEqual(detail.runState.value?.logPath, log.path)
+        XCTAssertEqual(detail.runState.value, AppRunResult(id: .string("fake-session"), logPath: log.path))
         XCTAssertTrue(try requests(for: "app.run")[0].contains("\"params\":{\"appid\":220,\"probe_direct\":false}"))
         await app.shutdown()
 
@@ -194,6 +216,23 @@ final class ViewModelTests: XCTestCase {
         }
         XCTAssertEqual(reason.method, "app.run")
         await pending.shutdown()
+    }
+
+    func testASecondRunWhileOneIsInFlightSendsNothing() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RUN_DELAY_MS": "300"])
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        let first = Task { await detail.run() }
+        try await waitUntil { detail.runState == .loading }
+        await detail.run()
+        XCTAssertEqual(detail.runState, .loading, "the second Run returns at once and leaves the first in flight")
+        await first.value
+        XCTAssertNotNil(detail.runState.value)
+        XCTAssertEqual(try requests(for: "app.run").count, 1)
+
+        // Once the first returned, Run works again.
+        await detail.run()
+        XCTAssertEqual(try requests(for: "app.run").count, 2)
+        await app.shutdown()
     }
 
     // MARK: - Engines and jobs
@@ -297,12 +336,26 @@ final class ViewModelTests: XCTestCase {
 
     // MARK: - D3DMetal
 
+    /// A directory standing in for a mounted Game Porting Toolkit image,
+    /// with `License.pdf` unless `licensed` is false.
+    func makeVolume(licensed: Bool = true) throws -> URL {
+        let volume = FileManager.default.temporaryDirectory.appendingPathComponent("gptk-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: volume, withIntermediateDirectories: true)
+        if licensed {
+            try Data("%PDF-1.4\n".utf8).write(to: volume.appendingPathComponent("License.pdf"))
+        }
+        return volume
+    }
+
     func testD3DMetalImportIsNeverSentWithoutTheAcknowledgement() async throws {
+        let volume = try makeVolume()
+        defer { try? FileManager.default.removeItem(at: volume) }
         let app = makeApp()
         let model = D3DMetalImportViewModel(app: app)
         await model.requestImport()
         XCTAssertFalse(model.showingLicense, "no volume, nothing to acknowledge")
-        model.chooseVolume("/Volumes/Game Porting Toolkit")
+        model.chooseVolume(volume.path)
+        XCTAssertTrue(model.licenseFound)
         await model.requestImport()
         XCTAssertTrue(model.showingLicense)
         XCTAssertEqual(model.importState, .idle)
@@ -317,15 +370,43 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(model.importState, .ready(.object([:])))
         let imports = try requests(for: "engine.d3dmetal.import")
         XCTAssertEqual(imports.count, 1)
-        XCTAssertTrue(imports[0].contains("\"params\":{\"license_acknowledged\":true,\"path\":\"/Volumes/Game Porting Toolkit\"}"))
-        XCTAssertEqual(model.licenseURL?.path, "/Volumes/Game Porting Toolkit/License.pdf")
+        XCTAssertTrue(imports[0].contains("\"params\":{\"license_acknowledged\":true,\"path\":\"\(volume.path)\"}"), imports[0])
+        XCTAssertEqual(model.licenseURL?.path, volume.appendingPathComponent("License.pdf").path)
+        await app.shutdown()
+    }
+
+    func testTheLicenseGateNeedsTheFileOnTheVolume() async throws {
+        let volume = try makeVolume(licensed: false)
+        defer { try? FileManager.default.removeItem(at: volume) }
+        let app = makeApp()
+        let model = D3DMetalImportViewModel(app: app)
+        model.chooseVolume(volume.path)
+        XCTAssertFalse(model.licenseFound)
+        await model.requestImport()
+        XCTAssertTrue(model.showingLicense)
+        await model.acknowledgeLicense()
+        XCTAssertTrue(model.showingLicense, "nothing to accept without License.pdf")
+        XCTAssertFalse(model.licenseAcknowledged)
+        _ = await app.run { try await $0.hostDoctor() }
+        XCTAssertTrue(try requests(for: "engine.d3dmetal.import").isEmpty)
+
+        // The image is mounted while the sheet is open: the sheet's poll
+        // calls `refreshLicense()`, and the next acceptance goes through.
+        try Data("%PDF-1.4\n".utf8).write(to: volume.appendingPathComponent("License.pdf"))
+        model.refreshLicense()
+        XCTAssertTrue(model.licenseFound)
+        await model.acknowledgeLicense()
+        XCTAssertFalse(model.showingLicense)
+        XCTAssertEqual(try requests(for: "engine.d3dmetal.import").count, 1)
         await app.shutdown()
     }
 
     func testEachD3DMetalImportNeedsItsOwnAcknowledgement() async throws {
+        let volume = try makeVolume()
+        defer { try? FileManager.default.removeItem(at: volume) }
         let app = makeApp()
         let model = D3DMetalImportViewModel(app: app)
-        model.chooseVolume("/Volumes/Game Porting Toolkit")
+        model.chooseVolume(volume.path)
         await model.requestImport()
         await model.acknowledgeLicense()
         XCTAssertEqual(try requests(for: "engine.d3dmetal.import").count, 1)
@@ -340,7 +421,7 @@ final class ViewModelTests: XCTestCase {
         // Choosing another volume drops an acknowledgement given for the last one.
         model.declineLicense()
         model.licenseAcknowledged = true
-        model.chooseVolume("/Volumes/Game Porting Toolkit")
+        model.chooseVolume(volume.path)
         XCTAssertTrue(model.licenseAcknowledged, "the same volume keeps it")
         model.chooseVolume("/Volumes/GPTK 4")
         XCTAssertFalse(model.licenseAcknowledged)
@@ -385,6 +466,77 @@ final class ViewModelTests: XCTestCase {
         XCTAssertTrue(logs.lines.isEmpty)
         XCTAssertNil(logs.tailedPath)
         await app.shutdown()
+    }
+
+    func testACancelledTailAddsNothingAndAResumedOneStartsClean() async throws {
+        // Regression for the round-two review (probes PH, PH2, PH3): the
+        // tailer yields a whole file into the stream at once, and lines the
+        // consumer had not reached when `suspend()`, `stop()`, or a new
+        // `follow` cancelled it used to land in the next tail's `lines`.
+        let a = FileManager.default.temporaryDirectory.appendingPathComponent("tail-a-\(UUID().uuidString).log")
+        let b = FileManager.default.temporaryDirectory.appendingPathComponent("tail-b-\(UUID().uuidString).log")
+        defer {
+            try? FileManager.default.removeItem(at: a)
+            try? FileManager.default.removeItem(at: b)
+        }
+        let expected = (0..<1500).map { "line\($0)" }
+        try Data((expected.joined(separator: "\n") + "\n").utf8).write(to: a)
+        try Data("B0\nB1\n".utf8).write(to: b)
+        let logs = LogsViewModel(app: AppModel(client: nil))
+
+        logs.follow(a.path)
+        while logs.lines.count < 50 { await Task.yield() }
+        logs.suspend()
+        let atSuspend = logs.lines.count
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(logs.lines.count, atSuspend, "a suspended tail appends nothing")
+        logs.resume()
+        try await waitUntil { logs.lines.count == expected.count }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(logs.lines, expected, "resume re-reads the file once, in order")
+
+        // Hide and show in the same turn, mid-consumption.
+        logs.stop()
+        logs.follow(a.path)
+        while logs.lines.count < 50 { await Task.yield() }
+        logs.suspend()
+        logs.resume()
+        try await waitUntil { logs.lines.count == expected.count }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(logs.lines, expected)
+
+        // Following another file mid-consumption shows only that file.
+        logs.follow(a.path)
+        while logs.lines.count < 50 { await Task.yield() }
+        logs.follow(b.path)
+        try await waitUntil { logs.lines.count == 2 }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(logs.lines, ["B0", "B1"])
+        logs.stop()
+    }
+
+    func testLogTailerStartsOverWhenTheFileIsReplacedByALongerOne() async throws {
+        // Probe PI of the round-two review read ["a", "23456789", "next"]:
+        // a replacement at least as long as what was read passed the
+        // size-only rotation check.
+        let log = FileManager.default.temporaryDirectory.appendingPathComponent("replaced-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        try Data("a\n".utf8).write(to: log)
+        let stream = LogTailer.lines(at: log.path, interval: .milliseconds(20))
+        let collector = Task {
+            var lines: [String] = []
+            for await line in stream {
+                lines.append(line)
+            }
+            return lines
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        try FileManager.default.removeItem(at: log)
+        try Data("0123456789\nnext\n".utf8).write(to: log)
+        try await Task.sleep(for: .milliseconds(150))
+        collector.cancel()
+        let lines = await collector.value
+        XCTAssertEqual(lines, ["a", "0123456789", "next"])
     }
 
     func testLogTailerStartsOverAfterRotation() async throws {
@@ -438,6 +590,94 @@ final class ViewModelTests: XCTestCase {
         let none = AppModel(locator: missing)
         XCTAssertEqual(none.coreStatus, .missing)
         XCTAssertNil(none.client)
+        // A set variable is used as given; whether it runs is the spawn's call.
+        let unusable = CoreLocator(environment: ["APPLEJACK_CORE_BIN": "/nonexistent/core"], executableURL: executable, isExecutable: { _ in false })
+        XCTAssertEqual(unusable.locate(), URL(fileURLWithPath: "/nonexistent/core"))
+    }
+
+    func testAnUnsetCoreBinIsMissingButASetUnusableOneIsStoppedWithRestart() async throws {
+        // Round-two review B-I1: `APPLEJACK_CORE_BIN=/nonexistent` used to
+        // read "is not set" with no Restart.
+        let unset = AppModel(locator: CoreLocator(environment: [:], executableURL: nil))
+        await unset.start()
+        XCTAssertEqual(unset.coreStatus, .missing)
+        XCTAssertNil(unset.client)
+        await unset.shutdown()
+
+        let bad = FileManager.default.temporaryDirectory.appendingPathComponent("no-such-core-\(UUID().uuidString)").path
+        let app = AppModel(locator: CoreLocator(environment: ["APPLEJACK_CORE_BIN": bad], executableURL: nil))
+        XCTAssertNotNil(app.client)
+        XCTAssertEqual(app.coreLocation, URL(fileURLWithPath: bad))
+        XCTAssertEqual(app.coreStatus, .starting)
+        await app.start()
+        guard case .stopped(.launchFailed(let detail)) = app.coreStatus else {
+            return XCTFail("expected stopped(launchFailed), got \(app.coreStatus)")
+        }
+        XCTAssertTrue(detail.contains(bad), "the banner names the path: \(detail)")
+        let host = HostViewModel(app: app)
+        await host.load()
+        guard case .failed(.launchFailed) = host.facts else { return XCTFail("expected launchFailed, got \(host.facts)") }
+
+        // Restart after the file is fixed recovers without a relaunch.
+        await app.restart()
+        guard case .stopped(.launchFailed) = app.coreStatus else { return XCTFail("still no file: \(app.coreStatus)") }
+        try FileManager.default.copyItem(at: CoreClientTests.fakeCore, to: URL(fileURLWithPath: bad))
+        defer { try? FileManager.default.removeItem(atPath: bad) }
+        await app.restart()
+        guard case .running = app.coreStatus else { return XCTFail("expected running after the fix, got \(app.coreStatus)") }
+        let restarts = await app.client?.restarts
+        XCTAssertEqual(restarts, 0, "a launch failure spends no restart")
+        await app.shutdown()
+    }
+
+    func testAHelloThatCannotBeReadIsStoppedWithRestart() async throws {
+        // Round-two review A-S1: the banner stayed on "Starting the core…".
+        for (knob, expectation) in [("malformed", "malformedResponse"), ("error", "rpc")] {
+            let app = makeApp(environment: ["FAKE_CORE_BAD_HELLO": knob])
+            await app.start()
+            guard case .stopped(let error) = app.coreStatus else {
+                return XCTFail("\(knob): expected stopped, got \(app.coreStatus)")
+            }
+            switch (expectation, error) {
+            case ("malformedResponse", .malformedResponse), ("rpc", .rpc): break
+            default: XCTFail("\(knob): expected \(expectation), got \(error)")
+            }
+            await app.restart()
+            guard case .stopped = app.coreStatus else { return XCTFail("\(knob): expected stopped after Restart, got \(app.coreStatus)") }
+            // A flow's own rpc error still never reaches the banner.
+            await app.shutdown()
+        }
+    }
+
+    func testADroppedModelReleasesItsClient() async throws {
+        // Round-two review A-S2 (probe PM): the exit observer held the
+        // client until the next event, which an idle core never sends.
+        weak var weakClient: CoreClient?
+        weak var weakModel: AppModel?
+        do {
+            let client = CoreClient(executable: CoreClientTests.fakeCore, arguments: [], environment: [:])
+            weakClient = client
+            let app = AppModel(client: client)
+            weakModel = app
+            await app.start()
+            guard case .running = app.coreStatus else { return XCTFail("expected running, got \(app.coreStatus)") }
+        }
+        try await waitUntil { weakModel == nil && weakClient == nil }
+    }
+
+    func testBannerRestartReloadsTheSelectedSection() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_CRASH_AFTER": "2"])
+        let models = ShellModels(app: app, initialSection: .host)
+        await app.start()
+        await models.host.load()
+        await models.host.load()
+        XCTAssertEqual(models.host.facts, .failed(.coreExited(1)))
+        XCTAssertEqual(app.coreStatus, .exited(1))
+        await app.restart()
+        guard case .running = app.coreStatus else { return XCTFail("expected running, got \(app.coreStatus)") }
+        await models.reloadSection()
+        XCTAssertEqual(models.host.facts.value?.arch, "arm64", "the view's failed state clears with the banner")
+        await app.shutdown()
     }
 
     func testCoreExitShowsTheBannerAndRestartRecovers() async throws {

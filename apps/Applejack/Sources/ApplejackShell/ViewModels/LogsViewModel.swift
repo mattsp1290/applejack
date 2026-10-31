@@ -39,7 +39,10 @@ public final class LogsViewModel {
         tailedPath = path
         tail = Task { [weak self] in
             for await line in LogTailer.lines(at: path) {
-                guard let self else { return }
+                // `stop()` and `suspend()` cancel on this actor, but lines the
+                // tailer already buffered still arrive; they belong to the old
+                // tail, not to whatever `lines` holds now.
+                guard let self, !Task.isCancelled else { return }
                 lines.append(line)
                 if lines.count > Self.maxLines {
                     lines.removeFirst(lines.count - Self.maxLines)
