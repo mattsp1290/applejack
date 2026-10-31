@@ -111,6 +111,13 @@ pub enum Error {
         version: Version,
     },
 
+    /// Another install of `id` holds `engines/<id>/.install.lock`.
+    #[error("another install of engine {id} is running")]
+    InstallInProgress {
+        /// The engine.
+        id: EngineId,
+    },
+
     /// The archive's `BUNDLE.toml` describes a different engine or version
     /// than the one being installed.
     #[error(

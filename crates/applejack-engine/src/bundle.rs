@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
 use applejack_manifest::{Arch, HttpsUrl, Sha256};
@@ -592,6 +592,202 @@ impl InstallRequest {
             manifest: None,
         }
     }
+}
+
+/// How often [`pack_dir`] reports progress, in compressed bytes.
+const PACK_REPORT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Largest `BUNDLE.toml` read out of an archive before install.
+const MAX_DESCRIPTOR_BYTES: u64 = 1 << 20;
+
+const LOCK_FILE: &str = ".install.lock";
+
+/// Exclusive for one engine id across every applejack process, held from
+/// before a local bundle is packed until the install has been recorded, so
+/// two installs never share a `.partial`. Released on drop.
+#[derive(Debug)]
+pub struct InstallLock {
+    _file: File,
+}
+
+impl InstallLock {
+    /// Takes `engines/<id>/.install.lock` without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InstallInProgress`] when another install holds it,
+    /// or [`Error::Io`].
+    pub fn acquire(layout: &EngineLayout, id: EngineId) -> Result<Self> {
+        let root = layout.engine_root(id);
+        fs::create_dir_all(&root).map_err(|error| Error::io(&root, error))?;
+        let path = root.join(LOCK_FILE);
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|error| Error::io(&path, error))?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(Error::InstallInProgress { id }),
+            Err(error) => Err(Error::io(path, error.into())),
+        }
+    }
+}
+
+/// An unsigned local bundle made ready for [`install`]: the request, plus
+/// the archive packed from a directory, which is removed on drop.
+#[derive(Debug)]
+pub struct LocalBundle {
+    /// The request for [`install`] or [`crate::Engine::install`].
+    pub request: InstallRequest,
+    packed: Option<PathBuf>,
+}
+
+impl Drop for LocalBundle {
+    fn drop(&mut self) {
+        if let Some(path) = &self.packed {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+impl LocalBundle {
+    /// Builds the [`InstallRequest::local`] for `from`: a `.tar.zst`, or a
+    /// bundle directory, which is packed to
+    /// `engines/<id>/<version>.local.tar.zst` first so it takes the same
+    /// hashing, extraction, and validation path as an archive. The version
+    /// and id come from the bundle's own `BUNDLE.toml`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BundleIdentityMismatch`] when the bundle names another
+    /// engine, [`Error::AlreadyInstalled`] before anything is packed,
+    /// [`Error::InvalidArchive`] for an archive with no root
+    /// `BUNDLE.toml`, the descriptor's load errors, or [`Error::Io`].
+    pub fn prepare(
+        layout: &EngineLayout,
+        id: EngineId,
+        from: &Path,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Self> {
+        let is_dir = fs::metadata(from)
+            .map_err(|error| Error::io(from, error))?
+            .is_dir();
+        let bundle = if is_dir {
+            BundleToml::load(from)?
+        } else {
+            BundleToml::parse(&descriptor_in_archive(from)?)?
+        };
+        if bundle.id != id {
+            return Err(Error::BundleIdentityMismatch {
+                expected: id,
+                expected_version: bundle.version.clone(),
+                found: bundle.id,
+                found_version: bundle.version,
+            });
+        }
+        if is_bundle_dir(&layout.engine_dir(id, &bundle.version)) {
+            return Err(Error::AlreadyInstalled {
+                id,
+                version: bundle.version,
+            });
+        }
+        let (archive, packed) = if is_dir {
+            let root = layout.engine_root(id);
+            fs::create_dir_all(&root).map_err(|error| Error::io(&root, error))?;
+            let archive = root.join(format!("{}.local.tar.zst", bundle.version));
+            if let Err(error) = pack_dir(from, &archive, progress) {
+                let _ = fs::remove_file(&archive);
+                return Err(error);
+            }
+            (archive.clone(), Some(archive))
+        } else {
+            (from.to_path_buf(), None)
+        };
+        let sha256 = sha256_file(&archive)?;
+        Ok(Self {
+            request: InstallRequest::local(id, bundle.version, archive, sha256),
+            packed,
+        })
+    }
+}
+
+/// The text of the root `BUNDLE.toml` entry of a `.tar.zst`.
+fn descriptor_in_archive(archive: &Path) -> Result<String> {
+    let file = File::open(archive).map_err(|error| Error::io(archive, error))?;
+    let decoder = zstd::stream::read::Decoder::with_buffer(io::BufReader::new(file))
+        .map_err(|error| Error::io(archive, error))?;
+    let mut tar = tar::Archive::new(decoder);
+    for entry in tar.entries().map_err(|error| Error::io(archive, error))? {
+        let entry = entry.map_err(|error| Error::io(archive, error))?;
+        let path = entry.path().map_err(|error| Error::io(archive, error))?;
+        if path.components().ne(Path::new(BUNDLE_FILE).components()) {
+            continue;
+        }
+        let mut text = String::new();
+        entry
+            .take(MAX_DESCRIPTOR_BYTES)
+            .read_to_string(&mut text)
+            .map_err(|error| Error::io(archive, error))?;
+        return Ok(text);
+    }
+    Err(Error::InvalidArchive(
+        "archive has no BUNDLE.toml at its root; entries must not be nested under a top-level directory"
+            .to_owned(),
+    ))
+}
+
+/// Counts compressed bytes on their way to the file.
+struct Counted<'a> {
+    file: File,
+    written: u64,
+    reported: u64,
+    progress: &'a mut dyn FnMut(Progress),
+}
+
+impl Write for Counted<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.file.write(bytes)?;
+        self.written += count as u64;
+        if self.written - self.reported >= PACK_REPORT_BYTES {
+            self.reported = self.written;
+            (self.progress)(Progress::Packing {
+                written: self.written,
+            });
+        }
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Packs `dir` into `archive` as `.tar.zst` with entries at the archive
+/// root. Symlinks stay symlinks, so [`install`] judges them as it judges
+/// any archive's.
+fn pack_dir(dir: &Path, archive: &Path, progress: &mut dyn FnMut(Progress)) -> Result<()> {
+    progress(Progress::Packing { written: 0 });
+    let file = File::create(archive).map_err(|error| Error::io(archive, error))?;
+    let counted = Counted {
+        file,
+        written: 0,
+        reported: 0,
+        progress,
+    };
+    let encoder =
+        zstd::stream::write::Encoder::new(counted, 3).map_err(|error| Error::io(archive, error))?;
+    let mut builder = tar::Builder::new(encoder);
+    builder.follow_symlinks(false);
+    builder
+        .append_dir_all("", dir)
+        .map_err(|error| Error::io(dir, error))?;
+    builder
+        .into_inner()
+        .and_then(zstd::stream::write::Encoder::finish)
+        .map_err(|error| Error::io(archive, error))?;
+    Ok(())
 }
 
 /// Installs an engine bundle, reporting [`Progress`] as it goes:

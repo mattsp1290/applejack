@@ -852,3 +852,124 @@ fn snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, SystemTime)> {
     out.sort();
     out
 }
+
+#[test]
+fn local_bundle_packs_a_directory_through_the_full_install_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let tree = dir.path().join("tree");
+    write_bundle_tree(&tree, BUNDLE_TOML);
+    fs::create_dir_all(tree.join("wine/share")).unwrap();
+    std::os::unix::fs::symlink("../bin/wine64", tree.join("wine/share/link")).unwrap();
+
+    let mut seen = Vec::new();
+    let local = applejack_engine::LocalBundle::prepare(&layout, rosetta(), &tree, &mut |p| {
+        seen.push(p);
+    })
+    .unwrap();
+    assert_eq!(local.request.version(), &version("10.0.0"));
+    let applejack_engine::ArchiveSource::LocalFile(archive) = local.request.source().clone() else {
+        panic!("a local request reads a file");
+    };
+    assert!(archive.is_file());
+    assert_eq!(seen, [Progress::Packing { written: 0 }]);
+    let installed =
+        applejack_engine::bundle::install(&layout, &local.request, &mut |_| {}).unwrap();
+    assert!(
+        fs::symlink_metadata(installed.root.join("wine/share/link"))
+            .unwrap()
+            .is_symlink()
+    );
+    drop(local);
+    assert!(
+        !archive.exists(),
+        "the packed archive is removed with the guard"
+    );
+}
+
+#[test]
+fn local_bundle_reads_the_version_out_of_an_archive_and_leaves_it_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let (archive, digest) = fixture_archive(dir.path(), "10.0.1");
+    let local =
+        applejack_engine::LocalBundle::prepare(&layout, rosetta(), &archive, &mut |_| {}).unwrap();
+    assert_eq!(local.request.version(), &version("10.0.1"));
+    assert_eq!(local.request.sha256(), &digest);
+    drop(local);
+    assert!(archive.is_file(), "an archive the user passed stays");
+}
+
+#[test]
+fn local_bundle_refuses_before_packing() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let tree = dir.path().join("tree");
+    write_bundle_tree(&tree, BUNDLE_TOML);
+
+    fs::remove_file(tree.join("wine/bin/wine64")).unwrap();
+    let invalid = applejack_engine::LocalBundle::prepare(&layout, rosetta(), &tree, &mut |_| {
+        panic!("nothing is packed");
+    })
+    .unwrap_err();
+    assert!(matches!(invalid, Error::MissingLoader { .. }), "{invalid}");
+
+    write_bundle_tree(&tree, BUNDLE_TOML);
+    fake_installed(&layout, "10.0.0");
+    let present = applejack_engine::LocalBundle::prepare(&layout, rosetta(), &tree, &mut |_| {
+        panic!("nothing is packed");
+    })
+    .unwrap_err();
+    assert!(
+        matches!(present, Error::AlreadyInstalled { .. }),
+        "{present}"
+    );
+
+    let other = applejack_engine::LocalBundle::prepare(
+        &layout,
+        applejack_engine::EngineId::NativeArm64,
+        &tree,
+        &mut |_| panic!("nothing is packed"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(other, Error::BundleIdentityMismatch { .. }),
+        "{other}"
+    );
+}
+
+#[test]
+fn local_bundle_refuses_an_archive_without_a_root_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    write_bundle_tree(&tree.join("nested"), BUNDLE_TOML);
+    let archive = dir.path().join("nested.tar.zst");
+    common::pack(&tree, &archive);
+    let error = applejack_engine::LocalBundle::prepare(
+        &layout(dir.path()),
+        rosetta(),
+        &archive,
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidArchive(_)), "{error}");
+}
+
+#[test]
+fn install_lock_is_exclusive_until_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let held = applejack_engine::InstallLock::acquire(&layout, rosetta()).unwrap();
+    let second = applejack_engine::InstallLock::acquire(&layout, rosetta()).unwrap_err();
+    assert!(
+        matches!(second, Error::InstallInProgress { .. }),
+        "{second}"
+    );
+    drop(held);
+    applejack_engine::InstallLock::acquire(&layout, rosetta()).unwrap();
+    assert_eq!(
+        applejack_engine::versions::list(&layout, rosetta()).unwrap(),
+        Vec::new(),
+        "the lock file is not a version"
+    );
+}

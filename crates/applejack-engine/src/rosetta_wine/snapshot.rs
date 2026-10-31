@@ -215,7 +215,12 @@ fn sibling(prefix_dir: &Path, suffix: &str) -> PathBuf {
     prefix_dir.with_file_name(name)
 }
 
-fn check_name(name: &str) -> Result<()> {
+/// Refuses a prefix name that cannot be a directory under `prefixes/`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSnapshotName`] with the rule that failed.
+pub fn check_name(name: &str) -> Result<()> {
     let reason = if name.is_empty() {
         Some("empty")
     } else if name == "." || name == ".." {
