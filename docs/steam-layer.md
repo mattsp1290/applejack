@@ -6,8 +6,15 @@ serialize applejack processes. It depends on external crates only, never on
 `applejack-config` or another applejack crate; it accepts and returns plain
 structs.
 
-Gate G2 status: **not yet run**. The spike builds (`examples/auth_spike.rs`);
-the operator runs it with their own account and records the outcome below.
+Gate G2 status: **green** (2026-10-30, `steamroom` and `steamroom-client`
+0.3.0, macOS 26.6.2, `--credentials` with a Steam Guard device code). Login,
+refresh logon, and the license list all worked against live Steam, and the CM
+asked for a 9 s heartbeat. The Rust path stays primary. QR mode was not run.
+
+Approving the mobile prompt and then typing a code fails with EResult
+`DuplicateRequest`, on the first attempt of this run. SteamKit treats that
+result as success because the next poll returns tokens; `steamroom-client`
+treats it as fatal, so use one factor or the other.
 
 ## Flows
 
@@ -260,6 +267,9 @@ to file; the local copies in `live.rs` stay until they land:
    discards the sibling messages of the `MULTI` that carries the logon
    response, which is the MULTI-drain risk described under "Reading the
    result".
+4. `GuardChallenge::submit_code` (`steamroom-client-0.3.0/src/login/credentials.rs:167-187`)
+   treats `DuplicateRequest` as fatal, and `GuardChallenge` exposes no poll,
+   so a caller cannot continue after the user approved in the app.
 
 ## Legal note
 
