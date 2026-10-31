@@ -1,18 +1,55 @@
-Origin: applejack, adapted from cyyever/wine c5375ee66cb (written for Wine 11.9, https://github.com/3Shain/dxmt/issues/170). LGPL-2.1-or-later, as Wine.
-Reason: DXMT 0.80 finds macdrv_functions through dlsym(RTLD_DEFAULT) and reads a Wine 8.16 window data layout. Wine 11.0 loads Unix libraries RTLD_LOCAL, exports no such table, and has no client view until a client surface exists, so every D3D11 swap chain fails with "Failed to create metal view".
+Origin: applejack, https://github.com/mattsp1290/applejack/tree/main/build/wine/patches, adapted from https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3 by cyy (written for Wine 11.9, see https://github.com/3Shain/dxmt/issues/170). LGPL-2.1-or-later, as Wine.
+Date: 2026-10-31
+Reason: DXMT 0.80 finds macdrv_functions through dlsym(RTLD_DEFAULT) and reads a Wine 8.16 window data layout. Wine 11.0 exports no such table and has no client view until a client surface exists, so every D3D11 swap chain fails with "Failed to create metal view".
 Drop-when: the pinned Wine and DXMT both carry the upstream route (dxmt PR 166 and its Wine merge request), or DXMT stops reading macdrv_win_data.
 
---- a/dlls/ntdll/unix/virtual.c
-+++ b/dlls/ntdll/unix/virtual.c
-@@ -847,7 +847,7 @@
-         if (builtin->module != module) continue;
-         if (builtin->unix_path && !builtin->unix_handle)
-         {
--            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW );
-+            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW | RTLD_GLOBAL );
-             if (!builtin->unix_handle)
-                 WARN_(module)( "failed to load %s: %s\n", debugstr_a(builtin->unix_path), dlerror() );
-         }
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -349,6 +349,8 @@
+ @interface WineMetalView : WineBaseView
+ {
+     id<MTLDevice> _device;
++@public
++    NSUInteger _dxmtUsers;
+ }
+ 
+     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+@@ -3972,6 +3974,35 @@
+     });
+ }
+ 
++/* A content view keeps one Metal view, so every swap chain on a window shares
++ * it, and DXMT holds its layer unretained. Each user owns a reference, and the
++ * last one takes the view off the window. */
++macdrv_metal_view macdrv_view_acquire_dxmt_metal_view(macdrv_view v, macdrv_metal_device d)
++{
++    id<MTLDevice> device = (id<MTLDevice>)d;
++    WineContentView* view = (WineContentView*)v;
++    __block WineMetalView *metalView;
++
++    OnMainThread(^{
++        metalView = [view newMetalViewWithDevice:device];
++        if (metalView && metalView->_dxmtUsers++)
++            [metalView retain];
++    });
++
++    return (macdrv_metal_view)metalView;
++}
++
++void macdrv_view_release_dxmt_metal_view(macdrv_metal_view v)
++{
++    WineMetalView* view = (WineMetalView*)v;
++
++    OnMainThread(^{
++        if (!--view->_dxmtUsers)
++            [view removeFromSuperview];
++        [view release];
++    });
++}
++
+ bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2])
+ {
+     WineContentView* view = (WineContentView*)v;
 --- a/dlls/winemac.drv/macdrv.h
 +++ b/dlls/winemac.drv/macdrv.h
 @@ -174,6 +174,17 @@
@@ -42,6 +79,17 @@ Drop-when: the pinned Wine and DXMT both carry the upstream route (dxmt PR 166 a
  };
  
  struct macdrv_client_surface
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -527,6 +527,8 @@
+ extern macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d);
+ extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
+ extern void macdrv_view_release_metal_view(macdrv_metal_view v);
++extern macdrv_metal_view macdrv_view_acquire_dxmt_metal_view(macdrv_view v, macdrv_metal_device d);
++extern void macdrv_view_release_dxmt_metal_view(macdrv_metal_view v);
+ extern bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2]);
+ extern void macdrv_set_view_backing_size(macdrv_view v, const int backing_size[2]);
+ extern uint32_t macdrv_window_background_color(void);
 --- a/dlls/winemac.drv/window.c
 +++ b/dlls/winemac.drv/window.c
 @@ -1094,6 +1094,13 @@
@@ -77,16 +125,17 @@ Drop-when: the pinned Wine and DXMT both carry the upstream route (dxmt PR 166 a
  }
  
  
-@@ -2161,3 +2171,91 @@
+@@ -2160,4 +2170,92 @@
+     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
      pthread_mutex_init(&win_data_mutex, &attr);
      pthread_mutexattr_destroy(&attr);
- }
++}
 +
 +/* DXMT 0.80 finds this table with dlsym(RTLD_DEFAULT, "macdrv_functions") and
 + * reads the client view at a fixed offset of what get_win_data returns, so the
 + * layout of both is its ABI. It dereferences the result with no NULL check, so
-+ * a window without data gets an empty struct, which fails as "no Metal view"
-+ * rather than as a crash. */
++ * a window without data gets an empty struct: DXMT logs "Failed to create metal
++ * view" and aborts, rather than faulting on a NULL pointer. */
 +static struct dxmt_win_data dxmt_no_win_data;
 +
 +static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
@@ -132,7 +181,7 @@ Drop-when: the pinned Wine and DXMT both carry the upstream route (dxmt PR 166 a
 +    /* The lock stays held until dxmt_release_win_data, as for get_win_data: it
 +     * keeps the view alive while DXMT adds its Metal view to it. */
 +    return &data->dxmt;
-+}
+ }
 +
 +static void dxmt_release_win_data(struct dxmt_win_data *dxmt)
 +{
@@ -164,8 +213,8 @@ Drop-when: the pinned Wine and DXMT both carry the upstream route (dxmt PR 166 a
 +    macdrv_get_cocoa_window,
 +    macdrv_create_metal_device,
 +    macdrv_release_metal_device,
-+    macdrv_view_create_metal_view,
++    macdrv_view_acquire_dxmt_metal_view,
 +    macdrv_view_get_metal_layer,
-+    macdrv_view_release_metal_view,
++    macdrv_view_release_dxmt_metal_view,
 +    NULL,
 +};
