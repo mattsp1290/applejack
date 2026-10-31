@@ -7,8 +7,8 @@ bundle spec; edit `build/bundle-spec.toml`, not this file.
 
 | Component | Version | License | Location in the bundle |
 | --- | --- | --- | --- |
-| Wine | 11.0 | LGPL-2.1-or-later | `wine/` (built from https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz at `wine-11.0`) |
-| DXMT | 0.80 | MIT | `dxmt/` and `wine/lib/wine/x86_64-unix/winemetal.so` |
+| Wine | 11.0 | LGPL-2.1-or-later | `wine/` (built from https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz at `wine-11.0`, with the patches in the repository's `build/wine/patches/`) |
+| DXMT | 0.80 | MIT | `dxmt/`, and `winemetal.dll` and `winemetal.so` under `wine/lib/wine/` |
 | vkd3d-proton | 3.1 | LGPL-2.1-or-later | `vkd3d/` |
 | MoltenVK | 1.4.2 | Apache-2.0 | `vulkan/` |
 | GStreamer | 1.28.8 | LGPL-2.1-or-later | `wine/lib/GStreamer.framework` |

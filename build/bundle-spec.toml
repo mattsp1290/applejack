@@ -91,8 +91,9 @@ sdl2 = { version = "2.32.8", license = "Zlib" }
 
 # Bundle-relative DLL paths per Windows architecture; the installer copies
 # each into the prefix and overrides its stem. winemetal.dll is DXMT's bridge
-# to wine/lib/wine/x86_64-unix/winemetal.so; nvapi64.dll and nvngx.dll are
-# optional and not shipped.
+# to wine/lib/wine/x86_64-unix/winemetal.so, marked builtin, so the copy Wine
+# loads is the one under wine/lib/wine/<arch>-windows; nvapi64.dll and
+# nvngx.dll are optional and not shipped.
 [overrides.dxmt]
 x86_64 = [
   "dxmt/x86_64-windows/d3d11.dll",

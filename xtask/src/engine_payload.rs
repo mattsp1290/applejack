@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::bundle_toml::{BundleSpec, SHIPPED_ELSEWHERE, elsewhere_matches};
 use crate::closure;
 use crate::denylist::{Denylist, Hit};
+use crate::dxmt;
 use crate::pins::{Pin, Pins};
 use crate::self_contained::{
     Search, Violation, binary_dir, check_otool_listing, check_references_resolve, check_rpaths,
@@ -25,7 +26,8 @@ use crate::self_contained::{
 pub const USAGE: &str = "\
 usage: cargo xtask engine-payload <mode>
   --fetch [id ...]                    download every pin (or the named ones) into build/work/, verify SHA-256, and denylist-scan the listing
-  --check <payload-dir>               denylist scan plus self-containment of every Mach-O and symlink; references resolve along the load chains of the executables <payload-dir>/BUNDLE.toml declares and of every executable under wine/
+  --check <payload-dir>               denylist scan plus self-containment of every Mach-O and symlink, and that DXMT can load under this Wine; references resolve along the load chains of the executables <payload-dir>/BUNDLE.toml declares and of every executable under wine/
+  --place-dxmt <payload-dir>          clear Wine's builtin marker on the DXMT DLLs that load as native and copy winemetal.dll among Wine's builtins, for both architectures
   --close <payload-dir>               the dylib closure: copy the x86-64 Homebrew libraries Wine links or dlopens into wine/lib/, rewrite install names and references to @rpath, add the run paths, re-sign, repeat until stable, then --check
   --check-listing <file|->            denylist scan of an archive listing, one path per line (an empty listing fails)
   --write-bundle-toml <spec> <out>    render BUNDLE.toml from a typed spec file, plus THIRD_PARTY_NOTICES.md beside it
@@ -58,6 +60,7 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     let result = match args.as_slice() {
         ["--fetch", ids @ ..] => fetch(root, ids),
         ["--check", payload] => check(root, Path::new(payload)),
+        ["--place-dxmt", payload] => dxmt::place(Path::new(payload)),
         ["--close", payload] => closure::close(root, Path::new(payload)),
         ["--check-listing", listing] => check_listing(root, listing),
         ["--write-bundle-toml", spec, out] => write_bundle_toml(Path::new(spec), Path::new(out)),
@@ -560,6 +563,7 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
     let targets: Vec<&str> = targets.targets.iter().map(String::as_str).collect();
     let chained = resolve_along_chains(&machos, &targets, &resolves);
     violations.extend(chained.violations);
+    violations.extend(dxmt::violations(&payload)?);
     Ok(Report {
         payload,
         paths: entries.len(),

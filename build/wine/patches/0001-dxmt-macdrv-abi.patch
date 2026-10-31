@@ -1,0 +1,171 @@
+Origin: applejack, adapted from cyyever/wine c5375ee66cb (written for Wine 11.9, https://github.com/3Shain/dxmt/issues/170). LGPL-2.1-or-later, as Wine.
+Reason: DXMT 0.80 finds macdrv_functions through dlsym(RTLD_DEFAULT) and reads a Wine 8.16 window data layout. Wine 11.0 loads Unix libraries RTLD_LOCAL, exports no such table, and has no client view until a client surface exists, so every D3D11 swap chain fails with "Failed to create metal view".
+Drop-when: the pinned Wine and DXMT both carry the upstream route (dxmt PR 166 and its Wine merge request), or DXMT stops reading macdrv_win_data.
+
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -847,7 +847,7 @@
+         if (builtin->module != module) continue;
+         if (builtin->unix_path && !builtin->unix_handle)
+         {
+-            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW );
++            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW | RTLD_GLOBAL );
+             if (!builtin->unix_handle)
+                 WARN_(module)( "failed to load %s: %s\n", debugstr_a(builtin->unix_path), dlerror() );
+         }
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -174,6 +174,17 @@
+ 
+ 
+ /* macdrv private window data */
++/* The window data layout DXMT reads through macdrv_functions. */
++struct dxmt_win_data
++{
++    HWND                hwnd;
++    macdrv_window       cocoa_window;
++    macdrv_view         cocoa_view;
++    macdrv_view         client_cocoa_view;
++};
++
++struct macdrv_client_surface;
++
+ struct macdrv_win_data
+ {
+     HWND                hwnd;                   /* hwnd that this private data belongs to */
+@@ -189,6 +200,8 @@
+     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
+     unsigned int        minimized : 1;          /* is window minimized? */
+     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
++    struct macdrv_client_surface *dxmt_surface; /* surface holding the view DXMT renders into */
++    struct dxmt_win_data dxmt;                  /* what dxmt_get_win_data hands out, guarded by the win data lock */
+ };
+ 
+ struct macdrv_client_surface
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1094,6 +1094,13 @@
+         {
+             if (data->client_view == surface->cocoa_view)
+                 data->client_view = NULL;
++            /* Cannot be the last reference: detach_client_surfaces holds one
++             * across this call, and surfaces_lock is held here. */
++            if (data->dxmt_surface == surface)
++            {
++                data->dxmt_surface = NULL;
++                client_surface_release(client);
++            }
+             release_win_data(data);
+         }
+ 
+@@ -1238,6 +1245,7 @@
+  */
+ void macdrv_DestroyWindow(HWND hwnd)
+ {
++    struct macdrv_client_surface *dxmt_surface;
+     struct macdrv_win_data *data;
+ 
+     TRACE("%p\n", hwnd);
+@@ -1250,8 +1258,10 @@
+     destroy_cocoa_window(data);
+ 
+     CFDictionaryRemoveValue(win_datas, hwnd);
++    dxmt_surface = data->dxmt_surface;
+     release_win_data(data);
+     free(data);
++    if (dxmt_surface) client_surface_release(&dxmt_surface->client);
+ }
+ 
+ 
+@@ -2161,3 +2171,91 @@
+     pthread_mutex_init(&win_data_mutex, &attr);
+     pthread_mutexattr_destroy(&attr);
+ }
++
++/* DXMT 0.80 finds this table with dlsym(RTLD_DEFAULT, "macdrv_functions") and
++ * reads the client view at a fixed offset of what get_win_data returns, so the
++ * layout of both is its ABI. It dereferences the result with no NULL check, so
++ * a window without data gets an empty struct, which fails as "no Metal view"
++ * rather than as a crash. */
++static struct dxmt_win_data dxmt_no_win_data;
++
++static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct macdrv_client_surface *surface = NULL;
++    struct macdrv_win_data *data;
++
++    if (!(data = get_win_data(hwnd))) return &dxmt_no_win_data;
++
++    /* A client surface and not a bare view, because win32u moves and sizes a
++     * surface's view with the window's client area and disposes of it with the
++     * window. It is created with no win data held: every other path takes
++     * surfaces_lock first and win_data_mutex second. */
++    if (!data->dxmt_surface)
++    {
++        release_win_data(data);
++        surface = macdrv_client_surface_create(hwnd);
++        data = get_win_data(hwnd);
++        if (surface && data && !data->dxmt_surface)
++        {
++            data->dxmt_surface = surface;
++            surface = NULL;
++        }
++        if (surface)
++        {
++            release_win_data(data);
++            client_surface_release(&surface->client);
++            data = get_win_data(hwnd);
++        }
++        if (!data) return &dxmt_no_win_data;
++    }
++
++    data->dxmt.hwnd = hwnd;
++    data->dxmt.cocoa_window = data->cocoa_window;
++    data->dxmt.cocoa_view = data->dxmt.client_cocoa_view = NULL;
++    if (data->dxmt_surface)
++    {
++        /* A racing create, or another surface on this window, may have hidden it. */
++        macdrv_client_surface_present(&data->dxmt_surface->client, 0);
++        data->dxmt.cocoa_view = data->dxmt.client_cocoa_view = data->dxmt_surface->cocoa_view;
++    }
++
++    /* The lock stays held until dxmt_release_win_data, as for get_win_data: it
++     * keeps the view alive while DXMT adds its Metal view to it. */
++    return &data->dxmt;
++}
++
++static void dxmt_release_win_data(struct dxmt_win_data *dxmt)
++{
++    if (dxmt != &dxmt_no_win_data)
++        release_win_data(CONTAINING_RECORD(dxmt, struct macdrv_win_data, dxmt));
++}
++
++struct dxmt_macdrv_functions
++{
++    void (*macdrv_init_display_devices)(BOOL);
++    struct dxmt_win_data *(*get_win_data)(HWND hwnd);
++    void (*release_win_data)(struct dxmt_win_data *data);
++    macdrv_window (*macdrv_get_cocoa_window)(HWND hwnd, BOOL require_on_screen);
++    macdrv_metal_device (*macdrv_create_metal_device)(void);
++    void (*macdrv_release_metal_device)(macdrv_metal_device d);
++    macdrv_metal_view (*macdrv_view_create_metal_view)(macdrv_view v, macdrv_metal_device d);
++    macdrv_metal_layer (*macdrv_view_get_metal_layer)(macdrv_metal_view v);
++    void (*macdrv_view_release_metal_view)(macdrv_metal_view v);
++    void (*on_main_thread)(void *block);
++};
++
++/* The two NULL slots have no Wine 11.0 counterpart and DXMT 0.80 never calls them. */
++__attribute__((visibility("default")))
++const struct dxmt_macdrv_functions macdrv_functions =
++{
++    NULL,
++    dxmt_get_win_data,
++    dxmt_release_win_data,
++    macdrv_get_cocoa_window,
++    macdrv_create_metal_device,
++    macdrv_release_metal_device,
++    macdrv_view_create_metal_view,
++    macdrv_view_get_metal_layer,
++    macdrv_view_release_metal_view,
++    NULL,
++};

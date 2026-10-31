@@ -2,8 +2,9 @@
 # Copies the staged components into the plan 02 payload layout:
 #   wine/                                   build/work/wine/stage (build/wine/build.sh), stripped; skipped with a message when not built
 #   wine/lib/wine/x86_64-unix/winemetal.so  DXMT's native half
+#   wine/lib/wine/*-windows/winemetal.dll   its PE half, a builtin (xtask engine-payload --place-dxmt)
 #   wine/lib/GStreamer.framework            the staged, x86_64-thinned framework
-#   dxmt/{x86_64-windows,i386-windows}      DXMT DLLs
+#   dxmt/{x86_64-windows,i386-windows}      DXMT DLLs, the ones that load as native without Wine's builtin marker
 #   vkd3d/{x64,x86}                         vkd3d-proton DLLs
 #   vulkan/                                 libMoltenVK.dylib (x86_64) and MoltenVK_icd.json
 #   probes/                                 hello32.exe, dx11-sample.exe, xinput-check.exe, cpuid, osslsigncode (host-arch)
@@ -63,6 +64,7 @@ mkdir -p "$T/dxmt/x86_64-windows" "$T/dxmt/i386-windows" "$T/vkd3d/x64" "$T/vkd3
 cp "$dxmt"/x86_64-windows/*.dll "$T/dxmt/x86_64-windows/"
 cp "$dxmt"/i386-windows/*.dll "$T/dxmt/i386-windows/"
 cp "$dxmt/x86_64-unix/winemetal.so" "$T/wine/lib/wine/x86_64-unix/winemetal.so"
+xtask engine-payload --place-dxmt "$T"
 cp "$vkd3d"/x64/*.dll "$T/vkd3d/x64/"
 cp "$vkd3d"/x86/*.dll "$T/vkd3d/x86/"
 cp "$vulkan/libMoltenVK.dylib" "$vulkan/MoltenVK_icd.json" "$T/vulkan/"

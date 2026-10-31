@@ -225,7 +225,7 @@ impl BundleSpec {
         let _ = writeln!(out, "| --- | --- | --- | --- |");
         let _ = writeln!(
             out,
-            "| Wine | {} | {WINE_LICENSE} | `wine/` (built from {} at `{}`) |",
+            "| Wine | {} | {WINE_LICENSE} | `wine/` (built from {} at `{}`, with the patches in the repository's `build/wine/patches/`) |",
             self.wine.version, self.wine.source_url, self.wine.source_rev
         );
         for (name, component, location) in self.components.rows() {
@@ -374,7 +374,7 @@ impl Components {
             (
                 "DXMT",
                 &self.dxmt,
-                "`dxmt/` and `wine/lib/wine/x86_64-unix/winemetal.so`",
+                "`dxmt/`, and `winemetal.dll` and `winemetal.so` under `wine/lib/wine/`",
             ),
             ("vkd3d-proton", &self.vkd3d_proton, "`vkd3d/`"),
             ("MoltenVK", &self.moltenvk, "`vulkan/`"),

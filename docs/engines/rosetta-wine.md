@@ -22,7 +22,7 @@ BUNDLE.toml                    descriptor (below)
 THIRD_PARTY_NOTICES.md         generated from BUNDLE.toml
 wine/                          x86-64 Wine: bin/, lib/, lib/wine/{x86_64-unix,x86_64-windows,i386-windows}, share/wine/
 wine/lib/GStreamer.framework   signed framework
-dxmt/                          DXMT DLLs and native component for the pinned Wine
+dxmt/                          DXMT DLLs for the pinned Wine; its Wine-side files are under wine/lib/wine (winemetal.so, winemetal.dll)
 vkd3d/                         vkd3d-proton x86-64 DLLs
 vulkan/                        MoltenVK ICD JSON and dylib; KosmicKrisp ICD when shipped
 probes/                        cpuid (x86-64 Mach-O), dx11-sample (PE), xinput-check (PE)
@@ -365,6 +365,46 @@ snapshot API below, since the engine does not know the snapshot root.
   D3DMetal under this Wine, not by the engine. Otherwise `create_prefix` and
   `apply_overrides` refuse with `Error::BackendUnavailable` before touching
   anything.
+
+### DXMT under Wine 11.0
+
+DXMT 0.80 targets a Wine 8.16 fork. Three things make it work here; `--check`
+fails on a payload missing any of them.
+
+- `d3d11`, `dxgi`, and `d3d10core` under `dxmt/` have Wine's builtin marker
+  cleared, so they load as native from the prefix. Wine's own remain under
+  `wine/lib/wine`, which is why one bundle serves every backend: a `wined3d`
+  prefix has neither the copies nor the overrides.
+- `winemetal.dll` is a builtin, under `wine/lib/wine/<arch>-windows`, so it
+  reaches `winemetal.so`. The prefix copy keeps its marker, so it is a
+  placeholder for that file.
+- `build/wine/patches/0001-dxmt-macdrv-abi.patch` loads Unix libraries
+  `RTLD_GLOBAL` and exports `macdrv_functions` from `winemac.so`. Its
+  `get_win_data` gives a window a client surface the first time, and hands out
+  that surface's view in DXMT's struct layout.
+
+The view follows the window: win32u moves and sizes a client surface's view
+with the client area on every position change, and the Metal view autoresizes
+inside it. Rendering at the new size is still the title's job through
+`ResizeBuffers`; until it calls that, Core Animation stretches the old drawable
+over the new bounds. The surface lives until the window is destroyed.
+
+Limits:
+
+- `RTLD_GLOBAL` applies to every Unix library. Wine resolves its own entry points
+  through the library handle, so this only adds to what
+  `dlsym(RTLD_DEFAULT)` sees.
+- One Metal view per window: `macdrv_view_create_metal_view` returns the view's
+  existing one, so two live swap chains on one window share it, and releasing
+  either removes it from under the other. Wine 8.16 behaved the same.
+- A window owned by another process has no window data here, so DXMT reports
+  `Failed to create metal view` instead of rendering.
+- The view is shown when a swap chain is created. A Vulkan surface presenting
+  on the same window afterwards hides it until the next swap chain.
+- This rests on DXMT's private layout, so a DXMT pin bump must recheck
+  `macdrv_functions` and `struct macdrv_win_data` in `winemetal_unix.c`, and a
+  Wine pin bump must rebase the patch. `build/wine/build.sh` fails if it stops
+  applying; a layout change fails only at run time.
 
 ## The environment the children see
 
