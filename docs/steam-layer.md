@@ -1,9 +1,10 @@
 # Steam layer
 
 `crates/applejack-steam` owns authentication, refresh-token storage, the
-owned-license list, `.acf` and `.vdf` handling, and the advisory locks that
-serialize applejack processes. It depends on external crates only, never on
-`applejack-config` or another applejack crate; it accepts and returns plain
+owned-app library, Windows depot install, update and verify, `.acf` and `.vdf`
+handling, and the advisory locks that serialize applejack processes. It
+depends on external crates only, never on `applejack-config`,
+`applejack-engine`, or another applejack crate; it accepts and returns plain
 structs.
 
 Gate G2 status: **green** (2026-10-30, `steamroom` and `steamroom-client`
@@ -14,13 +15,20 @@ asked for a 9 s heartbeat. The Rust path stays primary. QR mode was not run.
 Approving the mobile prompt and then typing a code fails with EResult
 `DuplicateRequest`, on the first attempt of this run. SteamKit treats that
 result as success because the next poll returns tokens; `steamroom-client`
-treats it as fatal, so use one factor or the other.
+treats it as fatal. applejack surfaces it as
+`AuthError::DuplicateGuardApproval`, which ends the login and tells the user
+to log in again with one factor. `GuardChallenge` keeps its client and poll
+loop private, so continuing would need a `[patch.crates-io]` fork of
+`steamroom-client`; a fork is a permanent rebase cost for a failure the user
+clears by retrying, so applejack does not carry one.
 
 ## Flows
 
 All flows go through `auth::Authenticator`, which drives a `SteamConnection`
-and a `RefreshTokenStore`. Unit tests use a scripted fake connection;
-`live::SteamroomConnection` is the only implementation that opens a socket.
+and a `RefreshTokenStore`. `SteamConnection` covers the auth flow only;
+`logon` returns a `SteamSession`, described under "Session". Unit tests use
+scripted fakes; `live::SteamroomConnection` and `live::SteamroomSession` are
+the only implementations that open a socket.
 
 - **QR login.** `begin(AuthMode::Qr)` calls `BeginAuthSessionViaQR` and returns
   `LoginStep::QrReady { payload }`; the shell renders the payload as a QR code.
@@ -46,31 +54,163 @@ and a `RefreshTokenStore`. Unit tests use a scripted fake connection;
   `InvalidGuardCode` once its challenge is gone (a mismatch reported by the
   token poll rather than the submit is `OutOfOrder`), so "try another code"
   is only ever said while another code can be accepted.
-- **Refresh.** `refresh(account_name)` reads the stored refresh token and sends
-  `CMsgClientLogon` with it on a fresh connection. The account name is not a
-  secret; `steamroom-client`'s token logon requires it alongside the token, so
-  the host persists it next to its other metadata (the `meta` table in work
-  package 6). `AuthError::NoStoredToken` means the user must log in;
-  `AuthError::Refused` means the token was rejected and the CLI exits 3.
+- **Refresh.** `refresh(account_name)` reads the stored refresh token, sends
+  `CMsgClientLogon` with it on a fresh connection, and returns the session.
+  The account name is not a secret; the token logon requires it alongside
+  the token, so the host persists it next to its other metadata (the `meta`
+  table in work package 6). `AuthError::NoStoredToken` means the user must
+  log in; `AuthError::Refused` means the token was rejected and the CLI
+  exits 3.
 - **Logout.** `logout()` deletes the Keychain item. Clearing cached library
   rows is the host's job.
-- **License list.** After `refresh`, `SteamConnection::license_list` reads
-  `EMsg::CLIENT_LICENSE_LIST` from the same connection (also inside `MULTI`
-  batches) and decodes `CMsgClientLicenseList`. It times out after 30 s,
-  and a timeout ends the session: the cancelled read may have consumed part
-  of a frame, so the connection returns to idle (`heartbeat_interval` is
-  `None`, `send_heartbeat` is `OutOfOrder`) and the caller must `logon`
-  again. Call it exactly once, directly after `logon` and before any PICS or
-  heartbeat call: the live implementation drops every other message it
-  receives while waiting, and Steam re-sends the list unprompted whenever
-  the account's licenses change, so once PICS calls and heartbeats share
-  the session a stray `license_list` can eat a PICS reply and a PICS call
-  can eat the list. The unit that shares the session must own one
-  receive-and-dispatch loop (see the design note under "Follow-ups").
 
 Rate limits and Steam Guard surface as typed errors (`AuthError::RateLimited
 { retry_after }`, `AuthError::GuardRequired { factor }`); nothing loops on
 them. The CM does not report a retry-after, so the value is a fixed 60 s floor.
+
+## Session
+
+`session::SteamSession` is everything after logon, and every method takes
+`&self`, so a caller can hold one session across concurrent calls.
+`live::SteamroomSession` implements it around one receive-and-dispatch loop.
+
+- **One receive loop.** A spawned task owns `recv_msg` for the life of the
+  session and routes each message. A request registers a waiter under a fresh
+  job id and only sends; replies come back by `jobid_target`. `steamroom`'s own
+  calls each run a private receive loop and would consume each other's
+  replies, so none of them is used on a session. A reply without a job id goes
+  to the oldest request expecting that message, except a service reply, which
+  always echoes its job; a reply for a job that timed out is dropped, so a
+  timeout costs one call, not the session.
+- **`Ready`, not `LoggedIn`.** `SteamClient<Ready>::login` returns on the
+  logon response and discards the other messages in its `MULTI`, and
+  `LoggedIn` offers only the private-loop calls. `Ready` has `send_msg` and
+  `recv_msg`, which is all the loop needs, so the session sends `CLIENT_LOGON`
+  itself after the loop starts and stays in `Ready`. The license list is no
+  longer racing the logon: it is caught whether it shares that `MULTI` or
+  arrives later. The cost is that `live/session.rs` carries the wire form of
+  each PICS, depot-key, and content-server call, built from the generated
+  protos.
+- **License list.** The loop keeps the newest `CMsgClientLicenseList`, which
+  Steam sends unprompted after logon and on any change. `license_list` answers
+  from it and waits up to 30 s for the first. Call it as often as needed.
+- **Heartbeat.** A second task sends `CLIENT_HEART_BEAT` at the CM's interval
+  (9 s when it does not say) whether or not a call is waiting. No caller
+  schedules anything.
+- **Failure.** A transport error, `CLIENT_LOGGED_OFF`, or an undecodable
+  `MULTI` closes the session: every waiter and later call gets that error, and
+  the caller must `logon` again. Dropping the session aborts both tasks and
+  closes the socket. PICS replies split with `response_pending` are collected
+  before the call returns. Each reply is waited for up to 60 s.
+- **CDN.** `live::LiveChunks` fetches chunks and manifests over `steamroom`'s
+  `CdnClient` with a 120 s bound per request. It replaces
+  `steamroom_client::download::CdnChunkFetcher` because a CDN auth token sits
+  in the URL and `reqwest::Error` prints the URL, so HTTP errors leave through
+  `without_url`; and because a token is per depot and host, requested the
+  when a host answers 403, whether it never had one or its token expired, and
+  at most once in 30 s per depot and host.
+
+## Library
+
+`library::Library::fetch` walks licenses to packages (`package_apps`, a binary
+`KeyValues` buffer behind a 4-byte prefix) to appids to PICS product info
+(`app_info`, text `KeyValues`, access tokens included). `Library` returns plain
+values; the caller persists them to the `apps` table with `fetched_at`.
+
+`OwnedApp { appid, name, installdir, size, default_branch, depots, drm,
+platforms, builds, change_number }` describes one app. `drm` is always
+`unknown`: it cannot be inferred from Steam, and the config database overrides
+it. `Library::windows_apps` is the installable list.
+`Library::windows_app(appid)` answers `AppNotOwned`, or `NoWindowsDepot` naming
+the platforms the app lists.
+
+`OwnedApp::windows_depots(branch, filter)` picks what to fetch: depots whose
+`oslist` includes `windows` or is empty, on an app whose own `oslist` allows
+Windows; `osarch` 64 and neutral, or 32 when the app has no 64-bit depot; the
+filter's language (`english` by default) or none; no `lowviolence` depots; a
+`dlcappid` depot only when that DLC is owned. A depot with no manifest on the
+branch is skipped, which also leaves out `depotfromapp` redistributables.
+
+## Install, update, verify
+
+`depot::InstallPlan::new(app, branch, filter)` chooses the depots and refuses
+an `installdir` that is not one plain name. Build it from fresh product info:
+Steam keeps serving old manifests, so a stale plan installs a stale build.
+`depot::DepotInstaller::new(session, paths, data_dir, client_running)` then
+runs it. `steamroom-client`'s `DepotJob` does the file work, through the
+`ChunkFetcher` trait; the installer decides what `DepotJob` sees by handing it
+a manifest trimmed to the files that still need writing.
+
+```text
+<library>/steamapps/common/<installdir>/                 the game
+<library>/steamapps/appmanifest_<appid>.acf              written last
+<library>/applejack/<appid>.download.json                exists only mid-download
+<library>/applejack/manifests/<depot>_<manifest>.json    decrypted file lists
+```
+
+- **`install(&plan)`** takes the per-appid lock, then the shared library lock,
+  both non-blocking, so a held lock fails at once with `Error::LockHeld` naming
+  the holder's pid and command. It refuses a title whose `.acf` is present:
+  `AlreadyInstalled` when fully installed, `ClientOwned` otherwise.
+- **Verification.** `DepotJob` checks each chunk's Adler-32 and SHA-1 id,
+  assembles the file under `<installdir>/.DepotDownloader/staging`, renames it
+  into place after a whole-file SHA-1, and is removed from the install on
+  success. A corrupt chunk is `Error::CorruptChunk`, never reaches the
+  install, and leaves the record for the next run. `steamroom` does not check
+  a manifest's signature, so the installer refuses any file name or symlink
+  target that would leave the install directory (`Error::UnsafePath`).
+- **Resume.** `<appid>.download.json` (`DownloadRecord`) lists, per depot, the
+  target manifest, the previous manifest, and the files in place. It is saved
+  atomically every 256 files and on every stop. A run whose branch and
+  manifests match resumes: recorded files whose size still matches are
+  skipped, a half-assembled file reuses its staged chunks after re-hashing
+  them, and any file finished after the last save is hashed rather than
+  fetched. A record for other manifests is replaced, and because that run may
+  have left its own files, the new record is marked `rescan`: the whole
+  manifest is hashed and anything that differs is rewritten, across stops,
+  until the run finishes. The record outlives
+  `Error::DiskFull`, a CDN failure, and a client starting; it goes only after
+  the `.acf` is written.
+- **`update(&plan)`** is `--update`. It re-reads the `.acf` under the lock,
+  refuses anything but fully installed with `ClientOwned` (which names
+  `applejack runtime steam`), and diffs each depot from the manifest the `.acf`
+  records, fetching that manifest if it is not stored, as for a title the
+  client updated. Only files that differ are written, unchanged chunks of
+  those files come off disk, and files gone from the new manifest are removed
+  unless another installed depot still owns them. Names compare without case,
+  since APFS is case-insensitive. Removal is skipped altogether when an
+  untouched depot's manifest is not stored, because nothing can then be proved
+  stale. A depot already current is left alone. The rewrite keeps every `.acf` key the writer does not model,
+  and keeps depots the plan did not select. The caller re-syncs its `apps` row
+  from the `.acf` first and afterwards.
+- **`verify_install(paths, data_dir, appid)`** is `--verify`. It takes the same
+  locks, needs no session, re-hashes every file against the stored manifests of
+  the depots the `.acf` records, and returns `VerifyReport { files_checked,
+  mismatched, missing }`. Files the manifests do not list are ignored. A depot
+  this crate did not install has no stored manifest, which is
+  `ManifestNotStored`. It hashes on the calling thread; use `spawn_blocking`.
+- **Errors.** A manifest Steam no longer serves triggers one re-read of the
+  product info, which moves every depot and the build id to the new build so
+  the install is never mixed; if a manifest still cannot be fetched, the run
+  fails with `ManifestChanged` carrying both ids. Rate limits from the CM or
+  the CDN are `AuthError::RateLimited`; `DepotJob` retries a failed chunk fetch
+  a bounded number of times and nothing here loops. `DiskFull` keeps the
+  partial state; run the install again after freeing space.
+
+An interrupted `update` leaves the `.acf` at the old manifest over files that
+are partly new. The record says so; see "Follow-ups".
+
+### What the CLI unit wires
+
+- `applejack steam library [--json] [--refresh]`: `Library::fetch`,
+  `windows_apps`, and the `apps` table.
+- `applejack install <appid> [--branch public]`: `InstallPlan::new` from fresh
+  product info, `DepotInstaller::install`. `--update` is `update`, after
+  syncing the row from the `.acf`. `--verify` is `verify_install`.
+- `client_running`: `wineserver_alive` over every prefix that maps the library.
+- The `steam-session` lock for as long as a session lives.
+- `InstallProgress`, through `with_progress`.
+- Exit codes and messages for `Error`'s variants.
 
 ## Token handling rules
 
@@ -86,12 +226,17 @@ them. The CM does not report a retry-after, so the value is a fixed 60 s floor.
   `tokio::process::Command` under `disallowed-types`, which the gate's Clippy
   run (`-D warnings`) enforces by resolved type, so an import alias cannot
   hide one; `tests/no_token_argv.rs` greps `src/` and `examples/` as a
-  textual backstop.
+  textual backstop, and also fails on a print of a line that names a token or
+  depot key.
 - `RefreshToken`, `AccessToken`, `Password`, and `Credentials` are not
   comparable (no `PartialEq`: a derived comparison is not constant time and
   nothing needs one), `License::Debug` omits the PICS `access_token`, and the
-  `CMsgClientLogon` built in `live::logon` carries the refresh token and is
-  never logged or `Debug`-formatted.
+  `CMsgClientLogon` built in `SteamroomSession::start` carries the refresh
+  token and is never logged or `Debug`-formatted.
+- A depot key stays in memory for one run and is never written or printed. CDN
+  auth tokens stay in `LiveChunks`, and no HTTP error leaves it with its URL.
+  The record, stored manifests, and `.acf` hold no secret;
+  `tests/depot.rs` scans what an install leaves on disk.
 - Fixtures and docs contain no credential values. The fixture token in tests is
   the literal `fixture-refresh-token-not-a-real-value`.
 - The `applejack` CLI and the copy embedded in the app are the same signed
@@ -174,14 +319,14 @@ its app locks first, in ascending appid order (one `LockDir` per app lock),
 then the library lock from the `AppLock` it took last, and never an app lock
 while holding the library lock; `Wait` rather than `Blocking` wherever a hung
 holder must not wedge the caller. A typed multi-app acquire (`LockDir::apps`
-over a sorted, deduplicated appid list) is a follow-up for the depot unit if
-it needs more than one title per process.
+over a sorted, deduplicated appid list) would be added if one process ever
+needs more than one title; the installer holds one.
 
 Every applejack process sends the same `LOGIN_ID` in `CMsgClientLogon`, so two
 concurrent logged-in applejack connections on one account displace each
 other. The CLI/RPC unit that owns the connection lifetime must hold a
-`steam-session` lock (a `LockDir` name) for as long as a `SteamroomConnection`
-is in the logged-in stage; this crate only documents that rule.
+`steam-session` lock (a `LockDir` name) for as long as a `SteamroomSession`
+exists; this crate only documents that rule.
 
 These locks serialize applejack processes only. They say nothing about the
 Windows Steam client.
@@ -190,9 +335,15 @@ Windows Steam client.
 
 A title is written by applejack's depot code only while no Steam client is
 running in any prefix that maps the shared library, where "running" means
-`wineserver_alive(prefix)` from work package 2, not the advisory lock. While a
-client runs, applejack treats the library as read-only and re-syncs its `apps`
-rows from the `.acf` files after `wineserver_alive` turns false. An
+`wineserver_alive(prefix)` from work package 2, not the advisory lock. That
+function lives in `applejack-engine`, which this crate does not depend on, so
+`DepotInstaller::new` takes it as a `client_running` predicate. It is read
+under the locks before the first write, once a second while downloading, and
+again before stale files are removed and the `.acf` written.
+While it is true, the run stops with `Error::ClientRunning`: the record is
+saved, and in-flight writes land only in staging. While a client runs,
+applejack treats the library as read-only and re-syncs its `apps` rows from
+the `.acf` files after `wineserver_alive` turns false. An
 `appmanifest` whose `StateFlags` is not `4` (`AppManifest::is_fully_installed`
 is false) belongs to the client; `install --update` refuses and names
 `applejack runtime steam` as the owner.
@@ -225,35 +376,34 @@ names and order follow the public format as documented by SteamKit and
 SteamDB. `StateFlags` is the `EAppState` bitfield (`acf::app_state` exposes
 the bits: 1 Uninstalled, 2 UpdateRequired, 4 FullyInstalled, 64 AppRunning,
 256 UpdateRunning, 1048576 Downloading, ...); `is_fully_installed` compares
-the whole value with `4`, so `6`, `68`, and `1030` all refuse. Keys the
-writer does not model are dropped on rewrite; the depot unit, which rewrites
-client-written files for `install --update`, retains them.
+the whole value with `4`, so `6`, `68`, and `1030` all refuse.
+`AcfWriter::write` emits the modelled keys only; `AcfWriter::merge`, used for
+`update`, keeps every key of the existing file. This field list is
+provisional until work package 5 captures a real file.
 `tests/fixtures/appmanifest_000000.acf` is hand-written and redacted (appid
 0); work package 5 replaces it with a captured client file and extends the
 writer with whatever keys the client needs.
 
 ## Follow-ups
 
-Design notes for the depot unit, recorded here rather than changed in this
-work package:
-
-- **Auth/session split.** `SteamConnection` covers both the auth flow and
-  the logged-in session, and every method takes `&mut self`, so a keepalive
-  task cannot run `send_heartbeat` while a long `license_list` or PICS call
-  holds the same object, even though steamroom's `SteamClient<LoggedIn>`
-  methods are all `&self`. The next unit should have `logon` return a
-  session object (`type Session: SteamSession`) whose methods take `&self`,
-  keep `SteamConnection` for the auth flow only, and let the fake script PICS
-  answers per session; that mirrors steamroom's `Ready`/`LoggedIn` split.
-  Until then the trait carries `heartbeat_interval` and `send_heartbeat` so a
-  CLI written against the trait (the only way to test it with the fake) can
-  keep the session alive between calls.
-- **One receive loop.** `license_list` and steamroom's `pics_get_*` and
-  `call_service_method` read from the same `recv_raw`; whichever is waiting
-  consumes the other's reply. The unit that shares the session must own one
-  receive-and-dispatch loop.
-- **Multi-app locking.** `LockDir::apps` over a sorted, deduplicated appid
-  list, if the depot unit ever holds more than one title per process.
+- **Interrupted update.** The `.acf` stays at the old manifest while files
+  change. Launch code should check `LibraryPaths::record` and refuse a title
+  with a record present until the install is resumed.
+- **Verify a client-installed depot.** `verify_install` needs a stored manifest;
+  a session-aware variant could fetch it.
+- **Power loss.** Resume trusts a recorded file's size. `DepotJob` does not
+  fsync before its rename, so after a power cut `verify_install` is the check.
+- **Repair.** `VerifyReport` only reports; `install` refuses an installed title.
+- **`depotfromapp` depots** are skipped. If a title turns out to need one, read
+  the manifest from the other app's product info.
+- **PICS over HTTP.** A reply can carry `http_host` and omit a large buffer.
+  Such an app lands in `Library::skipped`. Whether Steam still does this for
+  this request is unknown until a large account runs the spike.
+- **Family sharing** is out of scope, and `Library` does not yet filter
+  licenses by `owner_id`, since the value on an account's own licenses has not
+  been observed. Expired licenses are not filtered either; the `ELicenseFlags`
+  bits are not in `steamroom`, and such an app fails at install with a depot
+  access error.
 
 Upstream gaps in `steamroom` and `steamroom-client` 0.3.0, for the operator
 to file; the local copies in `live.rs` stay until they land:
@@ -265,11 +415,22 @@ to file; the local copies in `live.rs` stay until they land:
    logon comes back as a generic failure rather than the typed EResult.
 3. `SteamClient<Ready>::login` (`steamroom-0.3.0/src/client/mod.rs:286-350`)
    discards the sibling messages of the `MULTI` that carries the logon
-   response, which is the MULTI-drain risk described under "Reading the
-   result".
+   response; applejack avoids `login` entirely (see "Session").
 4. `GuardChallenge::submit_code` (`steamroom-client-0.3.0/src/login/credentials.rs:167-187`)
    treats `DuplicateRequest` as fatal, and `GuardChallenge` exposes no poll,
    so a caller cannot continue after the user approved in the app.
+5. Each `SteamClient<LoggedIn>` call runs its own receive loop, so they cannot
+   share a connection with anything else that reads. A receive buffer in
+   `ClientInner`, or a dispatcher, would let applejack drop the wire copies in
+   `live/session.rs`.
+6. `get_cdn_servers` is only on `LoggedIn`, and `CdnServer` is
+   `#[non_exhaustive]` with no constructor, so `live/cdn.rs` builds one through
+   its `serde` form.
+7. `CdnClient` puts the auth token in the URL with no timeout, and
+   `CdnChunkFetcher` logs and returns `reqwest` errors that contain it.
+8. `pics_get_package_info` hard-codes `access_token: 0`
+   (`steamroom-0.3.0/src/client/mod.rs:731`) and every PICS call ignores
+   `response_pending`.
 
 ## Legal note
 
@@ -278,6 +439,31 @@ Valve's communication protocols without consent; SteamKit2 and DepotDownloader
 have been tolerated for years. The plan records this as a legal risk the user
 accepts. This layer acts on the user's own account for the user's own
 purchases only and does not bypass DRM.
+
+## Running the depot spike
+
+`examples/depot_spike.rs` is the live check of this code. Without
+`APPLEJACK_LIVE_STEAM=1` it prints usage, exits 0, and contacts nothing.
+
+```sh
+cargo run -p applejack-steam --example depot_spike                 # prints usage, exits 0
+APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike
+APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \
+    --install 480 --dir /tmp/applejack-spike
+```
+
+Spacewar (480) is a small free title; add it to the account first, or use any
+small Windows title the account owns. `--dir` is the library root, and it also
+holds `locks/`. The spike reads the account name from stdin and the password
+from the terminal without echo. When Steam asks for a code, enter the code and
+do not also approve in the mobile app; doing both fails with
+`DuplicateRequest`. It holds the refresh token in memory only and never prints
+it. It passes a `client_running` that is always false, so quit any client that
+maps the directory first.
+
+Green is `logon ok`, a plausible `owned apps with a Windows depot` count, and
+with `--install`, `verify: N files, 0 mismatched, 0 missing` and `depot spike:
+green`. Interrupt an install and run it again to see `resumed: true`.
 
 ## Running the G2 spike
 
@@ -342,7 +528,7 @@ Record the outcome here:
 
 | Date | Outcome | steamroom | steamroom-client | Notes |
 |------|---------|-----------|------------------|-------|
-| not yet run | pending | 0.3.0 | 0.3.0 | |
+| 2026-10-30 | green | 0.3.0 | 0.3.0 | macOS 26.6.2, `--credentials` with a Steam Guard device code |
 
 Green: the Rust crates stay primary. Red: DepotDownloader becomes primary for
 the first release and the Rust path is deferred in the handoff.
@@ -372,7 +558,11 @@ real ones are listed in the unit report's DEVIATIONS.
 | PICS product info | `SteamClient<LoggedIn>::pics_get_product_info` | `steamroom-0.3.0/src/client/mod.rs:625` |
 | PICS package access tokens | `SteamClient<LoggedIn>::pics_get_package_access_tokens` | `steamroom-0.3.0/src/client/mod.rs:681` |
 | PICS package info | `SteamClient<LoggedIn>::pics_get_package_info` | `steamroom-0.3.0/src/client/mod.rs:731` |
-| `recv_msg` | `SteamClient<LoggedIn>::recv_msg` (also on `Ready`) | `steamroom-0.3.0/src/client/mod.rs:533` (`:366`) |
+| `recv_msg`, `send_msg` (used) | `SteamClient<Ready>::recv_msg`, `send_msg` (also on `LoggedIn`) | `steamroom-0.3.0/src/client/mod.rs:366,362` |
+| depot download | `steamroom_client::download::{DepotJob, DepotJobBuilder, ChunkFetcher, OldChunkLoc, RetryConfig, DownloadError, DownloadReport}` | `steamroom-client-0.3.0/src/download.rs` |
+| manifest decode | `steamroom_client::manifest::parse_cdn_manifest`, `DepotManifest::decrypt_filenames` | `steamroom-client-0.3.0/src/manifest.rs:65`, `steamroom-0.3.0/src/depot/manifest.rs` |
+| CDN | `CdnClient::{download_chunk, download_manifest}`, `CdnServerPool::{pick, report_success, report_failure}` | `steamroom-0.3.0/src/cdn/mod.rs`, `src/cdn/pool.rs` |
+| KeyValues | `KeyValue::from_text`, `key_value::parse_binary_kv` | `steamroom-0.3.0/src/types/key_value.rs:78,111` |
 | `EMsg::CLIENT_LICENSE_LIST` | `EMsg::CLIENT_LICENSE_LIST = EMsg(780)` | `steamroom-0.3.0/src/messages/mod.rs:27` |
 | `CMsgClientLicenseList` | `steamroom::generated::CMsgClientLicenseList` (prost, `build.rs`) | `steamroom-0.3.0/proto/steam/steammessages_clientserver.proto:167`; `src/generated/mod.rs:1` |
 | MULTI unpacking | `steamroom::client::multi::unpack_multi`, `messages::header::PacketHeader::parse` | `steamroom-0.3.0/src/client/multi.rs:10`, `src/messages/header.rs:53` |

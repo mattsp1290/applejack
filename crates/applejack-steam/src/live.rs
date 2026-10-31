@@ -1,36 +1,30 @@
-//! The [`SteamConnection`] that talks to Steam through `steamroom` 0.3.0 and
-//! `steamroom-client` 0.3.0. Compiled always, run only by the G2 spike and by
-//! live tests; nothing here executes under `cargo test` without
-//! `APPLEJACK_LIVE_STEAM=1`.
+//! The [`SteamConnection`] and [`SteamroomSession`] that talk to Steam through
+//! `steamroom` 0.3.0 and `steamroom-client` 0.3.0. Compiled always; only the
+//! spikes and live tests open a socket. `cargo test` drives
+//! [`SteamroomSession`] over an in-memory transport.
 //!
 //! Every call below is named in `docs/steam-layer.md` under "API grounding"
 //! with the registry file and line it was confirmed against.
 
+mod cdn;
+mod session;
+
 use std::time::Duration;
 
-use prost::Message;
-use steamroom::client::msg::ClientMsg;
-use steamroom::client::multi::unpack_multi;
-use steamroom::client::{LoggedIn, PROTOCOL_VERSION, SteamClient};
+use steamroom::client::SteamClient;
 use steamroom::connection::{CmServer, Protocol};
 use steamroom::enums::EResultError;
 use steamroom::error::ConnectionError;
-use steamroom::generated::{
-    CMsgClientLicenseList, CMsgClientLogon, CMsgClientLogonResponse, CMsgIpAddress,
-    c_msg_ip_address,
-};
-use steamroom::messages::EMsg;
-use steamroom::messages::header::PacketHeader;
 use steamroom::transport::tcp::TcpTransport;
-use steamroom::types::SteamId;
 use steamroom_client::login::{
     ApprovedAuth, CredentialsLoginFlow, GuardChallenge, GuardType, LoginBuilder, LoginError,
     MobileChallenge, QrLoginFlow,
 };
 
-use crate::auth::{
-    AccessToken, AuthError, Credentials, GuardFactor, License, SteamConnection, Tokens,
-};
+pub use cdn::LiveChunks;
+pub use session::SteamroomSession;
+
+use crate::auth::{AccessToken, AuthError, Credentials, GuardFactor, SteamConnection, Tokens};
 use crate::keychain::RefreshToken;
 
 /// Pinned crate versions, reported by the spike. Mirror `[workspace.dependencies]`.
@@ -50,9 +44,6 @@ pub const LOGIN_ID: u32 = 0x4150_4A4B;
 /// the session asks for Windows depots.
 const CLIENT_OS_WINDOWS_11: u32 = 20;
 
-/// How long `license_list` waits for `CLIENT_LICENSE_LIST` after logon.
-const LICENSE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// The CM does not report a retry-after; this is a conservative floor.
 const RATE_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
@@ -62,18 +53,10 @@ enum Stage {
     GuardCode(GuardChallenge),
     MobileConfirm(MobileChallenge),
     Approved(ApprovedAuth),
-    LoggedIn(Session),
 }
 
-/// A logged-on client plus what the logon response said about keeping it.
-struct Session {
-    client: SteamClient<LoggedIn>,
-    /// `CMsgClientLogonResponse.heartbeat_seconds`: how often the CM expects
-    /// `SteamClient::send_heartbeat`. `None` when the CM did not say.
-    heartbeat: Option<Duration>,
-}
-
-/// One Steam connection at a time, as decision 5 in the plan requires.
+/// The auth flow, one connection at a time. `logon` opens the session on its
+/// own socket, as decision 5 in the plan requires.
 pub struct SteamroomConnection {
     stage: Stage,
 }
@@ -103,7 +86,6 @@ impl std::fmt::Debug for SteamroomConnection {
             Stage::GuardCode(_) => "GuardCode",
             Stage::MobileConfirm(_) => "MobileConfirm",
             Stage::Approved(_) => "Approved",
-            Stage::LoggedIn(_) => "LoggedIn",
         };
         f.debug_struct("SteamroomConnection")
             .field("stage", &stage)
@@ -112,6 +94,8 @@ impl std::fmt::Debug for SteamroomConnection {
 }
 
 impl SteamConnection for SteamroomConnection {
+    type Session = SteamroomSession;
+
     async fn begin_qr(&mut self) -> Result<String, AuthError> {
         let flow = LoginBuilder::new()
             .device_name(DEVICE_NAME)
@@ -158,8 +142,8 @@ impl SteamConnection for SteamroomConnection {
     }
 
     async fn submit_guard_code(&mut self, code: &str) -> Result<(), AuthError> {
-        // Check before taking: a wrong-stage call must leave the stage (and
-        // any logged-in session) untouched, as `OutOfOrder` promises.
+        // Check before taking: a wrong-stage call must leave the stage
+        // untouched, as `OutOfOrder` promises.
         if !matches!(self.stage, Stage::GuardCode(_)) {
             return Err(AuthError::OutOfOrder("no Steam Guard code is pending"));
         }
@@ -199,7 +183,7 @@ impl SteamConnection for SteamroomConnection {
                     factor: guard_factor(challenge.allowed_kinds()),
                 });
             }
-            Stage::Idle | Stage::LoggedIn(_) => {
+            Stage::Idle => {
                 return Err(AuthError::OutOfOrder("no auth session is pending"));
             }
             Stage::Qr(_) | Stage::MobileConfirm(_) | Stage::Approved(_) => {}
@@ -211,9 +195,7 @@ impl SteamConnection for SteamroomConnection {
                 .await
                 .map_err(map_login_error)?,
             Stage::Approved(approved) => approved,
-            Stage::Idle | Stage::GuardCode(_) | Stage::LoggedIn(_) => {
-                unreachable!("stage checked above")
-            }
+            Stage::Idle | Stage::GuardCode(_) => unreachable!("stage checked above"),
         };
         let tokens = approved.tokens();
         let account_name = tokens
@@ -233,7 +215,7 @@ impl SteamConnection for SteamroomConnection {
         &mut self,
         account_name: &str,
         refresh_token: &RefreshToken,
-    ) -> Result<(), AuthError> {
+    ) -> Result<SteamroomSession, AuthError> {
         self.stage = Stage::Idle;
         let servers = CmServer::fetch()
             .await
@@ -255,112 +237,8 @@ impl SteamConnection for SteamroomConnection {
             .prepare()
             .await
             .map_err(map_steamroom_error)?;
-
-        let logon = CMsgClientLogon {
-            protocol_version: Some(PROTOCOL_VERSION),
-            cell_id: Some(0),
-            client_os_type: Some(CLIENT_OS_WINDOWS_11),
-            account_name: Some(account_name.to_owned()),
-            // Steam's wire name for the refresh-token slot. This struct now
-            // holds the secret: never log it or format it with `Debug`.
-            access_token: Some(refresh_token.expose().to_owned()),
-            obfuscated_private_ip: Some(CMsgIpAddress {
-                ip: Some(c_msg_ip_address::Ip::V4(LOGIN_ID)),
-            }),
-            supports_rate_limit_response: Some(true),
-            ..Default::default()
-        };
-        let body = logon.encode_to_vec();
-        let mut msg = ClientMsg::with_body(EMsg::CLIENT_LOGON, &body);
-        msg.header.steamid = Some(SteamId::from_parts(1, 1, 1, 0).raw());
-        msg.header.client_sessionid = Some(0);
-        // `login` has already checked the response's eresult; its body is
-        // the `CMsgClientLogonResponse` whether it arrived alone or in a MULTI.
-        let (client, response) = client.login(msg).await.map_err(map_steamroom_error)?;
-        let response = CMsgClientLogonResponse::decode(&*response.body)
-            .map_err(|error| AuthError::Connection(format!("CMsgClientLogonResponse: {error}")))?;
-        let heartbeat = response
-            .heartbeat_seconds
-            .and_then(|seconds| u64::try_from(seconds).ok())
-            .filter(|seconds| *seconds > 0)
-            .map(Duration::from_secs);
-        self.stage = Stage::LoggedIn(Session { client, heartbeat });
-        Ok(())
+        SteamroomSession::start(client, account_name, refresh_token).await
     }
-
-    async fn license_list(&mut self) -> Result<Vec<License>, AuthError> {
-        let Stage::LoggedIn(Session { client, .. }) = &self.stage else {
-            return Err(AuthError::OutOfOrder(
-                "license_list needs a logged-in session",
-            ));
-        };
-        match tokio::time::timeout(LICENSE_LIST_TIMEOUT, receive_license_list(client)).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                // `TcpTransport::recv` reads the header and body in separate
-                // `read_exact` calls with no partial-frame buffer, so the
-                // cancelled read may have consumed part of a frame. The
-                // stream cannot be trusted after this; the session ends here.
-                self.stage = Stage::Idle;
-                Err(AuthError::Connection(
-                    "timed out waiting for CLIENT_LICENSE_LIST; session closed".to_owned(),
-                ))
-            }
-        }
-    }
-
-    fn heartbeat_interval(&self) -> Option<Duration> {
-        match &self.stage {
-            Stage::LoggedIn(session) => session.heartbeat,
-            _ => None,
-        }
-    }
-
-    async fn send_heartbeat(&mut self) -> Result<(), AuthError> {
-        let Stage::LoggedIn(Session { client, .. }) = &self.stage else {
-            return Err(AuthError::OutOfOrder(
-                "send_heartbeat needs a logged-in session",
-            ));
-        };
-        client.send_heartbeat().await.map_err(map_steamroom_error)
-    }
-}
-
-async fn receive_license_list(client: &SteamClient<LoggedIn>) -> Result<Vec<License>, AuthError> {
-    loop {
-        let incoming = client.recv_msg().await.map_err(map_steamroom_error)?;
-        if incoming.emsg == EMsg::CLIENT_LICENSE_LIST {
-            return decode_license_list(&incoming.body);
-        }
-        if incoming.emsg == EMsg::MULTI {
-            for sub in unpack_multi(&incoming.body).map_err(map_steamroom_error)? {
-                if let PacketHeader::Protobuf { header, body } =
-                    PacketHeader::parse(&sub).map_err(|error| map_steamroom_error(error.into()))?
-                    && header.emsg == EMsg::CLIENT_LICENSE_LIST
-                {
-                    return decode_license_list(&body);
-                }
-            }
-        }
-    }
-}
-
-fn decode_license_list(body: &[u8]) -> Result<Vec<License>, AuthError> {
-    let list = CMsgClientLicenseList::decode(body)
-        .map_err(|error| AuthError::Connection(format!("CMsgClientLicenseList: {error}")))?;
-    // The proto default for a missing eresult is 2 (Fail).
-    steamroom::enums::eresult(list.eresult.unwrap_or(2)).map_err(map_eresult)?;
-    Ok(list
-        .licenses
-        .iter()
-        .map(|license| License {
-            package_id: license.package_id.unwrap_or(0),
-            license_type: license.license_type.unwrap_or(0),
-            flags: license.flags.unwrap_or(0),
-            owner_id: license.owner_id.unwrap_or(0),
-            access_token: license.access_token.unwrap_or(0),
-        })
-        .collect())
 }
 
 fn guard_factor(kinds: &[GuardType]) -> GuardFactor {
@@ -375,6 +253,10 @@ fn guard_factor(kinds: &[GuardType]) -> GuardFactor {
 
 fn map_login_error(error: LoginError) -> AuthError {
     match error {
+        LoginError::LogonFailed(EResultError::DuplicateRequest)
+        | LoginError::Transport(steamroom::Error::Connection(
+            ConnectionError::ServiceMethodFailed(EResultError::DuplicateRequest),
+        )) => AuthError::DuplicateGuardApproval,
         LoginError::InvalidPassword => AuthError::Refused,
         LoginError::InvalidGuardCode => AuthError::InvalidGuardCode,
         LoginError::LogonFailed(result) => map_eresult(result),
@@ -410,5 +292,29 @@ fn map_eresult(result: EResultError) -> AuthError {
         | EResultError::Revoked
         | EResultError::Banned => AuthError::Refused,
         other => AuthError::Connection(format!("Steam EResult {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_request_tells_the_user_to_use_one_factor() {
+        let error = map_login_error(LoginError::Transport(steamroom::Error::Connection(
+            ConnectionError::ServiceMethodFailed(EResultError::DuplicateRequest),
+        )));
+        assert!(matches!(error, AuthError::DuplicateGuardApproval));
+        assert!(error.to_string().contains("not both"));
+        assert!(matches!(
+            map_eresult(EResultError::DuplicateRequest),
+            AuthError::Connection(_)
+        ));
+    }
+
+    #[test]
+    fn a_throttled_service_call_is_a_typed_rate_limit() {
+        let error = map_eresult(EResultError::RateLimitExceeded);
+        assert!(matches!(error, AuthError::RateLimited { .. }));
     }
 }

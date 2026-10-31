@@ -1,6 +1,7 @@
 //! Login, refresh, and logout, driven over a [`SteamConnection`] so unit tests
 //! run against a fake while [`crate::live::SteamroomConnection`] talks to
-//! Steam.
+//! Steam. A successful logon yields a [`SteamSession`], which owns everything
+//! that happens after the auth flow.
 
 use std::fmt;
 use std::future::Future;
@@ -8,6 +9,7 @@ use std::time::Duration;
 
 use crate::Error;
 use crate::keychain::{RefreshToken, RefreshTokenStore};
+use crate::session::SteamSession;
 
 /// How a login starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +44,7 @@ pub enum LoginStep {
 }
 
 /// Failures while talking to Steam. Never carries a token or password.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum AuthError {
     /// Steam throttled the request; do not retry before `retry_after`.
@@ -57,6 +59,13 @@ pub enum AuthError {
     /// The Steam Guard code was wrong; the session is still open.
     #[error("Steam Guard code rejected")]
     InvalidGuardCode,
+    /// `DuplicateRequest`: the sign-in was approved in the Steam mobile app
+    /// and a code was typed as well. `steamroom-client` 0.3.0 cannot continue
+    /// from there, so the login is over; begin again with one factor.
+    #[error(
+        "Steam saw this sign-in approved twice; log in again and either enter a code or approve in the app, not both"
+    )]
+    DuplicateGuardApproval,
     /// No refresh token is stored; the user must log in.
     #[error("no stored Steam refresh token")]
     NoStoredToken,
@@ -153,13 +162,15 @@ impl fmt::Debug for License {
     }
 }
 
-/// The calls that reach Steam. Each method advances one connection's state;
-/// the order is `begin_qr` or `begin_credentials`, optionally
-/// `submit_guard_code`, then `wait_for_tokens`; `logon` opens a session from a
-/// refresh token, `license_list` reads from that session, and
-/// `send_heartbeat` keeps it open at `heartbeat_interval`. A call made in the
-/// wrong state is [`AuthError::OutOfOrder`] and leaves the state unchanged.
+/// The auth flow, which needs no logged-in session. Each method advances one
+/// connection's state; the order is `begin_qr` or `begin_credentials`,
+/// optionally `submit_guard_code`, then `wait_for_tokens`. `logon` turns a
+/// refresh token into a [`SteamSession`]. A call made in the wrong state is
+/// [`AuthError::OutOfOrder`] and leaves the state unchanged.
 pub trait SteamConnection {
+    /// What a successful `logon` yields.
+    type Session: SteamSession;
+
     /// Starts a QR session and returns the challenge payload to render.
     fn begin_qr(&mut self) -> impl Future<Output = Result<String, AuthError>> + Send;
 
@@ -184,26 +195,7 @@ pub trait SteamConnection {
         &mut self,
         account_name: &str,
         refresh_token: &RefreshToken,
-    ) -> impl Future<Output = Result<(), AuthError>> + Send;
-
-    /// Reads `CMsgClientLicenseList` from the logged-in session. Call it
-    /// once, directly after `logon` and before any PICS or heartbeat call:
-    /// the live implementation drops every other message that arrives while
-    /// it waits, and Steam sends the list unprompted after logon (and again
-    /// whenever the account's licenses change), so a later call can eat
-    /// another reply or wait out its timeout. A timeout ends the session,
-    /// because the cancelled read may have consumed part of a frame:
-    /// `heartbeat_interval` returns `None` afterwards, `send_heartbeat` is
-    /// [`AuthError::OutOfOrder`], and the caller must `logon` again.
-    fn license_list(&mut self) -> impl Future<Output = Result<Vec<License>, AuthError>> + Send;
-
-    /// The interval the CM asked for in the logon response; `None` before
-    /// `logon` succeeds or when the CM did not say.
-    fn heartbeat_interval(&self) -> Option<Duration>;
-
-    /// Sends `CLIENT_HEART_BEAT` on the logged-in session. The unit that keeps
-    /// a session open calls this at [`heartbeat_interval`](Self::heartbeat_interval).
-    fn send_heartbeat(&mut self) -> impl Future<Output = Result<(), AuthError>> + Send;
+    ) -> impl Future<Output = Result<Self::Session, AuthError>> + Send;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -334,10 +326,9 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
     ///
     /// [`AuthError::NoStoredToken`] when the store is empty;
     /// [`AuthError::Refused`] when Steam rejects the token.
-    pub async fn refresh(&mut self, account_name: &str) -> Result<(), Error> {
+    pub async fn refresh(&mut self, account_name: &str) -> Result<C::Session, Error> {
         let token = self.store.get()?.ok_or(AuthError::NoStoredToken)?;
-        self.connection.logon(account_name, &token).await?;
-        Ok(())
+        Ok(self.connection.logon(account_name, &token).await?)
     }
 
     /// Deletes the stored refresh token.

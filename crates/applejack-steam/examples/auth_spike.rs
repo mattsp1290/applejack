@@ -6,7 +6,7 @@
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use applejack_steam::SteamConnection;
+use applejack_steam::SteamSession;
 use applejack_steam::auth::{
     AuthMode, Authenticator, Credentials, GuardFactor, LoginStep, Password,
 };
@@ -84,16 +84,15 @@ async fn run(mode: AuthMode) -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("login ok for account `{account_name}`; refresh token held in memory");
 
-    {
-        let mut auth = Authenticator::new(&mut connection, &store);
-        auth.refresh(&account_name).await?;
-    }
+    let session = Authenticator::new(&mut connection, &store)
+        .refresh(&account_name)
+        .await?;
     println!("refresh logon ok");
 
-    if let Some(interval) = connection.heartbeat_interval() {
+    if let Some(interval) = session.heartbeat_interval() {
         println!("heartbeat interval: {}s", interval.as_secs());
     }
-    let licenses = connection.license_list().await?;
+    let licenses = session.license_list().await?;
     println!("licenses on account: {}", licenses.len());
     if licenses.is_empty() {
         // A logged-on account always holds package 0, so an empty list means

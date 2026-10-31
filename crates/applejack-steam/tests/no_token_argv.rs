@@ -1,7 +1,9 @@
-//! No token ever rides on a process command line: this crate constructs no
-//! `std::process::Command` at all, and the spike example does not either.
-//! `clippy.toml` (`disallowed-types`) is the type-resolved guard that an
-//! import alias cannot bypass; this grep is the textual backstop.
+//! No token ever rides on a process command line or reaches a print: this
+//! crate constructs no `std::process::Command` at all, and the spike examples
+//! do not either. `clippy.toml` (`disallowed-types`) is the type-resolved
+//! guard that an import alias cannot bypass; this grep is the textual
+//! backstop. The grep walks `src/` and `examples/`, so the session, library,
+//! and depot modules and `depot_spike` are covered as they are added.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,32 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
             rust_files(&path, out);
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             out.push(path);
+        }
+    }
+}
+
+/// A same-line backstop: a call split across lines is not seen.
+#[test]
+fn no_print_or_debug_format_touches_a_token() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    rust_files(&root.join("examples"), &mut files);
+    for path in files {
+        let text = fs::read_to_string(&path).unwrap();
+        for line in text.lines() {
+            let printing = ["println!", "eprintln!", "print!(", "tracing::", "dbg!"]
+                .iter()
+                .any(|call| line.contains(call));
+            let secret = ["expose()", "refresh_token", "access_token", "depot_key"]
+                .iter()
+                .any(|name| line.contains(name));
+            assert!(
+                !(printing && secret),
+                "{}: `{}` prints a secret",
+                path.display(),
+                line.trim()
+            );
         }
     }
 }

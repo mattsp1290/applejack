@@ -1,0 +1,1026 @@
+//! Install, resume, delta, and verify against a scripted session, through the
+//! real `DepotJob`. Chunks are encrypted the way the CDN serves them, so the
+//! hash checks that run here are the ones that run live.
+
+#[allow(dead_code, reason = "each test binary uses part of the shared fake")]
+mod support;
+
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use applejack_steam::Error;
+use applejack_steam::acf::{AppManifest, app_state};
+use applejack_steam::auth::AuthError;
+use applejack_steam::depot::{
+    DepotInstaller, DownloadRecord, InstallOptions, InstallPlan, InstallProgress, LibraryPaths,
+    verify_install,
+};
+use applejack_steam::library::{DepotFilter, OwnedApp};
+use applejack_steam::lock::{LockDir, Mode, app_lock_name};
+use applejack_steam::session::AppInfo;
+use steamroom::depot::ChunkId;
+use steamroom::depot::manifest::ManifestFile;
+use steamroom_client::download::RetryConfig;
+use support::{FakeSession, Fault, file, manifest};
+use tempfile::TempDir;
+
+const APPID: u32 = 100;
+const DEPOT: u32 = 101;
+const V1: u64 = 1001;
+const V2: u64 = 1002;
+const NOT_RUNNING: fn() -> bool = || false;
+
+fn product_info(manifest_id: u64, buildid: u64) -> AppInfo {
+    let text = format!(
+        r#""appinfo"
+{{
+	"common"
+	{{
+		"name"		"Synthetic Game"
+		"oslist"		"windows"
+	}}
+	"config"
+	{{
+		"installdir"		"Synthetic Game"
+	}}
+	"depots"
+	{{
+		"{DEPOT}"
+		{{
+			"config"
+			{{
+				"oslist"		"windows"
+				"osarch"		"64"
+			}}
+			"manifests"
+			{{
+				"public"
+				{{
+					"gid"		"{manifest_id}"
+					"size"		"100"
+				}}
+			}}
+		}}
+		"branches"
+		{{
+			"public"
+			{{
+				"buildid"		"{buildid}"
+			}}
+		}}
+	}}
+}}
+"#
+    );
+    AppInfo {
+        appid: APPID,
+        change_number: 1,
+        text: Some(text),
+    }
+}
+
+fn plan(manifest_id: u64, buildid: u64) -> InstallPlan {
+    let filter = DepotFilter::default();
+    let app = OwnedApp::parse(&product_info(manifest_id, buildid), &filter).unwrap();
+    InstallPlan::new(&app, "public", &filter).unwrap()
+}
+
+struct Bench {
+    dir: TempDir,
+    session: FakeSession,
+}
+
+impl Bench {
+    fn new() -> Self {
+        Self {
+            dir: TempDir::new().unwrap(),
+            session: FakeSession::default(),
+        }
+    }
+
+    fn paths(&self) -> LibraryPaths {
+        LibraryPaths::new(self.dir.path().join("library"))
+    }
+
+    fn data(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn game(&self) -> std::path::PathBuf {
+        self.paths().install_dir("Synthetic Game")
+    }
+
+    fn installer<'a>(
+        &'a self,
+        client_running: &'a (dyn Fn() -> bool + Send + Sync),
+    ) -> DepotInstaller<'a, FakeSession> {
+        let mut retry = RetryConfig::default();
+        retry.max_attempts = 2;
+        retry.initial_delay = Duration::from_millis(1);
+        DepotInstaller::new(&self.session, self.paths(), self.data(), client_running).with_options(
+            InstallOptions {
+                max_downloads: 1,
+                retry,
+            },
+        )
+    }
+
+    async fn install(&self, plan: &InstallPlan) -> Result<(), Error> {
+        self.installer(&NOT_RUNNING).install(plan).await.map(drop)
+    }
+
+    fn v1_files(&self) -> Vec<ManifestFile> {
+        let chunks = &self.session.chunks;
+        vec![
+            file(
+                chunks,
+                "bin\\game.exe",
+                &[b"game code one", b"game code two"],
+            ),
+            file(chunks, "data\\level.pak", &[b"level data"]),
+            file(chunks, "old\\gone.txt", &[b"removed by the update"]),
+        ]
+    }
+
+    fn add_v1(&self) {
+        let files = self.v1_files();
+        self.session.add_manifest(DEPOT, manifest(V1, files));
+    }
+
+    /// `level.pak` is unchanged, `game.exe` keeps one chunk, `gone.txt` goes,
+    /// and `new.txt` arrives.
+    fn add_v2(&self) {
+        let chunks = &self.session.chunks;
+        let files = vec![
+            file(
+                chunks,
+                "bin\\game.exe",
+                &[b"game code one", b"game code 2!!"],
+            ),
+            file(chunks, "data\\level.pak", &[b"level data"]),
+            file(chunks, "new.txt", &[b"added by the update"]),
+        ];
+        self.session.add_manifest(DEPOT, manifest(V2, files));
+    }
+
+    fn record(&self) -> DownloadRecord {
+        serde_json::from_slice(&fs::read(self.paths().record(APPID)).unwrap()).unwrap()
+    }
+
+    fn acf(&self) -> AppManifest {
+        AppManifest::parse(&fs::read_to_string(self.paths().acf(APPID)).unwrap()).unwrap()
+    }
+}
+
+fn chunk_of(entry: &ManifestFile, index: usize) -> ChunkId {
+    entry.chunks[index].id.clone()
+}
+
+#[tokio::test]
+async fn install_writes_the_game_and_an_acf_the_reader_accepts() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+
+    assert_eq!(
+        fs::read(bench.game().join("bin/game.exe")).unwrap(),
+        b"game code onegame code two"
+    );
+    assert_eq!(
+        fs::read(bench.game().join("data/level.pak")).unwrap(),
+        b"level data"
+    );
+    assert!(!bench.game().join(".DepotDownloader").exists());
+    assert!(!bench.paths().record(APPID).exists());
+    assert!(bench.paths().manifest(DEPOT, V1).exists());
+
+    let acf = bench.acf();
+    assert_eq!(acf.appid, APPID);
+    assert_eq!(acf.name, "Synthetic Game");
+    assert_eq!(acf.installdir, "Synthetic Game");
+    assert_eq!(acf.state_flags, app_state::FULLY_INSTALLED);
+    assert_eq!(acf.state_flags, 4);
+    assert_eq!(acf.buildid, 11);
+    assert_ne!(acf.last_updated, 0);
+    assert_eq!(acf.size_on_disk, 26 + 10 + 21);
+    assert_eq!(acf.installed_depots.len(), 1);
+    assert_eq!(acf.installed_depots[0].depot_id, DEPOT);
+    assert_eq!(acf.installed_depots[0].manifest_id, V1);
+    assert_eq!(acf.installed_depots[0].size, 26 + 10 + 21);
+    assert!(acf.is_fully_installed());
+}
+
+#[tokio::test]
+async fn installing_an_installed_title_is_refused() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    assert!(matches!(
+        bench.install(&plan(V1, 11)).await,
+        Err(Error::AlreadyInstalled { appid: APPID })
+    ));
+}
+
+#[tokio::test]
+async fn progress_reaches_the_sink() {
+    let bench = Bench::new();
+    bench.add_v1();
+    let reports = std::sync::Mutex::new(Vec::new());
+    let sink = |report: &InstallProgress| reports.lock().unwrap().push(*report);
+    bench
+        .installer(&NOT_RUNNING)
+        .with_progress(&sink)
+        .install(&plan(V1, 11))
+        .await
+        .unwrap();
+    let reports = reports.into_inner().unwrap();
+    let last = reports.last().unwrap();
+    assert_eq!(last.total_files, 3);
+    assert_eq!(last.completed_files, 3);
+    assert_eq!(last.completed_bytes, last.total_bytes);
+}
+
+#[tokio::test]
+async fn a_corrupted_chunk_is_rejected_and_never_reaches_the_install() {
+    let bench = Bench::new();
+    let files = bench.v1_files();
+    bench
+        .session
+        .chunks
+        .fault(&chunk_of(&files[0], 1), Fault::Corrupt);
+    bench.session.add_manifest(DEPOT, manifest(V1, files));
+
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::CorruptChunk {
+                depot_id: DEPOT,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(!bench.game().join("bin/game.exe").exists());
+    assert!(!bench.paths().acf(APPID).exists());
+    assert!(bench.paths().record(APPID).exists());
+
+    bench.session.chunks.clear_faults();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    assert!(bench.acf().is_fully_installed());
+}
+
+#[tokio::test]
+async fn a_failed_run_resumes_from_its_record_without_refetching_finished_files() {
+    let bench = Bench::new();
+    let files = bench.v1_files();
+    let late = chunk_of(&files[2], 0);
+    bench
+        .session
+        .chunks
+        .fault(&late, Fault::Fail(io::ErrorKind::ConnectionReset));
+    bench.session.add_manifest(DEPOT, manifest(V1, files));
+
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::Depot {
+                depot_id: DEPOT,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    let record = bench.record();
+    assert_eq!(record.depots[0].manifest_id, V1);
+    assert!(!record.depots[0].complete);
+    assert!(record.depots[0].files.contains("bin\\game.exe"));
+    assert!(record.depots[0].files.contains("data\\level.pak"));
+    assert!(!record.depots[0].files.contains("old\\gone.txt"));
+
+    bench.session.chunks.clear_faults();
+    bench.session.chunks.reset_counts();
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .install(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert!(outcome.resumed);
+    assert_eq!(bench.session.chunks.fetches(), 1);
+    assert_eq!(*bench.session.chunks.fetched.lock().unwrap(), [late]);
+    assert_eq!(bench.session.manifest_calls.load(Ordering::Relaxed), 1);
+    assert!(!bench.paths().record(APPID).exists());
+}
+
+#[tokio::test]
+async fn resume_picks_up_a_partial_record_from_disk_and_refetches_a_vanished_file() {
+    let bench = Bench::new();
+    bench.add_v1();
+    fs::create_dir_all(bench.game().join("data")).unwrap();
+    fs::create_dir_all(bench.game().join("bin")).unwrap();
+    fs::write(bench.game().join("data/level.pak"), b"level data").unwrap();
+    let path = bench.paths().record(APPID);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        format!(
+            r#"{{"version":1,"appid":{APPID},"branch":"public","depots":[{{"depot_id":{DEPOT},
+            "manifest_id":{V1},"previous_manifest_id":null,"complete":false,
+            "files":["data\\level.pak","bin\\game.exe"]}}]}}"#
+        ),
+    )
+    .unwrap();
+
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .install(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert!(outcome.resumed);
+    // Three chunks: both of game.exe, which the record claimed but is gone,
+    // and gone.txt. level.pak was not fetched.
+    assert_eq!(bench.session.chunks.fetches(), 3);
+    assert!(bench.game().join("bin/game.exe").exists());
+}
+
+#[tokio::test]
+async fn a_record_for_another_manifest_is_not_resumed() {
+    let bench = Bench::new();
+    bench.add_v1();
+    let path = bench.paths().record(APPID);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        format!(
+            r#"{{"version":1,"appid":{APPID},"branch":"public","depots":[{{"depot_id":{DEPOT},
+            "manifest_id":{V2},"previous_manifest_id":null,"complete":true,"files":[]}}]}}"#
+        ),
+    )
+    .unwrap();
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .install(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert!(!outcome.resumed);
+    assert_eq!(outcome.files_written, 3);
+}
+
+#[tokio::test]
+async fn disk_full_keeps_the_partial_state_and_the_next_run_finishes() {
+    let bench = Bench::new();
+    let files = bench.v1_files();
+    bench.session.chunks.fault(
+        &chunk_of(&files[1], 0),
+        Fault::Fail(io::ErrorKind::StorageFull),
+    );
+    bench.session.add_manifest(DEPOT, manifest(V1, files));
+
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+    assert!(
+        matches!(error, Error::DiskFull { appid: APPID, .. }),
+        "{error}"
+    );
+    assert!(bench.record().depots[0].files.contains("bin\\game.exe"));
+    assert!(bench.game().join("bin/game.exe").exists());
+    assert!(!bench.paths().acf(APPID).exists());
+
+    bench.session.chunks.clear_faults();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    assert!(bench.acf().is_fully_installed());
+}
+
+#[tokio::test]
+async fn a_cdn_rate_limit_is_typed_and_attempts_are_bounded() {
+    let bench = Bench::new();
+    let files = bench.v1_files();
+    bench
+        .session
+        .chunks
+        .fault(&chunk_of(&files[0], 0), Fault::RateLimited);
+    bench.session.add_manifest(DEPOT, manifest(V1, files));
+
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+    assert!(
+        matches!(error, Error::Auth(AuthError::RateLimited { .. })),
+        "{error}"
+    );
+    assert!(bench.session.chunks.fetches() <= 3, "retries are bounded");
+}
+
+#[tokio::test]
+async fn a_rate_limit_from_the_session_is_typed_and_not_retried() {
+    let bench = Bench::new();
+    bench.add_v1();
+    *bench.session.manifest_error.lock().unwrap() = Some(AuthError::RateLimited {
+        retry_after: Duration::from_secs(60),
+    });
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+    assert!(matches!(error, Error::Auth(AuthError::RateLimited { .. })));
+    assert_eq!(bench.session.manifest_calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn update_touches_only_changed_files() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let level = bench.game().join("data/level.pak");
+    let before = fs::metadata(&level).unwrap();
+    // A key the client wrote must survive the rewrite.
+    let acf_path = bench.paths().acf(APPID);
+    let text = fs::read_to_string(&acf_path).unwrap();
+    fs::write(
+        &acf_path,
+        text.replace(
+            "\t\"Universe\"\t\t\"1\"\n",
+            "\t\"Universe\"\t\t\"1\"\n\t\"LauncherPath\"\t\t\"redacted\"\n",
+        ),
+    )
+    .unwrap();
+
+    bench.add_v2();
+    bench.session.chunks.reset_counts();
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.changed_depots, [DEPOT]);
+    assert_eq!(outcome.files_written, 2);
+    assert_eq!(outcome.files_removed, 1);
+    // The changed chunk of game.exe and new.txt; the unchanged chunk came
+    // off disk.
+    assert_eq!(bench.session.chunks.fetches(), 2);
+    assert_eq!(
+        fs::read(bench.game().join("bin/game.exe")).unwrap(),
+        b"game code onegame code 2!!"
+    );
+    assert_eq!(
+        fs::read(bench.game().join("new.txt")).unwrap(),
+        b"added by the update"
+    );
+    assert!(!bench.game().join("old/gone.txt").exists());
+    assert!(!bench.game().join("old").exists());
+
+    let after = fs::metadata(&level).unwrap();
+    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(before.ino(), after.ino());
+    }
+
+    let acf = bench.acf();
+    assert_eq!(acf.buildid, 12);
+    assert_eq!(acf.installed_depots[0].manifest_id, V2);
+    assert!(
+        fs::read_to_string(&acf_path)
+            .unwrap()
+            .contains("LauncherPath")
+    );
+    assert!(!bench.paths().manifest(DEPOT, V1).exists());
+    assert!(bench.paths().manifest(DEPOT, V2).exists());
+}
+
+#[tokio::test]
+async fn update_keeps_a_file_that_moved_to_a_depot_it_did_not_change() {
+    const OTHER: u32 = 103;
+    let plan_with = |first: u64, build: u64| {
+        let info = product_info(first, build);
+        let text = info.text.as_ref().unwrap().replace(
+            "\"branches\"",
+            &format!(
+                "\"{OTHER}\"\n{{\n\"manifests\"\n{{\n\"public\"\n{{\n\"gid\" \"7\"\n\"size\" \"1\"\n}}\n}}\n}}\n\"branches\""
+            ),
+        );
+        let filter = DepotFilter::default();
+        let info = AppInfo {
+            text: Some(text),
+            ..info
+        };
+        let app = OwnedApp::parse(&info, &filter).unwrap();
+        InstallPlan::new(&app, "public", &filter).unwrap()
+    };
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let moved = file(chunks, "moved.txt", &[b"same bytes"]);
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![moved.clone()]));
+    bench.session.add_manifest(
+        OTHER,
+        manifest(7, vec![moved, file(chunks, "b.txt", &[b"b"])]),
+    );
+    bench.install(&plan_with(V1, 11)).await.unwrap();
+
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V2, vec![file(chunks, "a.txt", &[b"new content"])]),
+    );
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan_with(V2, 12))
+        .await
+        .unwrap();
+    assert_eq!(outcome.changed_depots, [DEPOT]);
+    assert_eq!(outcome.files_removed, 0);
+    assert!(bench.game().join("moved.txt").exists());
+    assert_eq!(bench.acf().installed_depots.len(), 2);
+}
+
+#[tokio::test]
+async fn an_update_keeps_a_file_renamed_only_in_case() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "Data\\Level.pak", &[b"same"])]),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V2, vec![file(chunks, "data\\level.pak", &[b"same"])]),
+    );
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+    assert_eq!(outcome.files_removed, 0);
+    assert_eq!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .missing,
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn an_update_after_one_to_another_target_stopped_rewrites_what_it_left() {
+    const V3: u64 = 1003;
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let original = file(chunks, "a.txt", &[b"original"]);
+    let other = file(chunks, "b.txt", &[b"other"]);
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![original.clone(), other.clone()]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+
+    // The stopped update got as far as writing a.txt for V2.
+    let changed = file(chunks, "a.txt", &[b"interim!"]);
+    let failing = file(chunks, "b.txt", &[b"fails"]);
+    chunks.fault(
+        &chunk_of(&failing, 0),
+        Fault::Fail(io::ErrorKind::ConnectionReset),
+    );
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V2, vec![changed, failing]));
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V2, 12))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(bench.game().join("a.txt")).unwrap(), b"interim!");
+
+    // V3 equals V1 for a.txt, so a diff against the `.acf` would skip it.
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V3, vec![original, file(chunks, "b.txt", &[b"third"])]),
+    );
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V3, 13))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("a.txt")).unwrap(), b"original");
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn a_stopped_rescan_stays_a_rescan_when_resumed() {
+    const V3: u64 = 1003;
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let original = file(chunks, "a.txt", &[b"original"]);
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![original.clone(), file(chunks, "b.txt", &[b"other"])],
+        ),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+
+    let failing = file(chunks, "b.txt", &[b"fails"]);
+    chunks.fault(
+        &chunk_of(&failing, 0),
+        Fault::Fail(io::ErrorKind::ConnectionReset),
+    );
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V2, vec![file(chunks, "a.txt", &[b"interim!"]), failing]),
+    );
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V2, 12))
+            .await
+            .is_err()
+    );
+
+    // The rescan for V3 stops on b.txt, listed first, before reaching a.txt.
+    let third = file(chunks, "b.txt", &[b"third"]);
+    chunks.clear_faults();
+    chunks.fault(
+        &chunk_of(&third, 0),
+        Fault::Fail(io::ErrorKind::ConnectionReset),
+    );
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V3, vec![third, original]));
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V3, 13))
+            .await
+            .is_err()
+    );
+    assert!(bench.record().rescan);
+    assert_eq!(fs::read(bench.game().join("a.txt")).unwrap(), b"interim!");
+
+    chunks.clear_faults();
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V3, 13))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("a.txt")).unwrap(), b"original");
+}
+
+#[tokio::test]
+async fn update_at_the_current_manifest_writes_nothing() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let text = fs::read_to_string(bench.paths().acf(APPID)).unwrap();
+    bench.session.chunks.reset_counts();
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert_eq!(outcome.changed_depots, Vec::<u32>::new());
+    assert_eq!(bench.session.chunks.fetches(), 0);
+    assert_eq!(fs::read_to_string(bench.paths().acf(APPID)).unwrap(), text);
+}
+
+#[tokio::test]
+async fn update_after_the_client_moved_the_title_diffs_from_what_the_acf_records() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    // The stored manifest is gone, as for a title the client updated, so the
+    // old one is fetched to compute the delta.
+    fs::remove_file(bench.paths().manifest(DEPOT, V1)).unwrap();
+    bench.add_v2();
+    bench.session.chunks.reset_counts();
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+    assert_eq!(bench.session.chunks.fetches(), 2);
+}
+
+#[tokio::test]
+async fn update_refuses_unless_the_acf_reports_fully_installed() {
+    let bench = Bench::new();
+    bench.add_v1();
+    assert!(matches!(
+        bench.installer(&NOT_RUNNING).update(&plan(V1, 11)).await,
+        Err(Error::NotInstalled { appid: APPID })
+    ));
+
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let path = bench.paths().acf(APPID);
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        text.replace("\"StateFlags\"\t\t\"4\"", "\"StateFlags\"\t\t\"6\""),
+    )
+    .unwrap();
+
+    bench.add_v2();
+    let error = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "app 100 has StateFlags 6; `applejack runtime steam` owns its update"
+    );
+    assert!(bench.game().join("old/gone.txt").exists());
+}
+
+#[tokio::test]
+async fn verify_detects_a_changed_file_and_a_missing_one() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+
+    let report = verify_install(&bench.paths(), bench.data(), APPID).unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(report.files_checked, 3);
+
+    // Same length, so only the hash can tell.
+    fs::write(bench.game().join("data/level.pak"), b"LEVEL DATA").unwrap();
+    fs::remove_file(bench.game().join("old/gone.txt")).unwrap();
+    let report = verify_install(&bench.paths(), bench.data(), APPID).unwrap();
+    assert_eq!(report.mismatched, ["data/level.pak"]);
+    assert_eq!(report.missing, ["old/gone.txt"]);
+    assert!(!report.is_clean());
+}
+
+#[tokio::test]
+async fn verify_needs_the_stored_manifest() {
+    let bench = Bench::new();
+    bench.add_v1();
+    assert!(matches!(
+        verify_install(&bench.paths(), bench.data(), APPID),
+        Err(Error::NotInstalled { .. })
+    ));
+    bench.install(&plan(V1, 11)).await.unwrap();
+    fs::remove_file(bench.paths().manifest(DEPOT, V1)).unwrap();
+    assert!(matches!(
+        verify_install(&bench.paths(), bench.data(), APPID),
+        Err(Error::ManifestNotStored {
+            depot_id: DEPOT,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_held_lock_fails_fast_naming_the_holder() {
+    let bench = Bench::new();
+    bench.add_v1();
+    let mut holder = LockDir::new(bench.data(), "run");
+    let held = holder.app(APPID, Mode::NonBlocking).unwrap();
+
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+    let Error::LockHeld { name, holder } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(*name, app_lock_name(APPID));
+    let holder = holder.as_ref().unwrap();
+    assert_eq!(holder.pid, std::process::id());
+    assert_eq!(holder.command, "run");
+    assert!(error.to_string().contains("`run`"));
+    assert!(!bench.game().exists());
+    assert_eq!(bench.session.manifest_calls.load(Ordering::Relaxed), 0);
+    drop(held);
+
+    let mut other = LockDir::new(bench.data(), "run");
+    let library = other.library_exclusive(Mode::NonBlocking).unwrap();
+    assert!(matches!(
+        bench.install(&plan(V1, 11)).await,
+        Err(Error::LockHeld { .. })
+    ));
+    drop(library);
+    bench.install(&plan(V1, 11)).await.unwrap();
+}
+
+#[tokio::test]
+async fn nothing_is_written_while_a_client_is_running() {
+    let bench = Bench::new();
+    bench.add_v1();
+    let running = || true;
+    let result = bench.installer(&running).install(&plan(V1, 11)).await;
+    assert!(matches!(result, Err(Error::ClientRunning { appid: APPID })));
+    assert!(!bench.paths().root().exists());
+    assert_eq!(bench.session.manifest_calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn a_client_that_starts_mid_download_stops_the_run_with_its_record() {
+    let bench = Bench::new();
+    let files = bench.v1_files();
+    // Long enough for the once-a-second check to come round mid-download.
+    let slow = chunk_of(&files[2], 0);
+    bench
+        .session
+        .chunks
+        .fault(&slow, Fault::Slow(Duration::from_millis(2500)));
+    bench.session.add_manifest(DEPOT, manifest(V1, files));
+    let chunks = &bench.session.chunks;
+    let running = || chunks.fetches() > 0;
+    let result = bench.installer(&running).install(&plan(V1, 11)).await;
+    assert!(matches!(result, Err(Error::ClientRunning { .. })));
+    assert!(!bench.paths().acf(APPID).exists());
+    assert!(bench.record().depots[0].files.contains("bin\\game.exe"));
+    assert!(!bench.game().join("old/gone.txt").exists());
+
+    bench.session.chunks.clear_faults();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    assert!(bench.acf().is_fully_installed());
+}
+
+#[tokio::test]
+async fn a_changed_manifest_is_refetched_once() {
+    let bench = Bench::new();
+    bench.add_v2();
+    bench
+        .session
+        .app_info
+        .lock()
+        .unwrap()
+        .push_back(vec![product_info(V2, 12)]);
+
+    bench.install(&plan(V1, 11)).await.unwrap();
+    assert_eq!(bench.session.app_info_calls.load(Ordering::Relaxed), 1);
+    let acf = bench.acf();
+    assert_eq!(acf.installed_depots[0].manifest_id, V2);
+    assert_eq!(acf.buildid, 12);
+}
+
+#[tokio::test]
+async fn a_refetch_moves_every_depot_to_the_new_build() {
+    const OTHER: u32 = 103;
+    let two_depots = |first: u64, second: u64, build: u64| {
+        let info = product_info(first, build);
+        let text = info.text.as_ref().unwrap().replace(
+            "\"branches\"",
+            &format!(
+                "\"{OTHER}\"\n{{\n\"manifests\"\n{{\n\"public\"\n{{\n\"gid\" \"{second}\"\n\"size\" \"1\"\n}}\n}}\n}}\n\"branches\""
+            ),
+        );
+        AppInfo {
+            text: Some(text),
+            ..info
+        }
+    };
+    let filter = DepotFilter::default();
+    let listed = OwnedApp::parse(&two_depots(V1, 70, 11), &filter).unwrap();
+    let listed = InstallPlan::new(&listed, "public", &filter).unwrap();
+
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    // Depot 101's old manifest is still served; depot 103's is not.
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "old.txt", &[b"old"])]),
+    );
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V2, vec![file(chunks, "new.txt", &[b"new"])]),
+    );
+    bench
+        .session
+        .add_manifest(OTHER, manifest(71, vec![file(chunks, "o.txt", &[b"o"])]));
+    bench
+        .session
+        .app_info
+        .lock()
+        .unwrap()
+        .push_back(vec![two_depots(V2, 71, 12)]);
+
+    bench.install(&listed).await.unwrap();
+    let acf = bench.acf();
+    assert_eq!(acf.buildid, 12);
+    let installed: Vec<u64> = acf.installed_depots.iter().map(|d| d.manifest_id).collect();
+    assert_eq!(installed, [V2, 71]);
+    assert!(!bench.game().join("old.txt").exists());
+}
+
+#[tokio::test]
+async fn a_manifest_that_is_gone_after_the_refetch_fails_with_both_ids() {
+    let bench = Bench::new();
+    bench
+        .session
+        .app_info
+        .lock()
+        .unwrap()
+        .push_back(vec![product_info(V2, 12)]);
+
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+    assert!(matches!(
+        error,
+        Error::ManifestChanged {
+            appid: APPID,
+            depot_id: DEPOT,
+            listed: V1,
+            current: V2,
+        }
+    ));
+    assert!(error.to_string().contains("1001"));
+    assert!(error.to_string().contains("1002"));
+    assert_eq!(bench.session.app_info_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(bench.session.manifest_calls.load(Ordering::Relaxed), 2);
+    assert!(!bench.game().exists());
+}
+
+#[tokio::test]
+async fn a_manifest_path_outside_the_install_is_refused() {
+    for name in ["..\\..\\escape.txt", "/etc/escape.txt", "a\\..\\..\\b"] {
+        let bench = Bench::new();
+        let entry = file(&bench.session.chunks, name, &[b"payload"]);
+        bench.session.add_manifest(DEPOT, manifest(V1, vec![entry]));
+        let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+        assert!(matches!(error, Error::UnsafePath { .. }), "{name}: {error}");
+        assert_eq!(bench.session.chunks.fetches(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_symlink_out_of_the_install_is_refused() {
+    let bench = Bench::new();
+    let mut entry = ManifestFile::new("link".to_owned(), 0);
+    entry.link_target = Some("../../outside".to_owned());
+    bench.session.add_manifest(DEPOT, manifest(V1, vec![entry]));
+    assert!(matches!(
+        bench.install(&plan(V1, 11)).await,
+        Err(Error::UnsafePath { .. })
+    ));
+}
+
+#[test]
+fn a_branch_without_a_build_id_is_refused() {
+    let filter = DepotFilter::default();
+    let mut app = OwnedApp::parse(&product_info(V1, 11), &filter).unwrap();
+    app.builds.clear();
+    assert!(matches!(
+        InstallPlan::new(&app, "public", &filter),
+        Err(Error::NoManifestForBranch { .. })
+    ));
+}
+
+#[test]
+fn an_installdir_that_is_not_one_name_is_refused() {
+    for installdir in ["../escape", "/abs", "a/b", "a\\b", ".."] {
+        let filter = DepotFilter::default();
+        let mut app = OwnedApp::parse(&product_info(V1, 11), &filter).unwrap();
+        app.installdir = installdir.to_owned();
+        assert!(
+            matches!(
+                InstallPlan::new(&app, "public", &filter),
+                Err(Error::UnsafePath { .. })
+            ),
+            "{installdir}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_library_file_carries_a_secret() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let key_hex = steamroom::util::hex::encode(&support::KEY.0);
+
+    let mut pending = vec![bench.dir.path().to_owned()];
+    let mut seen = 0;
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                seen += 1;
+                let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+                assert!(!text.contains(&key_hex), "{}", path.display());
+                assert!(!text.contains("170, 170, 170, 170"), "{}", path.display());
+                assert!(!text.contains("token"), "{}", path.display());
+            }
+        }
+    }
+    assert!(seen >= 5);
+}
+
+#[test]
+fn the_install_future_can_run_on_a_spawned_task() {
+    fn assert_send<T: Send>(_: T) {}
+    let session = FakeSession::default();
+    let installer = DepotInstaller::new(
+        &session,
+        LibraryPaths::new("/nonexistent"),
+        "/nonexistent",
+        &NOT_RUNNING,
+    );
+    let plan = plan(V1, 11);
+    assert_send(installer.install(&plan));
+    assert_send(installer.update(&plan));
+}

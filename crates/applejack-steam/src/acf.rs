@@ -4,7 +4,7 @@
 //! Field names follow the public format as documented by `SteamKit` and `SteamDB`.
 //! The committed fixture is hand-written and redacted; work package 5 replaces
 //! it with a captured client file, and the writer's key set and order are
-//! revisited then.
+//! revisited then, so the field list here is provisional.
 
 use crate::Error;
 use crate::vdf::{Document, Node, Value};
@@ -214,6 +214,37 @@ impl<'a> AcfWriter<'a> {
     #[must_use]
     pub fn write(&self) -> String {
         self.manifest.to_document().to_text()
+    }
+
+    /// Rewrites a client-written file: the modelled keys take this manifest's
+    /// values in place, a modelled key the file lacks is appended, and every
+    /// other key is kept. The list of keys the client needs is provisional
+    /// until work package 5 captures a real file, so nothing unknown may be
+    /// dropped on the way through.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VdfParse`] for malformed text, [`Error::AcfField`] when it
+    /// has no `AppState` map.
+    pub fn merge(&self, existing: &str) -> Result<String, Error> {
+        let mut document = Document::parse(existing)?;
+        let Some(Value::Map(children)) = document.get_mut(ROOT_KEY) else {
+            return Err(missing(ROOT_KEY));
+        };
+        let fresh = self.manifest.to_document();
+        for node in fresh.nodes.into_iter().flat_map(|root| match root.value {
+            Value::Map(children) => children,
+            Value::Str(_) => Vec::new(),
+        }) {
+            match children
+                .iter_mut()
+                .find(|child| child.key.eq_ignore_ascii_case(&node.key))
+            {
+                Some(child) => child.value = node.value,
+                None => children.push(node),
+            }
+        }
+        Ok(document.to_text())
     }
 }
 

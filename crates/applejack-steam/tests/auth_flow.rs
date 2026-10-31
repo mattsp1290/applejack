@@ -1,5 +1,8 @@
 //! The login driver against a scripted fake connection.
 
+#[allow(dead_code, reason = "each test binary uses part of the shared fake")]
+mod support;
+
 use std::future::{Future, ready};
 use std::time::Duration;
 
@@ -9,6 +12,7 @@ use applejack_steam::auth::{
     Password, SteamConnection, Tokens,
 };
 use applejack_steam::keychain::{InMemoryStore, RefreshToken, RefreshTokenStore};
+use support::FakeSession;
 
 const FIXTURE_TOKEN: &str = "fixture-refresh-token-not-a-real-value";
 
@@ -45,6 +49,8 @@ impl RefreshTokenStore for RejectingStore {
 }
 
 impl SteamConnection for Fake {
+    type Session = FakeSession;
+
     fn begin_qr(&mut self) -> impl Future<Output = Result<String, AuthError>> + Send {
         self.calls.push("begin_qr".into());
         ready(Ok("https://s.team/q/fixture".to_owned()))
@@ -87,35 +93,10 @@ impl SteamConnection for Fake {
         &mut self,
         account_name: &str,
         refresh_token: &RefreshToken,
-    ) -> impl Future<Output = Result<(), AuthError>> + Send {
+    ) -> impl Future<Output = Result<FakeSession, AuthError>> + Send {
         self.calls.push("logon".into());
         self.logged_on_with = Some((account_name.to_owned(), refresh_token.expose().to_owned()));
-        ready(Ok(()))
-    }
-
-    fn license_list(&mut self) -> impl Future<Output = Result<Vec<License>, AuthError>> + Send {
-        ready(Ok(vec![License {
-            package_id: 0,
-            license_type: 1,
-            flags: 0,
-            owner_id: 0,
-            access_token: 0,
-        }]))
-    }
-
-    fn heartbeat_interval(&self) -> Option<Duration> {
-        None
-    }
-
-    fn send_heartbeat(&mut self) -> impl Future<Output = Result<(), AuthError>> + Send {
-        self.calls.push("send_heartbeat".into());
-        ready(if self.logged_on_with.is_some() {
-            Ok(())
-        } else {
-            Err(AuthError::OutOfOrder(
-                "send_heartbeat needs a logged-in session",
-            ))
-        })
+        ready(Ok(FakeSession::default()))
     }
 }
 
@@ -369,8 +350,8 @@ async fn refresh_uses_the_stored_token_and_logout_deletes_it() {
     let mut fake = Fake::default();
     let mut auth = Authenticator::new(&mut fake, &store);
     assert!(matches!(
-        auth.refresh("redacted").await.unwrap_err(),
-        Error::Auth(AuthError::NoStoredToken)
+        auth.refresh("redacted").await,
+        Err(Error::Auth(AuthError::NoStoredToken))
     ));
 
     store.put(&RefreshToken::new(FIXTURE_TOKEN)).unwrap();
@@ -381,17 +362,7 @@ async fn refresh_uses_the_stored_token_and_logout_deletes_it() {
         fake.logged_on_with,
         Some(("redacted".to_owned(), FIXTURE_TOKEN.to_owned()))
     );
-    assert_eq!(fake.license_list().await.unwrap().len(), 1);
-    assert_eq!(fake.heartbeat_interval(), None);
-    assert!(matches!(
-        Fake::default().send_heartbeat().await,
-        Err(AuthError::OutOfOrder(_))
-    ));
-    fake.send_heartbeat().await.unwrap();
-    assert_eq!(
-        fake.calls.last().map(String::as_str),
-        Some("send_heartbeat")
-    );
+    assert_eq!(fake.calls, ["logon"]);
 }
 
 #[test]
