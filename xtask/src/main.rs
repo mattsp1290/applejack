@@ -10,6 +10,7 @@ use applejack_manifest::Manifest;
 
 mod app_bundle;
 mod bundle_toml;
+mod closure;
 mod denylist;
 mod engine_payload;
 mod pins;

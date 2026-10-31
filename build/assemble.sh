@@ -8,12 +8,15 @@
 #   vulkan/                                 libMoltenVK.dylib (x86_64) and MoltenVK_icd.json
 #   probes/                                 hello32.exe, dx11-sample.exe, xinput-check.exe, cpuid, osslsigncode (host-arch)
 #   BUNDLE.toml, THIRD_PARTY_NOTICES.md     rendered from build/bundle-spec.toml
-# The tree is built under <payload>.tmp and moved into place, so nothing an
-# earlier run produced survives a rerun and a failed run leaves the previous
-# payload untouched. The dylib closure and install-name rewrite
-# (docs/engines/payload-build.md step 7) run after this script and must be
-# redone after a reassembly. ASSEMBLE_PARTIAL=1 tolerates unbuilt probes and
-# an unbuilt osslsigncode.
+#   wine/lib/*.dylib                        the x86-64 Homebrew libraries Wine links or dlopens, copied in by
+#                                           `cargo xtask engine-payload --close` (docs/engines/payload-build.md step 7),
+#                                           which also rewrites install names and run paths and ends with --check
+# The tree is built under <payload>.tmp, closed and checked there, and moved
+# into place, so nothing an earlier run produced survives a rerun and a run
+# that fails anywhere (the closure included) leaves the previous payload
+# untouched. ASSEMBLE_PARTIAL=1 tolerates unbuilt probes and an unbuilt
+# osslsigncode; the closure and its check still run when wine/ is built (a
+# declared probe that is absent is skipped, not a violation).
 set -eu
 . "$(dirname "$0")/lib.sh"
 
@@ -84,6 +87,14 @@ copy_probe "$WORK/osslsigncode/osslsigncode" osslsigncode "sh build/osslsigncode
 
 xtask engine-payload --write-bundle-toml "$ROOT/build/bundle-spec.toml" "$T/BUNDLE.toml"
 
+# Last, so a reassembly never loses it: the closure reads BUNDLE.toml for the
+# library rows it records provenance against, and checks the closed tree.
+if [ -x "$T/wine/bin/wine" ]; then
+  xtask engine-payload --close "$T"
+else
+  echo "assemble: no wine/ in the tree; the dylib closure (xtask engine-payload --close) skipped"
+fi
+
 rm -rf "$P.old"
 [ ! -e "$P" ] || mv "$P" "$P.old"
 mv "$T" "$P"
@@ -92,4 +103,3 @@ rm -rf "$P.old"
 echo "assembled $P ($(du -sh "$P" | cut -f1)):"
 [ "${ASSEMBLE_PARTIAL:-0}" != 1 ] || echo "assemble: PARTIAL tree: BUNDLE.toml names files that are absent (wine/bin/wine, wine/bin/wineserver, probes), so the engine reader's validate rejects it; not installable"
 (cd "$P" && find . -maxdepth 2 -not -path './wine/lib/GStreamer.framework/*' | sort | sed 's|^\./|  |')
-echo "next: the dylib closure (docs/engines/payload-build.md step 7), then cargo xtask engine-payload --check $P"

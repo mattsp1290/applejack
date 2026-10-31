@@ -203,12 +203,197 @@ Environment knobs:
    tool; GPL-3.0, listed in the notices), then `BUNDLE.toml` and
    `THIRD_PARTY_NOTICES.md` rendered from `build/bundle-spec.toml` (step 8).
    `ASSEMBLE_PARTIAL=1` tolerates unbuilt probes and an unbuilt
-   `osslsigncode`. `cargo xtask engine-payload --build` runs steps 3 through 7
-   in order and stops here. What remains unscripted is the dylib closure: walk
-   every Mach-O with `otool -L`, copy non-system dependencies (the x86-64
-   Homebrew dylibs recorded in `brew-versions.txt`) into `wine/lib/`, rewrite
-   install names and `LC_RPATH` entries to `@rpath`/`@loader_path` with
-   `install_name_tool`, repeat until stable. A reassembly discards that work.
+   `osslsigncode`. The script's last step, inside the `.tmp` tree so a
+   failure leaves the previous payload untouched, is the dylib closure,
+   `cargo xtask engine-payload --close <payload>` (`xtask/src/closure.rs`),
+   which makes the tree self-contained and ends with step 9's check.
+   `cargo xtask engine-payload --build` runs steps 3 through 7 in order and
+   then checks the payload at its final location.
+
+   The closure is a fixed-point loop: read every Mach-O's load commands
+   (`otool -l`), plan one round, apply it, look again, until a round plans
+   nothing (a closed payload is left as it is; a tree that has not settled
+   after eight rounds fails). A round lands whole or not at all. One round
+   does, in this order:
+
+   - **One file per install name.** dyld keeps one image per install name
+     per process: once any image with `LC_ID_DYLIB @rpath/libfreetype.6.dylib`
+     is loaded, every later `@rpath/libfreetype.6.dylib` reference and every
+     bare-leaf `dlopen("libfreetype.6.dylib")` binds to it, whatever run
+     paths the client has. Two regular files with one install name would
+     therefore let load order pick the library (the staged GStreamer
+     framework ships `libfreetype.6.dylib`, `libintl.8.dylib` (proxy-libintl,
+     a stub gettext runtime, not gettext's), and a `libMoltenVK.dylib` of
+     its own, 1.2.9, for its vulkan and applemedia plugins). The round
+     first groups the tree's regular Mach-O files by install name: where
+     the `SONAME_POLICY` table names one of a group's files as the
+     payload's copy, the others become relative links to it (the
+     framework's `libMoltenVK.dylib` becomes a link to the pinned
+     `vulkan/libMoltenVK.dylib`, whose exports cover every symbol those
+     plugins import); any other group fails the closure with every file
+     named. A file replaced this way gets no edit in the same round: an
+     edit planned from its own load commands would run through the new
+     link onto the canonical file, and `apply` refuses to run
+     `install_name_tool` or `codesign` on any path that is a link, naming
+     the link and its target. The rules below never create a duplicate: a
+     library the payload already ships is linked or reached by a run path,
+     not copied again.
+   - **SONAMEs.** Wine `dlopen`s some libraries by bare SONAME rather than
+     linking them: `config.h` in the build tree defines
+     `SONAME_LIBFREETYPE` (`win32u`, `dwrite`), `SONAME_LIBGNUTLS`
+     (`bcrypt`, `crypt32`, `secur32`), `SONAME_LIBSDL2` (`winebus.sys`),
+     `SONAME_LIBVULKAN`/`SONAME_LIBMOLTENVK` (`win32u`), `SONAME_LIBCUPS`
+     (`localspl`, `winspool.drv`), and `SONAME_LIBODBC` (`odbc32`). Wine
+     sets no search path for them (`dlls/ntdll/unix/loader.c` touches
+     `DYLD_LIBRARY_PATH` only for an in-tree build), and dyld resolves a
+     bare leaf name as `@rpath/<leaf>` through the run paths of the
+     calling image and of the main executable, then the working directory
+     and `/usr/lib`; it never looks in `/usr/local/lib`, so a payload
+     without the closure runs with no fonts, no TLS, no game controllers
+     through SDL, and no Vulkan even on the build host. Each SONAME must
+     therefore be a file under `wine/lib/`: copied from the x86-64
+     Homebrew (`/usr/local/lib/<soname>`) by default, or per the
+     `SONAME_POLICY` table in `closure.rs`: `libMoltenVK.dylib` is a
+     relative link to the pinned `vulkan/libMoltenVK.dylib` (not
+     Homebrew's `molten-vk`), `libfreetype.6.dylib` is a relative link to
+     the framework's `GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib`
+     (which its fontconfig, harfbuzz, cairo, pango, and libass link, and
+     which exports every `FT_*` symbol `win32u` and `dwrite` look up),
+     `libcups.2.dylib` is the system's (dyld serves it from the shared
+     cache; no file exists under `/usr/lib`), and `libodbc.dylib` is
+     optional (copied when the x86-64 Homebrew has unixODBC, skipped with
+     a message otherwise). A SONAME that is neither in the table nor in
+     the x86-64 Homebrew fails the closure, and so does one the payload
+     already ships somewhere without a table row, whether the slot is
+     empty or already a link to that file. The slot under `wine/lib/`
+     holds a dylib or nothing: a regular file there that is no Mach-O, or
+     a link there that resolves to anything but a dylib, is refused naming
+     the target, since `dlopen` of the leaf would fail at run time
+     whatever the slot is called, and so is a link to a dylib whose
+     `LC_ID_DYLIB` leaf is not the slot's name (`--close` holds these slot
+     rules, since `--check` has no SONAME list). Every Unix module under
+     `wine/lib/wine/` whose bytes contain a supplied SONAME is a `dlopen`
+     caller and gets `LC_RPATH @loader_path/../..`, which is `wine/lib/`.
+     The run path goes on the callers, not on the executables, because the
+     caller's run paths are what dyld consults for a bare-leaf `dlopen`:
+     the module that calls `dlopen` is the right owner, and the two main
+     executables (`wine/bin/wine` for the first process,
+     `wine/lib/wine/x86_64-unix/wine` for every child, in different
+     directories) stay untouched. (`install_name_tool -add_rpath` would
+     fit a short entry into all three, 72, 72, and 48 bytes of header
+     slack; that is not the reason.)
+   - **Links.** For every Mach-O: an install name outside `/usr/lib` and
+     `/System` becomes `@rpath/<file name>`; an absolute `LC_RPATH` outside
+     them is deleted; a dependency on an absolute non-system path (a
+     Homebrew `opt/` or `Cellar/` path) is rewritten to `@rpath/<leaf>`
+     and bound to `wine/lib/<leaf>` when that exists, else to the one file
+     of that name another component ships. One rule decides either way,
+     over the regular file the path resolves to: the closure's own copies
+     under `wine/lib/` bind on their version alone, and a file in another
+     component's tree, reached directly or through a link under
+     `wine/lib/`, takes a `SONAME_POLICY` row naming the file (the
+     framework's proxy-libintl `libintl.8.dylib` for gnutls and libidn2;
+     a hand-placed link to the framework's glib binds nothing). The
+     planner then checks the dependent's required compatibility version
+     against the file's `LC_ID_DYLIB` current version and fails with both
+     numbers when the requirement is higher, unless the row carries
+     `allow_older_compat` with a reason, which the run that makes the
+     binding prints once (a later run has nothing left to rebind, so the
+     line does not recur). The libintl row does: gnutls
+     and libidn2 record 13.0.0 against gettext 0.26, proxy-libintl reports
+     10.5.0, the two symbols they import are exported, and dyld does not
+     enforce the compatibility version (observed on macOS 26; unverified
+     on the macOS 14 to 25 range the plan supports on a best-effort basis).
+     A leaf the payload holds nowhere is copied into `wine/lib/` (thinned
+     to x86-64 with `lipo` if universal; the copy must be an x86-64
+     Mach-O); and every `@rpath/<leaf>` dependency must then resolve
+     through the binary's own `@loader_path` run paths, else the closure
+     adds the run path to the one payload directory holding that leaf
+     (the binary's own directory wins a tie; a leaf nowhere in the payload
+     is copied from Homebrew). For a library directly under `wine/lib/`,
+     which the closure places, that binding follows the same row and
+     version rule as an absolute dependency; a component's own reference
+     into another tree is its build's decision and needs no row, and a
+     reference a run path already reaches plans nothing. A link and the file it resolves to are one
+     image, so a leaf in two directories that way is no tie; a leaf in two
+     directories as two files is judged after the binary's unambiguous
+     references have settled its run paths, so load-command order does
+     not decide, and a reference still ambiguous then is an error naming
+     both directories. This is what gives `winegstreamer.so`
+     `@loader_path/../../GStreamer.framework/Versions/1.0/lib` for its
+     `libgst*` references and gives each copied library `@loader_path`
+     for its siblings. `@loader_path/` and `@executable_path/` references
+     are left to step 9's chain rules. Each rewritten binary is re-signed
+     ad hoc (`codesign --force --sign -
+     --preserve-metadata=entitlements,flags,runtime`, so an edit of a
+     signed binary keeps what it had rather than dropping it silently).
+   - **Links the tree carries.** Every path a round writes resolves inside
+     the payload. A destination at or below a symlink that is dangling,
+     leaves the payload, or names a directory is an occupied slot, not an
+     empty one: the planner fails naming the link, its target, and the
+     component, and `apply` walks each path component by component again
+     before writing, as the engine's install check does, and refuses to
+     overwrite anything the plan expected absent. What a round rewrites or
+     replaces is journaled first, and the rollback message counts created
+     paths removed and pre-existing files restored separately. A
+     pre-existing link is never written through or replaced, so nothing
+     restores one; the journal can still record a link as its target, a
+     branch only its unit test reaches.
+   - **Gates.** Before a round lands, the destinations are scanned against
+     `build/denylist.toml`, and every copy's Homebrew provenance
+     (`/usr/local/Cellar/<formula>/<version>/`) must match a
+     `[components.<formula>]` row of `BUNDLE.toml` with that version, so
+     the notices list every copied library family or the build fails;
+     `build/bundle-spec.toml` carries those rows (gnutls, p11-kit,
+     libidn2, libunistring, libtasn1, nettle, gmp, sdl2; the Cellar path
+     of each copy is the source of the versions, and a versioned formula
+     such as `openssl@3` is a quoted key). The two libraries Wine binds
+     to inside the framework have rows too, rendered at their real
+     location rather than as copies: `freetype` (FreeType 2.13.3 under
+     the `FTL`, whose binary redistribution requires the FreeType credit
+     the notices carry) and `proxy-libintl` (LGPL-2.0-or-later); the
+     GStreamer row's LGPL-2.1-or-later is GStreamer's own and covers
+     neither. Those two rows are tied to the bytes: `SHIPPED_ELSEWHERE`
+     records each row's version and the file's `LC_ID_DYLIB` current
+     version (26.2.20 and 10.5.0), the spec parser refuses a row stating
+     another version, `--close` refuses a payload whose file is missing,
+     is a link, or reports another current version before its first
+     round, and `--check` reports the same as a violation, as it does a
+     framework file the tree ships with no row, so a GStreamer
+     pin bump that replaces the file fails until the table, the row, and
+     the credit are updated together. A run that copied anything reports
+     a library row no copy came from, so a stale row cannot sit in the
+     notices unnoticed.
+     Anything the closure cannot resolve fails the run with the binary
+     and the reference named, and nothing of that round is applied. A
+     tool failure part-way through a round (`install_name_tool`,
+     `codesign`, `lipo`) removes what the round created and puts every
+     file it replaced or rewrote back from its pre-image, then fails
+     naming the file and the tool's stderr.
+
+   On the planning host (2026-10-30) the closure applies three rounds and
+   the fourth plans nothing: it replaces the framework's `libMoltenVK.dylib`
+   with a link to the pin, links `wine/lib/libfreetype.6.dylib` and
+   `wine/lib/libMoltenVK.dylib`, copies nine dylibs (`libgnutls.30`,
+   `libp11-kit.0`, `libidn2.0`, `libunistring.5`, `libtasn1.6`,
+   `libhogweed.6`, `libnettle.8`, `libgmp.10`, `libSDL2-2.0.0`), and
+   rewrites sixteen binaries: the nine copies, `winegstreamer.so`, and the
+   six `dlopen` callers of a supplied SONAME (`win32u`, `dwrite`, `bcrypt`,
+   `crypt32`, `secur32`, `winebus`; `localspl` and `winspool` name only the
+   system's cups, `odbc32` only the absent odbc). About a minute, most of
+   it `otool`. A rerun on the closed tree changes nothing. The copies keep
+   compile-time paths the load commands do not show: `libgnutls.30.dylib`
+   names `/usr/local/etc/gnutls/cert.pem` (its system trust file) and
+   `libp11-kit.0.dylib` names `/usr/local/etc/pkcs11/modules`,
+   `/usr/local/etc/pkcs11.conf`, and its `Cellar/p11-kit/.../lib/pkcs11`
+   module directory, which is a code-loading path. None of them exists on
+   a user's machine, so gnutls's system trust is empty and p11-kit finds no
+   PKCS#11 modules there; Wine 11.0 reaches neither
+   (`gnutls_certificate_set_x509_system_trust` and `gnutls_pkcs11_init`
+   have no caller under `dlls/bcrypt`, `dlls/secur32`, `dlls/crypt32`;
+   crypt32 validates chains itself). A `P11_KIT_NO_USER_CONFIG`-style
+   mitigation in the launch environment is for the day a Wine release calls
+   them.
 8. `cargo xtask engine-payload --write-bundle-toml build/bundle-spec.toml <payload>/BUNDLE.toml`
    — renders `BUNDLE.toml` and, beside it, `THIRD_PARTY_NOTICES.md` (one row
    per `[components]` entry plus Wine, with version, SPDX license, and
@@ -319,7 +504,15 @@ Environment knobs:
    The report prints the chain list it derived. After the real build
    `wineserver` is a chain too, although it dlopens no Unix module: a
    violation reported only under its chain is a candidate for a rule
-   change, not a payload defect.
+   change, not a payload defect. Two regular Mach-O files anywhere in the
+   payload with the same `LC_ID_DYLIB` are a violation naming both: dyld
+   keeps one image per install name per process, so the closure (step 7)
+   links such duplicates to one file, and a payload that still carries two
+   would bind clients by load order. The check sees load commands only: a
+   library Wine `dlopen`s by bare SONAME (step 7) is not a reference it can
+   resolve, so the runtime probe below is what proves those load; and the
+   compile-time `/usr/local` paths inside the copied gnutls and p11-kit
+   (step 7) are strings, not load commands, so it does not see them either.
 
 ## Running the built Wine
 
@@ -331,6 +524,19 @@ export WINEPREFIX=$(mktemp -d)
 <payload>/wine/bin/wine wineboot --init
 <payload>/wine/bin/wineserver -w
 ```
+
+To see where every library of a running process comes from, keep one
+alive and list its mapped files; nothing may come from `/usr/local` or
+`/opt/homebrew`:
+
+```sh
+<payload>/wine/bin/wine <payload>/probes/xinput-check.exe &
+sleep 5; lsof -p "$(pgrep -f xinput-check.exe | head -1)" | grep -E 'dylib|\.so'
+```
+
+`DYLD_PRINT_LIBRARIES=1` prints the same for a single process, but
+`arch -x86_64` strips `DYLD_*` from the environment, so pass it through
+`/usr/bin/env` after `arch` or run the (thin x86-64) loader directly.
 
 Gate G4c (DXMT) copies the DLLs into that prefix:
 `<payload>/dxmt/x86_64-windows/{d3d11,dxgi,d3d10core,winemetal}.dll` into

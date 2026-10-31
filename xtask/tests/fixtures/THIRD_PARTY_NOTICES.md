@@ -13,8 +13,34 @@ bundle spec; edit `build/bundle-spec.toml`, not this file.
 | MoltenVK | 1.4.2 | Apache-2.0 | `vulkan/` |
 | GStreamer | 1.28.8 | LGPL-2.1-or-later | `wine/lib/GStreamer.framework` |
 | osslsigncode | 2.14 | GPL-3.0-or-later | `probes/osslsigncode` |
+| freetype | 2.13.3 | FTL | `wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib` (`LC_ID_DYLIB` current version 26.2.20; FreeType as the GStreamer framework ships it; Wine's font engine, which `win32u` and `dwrite` load by name through the link `wine/lib/libfreetype.6.dylib`) |
+| gmp | 6.3.0 | LGPL-3.0-or-later OR GPL-2.0-or-later | `wine/lib/` (x86-64 Homebrew formula `gmp`, copied by the dylib closure) |
+| gnutls | 3.8.10 | LGPL-2.1-or-later | `wine/lib/` (x86-64 Homebrew formula `gnutls`, copied by the dylib closure) |
+| libidn2 | 2.3.8 | (GPL-2.0-or-later OR LGPL-3.0-or-later) AND Unicode-DFS-2016 | `wine/lib/` (x86-64 Homebrew formula `libidn2`, copied by the dylib closure) |
+| libtasn1 | 4.20.0 | LGPL-2.1-or-later | `wine/lib/` (x86-64 Homebrew formula `libtasn1`, copied by the dylib closure) |
+| libunistring | 1.3 | GPL-2.0-or-later OR LGPL-3.0-or-later | `wine/lib/` (x86-64 Homebrew formula `libunistring`, copied by the dylib closure) |
+| nettle | 3.10.2 | GPL-2.0-or-later OR LGPL-3.0-or-later | `wine/lib/` (x86-64 Homebrew formula `nettle`, copied by the dylib closure) |
+| p11-kit | 0.25.5 | BSD-3-Clause | `wine/lib/` (x86-64 Homebrew formula `p11-kit`, copied by the dylib closure) |
+| proxy-libintl | 1 | LGPL-2.0-or-later | `wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib` (`LC_ID_DYLIB` current version 10.5.0; proxy-libintl as the GStreamer framework ships it, a stub gettext runtime whose `dgettext` returns the message untranslated; the copied gnutls and libidn2 bind to it, so their messages are English) |
+| sdl2 | 2.32.8 | Zlib | `wine/lib/` (x86-64 Homebrew formula `sdl2`, copied by the dylib closure) |
 
 The GStreamer row covers only the sub-packages `build/gstreamer/fetch.sh` stages
 (the LGPL, MIT, BSD, and Apache set); the GPL and patent-restricted sub-packages
 of the upstream package are not shipped. `osslsigncode` is a host-arch tool the
 launcher runs to verify Authenticode signatures; it is not linked into Wine.
+The `wine/lib/` rows are the x86-64 Homebrew libraries Wine links or loads by
+name, copied in by `cargo xtask engine-payload --close` with the formula version
+the build host had installed; each license is the shipped library's own, not
+that of the formula's command-line tools. A row whose location is a file inside
+`wine/lib/GStreamer.framework` is a library the framework ships that Wine or a
+copied library binds to directly: dyld keeps one image per install name per
+process, so it is not copied again, and its license is its own, as listed, not
+GStreamer's.
+
+FreeType is used under the FreeType License (`FTL`); FreeType's GPL-2.0-or-later
+alternative is not elected. This software is based in part on the work of the
+FreeType Team. Portions of this software are copyright © 2024 The FreeType
+Project (www.freetype.org). All rights reserved.
+
+Where a license above is an `OR` expression (gmp, libidn2, libunistring, nettle), this bundle exercises
+the LGPL-3.0-or-later option of that choice; any `AND` terms apply as written.

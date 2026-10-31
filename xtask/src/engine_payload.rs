@@ -1,8 +1,9 @@
 //! `cargo xtask engine-payload`: fetches the pinned inputs of the Rosetta
-//! engine payload, checks an assembled payload tree, and writes `BUNDLE.toml`.
-//! The Wine build itself runs through the scripts under `build/`.
+//! engine payload, checks an assembled payload tree, closes its dylib
+//! references (`closure.rs`), and writes `BUNDLE.toml`. The Wine build itself
+//! runs through the scripts under `build/`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
@@ -11,22 +12,25 @@ use std::process::{Command, ExitCode};
 
 use sha2::{Digest, Sha256};
 
-use crate::bundle_toml::BundleSpec;
+use crate::bundle_toml::{BundleSpec, SHIPPED_ELSEWHERE, elsewhere_matches};
+use crate::closure;
 use crate::denylist::{Denylist, Hit};
 use crate::pins::{Pin, Pins};
 use crate::self_contained::{
     Search, Violation, binary_dir, check_otool_listing, check_references_resolve, check_rpaths,
-    has_system_rpath, is_executable, normalize_relative, references_left_to_dyld, relocated_rpaths,
+    has_system_rpath, id_entry, is_executable, normalize_relative, references_left_to_dyld,
+    relocated_rpaths,
 };
 
 pub const USAGE: &str = "\
 usage: cargo xtask engine-payload <mode>
   --fetch [id ...]                    download every pin (or the named ones) into build/work/, verify SHA-256, and denylist-scan the listing
   --check <payload-dir>               denylist scan plus self-containment of every Mach-O and symlink; references resolve along the load chains of the executables <payload-dir>/BUNDLE.toml declares and of every executable under wine/
+  --close <payload-dir>               the dylib closure: copy the x86-64 Homebrew libraries Wine links or dlopens into wine/lib/, rewrite install names and references to @rpath, add the run paths, re-sign, repeat until stable, then --check
   --check-listing <file|->            denylist scan of an archive listing, one path per line (an empty listing fails)
   --write-bundle-toml <spec> <out>    render BUNDLE.toml from a typed spec file, plus THIRD_PARTY_NOTICES.md beside it
   --print-pin <id> [field]            print a pin (all fields as key=value, or one field)
-  --build                             run the build scripts under build/ in order";
+  --build                             run the build scripts under build/ in order (assemble.sh ends with --close), then --check the payload";
 
 const PINS_FILE: &str = "build/pins.toml";
 const DENYLIST_FILE: &str = "build/denylist.toml";
@@ -54,6 +58,7 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     let result = match args.as_slice() {
         ["--fetch", ids @ ..] => fetch(root, ids),
         ["--check", payload] => check(root, Path::new(payload)),
+        ["--close", payload] => closure::close(root, Path::new(payload)),
         ["--check-listing", listing] => check_listing(root, listing),
         ["--write-bundle-toml", spec, out] => write_bundle_toml(Path::new(spec), Path::new(out)),
         ["--print-pin", id] => print_pin(root, id, None),
@@ -102,7 +107,7 @@ fn load_pins(root: &Path) -> Result<Pins, String> {
     Pins::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn load_denylist(root: &Path) -> Result<Denylist, String> {
+pub(crate) fn load_denylist(root: &Path) -> Result<Denylist, String> {
     let path = root.join(DENYLIST_FILE);
     let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     Denylist::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
@@ -424,7 +429,7 @@ struct Report {
     left_to_dyld: Vec<(String, String)>,
 }
 
-fn check(root: &Path, payload: &Path) -> Result<(), String> {
+pub(crate) fn check(root: &Path, payload: &Path) -> Result<(), String> {
     let report = inspect(root, payload)?;
     for hit in &report.hits {
         eprintln!("[xtask] denylist: {hit}");
@@ -474,7 +479,8 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
         .canonicalize()
         .map_err(|error| format!("{}: {error}", payload.display()))?;
     let denylist = load_denylist(root)?;
-    let declared = declared_executables(&payload)?;
+    let spec = read_spec(&payload)?;
+    let declared = declared_executables(&spec);
     // Canonical like `payload`, so a checkout reached through a symlink still
     // reports "links into the build directory" rather than the generic reason.
     let build_dir = root.join(WORK_DIR);
@@ -543,6 +549,8 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
             &build_dir,
         ));
     }
+    violations.extend(duplicate_install_names(&machos));
+    violations.extend(shipped_elsewhere_violations(&spec, &machos));
     let resolves = |candidate: &Path| {
         fs::canonicalize(payload.join(candidate))
             .is_ok_and(|real| real.starts_with(&payload) && real.is_file())
@@ -563,14 +571,33 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
     })
 }
 
-const BUNDLE_FILE: &str = "BUNDLE.toml";
+/// dyld keeps one image per install name per process, so two regular files
+/// carrying the same `LC_ID_DYLIB` let load order pick the library every
+/// client gets; the closure links such duplicates to one file (symlinks are
+/// not inspected here, so they pass).
+fn duplicate_install_names(machos: &[MachO]) -> Vec<Violation> {
+    let mut by_id: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for macho in machos {
+        if let Some(id) = id_entry(&macho.load_commands) {
+            by_id.entry(id).or_default().push(&macho.relative);
+        }
+    }
+    by_id
+        .into_iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(id, files)| Violation {
+            binary: files.join(", "),
+            reference: id.to_owned(),
+            reason: "several regular files carry this install name; dyld keeps one image per install name per process, so load order would pick the library".to_owned(),
+        })
+        .collect()
+}
 
-/// The executables `BUNDLE.toml` declares, bundle-relative: the loader, the
-/// server, the preloader when present, and the probes. Together with the
-/// executables under `wine/` these are the load chains that exist at run
-/// time; an executable elsewhere (one of the tools a component ships, say)
-/// loads nothing of the payload.
-fn declared_executables(payload: &Path) -> Result<Vec<String>, String> {
+pub(crate) const BUNDLE_FILE: &str = "BUNDLE.toml";
+
+/// The payload's `BUNDLE.toml`, which `--check` reads for the declared
+/// executables and the library rows.
+fn read_spec(payload: &Path) -> Result<BundleSpec, String> {
     let path = payload.join(BUNDLE_FILE);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -582,15 +609,58 @@ fn declared_executables(payload: &Path) -> Result<Vec<String>, String> {
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    let spec = BundleSpec::parse(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut declared = vec![spec.wine.loader, spec.wine.server];
-    declared.extend(spec.wine.preloader);
+    BundleSpec::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The executables `BUNDLE.toml` declares, bundle-relative: the loader, the
+/// server, the preloader when present, and the probes. Together with the
+/// executables under `wine/` these are the load chains that exist at run
+/// time; an executable elsewhere (one of the tools a component ships, say)
+/// loads nothing of the payload.
+fn declared_executables(spec: &BundleSpec) -> Vec<String> {
+    let mut declared = vec![spec.wine.loader.clone(), spec.wine.server.clone()];
+    declared.extend(spec.wine.preloader.clone());
     declared.extend([
-        spec.probes.cpuid,
-        spec.probes.dx11_sample,
-        spec.probes.xinput_check,
+        spec.probes.cpuid.clone(),
+        spec.probes.dx11_sample.clone(),
+        spec.probes.xinput_check.clone(),
     ]);
-    Ok(declared)
+    declared
+}
+
+/// Each file `SHIPPED_ELSEWHERE` names that the tree ships has its row in
+/// `BUNDLE.toml`, each such row names a regular Mach-O of the tree, and that
+/// file's `LC_ID_DYLIB` current version is the one recorded: the comparison
+/// `--close` makes before its first round, so a row left stale by a pin
+/// bump is a violation here too. A tree with neither row nor file ships no
+/// framework.
+fn shipped_elsewhere_violations(spec: &BundleSpec, machos: &[MachO]) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for elsewhere in SHIPPED_ELSEWHERE {
+        let row = spec.components.libraries.contains_key(elsewhere.key);
+        let macho = machos.iter().find(|macho| macho.relative == elsewhere.file);
+        let reason = match (row, macho) {
+            (false, None) => continue,
+            (false, Some(_)) => format!(
+                "{}: the payload ships it, but {BUNDLE_FILE} has no row for it, which the notices must list",
+                elsewhere.file
+            ),
+            (true, None) => format!(
+                "{}: not a regular Mach-O file of the payload, which the row describes",
+                elsewhere.file
+            ),
+            (true, Some(macho)) => match elsewhere_matches(elsewhere, &macho.load_commands) {
+                Ok(()) => continue,
+                Err(reason) => reason,
+            },
+        };
+        violations.push(Violation {
+            binary: BUNDLE_FILE.to_owned(),
+            reference: format!("[components.{}]", elsewhere.key),
+            reason,
+        });
+    }
+    violations
 }
 
 struct DeclaredTargets {
@@ -870,6 +940,9 @@ fn write_bundle_toml(spec: &Path, out: &Path) -> Result<(), String> {
     let rendered = parsed
         .to_toml()
         .map_err(|error| format!("{}: {error}", spec.display()))?;
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
     fs::write(out, rendered).map_err(|error| format!("{}: {error}", out.display()))?;
     println!("[xtask] wrote {}", out.display());
     let notices = out.with_file_name(NOTICES_FILE);
@@ -921,10 +994,29 @@ fn build(root: &Path) -> Result<(), String> {
     for script in BUILD_SCRIPTS {
         run_script(root, script, &[])?;
     }
+    // assemble.sh already closed and checked the tree it swapped in; checking
+    // the final location proves the swap kept it whole.
+    let payload = payload_dir(root)?;
     println!(
-        "[xtask] build scripts finished; the dylib closure (docs/engines/payload-build.md step 7) is not scripted yet"
+        "[xtask] build scripts finished; checking {}",
+        payload.display()
     );
-    Ok(())
+    check(root, &payload)
+}
+
+/// Where `build/lib.sh`'s `payload_dir` assembles the tree:
+/// `$APPLEJACK_PAYLOAD_DIR`, else `fixtures/payloads/rosetta-wine-<wine version>`.
+fn payload_dir(root: &Path) -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("APPLEJACK_PAYLOAD_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let pins = load_pins(root)?;
+    let wine = pins
+        .get("wine")
+        .ok_or_else(|| format!("no pin with id `wine` in {PINS_FILE}"))?;
+    Ok(root
+        .join("fixtures/payloads")
+        .join(format!("rosetta-wine-{}", wine.version)))
 }
 
 fn run_script(root: &Path, script: &str, args: &[&str]) -> Result<(), String> {
@@ -946,15 +1038,15 @@ fn run_script(root: &Path, script: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-struct Entry {
-    relative: String,
-    absolute: PathBuf,
-    is_file: bool,
+pub(crate) struct Entry {
+    pub(crate) relative: String,
+    pub(crate) absolute: PathBuf,
+    pub(crate) is_file: bool,
     /// Set for a symlink: where it points, as stored.
-    link_target: Option<PathBuf>,
+    pub(crate) link_target: Option<PathBuf>,
 }
 
-fn walk(base: &Path, dir: &Path, entries: &mut Vec<Entry>) -> Result<(), String> {
+pub(crate) fn walk(base: &Path, dir: &Path, entries: &mut Vec<Entry>) -> Result<(), String> {
     let listing = fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     let mut children: Vec<PathBuf> = listing
         .map(|entry| entry.map(|entry| entry.path()))
@@ -1003,7 +1095,7 @@ const MACHO_MAGICS: [[u8; 4]; 8] = [
     [0xbf, 0xba, 0xfe, 0xca],
 ];
 
-fn is_macho(path: &Path) -> Result<bool, String> {
+pub(crate) fn is_macho(path: &Path) -> Result<bool, String> {
     let mut file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut magic = [0_u8; 4];
     let mut read = 0;
@@ -1019,7 +1111,7 @@ fn is_macho(path: &Path) -> Result<bool, String> {
     Ok(MACHO_MAGICS.contains(&magic))
 }
 
-fn otool(path: &Path, flag: &str) -> Result<String, String> {
+pub(crate) fn otool(path: &Path, flag: &str) -> Result<String, String> {
     let output = Command::new("otool")
         .arg(flag)
         .arg(path)
@@ -1048,15 +1140,104 @@ mod tests {
     use super::{
         ArchiveKind, BUNDLE_FILE, MachO, archive_kind, check_listing, declared_chain_targets,
         inspect, is_macho, list_archive, load_denylist, pkg_boms, reject_denylisted,
-        resolve_along_chains,
+        resolve_along_chains, shipped_elsewhere_violations,
     };
+    use crate::bundle_toml::{BundleSpec, SHIPPED_ELSEWHERE};
 
     /// The committed rendering of `build/bundle-spec.toml`: every `--check`
     /// reads the declared executables from it.
     const BUNDLE_TOML: &str = include_str!("../tests/fixtures/BUNDLE.toml");
 
+    /// The fixture without the rows for the two framework libraries: these
+    /// trees ship no framework, and a row whose file is absent is a
+    /// violation of its own (`a_framework_row_without_its_file_is_a_violation`).
     fn write_bundle_fixture(payload: &Path) {
+        let mut spec = BundleSpec::parse(BUNDLE_TOML).expect("the fixture parses");
+        for elsewhere in SHIPPED_ELSEWHERE {
+            spec.components.libraries.remove(elsewhere.key);
+        }
+        fs::write(payload.join(BUNDLE_FILE), spec.to_toml().expect("renders"))
+            .expect("BUNDLE.toml");
+    }
+
+    /// A tree whose `BUNDLE.toml` carries the two framework rows but holds
+    /// neither file reports each row, naming the file.
+    #[test]
+    fn a_framework_row_without_its_file_is_a_violation() {
+        let dir = scratch("framework-rows");
+        let payload = dir.join("payload");
+        fs::create_dir_all(payload.join("wine/lib")).expect("payload");
         fs::write(payload.join(BUNDLE_FILE), BUNDLE_TOML).expect("BUNDLE.toml");
+        let report = inspect(&root(), &payload).expect("report");
+        let violations: Vec<String> = report.violations.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            violations,
+            [
+                "BUNDLE.toml: [components.freetype] (wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib: not a regular Mach-O file of the payload, which the row describes)",
+                "BUNDLE.toml: [components.proxy-libintl] (wine/lib/GStreamer.framework/Versions/1.0/lib/libintl.8.dylib: not a regular Mach-O file of the payload, which the row describes)",
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A framework file as `inspect` scans it, at `current`.
+    fn framework_macho(file: &str, current: &str) -> MachO {
+        MachO {
+            relative: file.to_owned(),
+            listing: String::new(),
+            load_commands: format!(
+                "Load command 2\n          cmd LC_ID_DYLIB\n      cmdsize 48\n         name @rpath/x (offset 24)\n   time stamp 1 x\n      current version {current}\ncompatibility version 1.0.0\n"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_framework_file_reporting_another_version_is_a_violation() {
+        let spec = BundleSpec::parse(BUNDLE_TOML).expect("the fixture parses");
+        let [freetype, intl] = SHIPPED_ELSEWHERE else {
+            panic!("two rows");
+        };
+        let matching = [
+            framework_macho(freetype.file, freetype.current_version),
+            framework_macho(intl.file, intl.current_version),
+        ];
+        assert_eq!(shipped_elsewhere_violations(&spec, &matching), []);
+        let stale = [
+            framework_macho(freetype.file, "26.3.20"),
+            framework_macho(intl.file, intl.current_version),
+        ];
+        let violations = shipped_elsewhere_violations(&spec, &stale);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].reference, "[components.freetype]");
+        assert!(
+            violations[0]
+                .reason
+                .contains("current version is 26.3.20, not the 26.2.20"),
+            "{}",
+            violations[0].reason
+        );
+    }
+
+    /// The file decides: a framework file with no row is a violation, even
+    /// at the right version, and a tree with neither ships no framework.
+    #[test]
+    fn a_framework_file_without_its_row_is_a_violation() {
+        let mut spec = BundleSpec::parse(BUNDLE_TOML).expect("the fixture parses");
+        let [freetype, intl] = SHIPPED_ELSEWHERE else {
+            panic!("two rows");
+        };
+        spec.components.libraries.remove(freetype.key);
+        spec.components.libraries.remove(intl.key);
+        assert_eq!(shipped_elsewhere_violations(&spec, &[]), []);
+        let machos = [framework_macho(freetype.file, freetype.current_version)];
+        let violations = shipped_elsewhere_violations(&spec, &machos);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].reference, "[components.freetype]");
+        assert!(
+            violations[0].reason.contains("has no row for it"),
+            "{}",
+            violations[0].reason
+        );
     }
 
     fn root() -> PathBuf {
@@ -1779,6 +1960,40 @@ Load command 9
             outcome.left_to_dyld,
             [(module.to_owned(), "@rpath/libfreetype.6.dylib".to_owned())]
         );
+    }
+
+    /// The closed payload's own trap: Homebrew's `libfreetype.6.dylib` beside
+    /// the framework's, both `@rpath/libfreetype.6.dylib`; the framework's
+    /// `libpng16.16.56.0.dylib` and a `libpng16.16.dylib` differ and pass.
+    #[test]
+    fn two_regular_files_with_one_install_name_are_a_violation() {
+        let id = |name: &str| {
+            format!(
+                "Load command 0\n          cmd LC_ID_DYLIB\n         name @rpath/{name} (offset 24)\n"
+            )
+        };
+        let machos = [
+            macho("wine/bin/wine", "Load command 0\n          cmd LC_MAIN\n"),
+            macho("wine/lib/libfreetype.6.dylib", &id("libfreetype.6.dylib")),
+            macho(
+                "wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib",
+                &id("libfreetype.6.dylib"),
+            ),
+            macho("wine/lib/libpng16.16.dylib", &id("libpng16.16.dylib")),
+            macho(
+                "wine/lib/GStreamer.framework/Versions/1.0/lib/libpng16.16.56.0.dylib",
+                &id("libpng16.16.56.0.dylib"),
+            ),
+        ];
+        assert_eq!(
+            describe(&super::duplicate_install_names(&machos)),
+            [(
+                "wine/lib/libfreetype.6.dylib, wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib".to_owned(),
+                "@rpath/libfreetype.6.dylib".to_owned(),
+                "several regular files carry this install name; dyld keeps one image per install name per process, so load order would pick the library".to_owned(),
+            )]
+        );
+        assert_eq!(super::duplicate_install_names(&machos[..2]), []);
     }
 
     #[test]
