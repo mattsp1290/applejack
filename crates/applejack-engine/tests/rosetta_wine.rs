@@ -10,6 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::launch::{
     HOST_PATH, MONO_GECKO_OVERRIDE, PeMachine, check_32bit, child_path, dll_overrides_value,
@@ -976,6 +977,19 @@ fn real_base() -> MutexGuard<'static, ()> {
     REAL_BASE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// macOS marks a new socket close-on-exec only after creating it, so a child
+/// another test spawns in that window can hold the listener open until it exits.
+fn reads_dead(alive: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
 fn mode_of(path: &Path) -> Option<u32> {
     fs::metadata(path)
         .ok()
@@ -1030,7 +1044,7 @@ fn wineserver_liveness_follows_the_socket_under_a_base_directory() {
     stub.stop();
     assert!(socket.exists());
     assert!(
-        !wineserver_alive_in(base.path(), &prefix).unwrap(),
+        reads_dead(|| wineserver_alive_in(base.path(), &prefix).unwrap()),
         "a stale socket reads as dead"
     );
     drop(stub);
@@ -1090,7 +1104,7 @@ fn snapshot_restore_and_reset_refuse_a_prefix_with_a_live_wineserver() {
     // operations go through.
     stub.stop();
     assert!(socket.exists());
-    assert!(!wineserver_alive(&prefix).unwrap());
+    assert!(reads_dead(|| wineserver_alive(&prefix).unwrap()));
     snapshot::restore(&prefix, &root, "steam", &snap.timestamp).unwrap();
     assert_eq!(fs::read_to_string(prefix.join("system.reg")).unwrap(), "v1");
     drop(stub);
