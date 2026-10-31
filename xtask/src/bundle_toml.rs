@@ -174,6 +174,15 @@ const RESERVED_VERSION_SUFFIXES: [&str; 3] = [".partial", ".user", ".download"];
 /// Wine's license is not a `[wine]` field (the reader's table has none), so
 /// the notices file names it here.
 const WINE_LICENSE: &str = "LGPL-2.1-or-later";
+/// The repository holding `build/wine/patches/`, and the notice LGPL-2.1
+/// section 2(b) asks for. A new patch updates the date and the credit, which
+/// repeat the `Origin:` and `Date:` headers of the patches.
+const WINE_PATCHES_REPOSITORY: &str = "https://github.com/mattsp1290/applejack";
+const WINE_PATCHES_CHANGED: &str = "2026-10-31";
+const WINE_PATCHES_CREDIT: &str = "adapted from https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3 by cyy";
+/// The revision in the notices when the renderer is given none, which is what
+/// the checked-in fixtures carry; `build/assemble.sh` passes the commit.
+pub(crate) const DEFAULT_PATCHES_REV: &str = "main";
 
 impl BundleSpec {
     /// Parses a spec file written in the same shape as the output.
@@ -199,12 +208,13 @@ impl BundleSpec {
 
     /// Renders `THIRD_PARTY_NOTICES.md` from the `[wine]` and `[components]`
     /// tables: one row per shipped third-party part with its version, SPDX
-    /// license, and location in the bundle.
+    /// license, and location in the bundle. `patches_rev` is the revision of
+    /// the repository whose `build/wine/patches/` this Wine carries.
     ///
     /// # Errors
     ///
     /// Returns the first validation failure.
-    pub fn to_notices(&self) -> Result<String, Error> {
+    pub fn to_notices(&self, patches_rev: &str) -> Result<String, Error> {
         self.validate()?;
         let mut out = String::new();
         let _ = writeln!(out, "# Third-party notices");
@@ -225,7 +235,7 @@ impl BundleSpec {
         let _ = writeln!(out, "| --- | --- | --- | --- |");
         let _ = writeln!(
             out,
-            "| Wine | {} | {WINE_LICENSE} | `wine/` (built from {} at `{}`, with the patches in the repository's `build/wine/patches/`) |",
+            "| Wine | {} | {WINE_LICENSE} | `wine/` (built from {} at `{}`, changed on {WINE_PATCHES_CHANGED} by the patches at {WINE_PATCHES_REPOSITORY}/tree/{patches_rev}/build/wine/patches, {WINE_PATCHES_CREDIT}) |",
             self.wine.version, self.wine.source_url, self.wine.source_rev
         );
         for (name, component, location) in self.components.rows() {
@@ -824,8 +834,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        BundleSpec, Component, Components, D3DMetal, DllOverrides, Overrides, Probes, Registry,
-        Wine, Wow64,
+        BundleSpec, Component, Components, D3DMetal, DEFAULT_PATCHES_REV, DllOverrides, Overrides,
+        Probes, Registry, Wine, Wow64,
     };
 
     fn component(version: &str, license: &str) -> Component {
@@ -975,6 +985,18 @@ mod tests {
     }
 
     #[test]
+    fn notices_name_where_to_get_the_wine_patches_and_when_they_changed() {
+        let notices = spec().to_notices("0123abcd").expect("renders");
+        for needle in [
+            "https://github.com/mattsp1290/applejack/tree/0123abcd/build/wine/patches",
+            "changed on 2026-10-31",
+            "https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3 by cyy",
+        ] {
+            assert!(notices.contains(needle), "{needle}");
+        }
+    }
+
+    #[test]
     fn a_versioned_formula_row_round_trips_as_a_quoted_key() {
         let mut spec = spec();
         spec.components
@@ -987,7 +1009,7 @@ mod tests {
         assert!(text.contains("\"openssl@3\""), "{text}");
         assert!(text.contains("\"c++.utils\""), "{text}");
         assert_eq!(BundleSpec::parse(&text).expect("parses"), spec);
-        let notices = spec.to_notices().expect("renders");
+        let notices = spec.to_notices(DEFAULT_PATCHES_REV).expect("renders");
         assert!(
             notices.contains("| openssl@3 | 3.5.1 | Apache-2.0 |"),
             "{notices}"
@@ -1031,7 +1053,7 @@ mod tests {
     fn an_or_license_names_the_exercised_option_in_the_notices() {
         assert!(
             !spec()
-                .to_notices()
+                .to_notices(DEFAULT_PATCHES_REV)
                 .expect("renders")
                 .contains("OR` expression")
         );
@@ -1047,7 +1069,7 @@ mod tests {
                 "(GPL-2.0-or-later OR LGPL-3.0-or-later) AND Unicode-DFS-2016",
             ),
         );
-        let notices = dual.to_notices().expect("renders");
+        let notices = dual.to_notices(DEFAULT_PATCHES_REV).expect("renders");
         assert!(
             notices.contains(
                 "Where a license above is an `OR` expression (gmp, libidn2), this bundle exercises\nthe LGPL-3.0-or-later option of that choice; any `AND` terms apply as written."
@@ -1058,7 +1080,7 @@ mod tests {
         bad.components
             .libraries
             .insert("x".into(), component("1", "MIT OR GPL-2.0-only"));
-        let error = bad.to_notices().unwrap_err();
+        let error = bad.to_notices(DEFAULT_PATCHES_REV).unwrap_err();
         assert!(error.to_string().contains("offers a choice"), "{error}");
     }
 
@@ -1071,7 +1093,7 @@ mod tests {
             spec.components
                 .libraries
                 .insert("x".into(), component("1", license));
-            spec.to_notices()
+            spec.to_notices(DEFAULT_PATCHES_REV)
         };
         for real in [
             "LGPL-3.0-or-later OR GPL-2.0-or-later",
@@ -1154,7 +1176,7 @@ mod tests {
             .insert("b".into(), component("1", "MIT"));
         assert!(
             nested
-                .to_notices()
+                .to_notices(DEFAULT_PATCHES_REV)
                 .expect("renders")
                 .contains("`OR` expression (a), this bundle"),
         );
@@ -1173,7 +1195,7 @@ mod tests {
             .components
             .libraries
             .insert("proxy-libintl".into(), component("1", "LGPL-2.0-or-later"));
-        let notices = elsewhere.to_notices().expect("renders");
+        let notices = elsewhere.to_notices(DEFAULT_PATCHES_REV).expect("renders");
         assert!(
             notices.contains(
                 "| freetype | 2.13.3 | FTL | `wine/lib/GStreamer.framework/Versions/1.0/lib/libfreetype.6.dylib` (`LC_ID_DYLIB` current version 26.2.20; FreeType as the GStreamer framework ships it"
@@ -1191,7 +1213,12 @@ mod tests {
             "{notices}"
         );
         assert!(!notices.contains("copied by the dylib closure)\n| freetype"));
-        assert!(!spec().to_notices().expect("renders").contains("FreeType"));
+        assert!(
+            !spec()
+                .to_notices(DEFAULT_PATCHES_REV)
+                .expect("renders")
+                .contains("FreeType")
+        );
 
         // The row's version is the table's: a bumped row with the table
         // unchanged is refused, naming both.
@@ -1199,7 +1226,10 @@ mod tests {
             .components
             .libraries
             .insert("freetype".into(), component("2.14.0", "FTL"));
-        let error = elsewhere.to_notices().unwrap_err().to_string();
+        let error = elsewhere
+            .to_notices(DEFAULT_PATCHES_REV)
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains(
                 "`components.freetype.version` is `2.14.0`, but SHIPPED_ELSEWHERE records 2.13.3"
@@ -1366,6 +1396,9 @@ mod tests {
         assert_eq!(BundleSpec::parse(&expected).expect("fixture parses"), spec);
         let notices = xtask.join("tests/fixtures/THIRD_PARTY_NOTICES.md");
         let expected = fs::read_to_string(&notices).expect("tests/fixtures/THIRD_PARTY_NOTICES.md");
-        assert_eq!(spec.to_notices().expect("renders"), expected);
+        assert_eq!(
+            spec.to_notices(DEFAULT_PATCHES_REV).expect("renders"),
+            expected
+        );
     }
 }

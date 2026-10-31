@@ -7,8 +7,10 @@
 
 id = "rosetta-wine"
 # Bundle version: Wine version, then the bundle revision. Directory name under
-# engines/rosetta-wine/, so lowercase [0-9a-z._+-] starting with a digit.
-version = "11.0-1"
+# engines/rosetta-wine/, so lowercase [0-9a-z._+-] starting with a digit. Any
+# change to what the bundle ships bumps the revision: `engine install` refuses a
+# version that is already installed.
+version = "11.0-2"
 arch = "x86_64"
 # MACOSX_DEPLOYMENT_TARGET in build/wine/build.sh.
 min_macos = "14.0"
@@ -92,8 +94,10 @@ sdl2 = { version = "2.32.8", license = "Zlib" }
 # Bundle-relative DLL paths per Windows architecture; the installer copies
 # each into the prefix and overrides its stem. winemetal.dll is DXMT's bridge
 # to wine/lib/wine/x86_64-unix/winemetal.so, marked builtin, so the copy Wine
-# loads is the one under wine/lib/wine/<arch>-windows; nvapi64.dll and
-# nvngx.dll are optional and not shipped.
+# loads is the one under wine/lib/wine/<arch>-windows. nvapi64.dll and
+# nvngx.dll ship under dxmt/x86_64-windows, because the release has them, but
+# are not overridden and keep the marker; listing them here also takes adding
+# them to NATIVE_STEMS in xtask/src/dxmt.rs.
 [overrides.dxmt]
 x86_64 = [
   "dxmt/x86_64-windows/d3d11.dll",

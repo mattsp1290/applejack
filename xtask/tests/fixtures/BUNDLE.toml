@@ -1,5 +1,5 @@
 id = "rosetta-wine"
-version = "11.0-1"
+version = "11.0-2"
 arch = "x86_64"
 min_macos = "14.0"
 sync_modes = ["esync", "none"]

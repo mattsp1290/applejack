@@ -366,6 +366,7 @@ pub(crate) fn spawn(
         });
     }
     check_32bit(installed, &prefix.dir, &spec.cwd, &spec.exe)?;
+    check_dxmt_copies(&prefix.dir, prefix.backend)?;
     let id = new_session_id("launch");
     let log_path = spec.log_dir.join(&id).join("wine.log");
     let rows = engine_rows(
@@ -536,6 +537,40 @@ pub fn resolve_exe(prefix_dir: &Path, cwd: &Path, exe: &Path) -> PathBuf {
         return prefix_dir.join("dosdevices").join(drive).join(rest);
     }
     cwd.join(text.replace('\\', "/"))
+}
+
+/// `builtin_signature` in Wine's `dlls/ntdll/loader.c`, right after the 64-byte
+/// DOS header.
+const BUILTIN_MARKER: &[u8] = b"Wine builtin DLL\0";
+const BUILTIN_MARKER_OFFSET: usize = 0x40;
+
+/// Refuses a `dxmt` prefix made with an engine before 11.0-2, whose `d3d11.dll`
+/// still carries Wine's builtin marker. Wine takes such a copy for a
+/// placeholder and quietly loads its own, so the title would otherwise fail in
+/// `D3D11CreateDeviceAndSwapChain` with nothing naming the cause. A file that
+/// cannot be read passes: the launch reports its own error.
+///
+/// # Errors
+///
+/// Returns [`Error::PrefixUnusable`].
+pub fn check_dxmt_copies(prefix_dir: &Path, backend: GraphicsBackend) -> Result<()> {
+    if backend != GraphicsBackend::Dxmt {
+        return Ok(());
+    }
+    let d3d11 = prefix_dir.join("drive_c/windows/system32/d3d11.dll");
+    let mut head = [0; BUILTIN_MARKER_OFFSET + BUILTIN_MARKER.len()];
+    let marked = File::open(d3d11)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok()
+        && head.ends_with(BUILTIN_MARKER);
+    if marked {
+        return Err(Error::PrefixUnusable {
+            path: prefix_dir.to_path_buf(),
+            reason: "its DXMT DLLs came from an engine before 11.0-2 and Wine would ignore \
+                     them; activate a newer engine and run `applejack prefix reset`",
+        });
+    }
+    Ok(())
 }
 
 /// Refuses a 32-bit executable when the bundle runs 64-bit code only. A

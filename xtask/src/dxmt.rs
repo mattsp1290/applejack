@@ -24,7 +24,9 @@ const WINEMETAL: &str = "winemetal.dll";
 const BUILTIN_MARKER: &[u8] = b"Wine builtin DLL\0";
 const MARKER_OFFSET: usize = 0x40;
 
+const WINE_LOADER: &str = "wine/bin/wine";
 const WINE_MODULES: &str = "wine/lib/wine";
+const WINEMETAL_SO: &str = "wine/lib/wine/x86_64-unix/winemetal.so";
 const WINEMAC: &str = "wine/lib/wine/x86_64-unix/winemac.so";
 /// As `nm` prints it, with the Mach-O underscore.
 const MACDRV_FUNCTIONS: &str = "_macdrv_functions";
@@ -62,8 +64,12 @@ pub fn place(payload: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// What `--check` reports. A tree with no `dxmt/` ships no such backend and a
-/// tree with no built Wine has nothing to place into, as in a partial assembly.
+/// What `--check` can see of the DXMT setup: the DLLs that must be there and
+/// their markers, the two native pieces, and the name of an export. It reads
+/// neither the table nor what the patched `winemac.so` does with it; only
+/// running `dx11-sample` (gate G4c) proves those. A tree with no `dxmt/` ships
+/// no such backend, and one with no built Wine has nothing to place into, as
+/// in a partial assembly.
 pub fn violations(payload: &Path) -> Result<Vec<Violation>, String> {
     let mut violations = Vec::new();
     if !payload.join("dxmt").is_dir() {
@@ -72,30 +78,34 @@ pub fn violations(payload: &Path) -> Result<Vec<Violation>, String> {
     for arch in ARCH_DIRS {
         for stem in NATIVE_STEMS {
             let relative = format!("dxmt/{arch}/{stem}.dll");
-            let path = payload.join(&relative);
-            if path.is_file()
-                && has_marker(&fs::read(&path).map_err(|error| format!("{relative}: {error}"))?)
-            {
-                violations.push(Violation {
+            match marked(payload, &relative)? {
+                None => violations.push(missing_dll(relative)),
+                Some(true) => violations.push(Violation {
                     binary: relative,
                     reference: "Wine builtin DLL".to_owned(),
                     reason: "marked DLLs in system32 are placeholders, so Wine would load its own instead (xtask engine-payload --place-dxmt)".to_owned(),
-                });
+                }),
+                Some(false) => {}
             }
         }
+        require_builtin(payload, format!("dxmt/{arch}/{WINEMETAL}"), &mut violations)?;
     }
-    if !payload.join(WINE_MODULES).is_dir() {
+    if !payload.join(WINE_LOADER).exists() {
         return Ok(violations);
     }
     for arch in ARCH_DIRS {
-        let relative = format!("{WINE_MODULES}/{arch}/{WINEMETAL}");
-        if !payload.join(&relative).is_file() {
-            violations.push(Violation {
-                binary: relative,
-                reference: WINEMETAL.to_owned(),
-                reason: "missing; it only reaches winemetal.so as a builtin (xtask engine-payload --place-dxmt)".to_owned(),
-            });
-        }
+        require_builtin(
+            payload,
+            format!("{WINE_MODULES}/{arch}/{WINEMETAL}"),
+            &mut violations,
+        )?;
+    }
+    if !payload.join(WINEMETAL_SO).is_file() {
+        violations.push(Violation {
+            binary: WINEMETAL_SO.to_owned(),
+            reference: WINEMETAL.to_owned(),
+            reason: "missing; it is the native half winemetal.dll calls".to_owned(),
+        });
     }
     let winemac = payload.join(WINEMAC);
     if !winemac.is_file() || !exports(&winemac, MACDRV_FUNCTIONS)? {
@@ -108,6 +118,43 @@ pub fn violations(payload: &Path) -> Result<Vec<Violation>, String> {
         });
     }
     Ok(violations)
+}
+
+/// Whether the file carries the marker, or `None` when it is not there.
+fn marked(payload: &Path, relative: &str) -> Result<Option<bool>, String> {
+    let path = payload.join(relative);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let image = fs::read(&path).map_err(|error| format!("{relative}: {error}"))?;
+    Ok(Some(has_marker(&image)))
+}
+
+fn missing_dll(relative: String) -> Violation {
+    Violation {
+        reference: relative.rsplit('/').next().unwrap_or_default().to_owned(),
+        binary: relative,
+        reason: "missing (xtask engine-payload --place-dxmt)".to_owned(),
+    }
+}
+
+/// `winemetal.dll` reaches `winemetal.so` only as a builtin, so every copy
+/// keeps the marker.
+fn require_builtin(
+    payload: &Path,
+    relative: String,
+    violations: &mut Vec<Violation>,
+) -> Result<(), String> {
+    match marked(payload, &relative)? {
+        None => violations.push(missing_dll(relative)),
+        Some(false) => violations.push(Violation {
+            binary: relative,
+            reference: "Wine builtin DLL".to_owned(),
+            reason: "no marker; Wine would not give it winemetal.so".to_owned(),
+        }),
+        Some(true) => {}
+    }
+    Ok(())
 }
 
 fn exports(path: &Path, symbol: &str) -> Result<bool, String> {
@@ -136,8 +183,8 @@ mod tests {
     use std::process::{Command, Stdio};
 
     use super::{
-        ARCH_DIRS, BUILTIN_MARKER, MARKER_OFFSET, NATIVE_STEMS, WINEMAC, WINEMETAL, place,
-        violations,
+        ARCH_DIRS, BUILTIN_MARKER, MARKER_OFFSET, NATIVE_STEMS, WINE_LOADER, WINEMAC, WINEMETAL,
+        WINEMETAL_SO, place, violations,
     };
 
     fn scratch(name: &str) -> PathBuf {
@@ -176,6 +223,15 @@ mod tests {
 
     /// A tree as `assemble.sh` copies it, before `place`.
     fn unplaced(payload: &Path) {
+        unplaced_without_wine(payload);
+        let loader = payload.join(WINE_LOADER);
+        fs::create_dir_all(loader.parent().expect("parent")).expect("bin");
+        fs::write(loader, b"").expect("loader");
+        winemac(payload, EXPORTED);
+        fs::write(payload.join(WINEMETAL_SO), b"").expect("winemetal.so");
+    }
+
+    fn unplaced_without_wine(payload: &Path) {
         for arch in ARCH_DIRS {
             let dxmt = payload.join("dxmt").join(arch);
             fs::create_dir_all(&dxmt).expect("dxmt");
@@ -184,7 +240,6 @@ mod tests {
             }
             fs::write(dxmt.join(WINEMETAL), marked_dll()).expect("winemetal");
         }
-        winemac(payload, EXPORTED);
     }
 
     fn reported(payload: &Path) -> Vec<String> {
@@ -273,10 +328,67 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_dll_is_a_violation_for_either_architecture() {
+        let payload = scratch("missing-dll");
+        unplaced(&payload);
+        place(&payload).expect("place");
+        for arch in ARCH_DIRS {
+            for name in ["d3d11.dll", "dxgi.dll", "d3d10core.dll", WINEMETAL] {
+                let relative = format!("dxmt/{arch}/{name}");
+                let path = payload.join(&relative);
+                let image = fs::read(&path).expect("dll");
+                fs::remove_file(&path).expect("remove");
+                assert_eq!(reported(&payload), std::slice::from_ref(&relative));
+                fs::write(&path, image).expect("restore");
+            }
+        }
+        let _ = fs::remove_dir_all(&payload);
+    }
+
+    #[test]
+    fn every_winemetal_must_keep_its_marker() {
+        let payload = scratch("unmarked");
+        unplaced(&payload);
+        place(&payload).expect("place");
+        let unmarked = vec![0_u8; 0x100];
+        for arch in ARCH_DIRS {
+            for dir in ["dxmt", "wine/lib/wine"] {
+                let relative = format!("{dir}/{arch}/{WINEMETAL}");
+                fs::write(payload.join(&relative), &unmarked).expect("winemetal");
+                assert_eq!(reported(&payload), std::slice::from_ref(&relative));
+                fs::write(payload.join(&relative), marked_dll()).expect("winemetal");
+            }
+        }
+        let _ = fs::remove_dir_all(&payload);
+    }
+
+    #[test]
+    fn a_missing_winemetal_so_is_a_violation() {
+        let payload = scratch("missing-so");
+        unplaced(&payload);
+        place(&payload).expect("place");
+        fs::remove_file(payload.join(WINEMETAL_SO)).expect("remove");
+        assert_eq!(reported(&payload), [WINEMETAL_SO]);
+        let _ = fs::remove_dir_all(&payload);
+    }
+
+    #[test]
+    fn a_built_wine_is_judged_even_if_its_module_directory_is_gone() {
+        let payload = scratch("no-modules");
+        unplaced(&payload);
+        place(&payload).expect("place");
+        fs::remove_dir_all(payload.join("wine/lib/wine")).expect("remove");
+        assert_eq!(reported(&payload).len(), 4);
+        let _ = fs::remove_dir_all(&payload);
+    }
+
+    #[test]
     fn a_tree_without_dxmt_or_without_wine_is_not_judged_on_what_it_lacks() {
         let payload = scratch("partial");
         assert_eq!(reported(&payload), Vec::<String>::new());
-        fs::create_dir_all(payload.join("dxmt/x86_64-windows")).expect("dxmt");
+        unplaced_without_wine(&payload);
+        place(&payload).expect("place");
+        fs::create_dir_all(payload.join("wine/lib/wine/x86_64-unix")).expect("as assemble.sh");
         assert_eq!(reported(&payload), Vec::<String>::new());
         let _ = fs::remove_dir_all(&payload);
     }

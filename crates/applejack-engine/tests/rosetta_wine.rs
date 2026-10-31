@@ -13,8 +13,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::launch::{
-    HOST_PATH, MONO_GECKO_OVERRIDE, PeMachine, check_32bit, child_path, dll_overrides_value,
-    engine_rows, pe_machine, resolve_exe,
+    HOST_PATH, MONO_GECKO_OVERRIDE, PeMachine, check_32bit, check_dxmt_copies, child_path,
+    dll_overrides_value, engine_rows, pe_machine, resolve_exe,
 };
 use applejack_engine::rosetta_wine::prefix::{
     PREFIX_STEPS, PrefixRecord, PrefixStep, STATE_DIR, backend_available, override_stems,
@@ -507,6 +507,46 @@ fn launch_refuses_a_prefix_of_another_engine() {
         RosettaWine.launch(&engine, &prefix, &spec).unwrap_err(),
         Error::InvalidPrefix { reason, .. } if reason.contains("native-arm64")
     ));
+}
+
+fn dll_with_marker(marker: &[u8]) -> Vec<u8> {
+    let mut image = vec![0_u8; 0x100];
+    image[..2].copy_from_slice(b"MZ");
+    image[0x40..0x40 + marker.len()].copy_from_slice(marker);
+    image
+}
+
+#[test]
+fn a_dxmt_prefix_with_marked_dlls_is_refused_and_says_what_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = installed(dir.path());
+    let prefix_dir = dir.path().join("prefix");
+    let system32 = prefix_dir.join("drive_c/windows/system32");
+    fs::create_dir_all(&system32).unwrap();
+    let d3d11 = system32.join("d3d11.dll");
+    fs::write(&d3d11, dll_with_marker(b"Wine builtin DLL\0")).unwrap();
+    let mut prefix = prefix_for(&engine, &prefix_dir);
+    let spec = LaunchSpec {
+        exe: PathBuf::from("C:\\x.exe"),
+        args: Vec::new(),
+        env_extras: Vec::new(),
+        cwd: dir.path().to_path_buf(),
+        log_dir: dir.path().join("logs"),
+        advertise_avx: false,
+        cpuid_probe: None,
+    };
+    assert!(matches!(
+        RosettaWine.launch(&engine, &prefix, &spec).unwrap_err(),
+        Error::PrefixUnusable { reason, .. } if reason.contains("prefix reset")
+    ));
+
+    prefix.backend = GraphicsBackend::WineD3D;
+    check_dxmt_copies(&prefix.dir, prefix.backend).unwrap();
+    prefix.backend = GraphicsBackend::Dxmt;
+    fs::write(&d3d11, dll_with_marker(b"")).unwrap();
+    check_dxmt_copies(&prefix.dir, prefix.backend).unwrap();
+    fs::remove_file(&d3d11).unwrap();
+    check_dxmt_copies(&prefix.dir, prefix.backend).unwrap();
 }
 
 fn os(items: &[&str]) -> Vec<OsString> {

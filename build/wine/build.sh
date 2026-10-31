@@ -11,6 +11,9 @@
 #   WINE_SKIP_MSYNC=1      do not attempt the msync patches (gate G4b)
 # Reruns skip the patch steps through the stamps build/work/wine/.msync-applied
 # and .patches-applied, which build/wine/fetch.sh removes when it re-extracts.
+# The second line of .patches-applied is the digest of the set the tree carries;
+# a different set in build/wine/patches stops here, since patches only go on
+# pristine source.
 set -eu
 . "$(dirname "$0")/../lib.sh"
 
@@ -272,8 +275,13 @@ fi
 # tree only when every patch applied there, so a failing set never leaves the
 # tree half patched. In preflight the clone is the unpatched tree, since msync
 # is only "would apply" there; the real run patches after msync.
+PATCH_SET_DIGEST=$(patch_set_digest)
 if [ -f "$PATCHES_STAMP" ]; then
-  echo "project patches: stamp present; step skipped"
+  if [ "$(sed -n 2p "$PATCHES_STAMP")" = "$PATCH_SET_DIGEST" ]; then
+    echo "project patches: stamp matches build/wine/patches; step skipped"
+  else
+    fail "a tree patched with build/wine/patches as they are now: the set changed since $WINE_SRC was patched (sh build/wine/fetch.sh, then rerun)"
+  fi
 else
   set -- "$ROOT"/build/wine/patches/*.patch
   if [ -f "$1" ]; then
@@ -304,11 +312,13 @@ else
       else
         echo "applied $# project patch(es):$names"
       fi
-      write_stamp "$PATCHES_STAMP" "${names# }"
+      write_stamp "$PATCHES_STAMP" "${names# }
+$PATCH_SET_DIGEST"
     fi
   else
     echo "project patches: none"
-    write_stamp "$PATCHES_STAMP" ""
+    write_stamp "$PATCHES_STAMP" "
+$PATCH_SET_DIGEST"
   fi
 fi
 

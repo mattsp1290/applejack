@@ -87,7 +87,16 @@ copy_probe "$probes/xinput-check-x86_64.exe" xinput-check.exe "sh crates/appleja
 copy_probe "$probes/cpuid" cpuid "sh crates/applejack-engine/probes/cpuid/build.sh"
 copy_probe "$WORK/osslsigncode/osslsigncode" osslsigncode "sh build/osslsigncode/build.sh"
 
-xtask engine-payload --write-bundle-toml "$ROOT/build/bundle-spec.toml" "$T/BUNDLE.toml"
+# The notices name the revision of the patches this Wine carries, so a built
+# Wine must come from the committed set.
+patches_rev=""
+if [ -x "$T/wine/bin/wine" ]; then
+  [ "$(sed -n 2p "$WORK/wine/.patches-applied")" = "$(patch_set_digest)" ] || { echo "assemble: build/work/wine/stage does not carry build/wine/patches as they are now (sh build/wine/fetch.sh && sh build/wine/build.sh)" >&2; exit 1; }
+  [ -z "$(git -C "$ROOT" status --porcelain -- build/wine/patches)" ] || { echo "assemble: commit build/wine/patches first; the notices name their revision" >&2; exit 1; }
+  patches_rev=$(git -C "$ROOT" log -1 --format=%H -- build/wine/patches)
+  [ -n "$patches_rev" ] || { echo "assemble: no commit touches build/wine/patches" >&2; exit 1; }
+fi
+xtask engine-payload --write-bundle-toml "$ROOT/build/bundle-spec.toml" "$T/BUNDLE.toml" ${patches_rev:+"$patches_rev"}
 
 # Last, so a reassembly never loses it: the closure reads BUNDLE.toml for the
 # library rows it records provenance against, and checks the closed tree.

@@ -74,6 +74,16 @@ mingw_cc() {
   fi
 }
 
+# patch_set_digest: identifies build/wine/patches by file names and contents.
+patch_set_digest() {
+  (
+    cd "$ROOT/build/wine/patches" || exit
+    for patch in *.patch; do
+      [ ! -f "$patch" ] || shasum -a 256 "$patch"
+    done
+  ) | shasum -a 256 | cut -d' ' -f1
+}
+
 # bison_accepts <bison>: true when <bison> takes the grammar wine-11.0's
 # configure feeds it (wine_cv_recent_bison); Apple's bison 2.3 does not.
 bison_accepts() {
