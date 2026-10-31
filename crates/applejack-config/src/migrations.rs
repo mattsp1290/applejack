@@ -9,10 +9,16 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("schema.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("schema.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("schema_v2.sql"),
+    },
+];
 
 pub(crate) const LATEST_VERSION: u32 = match MIGRATIONS.last() {
     Some(migration) => migration.version,
@@ -75,5 +81,32 @@ pub(crate) fn stored_version(conn: &Connection) -> Result<u32, Error> {
             .trim()
             .parse()
             .map_err(|_| Error::InvalidSchemaVersion(text)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_versions_are_contiguous_from_one() {
+        for (index, migration) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(migration.version as usize, index + 1);
+        }
+    }
+
+    #[test]
+    fn a_stored_version_that_is_not_a_number_is_refused() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_pending(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = 'two' WHERE key = ?1",
+            [SCHEMA_VERSION_KEY],
+        )
+        .unwrap();
+        assert!(matches!(
+            stored_version(&conn),
+            Err(Error::InvalidSchemaVersion(text)) if text == "two"
+        ));
     }
 }
