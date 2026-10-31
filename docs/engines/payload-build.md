@@ -264,7 +264,11 @@ Environment knobs:
      optional (copied when the x86-64 Homebrew has unixODBC, skipped with
      a message otherwise). A SONAME that is neither in the table nor in
      the x86-64 Homebrew fails the closure, and so does one the payload
-     already ships somewhere without a table row. Every Unix module under
+     already ships somewhere without a table row. The slot under
+     `wine/lib/` holds a dylib or nothing: a regular file there that is no
+     Mach-O, or a link there that resolves to anything but a dylib, is
+     refused naming the target, since `dlopen` of the leaf would fail at
+     run time whatever the slot is called. Every Unix module under
      `wine/lib/wine/` whose bytes contain a supplied SONAME is a `dlopen`
      caller and gets `LC_RPATH @loader_path/../..`, which is `wine/lib/`.
      The run path goes on the callers, not on the executables, because the
@@ -279,15 +283,20 @@ Environment knobs:
      `/System` becomes `@rpath/<file name>`; an absolute `LC_RPATH` outside
      them is deleted; a dependency on an absolute non-system path (a
      Homebrew `opt/` or `Cellar/` path) is rewritten to `@rpath/<leaf>`
-     and bound to `wine/lib/<leaf>` when that exists (the closure's own
-     copies and policy links), else to the one file of that name another
-     component ships, which takes a `SONAME_POLICY` row naming the file:
-     the framework's proxy-libintl `libintl.8.dylib` for gnutls and
-     libidn2. Either way the planner checks the dependent's required
-     compatibility version against the file's `LC_ID_DYLIB` current
-     version and fails with both numbers when the requirement is higher,
-     unless the row carries `allow_older_compat` with a reason, which
-     every round that relies on it prints. The libintl row does: gnutls
+     and bound to `wine/lib/<leaf>` when that exists, else to the one file
+     of that name another component ships. One rule decides either way,
+     over the regular file the path resolves to: the closure's own copies
+     under `wine/lib/` bind on their version alone, and a file in another
+     component's tree, reached directly or through a link under
+     `wine/lib/`, takes a `SONAME_POLICY` row naming the file (the
+     framework's proxy-libintl `libintl.8.dylib` for gnutls and libidn2;
+     a hand-placed link to the framework's glib binds nothing). The
+     planner then checks the dependent's required compatibility version
+     against the file's `LC_ID_DYLIB` current version and fails with both
+     numbers when the requirement is higher, unless the row carries
+     `allow_older_compat` with a reason, which the run that makes the
+     binding prints once (a later run has nothing left to rebind, so the
+     line does not recur). The libintl row does: gnutls
      and libidn2 record 13.0.0 against gettext 0.26, proxy-libintl reports
      10.5.0, the two symbols they import are exported, and dyld does not
      enforce the compatibility version (observed on macOS 26; unverified
@@ -318,9 +327,11 @@ Environment knobs:
      component, and `apply` walks each path component by component again
      before writing, as the engine's install check does, and refuses to
      overwrite anything the plan expected absent. What a round rewrites or
-     replaces is journaled first (a pre-existing link as its target, so it
-     comes back as a link), and the rollback message counts created paths
-     removed and pre-existing files restored separately.
+     replaces is journaled first, and the rollback message counts created
+     paths removed and pre-existing files restored separately. A
+     pre-existing link is never written through or replaced, so nothing
+     restores one; the journal can still record a link as its target, a
+     branch only its unit test reaches.
    - **Gates.** Before a round lands, the destinations are scanned against
      `build/denylist.toml`, and every copy's Homebrew provenance
      (`/usr/local/Cellar/<formula>/<version>/`) must match a
