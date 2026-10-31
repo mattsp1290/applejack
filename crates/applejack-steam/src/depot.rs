@@ -461,16 +461,16 @@ impl<'m> Layers<'m> {
 
     /// The name matters as well as the content: on a case-sensitive volume a
     /// respelled path is a new file.
-    fn changed(&self, file: &ManifestFile) -> bool {
+    fn changed(&self, file: &ManifestFile, install_dir: &Path) -> bool {
         let key = path_key(file);
         let moved = self.before.get(&key).is_none_or(|(_, before)| {
             before.normalized_path() != file.normalized_path() || !same_content(before, file)
         });
         moved
-            || self
-                .abandoned
-                .get(&key)
-                .is_some_and(|left| left.iter().any(|old| !same_content(old, file)))
+            || self.abandoned.get(&key).is_some_and(|left| {
+                left.iter()
+                    .any(|old| !same_content(old, file) && landed(install_dir, old))
+            })
     }
 
     /// The entries of `depot` this run has to write.
@@ -486,7 +486,7 @@ impl<'m> Layers<'m> {
             .iter()
             .filter(|file| self.owns(depot.depot_id, file))
             .filter(move |file| {
-                let changed = self.changed(file);
+                let changed = self.changed(file, install_dir);
                 (rescan || changed) && !keeps_user_copy(file, install_dir, changed)
             })
     }
@@ -1019,7 +1019,7 @@ impl<S: SteamSession> Run<'_, '_, S> {
             depots: kept,
             complete: every_depot_known,
         } = kept;
-        let kept = promote_heirs(&mut work, kept);
+        let kept = promote_heirs(&mut work, kept, &install_dir);
         work.sort_by_key(|depot| depot.depot_id);
         let layers = Layers::new(&work, &kept);
         // A symlink here on a title with no `.acf` may be anything. On an
@@ -1037,16 +1037,16 @@ impl<S: SteamSession> Run<'_, '_, S> {
         let mut tally = Tally::default();
         let queued = queue_files(&record, &work, &layers, &install_dir, &mut tally);
 
-        // Checked before the record exists on disk: a refused run wrote
-        // nothing, and a record would hold the title back from launching.
+        // Before the record exists on disk: a refused run wrote nothing, and a
+        // record would hold the title back from launching.
+        fs::create_dir_all(&install_dir).map_err(|source| io_error(appid, &install_dir, source))?;
         refuse_links_out(&install_dir, &queued)?;
         record.save(&record_path, appid)?;
-        fs::create_dir_all(&install_dir).map_err(|source| io_error(appid, &install_dir, source))?;
 
         // Without every manifest, nothing can be proved stale.
         let current = current_entries(&work, &kept);
         let stale = if every_depot_known {
-            stale_names(&work, &current)
+            stale_names(&work, &current, &install_dir)
         } else {
             BTreeSet::new()
         };
@@ -1372,16 +1372,18 @@ struct Kept {
 
 /// Moves into `work` each kept depot that came to own a path, which happens
 /// when a later depot drops an overlay, and returns the rest.
-fn promote_heirs(work: &mut Vec<WorkDepot>, kept: Vec<KeptDepot>) -> Vec<KeptDepot> {
+fn promote_heirs(
+    work: &mut Vec<WorkDepot>,
+    kept: Vec<KeptDepot>,
+    install_dir: &Path,
+) -> Vec<KeptDepot> {
     let heirs: BTreeSet<u32> = {
         let layers = Layers::new(work, &kept);
         kept.iter()
             .filter(|depot| {
-                depot
-                    .manifest
-                    .files
-                    .iter()
-                    .any(|file| layers.owns(depot.depot_id, file) && layers.changed(file))
+                depot.manifest.files.iter().any(|file| {
+                    layers.owns(depot.depot_id, file) && layers.changed(file, install_dir)
+                })
             })
             .map(|depot| depot.depot_id)
             .collect()
@@ -1406,14 +1408,31 @@ fn current_entries(work: &[WorkDepot], kept: &[KeptDepot]) -> BTreeMap<String, b
         .collect()
 }
 
-/// Paths the old manifests had and no current manifest names.
-fn stale_names(work: &[WorkDepot], current: &BTreeMap<String, bool>) -> BTreeSet<String> {
-    work.iter()
-        .flat_map(|depot| depot.previous.iter().chain(&depot.abandoned))
-        .flat_map(|previous| &previous.files)
-        .filter(|file| !is_user_config(file))
+/// Paths the old manifests had and no current manifest names. The `.acf` says
+/// a previous manifest was installed; an abandoned one only says what a
+/// stopped run meant to write, so its entries count once they prove `landed`.
+fn stale_names(
+    work: &[WorkDepot],
+    current: &BTreeMap<String, bool>,
+    install_dir: &Path,
+) -> BTreeSet<String> {
+    let gone = |file: &&ManifestFile| {
+        !is_user_config(file) && !current.contains_key(&file.normalized_path())
+    };
+    let installed = work
+        .iter()
+        .flat_map(|depot| &depot.previous)
+        .flat_map(|manifest| &manifest.files)
+        .filter(gone);
+    let left = work
+        .iter()
+        .flat_map(|depot| &depot.abandoned)
+        .flat_map(|manifest| &manifest.files)
+        .filter(gone)
+        .filter(|file| landed(install_dir, file));
+    installed
+        .chain(left)
         .map(ManifestFile::normalized_path)
-        .filter(|path| !current.contains_key(path))
         .collect()
 }
 
@@ -1748,6 +1767,30 @@ fn check_file(path: &Path, file: &ManifestFile) -> io::Result<bool> {
     if is_user_config(file) {
         return Ok(true);
     }
+    same_bytes(path, file, &meta)
+}
+
+/// `DepotJob` lands whole files, so a file a stopped run wrote still matches
+/// its entry. One that does not was never reached or has been edited since,
+/// and either way it is not the run's to touch.
+fn landed(install_dir: &Path, file: &ManifestFile) -> bool {
+    let path = install_dir.join(file.normalized_path());
+    let flags = DepotFileFlags::from_bits_retain(file.flags);
+    // `DepotJob` skips a link with no target, so it never landed.
+    if flags.is_symlink() && file.link_target.is_none() {
+        return false;
+    }
+    fs::symlink_metadata(&path).is_ok_and(|meta| {
+        if flags.is_directory() {
+            meta.is_dir()
+        } else {
+            same_bytes(&path, file, &meta).unwrap_or(false)
+        }
+    })
+}
+
+fn same_bytes(path: &Path, file: &ManifestFile, meta: &fs::Metadata) -> io::Result<bool> {
+    let flags = DepotFileFlags::from_bits_retain(file.flags);
     // `DepotJob` takes an empty file on its size, and what real manifests
     // carry as its hash is unconfirmed.
     if file.size == 0 && file.chunks.is_empty() && file.link_target.is_none() {

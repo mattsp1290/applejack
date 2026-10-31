@@ -129,7 +129,8 @@ pub struct OwnedApp {
     pub drm: String,
     /// Every platform the app or any depot lists, sorted.
     pub platforms: Vec<String>,
-    /// `depots/branches/<branch>/buildid`.
+    /// `depots/branches/<branch>/buildid`, leaving out branches that need a
+    /// password or list `encryptedmanifests`, which cannot be installed.
     pub builds: BTreeMap<String, u64>,
     pub change_number: u32,
     /// `common/freetodownload`: depots need no license.
@@ -146,18 +147,28 @@ impl OwnedApp {
         let app_oslist = oslist(text(&root, &["common", "oslist"]));
         let mut depots = Vec::new();
         let mut builds = BTreeMap::new();
+        let mut encrypted = BTreeSet::new();
         let mut default_branch = DEFAULT_BRANCH.to_owned();
         let depots_node = child(&root, "depots");
         if let Some(section) = children(depots_node) {
             for (key, entry) in section {
                 if let Ok(depot_id) = key.parse() {
                     depots.push(parse_depot(depot_id, entry));
+                    if let Some(locked) = children(child(entry, "encryptedmanifests")) {
+                        encrypted.extend(locked.keys());
+                    }
                 }
             }
             // The map's keys are text, so "1000" would sort before "999".
             depots.sort_by_key(|depot: &DepotInfo| depot.depot_id);
             if let Some(branches) = children(depots_node.and_then(|d| child(d, "branches"))) {
                 for (branch, entry) in branches {
+                    // Needs a password this crate cannot supply. Counted as a
+                    // branch, `public` would stand in under its build id.
+                    let password = text(entry, &["pwdrequired"]).is_some_and(|value| value != "0");
+                    if password || encrypted.contains(branch) {
+                        continue;
+                    }
                     if let Some(build) = text(entry, &["buildid"]).and_then(|id| id.parse().ok()) {
                         builds.insert(branch.clone(), build);
                     }
@@ -257,10 +268,10 @@ impl OwnedApp {
     }
 
     /// The depots to fetch for `branch`: Windows, x86-64 plus architecture
-    /// neutral, or 32-bit when the app has no x86-64 depot; the filter's
-    /// language or none; no low-violence variants; only what the account
-    /// licenses, with the rest reported. A depot with no manifest on a branch
-    /// the app has takes its `public` one.
+    /// neutral, or 32-bit when the app has no x86-64 depot of its own, DLC
+    /// aside; the filter's language or none; no low-violence variants; only
+    /// what the account licenses, with the rest reported. A depot with no
+    /// manifest on a branch the app has takes its `public` one.
     ///
     /// # Errors
     ///
@@ -299,11 +310,12 @@ impl OwnedApp {
             .filter(|depot| !depot.low_violence)
             .partition(|depot| self.is_licensed(depot, filter));
         // Over both lists: 32-bit is for an app that ships only that, not a
-        // stand-in for an x86-64 depot this account lacks.
+        // stand-in for an x86-64 depot this account lacks. A DLC depot is an
+        // add-on and says nothing about what the game itself ships.
         let has_x86_64 = licensed
             .iter()
             .chain(&unlicensed)
-            .any(|depot| depot.osarch == Some(X86_64));
+            .any(|depot| depot.osarch == Some(X86_64) && depot.dlc_appid.is_none());
         let fits =
             |depot: &&DepotInfo| !has_x86_64 || depot.osarch.is_none_or(|arch| arch == X86_64);
         let not_licensed: Vec<u32> = unlicensed

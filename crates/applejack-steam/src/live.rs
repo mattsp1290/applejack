@@ -54,6 +54,9 @@ const CM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// CM servers to try before giving up.
 const CM_ATTEMPTS: usize = 3;
 
+/// `EResult::TryAnotherCM`, which `steamroom` has no variant for.
+const TRY_ANOTHER_CM: i32 = 48;
+
 enum Stage {
     Idle,
     Qr(QrLoginFlow),
@@ -230,20 +233,36 @@ impl SteamConnection for SteamroomConnection {
         let tcp = servers
             .iter()
             .filter(|server| server.protocol == Protocol::Tcp);
-        let mut failure = AuthError::Connection("no TCP CM server available".to_owned());
-        for server in tcp.take(CM_ATTEMPTS) {
-            match timeout(CM_CONNECT_TIMEOUT, connect_ready(server)).await {
-                Ok(Ok(client)) => {
-                    return SteamroomSession::start(client, account_name, refresh_token).await;
-                }
-                Ok(Err(error)) => failure = error,
+        first_cm(tcp, |server| async move {
+            let client = match timeout(CM_CONNECT_TIMEOUT, connect_ready(server)).await {
+                Ok(Ok(client)) => client,
+                Ok(Err(error)) => return Err(AuthError::CmUnavailable(error.to_string())),
                 Err(_elapsed) => {
-                    failure = AuthError::Connection("timed out connecting to a CM".to_owned());
+                    let detail = "connection: timed out connecting to a CM".to_owned();
+                    return Err(AuthError::CmUnavailable(detail));
                 }
-            }
-        }
-        Err(failure)
+            };
+            SteamroomSession::start(client, account_name, refresh_token).await
+        })
+        .await
     }
+}
+
+/// Runs `attempt` on one server after another, at most [`CM_ATTEMPTS`]. Only
+/// [`AuthError::CmUnavailable`] moves on: any other answer holds on every CM,
+/// and repeating a refused logon or a rate limit would make it worse.
+async fn first_cm<S, T, F: Future<Output = Result<T, AuthError>>>(
+    servers: impl Iterator<Item = S>,
+    mut attempt: impl FnMut(S) -> F,
+) -> Result<T, AuthError> {
+    let mut failure = AuthError::Connection("no TCP CM server available".to_owned());
+    for server in servers.take(CM_ATTEMPTS) {
+        match attempt(server).await {
+            Err(error @ AuthError::CmUnavailable(_)) => failure = error,
+            other => return other,
+        }
+    }
+    Err(failure)
 }
 
 async fn connect_ready(server: &CmServer) -> Result<SteamClient<Ready>, AuthError> {
@@ -298,6 +317,9 @@ fn map_steamroom_error(error: steamroom::Error) -> AuthError {
 
 fn map_eresult(result: EResultError) -> AuthError {
     match result {
+        EResultError::Unknown(TRY_ANOTHER_CM) => {
+            AuthError::CmUnavailable("this Steam CM asked the client to try another".to_owned())
+        }
         EResultError::RateLimitExceeded | EResultError::LoginDeniedThrottle => {
             AuthError::RateLimited {
                 retry_after: RATE_LIMIT_RETRY_AFTER,
@@ -331,6 +353,71 @@ fn map_call_result(call: &str, result: EResultError) -> AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plays one answer per server and returns the result with the calls made.
+    async fn run_first_cm(answers: Vec<Result<u32, AuthError>>) -> (Result<u32, AuthError>, usize) {
+        let mut calls = 0;
+        let result = first_cm(answers.into_iter(), |answer| {
+            calls += 1;
+            std::future::ready(answer)
+        })
+        .await;
+        (result, calls)
+    }
+
+    fn unavailable() -> Result<u32, AuthError> {
+        Err(AuthError::CmUnavailable("try another".to_owned()))
+    }
+
+    #[tokio::test]
+    async fn a_cm_that_cannot_take_the_logon_moves_on_to_the_next() {
+        let (result, calls) = run_first_cm(vec![unavailable(), unavailable(), Ok(7)]).await;
+        assert!(matches!(result, Ok(7)));
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn failover_stops_at_three_cms_with_servers_left() {
+        let answers = vec![unavailable(), unavailable(), unavailable(), Ok(7), Ok(8)];
+        let (result, calls) = run_first_cm(answers).await;
+        assert!(matches!(result, Err(AuthError::CmUnavailable(_))));
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn an_answer_about_the_account_ends_the_logon_on_the_first_cm() {
+        let finals = [
+            AuthError::Refused,
+            AuthError::RateLimited {
+                retry_after: RATE_LIMIT_RETRY_AFTER,
+            },
+            AuthError::GuardRequired {
+                factor: GuardFactor::DeviceCode,
+            },
+            AuthError::InvalidGuardCode,
+            AuthError::Connection("Steam logged the session off (EResult 5)".to_owned()),
+        ];
+        for error in finals {
+            let expected = error.to_string();
+            let (result, calls) = run_first_cm(vec![Err(error), Ok(7)]).await;
+            assert_eq!(result.unwrap_err().to_string(), expected);
+            assert_eq!(calls, 1, "{expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_server_at_all_is_a_connection_error() {
+        let (result, calls) = run_first_cm(Vec::new()).await;
+        assert!(matches!(result, Err(AuthError::Connection(_))));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn try_another_cm_is_typed_and_says_so() {
+        let error = map_eresult(EResultError::from_code(TRY_ANOTHER_CM));
+        assert!(matches!(error, AuthError::CmUnavailable(_)));
+        assert!(error.to_string().contains("try another"));
+    }
 
     #[test]
     fn duplicate_request_tells_the_user_to_use_one_factor() {

@@ -26,7 +26,10 @@ clears by retrying, so applejack does not carry one.
 
 All flows go through `auth::Authenticator`, which drives a `SteamConnection`
 and a `RefreshTokenStore`. `SteamConnection` covers the auth flow only;
-`logon` returns a `SteamSession`, described under "Session". Unit tests use
+`logon` returns a `SteamSession`, described under "Session". It tries up to
+three TCP CMs in turn, moving on when one will not connect, answers
+`TryAnotherCM` (`EResult` 48), or does not answer the logon in 30 s; a refusal,
+a rate limit, a Guard error, or a hang-up ends it there. Unit tests use
 scripted fakes; `live::SteamroomConnection` and `live::SteamroomSession` are
 the only implementations that open a socket.
 
@@ -136,10 +139,13 @@ the platforms the app lists.
 
 `OwnedApp::windows_depots(branch, filter)` picks what to fetch: depots whose
 `oslist` includes `windows` or is empty, on an app whose own `oslist` allows
-Windows; `osarch` 64 and neutral, or 32 when the app ships no 64-bit depot; the
-filter's language (`english` by default) or none; no `lowviolence` depots. A
-depot with no manifest on a branch the app has takes its `public` one, as under
-`DepotDownloader`, and its request code then names `public`.
+Windows; `osarch` 64 and neutral, or 32 when the app ships no 64-bit depot of
+its own (a DLC depot does not count); the filter's language (`english` by
+default) or none; no `lowviolence` depots. A depot with no manifest on a branch
+the app has takes its `public` one, as under `DepotDownloader`, and its request
+code then names `public`. A branch with a non-zero `pwdrequired`, or one any
+depot lists under `encryptedmanifests`, is left out of `builds`, so it is refused
+with `NoManifestForBranch` rather than installing `public` under its build id.
 
 What the account may fetch follows `DepotDownloader`'s `AccountHasAccess`:
 `package_grants` reads both `appids` and `depotids` from every licensed
@@ -228,8 +234,11 @@ a manifest trimmed to the files that still need writing.
   no longer selects goes back to its `.acf` manifest, or is refused with
   `Error::UnfinishedDepot` when the `.acf` does not list it, and the record
   stays. A record that cannot be read counts as naming every depot the `.acf`
-  lists. Files only an abandoned target had are removed as stale, and a path
-  an abandoned target wrote is rewritten by whichever depot owns it now. The rewrite
+  lists. Files only an abandoned target wrote are removed as stale, and a path
+  an abandoned target wrote is rewritten by whichever depot owns it now. A
+  manifest says what a stopped run meant to write, not what it wrote, so an
+  entry counts as written only while the file on disk matches it: anything else
+  at that path was never reached or has been edited since, and stays. The rewrite
   keeps every `.acf` key the writer does not model, and keeps depots the plan
   did not select. The caller re-syncs its `apps` row from the `.acf` first and
   afterwards.
@@ -515,7 +524,9 @@ to file; the local copies in `live.rs` stay until they land:
     where `SteamKit` uses `vhost` and HTTPS only for `mandatory`.
 11. `parse_incoming` drops the job ids of a non-protobuf header, so a top-level
     `DestJobFailed` in that form cannot be routed and its call waits out the
-    60 s bound. One inside a `MULTI` is parsed here and routed.
+    60 s bound. One inside a `MULTI` is no different: `PacketHeader::parse`
+    returns `Simple` for every non-protobuf packet, so the `Extended` arm of
+    `parse_packet` never runs and the ids are lost there too.
 
 ## Legal note
 

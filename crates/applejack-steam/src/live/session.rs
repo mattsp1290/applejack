@@ -502,8 +502,9 @@ impl SteamroomSession {
     ///
     /// # Errors
     ///
-    /// The mapped `CMsgClientLogonResponse` result, or
-    /// [`AuthError::Connection`] on a transport failure or timeout.
+    /// The mapped `CMsgClientLogonResponse` result,
+    /// [`AuthError::Connection`] on a transport failure, or
+    /// [`AuthError::CmUnavailable`] when no reply comes in time.
     pub async fn start(
         client: SteamClient<Ready>,
         account_name: &str,
@@ -552,7 +553,9 @@ impl SteamroomSession {
 
         let reply = timeout(LOGON_TIMEOUT, logon_receiver)
             .await
-            .map_err(|_| AuthError::Connection("timed out waiting for the logon reply".to_owned()))?
+            .map_err(|_| {
+                AuthError::CmUnavailable("timed out waiting for the logon reply".to_owned())
+            })?
             .map_err(|_| AuthError::Connection("session closed during logon".to_owned()))??;
         session.heartbeat = reply.heartbeat;
         let period = reply.heartbeat.unwrap_or(DEFAULT_HEARTBEAT);
@@ -710,7 +713,7 @@ impl SteamSession for SteamroomSession {
         let response = decode::<CMsgClientGetDepotDecryptionKeyResponse>(&reply.body)?;
         let code = response.eresult.ok_or(AuthError::MissingField("eresult"))?;
         steamroom::enums::eresult(code)
-            .map_err(|result| map_call_result("the depot key", result))?;
+            .map_err(|result| map_call_result(&format!("the key for depot {depot_id}"), result))?;
         // A key for another depot would pass as a run of corrupt chunks.
         if response.depot_id.is_some_and(|id| id != depot_id) {
             return Err(AuthError::Connection(format!(

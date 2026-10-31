@@ -5,6 +5,7 @@ mod support;
 
 use applejack_steam::Error;
 use applejack_steam::auth::License;
+use applejack_steam::depot::InstallPlan;
 use applejack_steam::library::{DRM_UNKNOWN, DepotFilter, Library, OwnedApp};
 use applejack_steam::session::{AppInfo, PackageGrants};
 use support::FakeSession;
@@ -377,6 +378,145 @@ fn a_32_bit_depot_does_not_stand_in_for_an_unlicensed_x86_64_one() {
     assert_eq!(selection.depots.len(), 1);
     assert_eq!(selection.depots[0].depot_id, 103);
     assert!(selection.not_licensed.contains(&101));
+}
+
+/// One Windows depot entry for [`app_with`].
+fn depot(id: u32, config: &str, rest: &str) -> String {
+    format!(r#""{id}" {{ "config" {{ "oslist" "windows" {config} }} {rest} }}"#)
+}
+
+fn public_manifest(gid: u64) -> String {
+    format!(r#""manifests" {{ "public" {{ "gid" "{gid}" "size" "10" }} }}"#)
+}
+
+fn app_with(depots: &[String], branches: &str, filter: &DepotFilter) -> OwnedApp {
+    let text = format!(
+        r#""appinfo"
+{{
+    "common" {{ "name" "G" "oslist" "windows" }}
+    "config" {{ "installdir" "G" }}
+    "depots"
+    {{
+        {}
+        "branches" {{ {branches} }}
+    }}
+}}
+"#,
+        depots.join("\n")
+    );
+    OwnedApp::parse(&info(100, &text), filter).unwrap()
+}
+
+fn with_x86_64_dlc() -> Vec<String> {
+    vec![
+        depot(101, r#""osarch" "32""#, &public_manifest(1)),
+        depot(102, "", &public_manifest(2)),
+        depot(
+            103,
+            r#""osarch" "64""#,
+            &format!(r#"{} "dlcappid" "555""#, public_manifest(3)),
+        ),
+    ]
+}
+
+// From the install-safety review round two, probes l1 and l1b.
+#[test]
+fn an_unowned_64_bit_dlc_depot_does_not_drop_a_32_bit_game() {
+    let filter = DepotFilter {
+        owned_depots: [101, 102].into(),
+        ..DepotFilter::default()
+    };
+    let app = app_with(&with_x86_64_dlc(), r#""public" { "buildid" "9" }"#, &filter);
+    let plan = InstallPlan::new(&app, "public", &filter).unwrap();
+    let chosen: Vec<u32> = plan.depots.iter().map(|d| d.depot_id).collect();
+    assert_eq!(chosen, [101, 102]);
+    assert_eq!(plan.not_licensed, [103], "the plan reports the dropped DLC");
+}
+
+#[test]
+fn an_owned_64_bit_dlc_depot_comes_with_the_32_bit_game() {
+    let filter = DepotFilter {
+        owned_depots: [101, 102, 103].into(),
+        owned_appids: [555].into(),
+        ..DepotFilter::default()
+    };
+    let app = app_with(&with_x86_64_dlc(), r#""public" { "buildid" "9" }"#, &filter);
+    let selection = app.windows_depots("public", &filter).unwrap();
+    let chosen: Vec<u32> = selection.depots.iter().map(|d| d.depot_id).collect();
+    assert_eq!(chosen, [101, 102, 103]);
+    assert_eq!(selection.not_licensed, [] as [u32; 0]);
+}
+
+fn only_depot() -> DepotFilter {
+    DepotFilter {
+        owned_depots: [101].into(),
+        ..DepotFilter::default()
+    }
+}
+
+fn assert_branch_refused(app: &OwnedApp, branch: &str) {
+    let error = InstallPlan::new(app, branch, &only_depot()).unwrap_err();
+    assert!(
+        matches!(&error, Error::NoManifestForBranch { branch: named, .. } if named == branch),
+        "{error}"
+    );
+}
+
+const ENCRYPTED_BETA: &str =
+    r#""encryptedmanifests" { "beta" { "encrypted_gid_2" "abcd" "size" "10" } }"#;
+
+// From the protocol review round two, finding 1, and the install-safety
+// review's probe l2.
+#[test]
+fn a_password_branch_is_refused_rather_than_installing_public() {
+    let filter = only_depot();
+    let depots = [depot(
+        101,
+        "",
+        &format!("{} {ENCRYPTED_BETA}", public_manifest(1)),
+    )];
+    let branches = r#""public" { "buildid" "9" } "beta" { "buildid" "77" "pwdrequired" "1" }"#;
+    let app = app_with(&depots, branches, &filter);
+    assert_branch_refused(&app, "beta");
+    assert_eq!(
+        InstallPlan::new(&app, "public", &filter).unwrap().buildid,
+        9
+    );
+}
+
+#[test]
+fn a_password_branch_is_refused_even_with_a_plain_manifest() {
+    let filter = only_depot();
+    let manifests = r#""manifests" {
+        "public" { "gid" "1" "size" "10" }
+        "beta" { "gid" "2" "size" "10" }
+    }"#;
+    let branches = r#""public" { "buildid" "9" } "beta" { "buildid" "77" "pwdrequired" "1" }"#;
+    let app = app_with(&[depot(101, "", manifests)], branches, &filter);
+    assert_branch_refused(&app, "beta");
+}
+
+#[test]
+fn an_encrypted_manifest_refuses_a_branch_not_marked_for_a_password() {
+    let filter = only_depot();
+    let depots = [depot(
+        101,
+        "",
+        &format!("{} {ENCRYPTED_BETA}", public_manifest(1)),
+    )];
+    let branches = r#""public" { "buildid" "9" } "beta" { "buildid" "77" }"#;
+    assert_branch_refused(&app_with(&depots, branches, &filter), "beta");
+}
+
+#[test]
+fn a_zero_pwdrequired_is_an_ordinary_branch() {
+    let filter = only_depot();
+    let depots = [depot(101, "", &public_manifest(1))];
+    let branches = r#""public" { "buildid" "9" } "beta" { "buildid" "77" "pwdrequired" "0" }"#;
+    let app = app_with(&depots, branches, &filter);
+    let plan = InstallPlan::new(&app, "beta", &filter).unwrap();
+    assert_eq!(plan.buildid, 77);
+    assert!(plan.depots[0].public_manifest);
 }
 
 #[test]

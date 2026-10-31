@@ -83,6 +83,10 @@ pub enum AuthError {
     /// Transport, protocol, or decode failure.
     #[error("connection: {0}")]
     Connection(String),
+    /// This CM could not take the logon: it would not connect, answered
+    /// `TryAnotherCM`, or never answered. Another may, so `logon` moves on.
+    #[error("{0}")]
+    CmUnavailable(String),
 }
 
 /// A password typed by the user. `Debug` never reveals the value, and the

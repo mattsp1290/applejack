@@ -1205,6 +1205,214 @@ async fn a_recorded_depot_the_acf_does_not_list_is_refused_and_the_record_kept()
     assert!(bench.paths().record(APPID).exists());
 }
 
+/// Runs an update to `V2` and expects it to stop. Files land in list order, so
+/// where the caller puts the failing one decides what lands first.
+async fn stop_update_to_v2(bench: &Bench, files: Vec<ManifestFile>) {
+    bench.session.add_manifest(DEPOT, manifest(V2, files));
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V2, 12))
+            .await
+            .is_err()
+    );
+}
+
+// From the install-safety review round two, probe r6d: V2 adds a path the
+// user already has a file at, and stops before reaching it.
+#[tokio::test]
+async fn a_users_file_at_a_path_the_stopped_run_never_reached_survives_a_rollback() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"one"])]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let mine = bench.game().join("mods/mine.pak");
+    fs::create_dir_all(mine.parent().unwrap()).unwrap();
+    fs::write(&mine, b"user mod").unwrap();
+
+    let failing = file(chunks, "a-first.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    stop_update_to_v2(
+        &bench,
+        vec![
+            failing,
+            file(chunks, "a.txt", &[b"two"]),
+            file(chunks, "mods/mine.pak", &[b"official"]),
+        ],
+    )
+    .await;
+    assert_eq!(fs::read(&mine).unwrap(), b"user mod");
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&mine).unwrap(), b"user mod");
+    assert_eq!(fs::read(bench.game().join("a.txt")).unwrap(), b"one");
+    assert!(!bench.paths().record(APPID).exists());
+}
+
+// From the install-safety review round two, probe r6b: the depot's copy of
+// the config never changed for this user, since V2 did not reach it.
+#[tokio::test]
+async fn a_versioned_edit_the_stopped_run_never_reached_survives_a_rollback() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let config = flagged(file(chunks, "v.cfg", &[b"default"]), VERSIONED_USER_CONFIG);
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![config, file(chunks, "a.txt", &[b"one"])]),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let edited = bench.game().join("v.cfg");
+    fs::write(&edited, b"user edit").unwrap();
+
+    let newer = flagged(
+        file(chunks, "v.cfg", &[b"default two"]),
+        VERSIONED_USER_CONFIG,
+    );
+    let failing = file(chunks, "a-first.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    stop_update_to_v2(
+        &bench,
+        vec![failing, file(chunks, "a.txt", &[b"two"]), newer],
+    )
+    .await;
+    assert_eq!(fs::read(&edited).unwrap(), b"user edit");
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&edited).unwrap(), b"user edit");
+    assert!(!bench.paths().record(APPID).exists());
+}
+
+// A file the stopped run did land stops being the run's once it is edited.
+#[tokio::test]
+async fn a_file_edited_after_the_stopped_run_landed_it_stays() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"one"])]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+
+    let failing = file(chunks, "z.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    stop_update_to_v2(
+        &bench,
+        vec![
+            file(chunks, "a.txt", &[b"one"]),
+            file(chunks, "edited.ini", &[b"as shipped"]),
+            file(chunks, "untouched.ini", &[b"as shipped too"]),
+            failing,
+        ],
+    )
+    .await;
+    let edited = bench.game().join("edited.ini");
+    assert_eq!(fs::read(&edited).unwrap(), b"as shipped");
+    assert!(bench.game().join("untouched.ini").exists());
+    fs::write(&edited, b"user edit").unwrap();
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&edited).unwrap(), b"user edit");
+    assert!(
+        !bench.game().join("untouched.ini").exists(),
+        "what still matches is the run's, and goes"
+    );
+}
+
+#[tokio::test]
+async fn a_versioned_config_edited_after_the_stopped_run_landed_it_stays() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let config = flagged(file(chunks, "v.cfg", &[b"default"]), VERSIONED_USER_CONFIG);
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![config]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+
+    let newer = flagged(
+        file(chunks, "v.cfg", &[b"default two"]),
+        VERSIONED_USER_CONFIG,
+    );
+    let failing = file(chunks, "z.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    stop_update_to_v2(&bench, vec![newer, failing]).await;
+    let edited = bench.game().join("v.cfg");
+    assert_eq!(fs::read(&edited).unwrap(), b"default two");
+    fs::write(&edited, b"user edit").unwrap();
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&edited).unwrap(), b"user edit");
+}
+
+// `DepotJob` skips a link entry with no target, so it cannot have landed, and
+// a comparison of two missing targets must not read as a match.
+#[tokio::test]
+async fn a_link_entry_with_no_target_does_not_claim_a_users_file() {
+    const SYMLINK: u32 = 512;
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"one"])]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let mine = bench.game().join("mine.pak");
+    fs::write(&mine, b"user mod").unwrap();
+
+    let failing = file(chunks, "a-first.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    let link = flagged(file(chunks, "mine.pak", &[b"official"]), SYMLINK);
+    assert!(link.link_target.is_none());
+    stop_update_to_v2(&bench, vec![failing, link]).await;
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&mine).unwrap(), b"user mod");
+}
+
+// From the install-safety review round two, probe r5e: the disk a moved game
+// sits on is not mounted. A record would gate a title nothing was written to.
+#[tokio::test]
+async fn a_dangling_install_directory_link_leaves_no_record() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V1, vec![file(chunks, "a.txt", &[b"one"])]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+    fs::remove_dir_all(bench.game()).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/applejack-volume", bench.game()).unwrap();
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V2, vec![file(chunks, "a.txt", &[b"two"])]));
+
+    let error = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Io { .. }), "{error}");
+    assert!(!bench.paths().record(APPID).exists());
+}
+
 /// Installs `text.pak` from `DEPOT` and stops an update of `OTHER` that had
 /// already laid an overlay of it. `OTHER` is at manifest 70 in the `.acf`.
 async fn stop_after_an_abandoned_overlay(bench: &Bench) {

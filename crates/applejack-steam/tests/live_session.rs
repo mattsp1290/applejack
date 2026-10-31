@@ -477,6 +477,41 @@ async fn a_reply_without_a_job_id_reaches_the_request_expecting_it() {
     assert_eq!(call.await.unwrap().unwrap().0, [3; 32]);
 }
 
+// From the protocol review round two, finding 2.
+#[tokio::test]
+async fn try_another_cm_is_typed_for_the_failover() {
+    let (session, cm) = connect().await;
+    let body = CMsgClientLogonResponse {
+        eresult: Some(48),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    cm.send(ClientMsg::with_body(EMsg::CLIENT_LOG_ON_RESPONSE, &body).to_bytes());
+    assert!(matches!(
+        session.await.unwrap(),
+        Err(AuthError::CmUnavailable(_))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cm_that_never_answers_the_logon_is_typed_for_the_failover() {
+    let (session, _cm) = connect().await;
+    assert!(matches!(
+        session.await.unwrap(),
+        Err(AuthError::CmUnavailable(message)) if message.contains("logon reply")
+    ));
+}
+
+#[tokio::test]
+async fn a_cm_that_hangs_up_during_logon_is_not_a_failover() {
+    let (session, cm) = connect().await;
+    drop(cm);
+    assert!(matches!(
+        session.await.unwrap(),
+        Err(AuthError::Connection(_))
+    ));
+}
+
 #[tokio::test]
 async fn a_key_for_another_depot_is_refused() {
     let (session, mut cm) = logged_in(9).await;
@@ -692,7 +727,7 @@ async fn a_denied_depot_key_is_not_a_refused_login() {
     );
     assert!(matches!(
         call.await.unwrap(),
-        Err(AuthError::CallDenied { .. })
+        Err(AuthError::CallDenied { call, .. }) if call.contains("depot 7")
     ));
 }
 
