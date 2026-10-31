@@ -522,21 +522,13 @@ final class ViewModelTests: XCTestCase {
         let log = FileManager.default.temporaryDirectory.appendingPathComponent("replaced-\(UUID().uuidString).log")
         defer { try? FileManager.default.removeItem(at: log) }
         try Data("a\n".utf8).write(to: log)
-        let stream = LogTailer.lines(at: log.path, interval: .milliseconds(20))
-        let collector = Task {
-            var lines: [String] = []
-            for await line in stream {
-                lines.append(line)
-            }
-            return lines
-        }
-        try await Task.sleep(for: .milliseconds(150))
+        let tail = CollectedLines(LogTailer.lines(at: log.path, interval: .milliseconds(20)))
+        try await waitUntil { tail.lines.count == 1 }
         try FileManager.default.removeItem(at: log)
         try Data("0123456789\nnext\n".utf8).write(to: log)
-        try await Task.sleep(for: .milliseconds(150))
-        collector.cancel()
-        let lines = await collector.value
-        XCTAssertEqual(lines, ["a", "0123456789", "next"])
+        try await waitUntil { tail.lines.count >= 3 }
+        await tail.stop()
+        XCTAssertEqual(tail.lines, ["a", "0123456789", "next"])
     }
 
     func testLogTailerStartsOverAfterRotation() async throws {
@@ -545,28 +537,20 @@ final class ViewModelTests: XCTestCase {
         let log = FileManager.default.temporaryDirectory.appendingPathComponent("rotated-\(UUID().uuidString).log")
         defer { try? FileManager.default.removeItem(at: log) }
         try Data("one\ntwo\nthree\n".utf8).write(to: log)
-        let stream = LogTailer.lines(at: log.path, interval: .milliseconds(20))
-        let collector = Task {
-            var lines: [String] = []
-            for await line in stream {
-                lines.append(line)
-            }
-            return lines
-        }
-        try await Task.sleep(for: .milliseconds(150))
+        let tail = CollectedLines(LogTailer.lines(at: log.path, interval: .milliseconds(20)))
+        try await waitUntil { tail.lines.count == 3 }
         try FileManager.default.removeItem(at: log)
         try Data("new1\n".utf8).write(to: log)
-        try await Task.sleep(for: .milliseconds(150))
+        try await waitUntil { tail.lines.count >= 4 }
         // Appends as a log writer does: rewriting in place truncates first, and
         // a poll in that window rightly starts the file over.
         let handle = try FileHandle(forWritingTo: log)
         try handle.seekToEnd()
         try handle.write(contentsOf: Data("new2\nnew3\nnew4\n".utf8))
         try handle.close()
-        try await Task.sleep(for: .milliseconds(150))
-        collector.cancel()
-        let lines = await collector.value
-        XCTAssertEqual(lines, ["one", "two", "three", "new1", "new2", "new3", "new4"])
+        try await waitUntil { tail.lines.count >= 7 }
+        await tail.stop()
+        XCTAssertEqual(tail.lines, ["one", "two", "three", "new1", "new2", "new3", "new4"])
     }
 
     // MARK: - Controllers
@@ -758,5 +742,26 @@ final class ViewModelTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
         }
         XCTAssertTrue(condition(), "condition not met within \(limit)", file: file, line: line)
+    }
+}
+
+/// What a tailer has delivered so far, so a test can wait for a line rather
+/// than guess how long a poll takes on a busy machine.
+@MainActor
+private final class CollectedLines {
+    private(set) var lines: [String] = []
+    private var reader: Task<Void, Never>?
+
+    init(_ stream: AsyncStream<String>) {
+        reader = Task { [weak self] in
+            for await line in stream {
+                self?.lines.append(line)
+            }
+        }
+    }
+
+    func stop() async {
+        reader?.cancel()
+        await reader?.value
     }
 }
