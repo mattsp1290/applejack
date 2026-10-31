@@ -1,0 +1,60 @@
+import SwiftUI
+
+/// The core's lifecycle, above every view: hidden while it runs, a restart
+/// action after an exit or a stop, and the final states the client refuses
+/// to recover from.
+public struct CoreBanner: View {
+    let app: AppModel
+    /// Runs after a Restart that reached `.running`.
+    let afterRestart: @MainActor () async -> Void
+
+    public init(app: AppModel, afterRestart: @escaping @MainActor () async -> Void = {}) {
+        self.app = app
+        self.afterRestart = afterRestart
+    }
+
+    public var body: some View {
+        switch app.coreStatus {
+        case .running:
+            EmptyView()
+        case .starting:
+            banner(systemImage: "circle.dotted", text: "Starting the core…", tint: .secondary)
+        case .missing:
+            banner(
+                systemImage: "questionmark.app",
+                text: "applejack-core was not found beside the app and \(CoreLocator.environmentVariable) is not set.",
+                tint: .orange
+            )
+        case .exited(let status):
+            banner(systemImage: "bolt.slash", text: "The core exited (status \(status)).", tint: .red) {
+                Button("Restart") { Task { await restart() } }
+            }
+        case .stopped(let error):
+            banner(systemImage: "bolt.slash", text: describe(error), tint: .orange) {
+                Button("Restart") { Task { await restart() } }
+            }
+        case .failed(let error):
+            banner(systemImage: "xmark.octagon", text: describe(error), tint: .red)
+        }
+    }
+
+    private func restart() async {
+        await app.restart()
+        if case .running = app.coreStatus {
+            await afterRestart()
+        }
+    }
+
+    private func banner(
+        systemImage: String, text: String, tint: Color, @ViewBuilder action: () -> some View = { EmptyView() }
+    ) -> some View {
+        HStack {
+            Label(text, systemImage: systemImage)
+            Spacer()
+            action()
+        }
+        .padding(10)
+        .background(tint.opacity(0.12))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}

@@ -117,8 +117,56 @@ pub struct Probes {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Registry {
-    /// The `winebus.sys` key that toggles raw HID access.
+    /// The `winebus.sys` value that toggles raw HID access, as
+    /// `<root>\<key>\...\<value>` (see [`split_registry_value`]).
     pub hidraw_key: String,
+}
+
+impl Registry {
+    /// `hidraw_key` split into the full key name and the value name; `None`
+    /// when it is not a registry value path a seed can import.
+    #[must_use]
+    pub fn hidraw_value(&self) -> Option<(String, &str)> {
+        split_registry_value(&self.hidraw_key)
+    }
+}
+
+/// The root keys a `[registry]` path may start with, abbreviated and in
+/// full. `reg import` exits 0 for a well-formed file whose root it does not
+/// know, so an unknown root must be refused before a seed is rendered.
+pub const REGISTRY_ROOTS: [(&str, &str); 5] = [
+    ("HKLM", "HKEY_LOCAL_MACHINE"),
+    ("HKCU", "HKEY_CURRENT_USER"),
+    ("HKCR", "HKEY_CLASSES_ROOT"),
+    ("HKU", "HKEY_USERS"),
+    ("HKCC", "HKEY_CURRENT_CONFIG"),
+];
+
+/// Splits `ROOT\Sub\Key\Value` into the full key name (the root expanded
+/// to its long form, case-insensitively) and the value name. `None` unless
+/// the root is one of [`REGISTRY_ROOTS`] and at least one key component and
+/// a value name, none of them blank, follow it. A `"`, a bracket, or a
+/// control character is refused because the seed renders the path
+/// unescaped: on the real payload `reg import` exits 0 and drops a value
+/// whose name holds a `"`, and a newline starts further keys.
+#[must_use]
+pub fn split_registry_value(spec: &str) -> Option<(String, &str)> {
+    if spec
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '"' | '[' | ']'))
+    {
+        return None;
+    }
+    let (key, value) = spec.rsplit_once('\\')?;
+    let (root, rest) = key.split_once('\\')?;
+    if value.trim().is_empty() || rest.split('\\').any(|part| part.trim().is_empty()) {
+        return None;
+    }
+    let upper = root.to_ascii_uppercase();
+    let (_, long) = REGISTRY_ROOTS
+        .iter()
+        .find(|(short, long)| upper == *short || upper == *long)?;
+    Some((format!("{long}\\{rest}"), value))
 }
 
 /// The parsed `BUNDLE.toml` of an engine bundle.
@@ -149,9 +197,9 @@ pub struct BundleToml {
     /// The `[probes]` table.
     #[serde(default)]
     pub probes: Option<Probes>,
-    /// The `[registry]` table.
-    #[serde(default)]
-    pub registry: Option<Registry>,
+    /// The `[registry]` table. Required: without `hidraw_key` no seed
+    /// carries the HID toggle, whatever the prefix records.
+    pub registry: Registry,
     /// Executable (relative path) to the code-signing entitlements it needs.
     #[serde(default)]
     pub entitlements: BTreeMap<String, Vec<String>>,
@@ -199,7 +247,8 @@ impl BundleToml {
     ///   inside the canonical root; `i386` lists are empty when
     ///   `wine.wow64 = "none"`; a non-empty `[overrides.d3dmetal]` needs a
     ///   `[d3dmetal]` table;
-    /// - `entitlements` keys are relative paths.
+    /// - `entitlements` keys are relative paths;
+    /// - `registry.hidraw_key` splits per [`split_registry_value`].
     ///
     /// # Errors
     ///
@@ -230,6 +279,12 @@ impl BundleToml {
         }
         for executable in self.entitlements.keys() {
             relative("entitlements", Path::new(executable))?;
+        }
+        if self.registry.hidraw_value().is_none() {
+            return Err(Error::InvalidBundle(format!(
+                "registry.hidraw_key: `{}` must be `<root>\\<key>\\...\\<value>` with the root one of HKLM, HKCU, HKCR, HKU, HKCC or its long form, no blank component, and no quote, bracket, or control character",
+                self.registry.hidraw_key
+            )));
         }
 
         if self.sync_modes.is_empty() {
