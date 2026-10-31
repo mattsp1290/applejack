@@ -264,11 +264,14 @@ Environment knobs:
      optional (copied when the x86-64 Homebrew has unixODBC, skipped with
      a message otherwise). A SONAME that is neither in the table nor in
      the x86-64 Homebrew fails the closure, and so does one the payload
-     already ships somewhere without a table row. The slot under
-     `wine/lib/` holds a dylib or nothing: a regular file there that is no
-     Mach-O, or a link there that resolves to anything but a dylib, is
-     refused naming the target, since `dlopen` of the leaf would fail at
-     run time whatever the slot is called. Every Unix module under
+     already ships somewhere without a table row, whether the slot is
+     empty or already a link to that file. The slot under `wine/lib/`
+     holds a dylib or nothing: a regular file there that is no Mach-O, or
+     a link there that resolves to anything but a dylib, is refused naming
+     the target, since `dlopen` of the leaf would fail at run time
+     whatever the slot is called, and so is a link to a dylib whose
+     `LC_ID_DYLIB` leaf is not the slot's name (`--close` holds these slot
+     rules, since `--check` has no SONAME list). Every Unix module under
      `wine/lib/wine/` whose bytes contain a supplied SONAME is a `dlopen`
      caller and gets `LC_RPATH @loader_path/../..`, which is `wine/lib/`.
      The run path goes on the callers, not on the executables, because the
@@ -307,7 +310,11 @@ Environment knobs:
      through the binary's own `@loader_path` run paths, else the closure
      adds the run path to the one payload directory holding that leaf
      (the binary's own directory wins a tie; a leaf nowhere in the payload
-     is copied from Homebrew). A link and the file it resolves to are one
+     is copied from Homebrew). For a library directly under `wine/lib/`,
+     which the closure places, that binding follows the same row and
+     version rule as an absolute dependency; a component's own reference
+     into another tree is its build's decision and needs no row, and a
+     reference a run path already reaches plans nothing. A link and the file it resolves to are one
      image, so a leaf in two directories that way is no tie; a leaf in two
      directories as two files is judged after the binary's unambiguous
      references have settled its run paths, so load-command order does
@@ -351,7 +358,8 @@ Environment knobs:
      version (26.2.20 and 10.5.0), the spec parser refuses a row stating
      another version, `--close` refuses a payload whose file is missing,
      is a link, or reports another current version before its first
-     round, and `--check` reports the same as a violation, so a GStreamer
+     round, and `--check` reports the same as a violation, as it does a
+     framework file the tree ships with no row, so a GStreamer
      pin bump that replaces the file fails until the table, the row, and
      the credit are updated together. A run that copied anything reports
      a library row no copy came from, so a stale row cannot sit in the

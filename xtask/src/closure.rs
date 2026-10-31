@@ -30,8 +30,11 @@
 //! and proxy-libintl, the pinned `MoltenVK`) is linked or reached by a run
 //! path, never copied again, and only through a [`SONAME_POLICY`] row that
 //! names the file and that the dependent's compatibility version is checked
-//! against; a duplicate the tree carries becomes a relative link to that
-//! file, or is refused. Every path a round writes resolves inside the
+//! against ([`allowance`] is that rule, for a SONAME slot, an absolute
+//! dependency, and an `@rpath` reference of a library under `wine/lib/`; a
+//! component's own `@rpath` references, such as `winegstreamer.so`'s into the
+//! framework it was built against, are its build's decision); a duplicate
+//! the tree carries becomes a relative link to that file, or is refused. Every path a round writes resolves inside the
 //! payload: a link that leads out of it is an occupied slot, not an empty
 //! one, and a tool never runs on a link.
 
@@ -105,7 +108,7 @@ pub enum SonamePolicy {
 /// new SONAME in `config.h` that is neither here nor in the x86-64 Homebrew
 /// fails the closure, which is the moment to classify it; so does a SONAME
 /// or an absolute dependency's leaf the payload already ships somewhere
-/// without a row here. A formula that spells a pinned component
+/// without a row here, through a link at the slot or not. A formula that spells a pinned component
 /// (`molten-vk`) can never gain a `[components]` row, so a row here is the
 /// only way its library enters the payload.
 pub const SONAME_POLICY: &[(&str, SonamePolicy)] = &[
@@ -172,6 +175,25 @@ fn policy(soname: &str) -> SonamePolicy {
         .iter()
         .find(|(name, _)| *name == soname)
         .map_or(SonamePolicy::Homebrew, |(_, policy)| *policy)
+}
+
+/// The one rule for binding `leaf` to `shipped`, the regular file a path
+/// resolves to: a policy row naming the file admits it with the row's
+/// allowance; a file directly under `wine/lib/` is the closure's own copy and
+/// needs no row; anything else is a file another component ships, and is
+/// refused.
+fn allowance(leaf: &str, shipped: &Path) -> Result<Option<&'static str>, String> {
+    match policy(leaf) {
+        SonamePolicy::Payload {
+            file,
+            allow_older_compat,
+        } if Path::new(file) == shipped => Ok(allow_older_compat),
+        _ if shipped.parent() == Some(Path::new(LIB_DIR)) => Ok(None),
+        _ => Err(format!(
+            "{} already ships {leaf}; a rebinding to a file the payload ships needs a SONAME_POLICY row naming that file",
+            shipped.display()
+        )),
+    }
 }
 
 /// One Mach-O of the tree as the planner sees it.
@@ -297,7 +319,9 @@ pub type Runner<'a> = dyn FnMut(&str, &[&OsStr]) -> Result<(), String> + 'a;
 /// `@rpath/<leaf>`, bound to `wine/lib/<leaf>` when that exists, else to the
 /// one payload file of that name a policy row names (the dependent's
 /// compatibility version checked against the file's current version), else
-/// copied to `wine/lib/`; each `@rpath/<leaf>` dependency must be reachable
+/// copied to `wine/lib/`, and a file another component ships needs its row
+/// whichever path reaches it ([`allowance`]), a SONAME slot's too; each
+/// `@rpath/<leaf>` dependency must be reachable
 /// through the image's own `@loader_path` run paths (existing or planned
 /// this round), else the run path to the one directory holding the leaf is
 /// added (a link and its target are one file; the image's own directory
@@ -312,6 +336,7 @@ pub fn plan(tree: &Tree, sonames: &[String], source: &Source<'_>) -> Plan {
         source,
         plan: Plan::default(),
         planned: BTreeSet::new(),
+        planned_links: BTreeMap::new(),
         supplied: BTreeSet::new(),
     };
     round.duplicates();
@@ -344,6 +369,8 @@ struct Round<'a> {
     plan: Plan,
     /// Payload-relative destinations of this round's copies and links.
     planned: BTreeSet<PathBuf>,
+    /// This round's links and the regular file each resolves to.
+    planned_links: BTreeMap<PathBuf, PathBuf>,
     /// SONAMEs that are, or will be, files under `wine/lib/`.
     supplied: BTreeSet<String>,
 }
@@ -392,6 +419,7 @@ impl Round<'_> {
         self.tree
             .links
             .get(path)
+            .or_else(|| self.planned_links.get(path))
             .cloned()
             .unwrap_or_else(|| path.to_path_buf())
     }
@@ -527,34 +555,43 @@ impl Round<'_> {
         }
     }
 
-    /// Whether `reference` may bind to `shipped`, the regular file a
-    /// destination resolves to, whichever path reached it: the closure's
-    /// own copies under `wine/lib/` bind on their version alone; a file
-    /// another component ships binds only through a policy row naming it,
-    /// with the row's allowance. The refusal is recorded.
-    fn rebind(&mut self, image: &Image, reference: &str, leaf: &str, shipped: &Path) -> bool {
-        let allow_older = if shipped.parent() == Some(Path::new(LIB_DIR)) {
-            None
-        } else {
-            match policy(leaf) {
-                SonamePolicy::Payload {
-                    file,
-                    allow_older_compat,
-                } if Path::new(file) == shipped => allow_older_compat,
-                _ => {
-                    self.fail(
-                        &image.relative,
-                        reference,
-                        &format!(
-                            "{} already ships {leaf}; a rebinding to a file the payload ships needs a SONAME_POLICY row naming that file",
-                            shipped.display()
-                        ),
-                    );
-                    return false;
-                }
+    /// [`allowance`], and the file must be the library the name says: a link
+    /// can carry any name. Only a link: a copy's install name is rewritten
+    /// the round after it lands, so a regular file's may still differ.
+    fn admit(&self, leaf: &str, shipped: &Path) -> Result<Option<&'static str>, String> {
+        let allow_older = allowance(leaf, shipped)?;
+        let id = self
+            .tree
+            .images
+            .iter()
+            .find(|image| Path::new(&image.relative) == shipped)
+            .and_then(|image| image.id.as_deref())
+            .filter(|id| shipped.file_name() != Some(OsStr::new(leaf)) && file_name(id) != leaf);
+        match id {
+            Some(id) => Err(format!(
+                "a link named {leaf} resolves to {}, whose LC_ID_DYLIB is {id}",
+                shipped.display()
+            )),
+            None => Ok(allow_older),
+        }
+    }
+
+    /// Whether `reference` may bind to `dest`, judged on the regular file it
+    /// resolves to: [`Round::admit`], then the dependent's compatibility
+    /// version under the row's allowance. A copy this round plans is not
+    /// scanned yet, so it has no version to compare. The refusal is recorded.
+    fn rebind(&mut self, image: &Image, reference: &str, leaf: &str, dest: &Path) -> bool {
+        let shipped = self.canonical(dest);
+        if !self.tree.files.contains(&shipped) {
+            return true;
+        }
+        match self.admit(leaf, &shipped) {
+            Ok(allow_older) => self.compatible(image, reference, &shipped, allow_older),
+            Err(reason) => {
+                self.fail(&image.relative, reference, &reason);
+                false
             }
-        };
-        self.compatible(image, reference, shipped, allow_older)
+        }
     }
 
     fn soname(&mut self, soname: &str) {
@@ -570,7 +607,12 @@ impl Round<'_> {
                 .iter()
                 .any(|image| Path::new(&image.relative) == file && image.id.is_some());
             if is_dylib {
-                self.supplied.insert(soname.to_owned());
+                match self.admit(soname, &file) {
+                    Ok(_) => {
+                        self.supplied.insert(soname.to_owned());
+                    }
+                    Err(reason) => self.fail(CONFIG_H, soname, &reason),
+                }
             } else if file == dest {
                 self.fail(
                     CONFIG_H,
@@ -602,7 +644,8 @@ impl Round<'_> {
                         link: dest.clone(),
                         target: relative_path(Path::new(LIB_DIR), Path::new(path)),
                     });
-                    self.planned.insert(dest);
+                    self.planned.insert(dest.clone());
+                    self.planned_links.insert(dest, PathBuf::from(path));
                     self.supplied.insert(soname.to_owned());
                 } else {
                     self.fail(
@@ -723,9 +766,16 @@ impl Round<'_> {
         {
             return;
         }
+        // The closure places what sits directly under wine/lib/, so its
+        // references follow the one rule; a component's reference into another
+        // tree (winegstreamer.so's into the framework) is its build's own.
+        let judged = binary_dir(&image.relative) == Path::new(LIB_DIR);
+        let leaf = file_name(rest);
         if holding.contains(&pending.dir) {
             let own = pending.dir.clone();
-            pending.reach(&own);
+            if !judged || self.rebind(image, reference, leaf, &own.join(rest)) {
+                pending.reach(&own);
+            }
             return;
         }
         let candidates = self.providers(Path::new(rest));
@@ -752,7 +802,11 @@ impl Round<'_> {
                     ),
                 }
             }
-            [only] => pending.reach(only),
+            [only] => {
+                if !judged || self.rebind(image, reference, leaf, &only.join(rest)) {
+                    pending.reach(only);
+                }
+            }
             several => self.fail(
                 &image.relative,
                 reference,
@@ -770,13 +824,10 @@ impl Round<'_> {
         let dest = Path::new(LIB_DIR).join(leaf);
         let reach = if self.present(&dest) {
             // The leaf under wine/lib/ is a copy an earlier round made (or
-            // this one plans), or a link to a file another component ships:
-            // the same rule as below, over the file the link resolves to.
-            if self.tree.files.contains(&dest) {
-                let shipped = self.canonical(&dest);
-                if !self.rebind(image, reference, leaf, &shipped) {
-                    return;
-                }
+            // this one plans), or a link to a file another component ships,
+            // this round's included: the same rule as below.
+            if !self.rebind(image, reference, leaf, &dest) {
+                return;
             }
             PathBuf::from(LIB_DIR)
         } else {
@@ -803,8 +854,7 @@ impl Round<'_> {
                 // but only through a policy row that names it, and only if
                 // the file is new enough for the dependent.
                 [only] => {
-                    let shipped = self.canonical(&only.join(leaf));
-                    if !self.rebind(image, reference, leaf, &shipped) {
+                    if !self.rebind(image, reference, leaf, &only.join(leaf)) {
                         return;
                     }
                     only.clone()
@@ -996,7 +1046,7 @@ pub fn close(root: &Path, payload: &Path) -> Result<(), String> {
         CONFIG_H,
         sonames.join(" ")
     );
-    check_shipped_elsewhere(&spec, &payload)?;
+    check_shipped_elsewhere(&spec, &payload, |file| otool(file, "-l"))?;
 
     let source = |reference: &str| -> Result<PathBuf, String> {
         let path = if reference.starts_with('/') {
@@ -1053,7 +1103,11 @@ pub fn close(root: &Path, payload: &Path) -> Result<(), String> {
 /// whose `LC_ID_DYLIB` current version is the one `SHIPPED_ELSEWHERE`
 /// records, so a `GStreamer` pin bump cannot leave the notices crediting the
 /// old release. The copy gate does the same for copied libraries.
-fn check_shipped_elsewhere(spec: &BundleSpec, payload: &Path) -> Result<(), String> {
+fn check_shipped_elsewhere(
+    spec: &BundleSpec,
+    payload: &Path,
+    load_commands: impl Fn(&Path) -> Result<String, String>,
+) -> Result<(), String> {
     for elsewhere in SHIPPED_ELSEWHERE {
         if !spec.components.libraries.contains_key(elsewhere.key) {
             return Err(format!(
@@ -1069,7 +1123,7 @@ fn check_shipped_elsewhere(spec: &BundleSpec, payload: &Path) -> Result<(), Stri
                 elsewhere.file, elsewhere.key
             ));
         }
-        elsewhere_matches(elsewhere, &otool(&file, "-l")?)?;
+        elsewhere_matches(elsewhere, &load_commands(&file)?)?;
     }
     Ok(())
 }
@@ -3658,13 +3712,167 @@ mod tests {
             "vulkan/libSDL2-2.0.0.dylib",
         );
         let p = plan(&t, &sonames(&[soname]), &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(
+            (p.errors[0].reference.as_str(), p.errors[0].reason.as_str()),
+            (
+                soname,
+                "vulkan/libSDL2-2.0.0.dylib already ships libSDL2-2.0.0.dylib; a rebinding to a file the payload ships needs a SONAME_POLICY row naming that file"
+            )
+        );
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    /// A link's name says nothing about what it resolves to: a link under
+    /// `wine/lib/` to the closure's own copy of another library (the
+    /// prover's `slot-gmp`) is refused at a SONAME slot and as a dependency.
+    #[test]
+    fn a_link_to_another_library_supplies_nothing() {
+        let soname = "libSDL2-2.0.0.dylib";
+        let slot = "wine/lib/libSDL2-2.0.0.dylib";
+        let gmp = image(
+            "wine/lib/libgmp.10.dylib",
+            Some("@rpath/libgmp.10.dylib"),
+            &[],
+            &[],
+        );
+        let reason = "a link named libSDL2-2.0.0.dylib resolves to wine/lib/libgmp.10.dylib, whose LC_ID_DYLIB is @rpath/libgmp.10.dylib";
+        let t = linked(
+            tree(vec![gmp.clone()], &[]),
+            slot,
+            "wine/lib/libgmp.10.dylib",
+        );
+        let p = plan(&t, &sonames(&[soname]), &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(p.errors[0].reason, reason);
+        assert!(p.is_empty(), "{p:?}");
+
+        let reference = "/usr/local/opt/sdl2/lib/libSDL2-2.0.0.dylib";
+        let client = image(
+            "wine/lib/libclient.dylib",
+            Some("@rpath/libclient.dylib"),
+            &[reference],
+            &[],
+        );
+        let t = linked(
+            tree(vec![gmp, client], &[]),
+            slot,
+            "wine/lib/libgmp.10.dylib",
+        );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(p.errors[0].reference, reference);
+        assert_eq!(p.errors[0].reason, reason);
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    /// An `@rpath` reference of a library under `wine/lib/` follows the one
+    /// rule, through a new run path (the prover's `rpath-probe`) or through
+    /// a link beside it; a row admits it with its allowance.
+    #[test]
+    fn an_rpath_reference_from_wine_lib_follows_the_one_rule() {
+        let glib = format!("{GST_LIB}/libglib-2.0.0.dylib");
+        let reference = "@rpath/libglib-2.0.0.dylib";
+        let probe = "wine/lib/libprobe.dylib";
+        let refusal = format!(
+            "{glib} already ships libglib-2.0.0.dylib; a rebinding to a file the payload ships needs a SONAME_POLICY row naming that file"
+        );
+        let images = || {
+            vec![
+                image(probe, Some("@rpath/libprobe.dylib"), &[reference], &[]),
+                image(&glib, Some(reference), &[], &[]),
+            ]
+        };
+        let p = plan(&tree(images(), &[]), &[], &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(
+            (p.errors[0].binary.as_str(), p.errors[0].reason.as_str()),
+            (probe, refusal.as_str())
+        );
+        assert!(p.is_empty(), "{p:?}");
+
+        let t = linked(tree(images(), &[]), "wine/lib/libglib-2.0.0.dylib", &glib);
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(p.errors[0].reason, refusal);
+        assert!(p.is_empty(), "{p:?}");
+
+        let intl = format!("{GST_LIB}/libintl.8.dylib");
+        let reference = "@rpath/libintl.8.dylib";
+        let t = tree(
+            vec![
+                versioned(
+                    image(probe, Some("@rpath/libprobe.dylib"), &[reference], &[]),
+                    "1.0.0",
+                    &[(reference, "13.0.0")],
+                ),
+                versioned(image(&intl, Some(reference), &[], &[]), "10.5.0", &[]),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
         assert_eq!(p.errors, [], "{p:?}");
         assert_eq!(
-            edit(&p, &winebus),
-            &Edit {
-                add_rpaths: vec!["@loader_path/../..".into()],
-                ..Edit::default()
-            }
+            edit(&p, probe).add_rpaths,
+            ["@loader_path/GStreamer.framework/Versions/1.0/lib"]
+        );
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+    }
+
+    /// `winegstreamer.so` was built against the framework: its `@rpath`
+    /// references need the run path and no row. The one rule covers what
+    /// the closure places.
+    #[test]
+    fn a_components_own_rpath_reference_gets_its_run_path_without_a_row() {
+        let reference = "@rpath/libgstreamer-1.0.0.dylib";
+        let module = format!("{MODULES}/winegstreamer.so");
+        let t = tree(
+            vec![
+                image(&module, Some("@rpath/winegstreamer.so"), &[reference], &[]),
+                image(
+                    &format!("{GST_LIB}/libgstreamer-1.0.0.dylib"),
+                    Some(reference),
+                    &[],
+                    &[],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &[], &homebrew);
+        assert_eq!(p.errors, [], "{p:?}");
+        assert_eq!(edit(&p, &module).add_rpaths, [GST_RPATH]);
+    }
+
+    /// A link this round plans is a binding like one already on disk: the
+    /// absolute dependency planned against it compares versions with the
+    /// file the link will resolve to.
+    #[test]
+    fn an_absolute_dependency_on_a_link_planned_this_round_is_version_checked() {
+        let freetype = format!("{GST_LIB}/libfreetype.6.dylib");
+        let reference = "/usr/local/opt/freetype/lib/libfreetype.6.dylib";
+        let client = "wine/lib/libclient.dylib";
+        let t = tree(
+            vec![
+                versioned(
+                    image(client, Some("@rpath/libclient.dylib"), &[reference], &[]),
+                    "1.0.0",
+                    &[(reference, "27.0.0")],
+                ),
+                versioned(
+                    image(&freetype, Some("@rpath/libfreetype.6.dylib"), &[], &[]),
+                    "26.2.20",
+                    &[],
+                ),
+            ],
+            &[],
+        );
+        let p = plan(&t, &sonames(&["libfreetype.6.dylib"]), &homebrew);
+        assert_eq!(p.errors.len(), 1, "{p:?}");
+        assert_eq!(
+            p.errors[0].reason,
+            format!(
+                "requires compatibility version 27.0.0 but {freetype} is current version 26.2.20; only a SONAME_POLICY row with allow_older_compat and a reason binds a dependent to an older file"
+            )
         );
     }
 
@@ -3717,6 +3925,7 @@ mod tests {
             source: &homebrew,
             plan: Plan::default(),
             planned: BTreeSet::new(),
+            planned_links: BTreeMap::new(),
             supplied: BTreeSet::new(),
         };
         assert!(!round.compatible(&gnutls, intl, Path::new(&framework_intl), Some("  \n")));
@@ -3772,11 +3981,15 @@ mod tests {
         );
     }
 
+    /// These cases stop before the file's load commands are read.
+    fn no_reader(_: &Path) -> Result<String, String> {
+        Err("no otool here".to_owned())
+    }
+
     /// Before the first round, each framework library the notices describe
     /// must be there as a regular Mach-O, with its row: a missing file, a
     /// link in its place, and a missing row are each refused naming the
-    /// row and the file. (The version comparison itself runs on real
-    /// bytes; `elsewhere_matches` is tested on `otool -l` text.)
+    /// row and the file.
     #[test]
     fn the_closure_refuses_a_framework_row_whose_file_is_missing_or_a_link() {
         let dir = scratch("elsewhere");
@@ -3785,7 +3998,7 @@ mod tests {
         let freetype = &SHIPPED_ELSEWHERE[0];
         assert_eq!(freetype.key, "freetype");
         fs::create_dir_all(payload.join(GST_LIB)).expect("framework dir");
-        let error = super::check_shipped_elsewhere(&spec, &payload).unwrap_err();
+        let error = super::check_shipped_elsewhere(&spec, &payload, no_reader).unwrap_err();
         assert_eq!(
             error,
             format!(
@@ -3800,17 +4013,61 @@ mod tests {
         )
         .expect("link in the file's place");
         assert!(payload.join(freetype.file).is_file());
-        let error = super::check_shipped_elsewhere(&spec, &payload).unwrap_err();
+        let error = super::check_shipped_elsewhere(&spec, &payload, no_reader).unwrap_err();
         assert!(
             error.contains("[components.freetype] describes it, but it is not a regular Mach-O"),
             "{error}"
         );
         let mut without_row = fixture_spec();
         without_row.components.libraries.remove("freetype");
-        let error = super::check_shipped_elsewhere(&without_row, &payload).unwrap_err();
+        let error = super::check_shipped_elsewhere(&without_row, &payload, no_reader).unwrap_err();
         assert!(
             error.contains("has no [components.freetype] row for")
                 && error.contains("libfreetype.6.dylib"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The `otool -l` text of a dylib at `current`.
+    fn id_load_command(current: &str) -> String {
+        format!(
+            "Load command 2\n          cmd LC_ID_DYLIB\n      cmdsize 48\n         name @rpath/x (offset 24)\n   time stamp 1 x\n      current version {current}\ncompatibility version 1.0.0\n"
+        )
+    }
+
+    /// A framework file that reports another current version than its row
+    /// is refused before any round, naming the row and both numbers.
+    #[test]
+    fn the_closure_compares_each_framework_file_with_its_row() {
+        let dir = scratch("elsewhere-version");
+        let payload = dir.join("payload");
+        for elsewhere in SHIPPED_ELSEWHERE {
+            fake_macho(&payload.join(elsewhere.file), b"framework");
+        }
+        let spec = fixture_spec();
+        let recorded = |file: &Path| {
+            let elsewhere = SHIPPED_ELSEWHERE
+                .iter()
+                .find(|elsewhere| file.ends_with(elsewhere.file))
+                .expect("a framework file");
+            Ok(id_load_command(elsewhere.current_version))
+        };
+        assert_eq!(
+            super::check_shipped_elsewhere(&spec, &payload, recorded),
+            Ok(())
+        );
+        let error = super::check_shipped_elsewhere(&spec, &payload, |file| {
+            if file.ends_with("libfreetype.6.dylib") {
+                Ok(id_load_command("26.3.20"))
+            } else {
+                recorded(file)
+            }
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("LC_ID_DYLIB current version is 26.3.20, not the 26.2.20")
+                && error.contains("[components.freetype]"),
             "{error}"
         );
         let _ = fs::remove_dir_all(&dir);

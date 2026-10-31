@@ -628,26 +628,31 @@ fn declared_executables(spec: &BundleSpec) -> Vec<String> {
     declared
 }
 
-/// Each library row `BUNDLE.toml` carries for a file inside another
-/// component's tree names a regular Mach-O of the tree whose `LC_ID_DYLIB`
-/// current version is the one `SHIPPED_ELSEWHERE` records: the comparison
+/// Each file `SHIPPED_ELSEWHERE` names that the tree ships has its row in
+/// `BUNDLE.toml`, each such row names a regular Mach-O of the tree, and that
+/// file's `LC_ID_DYLIB` current version is the one recorded: the comparison
 /// `--close` makes before its first round, so a row left stale by a pin
-/// bump is a violation here too.
+/// bump is a violation here too. A tree with neither row nor file ships no
+/// framework.
 fn shipped_elsewhere_violations(spec: &BundleSpec, machos: &[MachO]) -> Vec<Violation> {
     let mut violations = Vec::new();
     for elsewhere in SHIPPED_ELSEWHERE {
-        if !spec.components.libraries.contains_key(elsewhere.key) {
-            continue;
-        }
-        let reason = match machos.iter().find(|macho| macho.relative == elsewhere.file) {
-            Some(macho) => match elsewhere_matches(elsewhere, &macho.load_commands) {
-                Ok(()) => continue,
-                Err(reason) => reason,
-            },
-            None => format!(
+        let row = spec.components.libraries.contains_key(elsewhere.key);
+        let macho = machos.iter().find(|macho| macho.relative == elsewhere.file);
+        let reason = match (row, macho) {
+            (false, None) => continue,
+            (false, Some(_)) => format!(
+                "{}: the payload ships it, but {BUNDLE_FILE} has no row for it, which the notices must list",
+                elsewhere.file
+            ),
+            (true, None) => format!(
                 "{}: not a regular Mach-O file of the payload, which the row describes",
                 elsewhere.file
             ),
+            (true, Some(macho)) => match elsewhere_matches(elsewhere, &macho.load_commands) {
+                Ok(()) => continue,
+                Err(reason) => reason,
+            },
         };
         violations.push(Violation {
             binary: BUNDLE_FILE.to_owned(),
@@ -1135,7 +1140,7 @@ mod tests {
     use super::{
         ArchiveKind, BUNDLE_FILE, MachO, archive_kind, check_listing, declared_chain_targets,
         inspect, is_macho, list_archive, load_denylist, pkg_boms, reject_denylisted,
-        resolve_along_chains,
+        resolve_along_chains, shipped_elsewhere_violations,
     };
     use crate::bundle_toml::{BundleSpec, SHIPPED_ELSEWHERE};
 
@@ -1155,9 +1160,8 @@ mod tests {
             .expect("BUNDLE.toml");
     }
 
-    /// The provenance reviewer's `clone-ver` in miniature: a tree whose
-    /// `BUNDLE.toml` carries the two framework rows but holds neither file
-    /// reports each row, naming the file.
+    /// A tree whose `BUNDLE.toml` carries the two framework rows but holds
+    /// neither file reports each row, naming the file.
     #[test]
     fn a_framework_row_without_its_file_is_a_violation() {
         let dir = scratch("framework-rows");
@@ -1174,6 +1178,66 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A framework file as `inspect` scans it, at `current`.
+    fn framework_macho(file: &str, current: &str) -> MachO {
+        MachO {
+            relative: file.to_owned(),
+            listing: String::new(),
+            load_commands: format!(
+                "Load command 2\n          cmd LC_ID_DYLIB\n      cmdsize 48\n         name @rpath/x (offset 24)\n   time stamp 1 x\n      current version {current}\ncompatibility version 1.0.0\n"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_framework_file_reporting_another_version_is_a_violation() {
+        let spec = BundleSpec::parse(BUNDLE_TOML).expect("the fixture parses");
+        let [freetype, intl] = SHIPPED_ELSEWHERE else {
+            panic!("two rows");
+        };
+        let matching = [
+            framework_macho(freetype.file, freetype.current_version),
+            framework_macho(intl.file, intl.current_version),
+        ];
+        assert_eq!(shipped_elsewhere_violations(&spec, &matching), []);
+        let stale = [
+            framework_macho(freetype.file, "26.3.20"),
+            framework_macho(intl.file, intl.current_version),
+        ];
+        let violations = shipped_elsewhere_violations(&spec, &stale);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].reference, "[components.freetype]");
+        assert!(
+            violations[0]
+                .reason
+                .contains("current version is 26.3.20, not the 26.2.20"),
+            "{}",
+            violations[0].reason
+        );
+    }
+
+    /// The file decides: a framework file with no row is a violation, even
+    /// at the right version, and a tree with neither ships no framework.
+    #[test]
+    fn a_framework_file_without_its_row_is_a_violation() {
+        let mut spec = BundleSpec::parse(BUNDLE_TOML).expect("the fixture parses");
+        let [freetype, intl] = SHIPPED_ELSEWHERE else {
+            panic!("two rows");
+        };
+        spec.components.libraries.remove(freetype.key);
+        spec.components.libraries.remove(intl.key);
+        assert_eq!(shipped_elsewhere_violations(&spec, &[]), []);
+        let machos = [framework_macho(freetype.file, freetype.current_version)];
+        let violations = shipped_elsewhere_violations(&spec, &machos);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].reference, "[components.freetype]");
+        assert!(
+            violations[0].reason.contains("has no row for it"),
+            "{}",
+            violations[0].reason
+        );
     }
 
     fn root() -> PathBuf {
