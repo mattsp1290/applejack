@@ -544,6 +544,7 @@ async fn an_update_keeps_a_file_renamed_only_in_case() {
         manifest(V1, vec![file(chunks, "Data\\Level.pak", &[b"same"])]),
     );
     bench.install(&plan(V1, 11)).await.unwrap();
+    let folds_case = bench.game().join("DATA").exists();
     bench.session.add_manifest(
         DEPOT,
         manifest(V2, vec![file(chunks, "data\\level.pak", &[b"same"])]),
@@ -553,13 +554,309 @@ async fn an_update_keeps_a_file_renamed_only_in_case() {
         .update(&plan(V2, 12))
         .await
         .unwrap();
-    assert_eq!(outcome.files_removed, 0);
+    assert_eq!(outcome.files_removed, u64::from(!folds_case));
     assert_eq!(
         verify_install(&bench.paths(), bench.data(), APPID)
             .unwrap()
             .missing,
         Vec::<String>::new()
     );
+}
+
+// From the install-safety review, probes p4 and p4b. `files_written: 0` was
+// the tell: `DepotJob` hashed the old spelling as the new file and skipped
+// it, and the stale pass then deleted it. On a volume that keeps the two
+// spellings apart the old one goes and the new one is written; verify holds
+// either way.
+#[tokio::test]
+async fn an_update_keeps_a_file_respelled_across_unicode_forms() {
+    for (before, after) in [
+        ("caf\u{e9}.pak", "cafe\u{301}.pak"),
+        ("STRASSE.pak", "stra\u{df}e.pak"),
+    ] {
+        let bench = Bench::new();
+        let chunks = &bench.session.chunks;
+        bench
+            .session
+            .add_manifest(DEPOT, manifest(V1, vec![file(chunks, before, &[b"same"])]));
+        bench.install(&plan(V1, 11)).await.unwrap();
+        bench
+            .session
+            .add_manifest(DEPOT, manifest(V2, vec![file(chunks, after, &[b"same"])]));
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V2, 12))
+            .await
+            .unwrap();
+        assert_eq!(fs::read(bench.game().join(after)).unwrap(), b"same");
+        let report = verify_install(&bench.paths(), bench.data(), APPID).unwrap();
+        assert!(report.is_clean(), "{after}: {report:?}");
+    }
+}
+
+// From the install-safety review, probe p5: `mods` moved to another disk and
+// linked back.
+#[tokio::test]
+async fn an_update_will_not_write_through_a_link_out_of_the_install() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let outside = bench.dir.path().join("Documents");
+    fs::create_dir_all(&outside).unwrap();
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![
+                file(chunks, "mods\\b.txt", &[b"b1"]),
+                file(chunks, "g.exe", &[b"1"]),
+            ],
+        ),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    fs::rename(bench.game().join("mods"), outside.join("mods")).unwrap();
+    std::os::unix::fs::symlink(outside.join("mods"), bench.game().join("mods")).unwrap();
+
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V2,
+            vec![
+                file(chunks, "mods\\b.txt", &[b"b2"]),
+                file(chunks, "g.exe", &[b"2"]),
+            ],
+        ),
+    );
+    let error = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap_err();
+
+    let Error::LinkOutOfInstall { link, target } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(*link, bench.game().join("mods"));
+    assert_eq!(*target, outside.join("mods"));
+    assert!(error.to_string().contains("Documents"));
+    assert_eq!(fs::read(outside.join("mods/b.txt")).unwrap(), b"b1");
+    assert_eq!(fs::read(bench.game().join("g.exe")).unwrap(), b"1");
+    // Nothing was written, so the title is not held back from launching.
+    assert!(!bench.paths().record(APPID).exists());
+}
+
+#[tokio::test]
+async fn stale_removal_skips_a_path_through_a_link_out_of_the_install() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let outside = bench.dir.path().join("Documents");
+    fs::create_dir_all(&outside).unwrap();
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![
+                file(chunks, "mods\\a.txt", &[b"a"]),
+                file(chunks, "g.exe", &[b"1"]),
+            ],
+        ),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    fs::rename(bench.game().join("mods"), outside.join("mods")).unwrap();
+    std::os::unix::fs::symlink(outside.join("mods"), bench.game().join("mods")).unwrap();
+
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V2, vec![file(chunks, "g.exe", &[b"2"])]));
+    let outcome = bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.files_removed, 0);
+    assert_eq!(fs::read(outside.join("mods/a.txt")).unwrap(), b"a");
+}
+
+#[tokio::test]
+async fn a_link_that_stays_inside_the_install_is_written_through() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![
+                file(chunks, "real\\b.txt", &[b"b1"]),
+                file(chunks, "mods\\c.txt", &[b"c1"]),
+            ],
+        ),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    fs::remove_dir_all(bench.game().join("mods")).unwrap();
+    std::os::unix::fs::symlink("real", bench.game().join("mods")).unwrap();
+
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V2,
+            vec![
+                file(chunks, "real\\b.txt", &[b"b1"]),
+                file(chunks, "mods\\c.txt", &[b"c2"]),
+            ],
+        ),
+    );
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("real/c.txt")).unwrap(), b"c2");
+}
+
+// From the install-safety review, probe p5b.
+#[tokio::test]
+async fn a_symlinked_install_dir_on_a_new_title_is_refused() {
+    let bench = Bench::new();
+    let outside = bench.dir.path().join("Important");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("data.txt"), b"mine").unwrap();
+    fs::create_dir_all(bench.paths().root().join("steamapps/common")).unwrap();
+    std::os::unix::fs::symlink(&outside, bench.game()).unwrap();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "data.txt", &[b"game"])]),
+    );
+
+    let error = bench.install(&plan(V1, 11)).await.unwrap_err();
+
+    assert!(matches!(error, Error::LinkOutOfInstall { .. }), "{error}");
+    assert_eq!(fs::read(outside.join("data.txt")).unwrap(), b"mine");
+}
+
+#[tokio::test]
+async fn an_installed_title_moved_to_another_disk_keeps_updating() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let moved = bench.dir.path().join("Other Disk");
+    fs::rename(bench.game(), &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, bench.game()).unwrap();
+
+    bench.add_v2();
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+    assert!(moved.join("new.txt").exists());
+    assert!(!moved.join("old/gone.txt").exists());
+}
+
+// From the install-safety review, probe p8.
+#[tokio::test]
+async fn a_file_that_becomes_a_directory_lands() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V1,
+            vec![
+                file(chunks, "x", &[b"file"]),
+                file(chunks, "g.exe", &[b"1"]),
+            ],
+        ),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(
+            V2,
+            vec![
+                file(chunks, "g.exe", &[b"2"]),
+                file(chunks, "x\\y", &[b"now a dir"]),
+            ],
+        ),
+    );
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("x/y")).unwrap(), b"now a dir");
+}
+
+#[tokio::test]
+async fn a_directory_that_becomes_a_file_lands() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "x\\y", &[b"in a dir"])]),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V2, vec![file(chunks, "x", &[b"now a file"])]),
+    );
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V2, 12))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("x")).unwrap(), b"now a file");
+}
+
+// From the install-safety review, probe p12.
+#[tokio::test]
+async fn a_stored_manifest_gets_the_same_path_check() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let stored = manifest(V1, vec![file(chunks, "..\\..\\..\\pwned.txt", &[b"x"])]);
+    let path = bench.paths().manifest(DEPOT, V1);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    assert!(bench.install(&plan(V1, 11)).await.is_err());
+    assert!(!bench.paths().root().join("pwned.txt").exists());
+    assert_eq!(bench.session.chunks.fetches(), 0);
+}
+
+// From the install-safety review, probe p11.
+#[tokio::test]
+async fn verify_refuses_an_installdir_that_leaves_the_library() {
+    let bench = Bench::new();
+    bench.add_v1();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let path = bench.paths().acf(APPID);
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("Synthetic Game", "../../..");
+    fs::write(&path, text).unwrap();
+    assert!(matches!(
+        verify_install(&bench.paths(), bench.data(), APPID),
+        Err(Error::UnsafePath { .. })
+    ));
+}
+
+// From the install-safety review, probe p10: `DepotJob` takes an empty file
+// on its size, whatever hash the manifest carries.
+#[tokio::test]
+async fn verify_takes_an_empty_file_on_its_size() {
+    let bench = Bench::new();
+    let mut empty = ManifestFile::new("empty.txt".to_owned(), 0);
+    empty.sha_content = Some([0; 20]);
+    bench.session.add_manifest(DEPOT, manifest(V1, vec![empty]));
+    bench.install(&plan(V1, 11)).await.unwrap();
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+    fs::write(bench.game().join("empty.txt"), b"x").unwrap();
+    let report = verify_install(&bench.paths(), bench.data(), APPID).unwrap();
+    assert_eq!(report.mismatched, ["empty.txt"]);
 }
 
 #[tokio::test]

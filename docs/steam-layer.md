@@ -158,7 +158,14 @@ a manifest trimmed to the files that still need writing.
   success. A corrupt chunk is `Error::CorruptChunk`, never reaches the
   install, and leaves the record for the next run. `steamroom` does not check
   a manifest's signature, so the installer refuses any file name or symlink
-  target that would leave the install directory (`Error::UnsafePath`).
+  target that would leave the install directory (`Error::UnsafePath`), for a
+  stored manifest as for a fetched one. A symlink already on disk is checked
+  too, since `DepotJob` joins paths and follows them: before the first write,
+  every parent of a queued path and of staging is walked, and one that leaves
+  the install fails with `Error::LinkOutOfInstall` naming the link and target.
+  Stale removal skips such a path. A link that stays inside is fine. The
+  install directory itself may be a symlink on an installed title, which is
+  how a game moves to another disk, and not on a title with no `.acf`.
 - **Resume.** `<appid>.download.json` (`DownloadRecord`) lists, per depot, the
   target manifest, the previous manifest, and the files in place. It is saved
   atomically every 256 files and on every stop. A run whose branch and
@@ -178,8 +185,12 @@ a manifest trimmed to the files that still need writing.
   records, fetching that manifest if it is not stored, as for a title the
   client updated. Only files that differ are written, unchanged chunks of
   those files come off disk, and files gone from the new manifest are removed
-  unless another installed depot still owns them. Names compare without case,
-  since APFS is case-insensitive. Removal is skipped altogether when an
+  unless another installed depot still owns them. A path is not removed while
+  it is the same file (device and inode) as a current one: APFS folds case and
+  Unicode form, so a respelled file is one file, and the volume is the only
+  thing that knows its own rules. A stale entry in the way of a queued path, a
+  file that became a directory or the reverse, goes before the fetch. Removal
+  is skipped altogether when an
   untouched depot's manifest is not stored, because nothing can then be proved
   stale. A depot already current is left alone, unless a stopped run's record
   names it: such a depot is rechecked in full whatever the `.acf` says, since

@@ -17,7 +17,7 @@
 //! applejack/manifests/<depot>_<manifest>.json    decrypted file lists
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -598,7 +598,9 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
     /// [`Error::AlreadyInstalled`] for a fully installed title and
     /// [`Error::ClientOwned`] for an `.acf` in any other state.
     /// [`Error::ManifestChanged`] when a manifest cannot be fetched after one
-    /// re-read of the product info. [`Error::CorruptChunk`],
+    /// re-read of the product info. [`Error::LinkOutOfInstall`] before any
+    /// write, when a path runs through a symlink that leaves the install.
+    /// [`Error::CorruptChunk`],
     /// [`Error::DiskFull`], and [`Error::Auth`] (including a CDN rate limit)
     /// leave the partial state in place for the next run.
     pub async fn install(&self, plan: &InstallPlan) -> Result<InstallOutcome, Error> {
@@ -878,6 +880,40 @@ impl<S: SteamSession> Run<'_, '_, S> {
         Ok(Ok(work))
     }
 
+    /// The record to run under: a matching one to resume, or a new one.
+    fn open_record(&self, work: &[WorkDepot], install_dir: &Path) -> (DownloadRecord, bool) {
+        let appid = self.plan.appid;
+        let record_path = self.paths().record(appid);
+        let interrupted = record_path.exists();
+        let loaded = DownloadRecord::load(&record_path)
+            .filter(|record| record.matches(appid, &self.plan.branch, work));
+        let resumed = loaded.is_some();
+        // A run for other manifests stopped here and may have left files of
+        // its own target, including ones the `.acf` says are current. The
+        // whole manifest goes through `DepotJob`, which hashes each file and
+        // rewrites only what differs. The record carries this, so stopping
+        // the rescan does not lose it.
+        let mut record = loaded.unwrap_or_else(|| DownloadRecord {
+            version: RECORD_VERSION,
+            appid,
+            branch: self.plan.branch.clone(),
+            rescan: interrupted,
+            depots: work
+                .iter()
+                .map(|depot| RecordDepot {
+                    depot_id: depot.depot_id,
+                    manifest_id: depot.manifest_id,
+                    previous_manifest_id: depot.previous_id,
+                    complete: false,
+                    files: BTreeSet::new(),
+                    abandoned: depot.abandoned_ids.clone(),
+                })
+                .collect(),
+        });
+        record.prune(install_dir, work);
+        (record, resumed)
+    }
+
     /// The depots the `.acf` lists that are not in `work`, with whatever
     /// manifests are to be had: a depot the plan does not select is not
     /// fetched, since the account may no longer reach it.
@@ -932,55 +968,35 @@ impl<S: SteamSession> Run<'_, '_, S> {
         let kept = promote_heirs(&mut work, kept);
         work.sort_by_key(|depot| depot.depot_id);
         let layers = Layers::new(&work, &kept);
+        // A symlink here on a title with no `.acf` may be anything. On an
+        // installed one it is how a game is moved to another disk.
+        if existing.is_none()
+            && let Ok(target) = fs::read_link(&install_dir)
+        {
+            return Err(Error::LinkOutOfInstall {
+                link: install_dir,
+                target,
+            });
+        }
 
-        let interrupted = record_path.exists();
-        let loaded = DownloadRecord::load(&record_path)
-            .filter(|record| record.matches(appid, &self.plan.branch, &work));
-        let resumed = loaded.is_some();
-        // A run for other manifests stopped here and may have left files of
-        // its own target, including ones the `.acf` says are current. The
-        // whole manifest goes through `DepotJob`, which hashes each file and
-        // rewrites only what differs. The record carries this, so stopping
-        // the rescan does not lose it.
-        let mut record = loaded.unwrap_or_else(|| DownloadRecord {
-            version: RECORD_VERSION,
-            appid,
-            branch: self.plan.branch.clone(),
-            rescan: interrupted,
-            depots: work
-                .iter()
-                .map(|depot| RecordDepot {
-                    depot_id: depot.depot_id,
-                    manifest_id: depot.manifest_id,
-                    previous_manifest_id: depot.previous_id,
-                    complete: false,
-                    files: BTreeSet::new(),
-                    abandoned: depot.abandoned_ids.clone(),
-                })
-                .collect(),
-        });
-        record.prune(&install_dir, &work);
+        let (mut record, resumed) = self.open_record(&work, &install_dir);
+        let mut tally = Tally::default();
+        let queued = queue_files(&record, &work, &layers, &install_dir, &mut tally);
+
+        // Checked before the record exists on disk: a refused run wrote
+        // nothing, and a record would hold the title back from launching.
+        refuse_links_out(&install_dir, &queued)?;
         record.save(&record_path, appid)?;
         fs::create_dir_all(&install_dir).map_err(|source| io_error(appid, &install_dir, source))?;
 
-        let mut queued = Vec::with_capacity(work.len());
-        let mut tally = Tally::default();
-        for (index, depot) in work.iter().enumerate() {
-            let done = &record.depots[index];
-            let remaining: Vec<ManifestFile> = if done.complete {
-                Vec::new()
-            } else {
-                layers
-                    .to_write(depot, record.rescan, &install_dir)
-                    .filter(|file| !done.files.contains(&file.filename))
-                    .cloned()
-                    .collect()
-            };
-            tally.total_files +=
-                remaining.iter().filter(|file| reports_events(file)).count() as u64;
-            tally.total_bytes += remaining.iter().map(|file| file.size).sum::<u64>();
-            queued.push(remaining);
-        }
+        // Without every manifest, nothing can be proved stale.
+        let current = current_entries(&work, &kept);
+        let stale = if every_depot_known {
+            stale_names(&work, &current)
+        } else {
+            BTreeSet::new()
+        };
+        let mut files_removed = remove_entries(&install_dir, &blockers(&stale, &queued), &current);
 
         for (index, (depot, remaining)) in work.iter().zip(queued).enumerate() {
             if !remaining.is_empty() {
@@ -999,12 +1015,7 @@ impl<S: SteamSession> Run<'_, '_, S> {
         }
 
         self.installer.refuse_while_client_runs(appid)?;
-        // Without every manifest, nothing can be proved stale.
-        let files_removed = if every_depot_known {
-            remove_stale_files(&install_dir, &work, &kept)
-        } else {
-            0
-        };
+        files_removed += remove_entries(&install_dir, &stale, &current);
         let staging = install_dir.join(STAGING_DIR);
         if staging.exists() {
             fs::remove_dir_all(&staging).map_err(|source| io_error(appid, &staging, source))?;
@@ -1271,6 +1282,32 @@ struct Tally {
     files_written: u64,
 }
 
+/// What each depot of `work` still has to write under `record`.
+fn queue_files(
+    record: &DownloadRecord,
+    work: &[WorkDepot],
+    layers: &Layers<'_>,
+    install_dir: &Path,
+    tally: &mut Tally,
+) -> Vec<Vec<ManifestFile>> {
+    let mut queued = Vec::with_capacity(work.len());
+    for (depot, done) in work.iter().zip(&record.depots) {
+        let remaining: Vec<ManifestFile> = if done.complete {
+            Vec::new()
+        } else {
+            layers
+                .to_write(depot, record.rescan, install_dir)
+                .filter(|file| !done.files.contains(&file.filename))
+                .cloned()
+                .collect()
+        };
+        tally.total_files += remaining.iter().filter(|file| reports_events(file)).count() as u64;
+        tally.total_bytes += remaining.iter().map(|file| file.size).sum::<u64>();
+        queued.push(remaining);
+    }
+    queued
+}
+
 /// What [`Run::kept_depots`] found. `complete` is false when a depot's
 /// manifest could not be had, so the rest does not describe the whole title.
 struct Kept {
@@ -1301,33 +1338,90 @@ fn promote_heirs(work: &mut Vec<WorkDepot>, kept: Vec<KeptDepot>) -> Vec<KeptDep
     kept
 }
 
-/// Deletes files the old manifests had and no current manifest has, then any
-/// directory that leaves empty. A file that will not go is left behind: it
-/// is harmless, and the depot is already correct.
-fn remove_stale_files(install_dir: &Path, work: &[WorkDepot], kept: &[KeptDepot]) -> u64 {
-    // Compared folded: on a case-insensitive volume a file renamed only in
-    // case is the same file, and removing the old spelling would delete it.
-    let current: BTreeSet<String> = work
-        .iter()
+/// Every path the final manifests name; true for a directory entry.
+fn current_entries(work: &[WorkDepot], kept: &[KeptDepot]) -> BTreeMap<String, bool> {
+    work.iter()
         .map(|depot| &depot.manifest)
         .chain(kept.iter().map(|depot| &depot.manifest))
         .flat_map(|manifest| &manifest.files)
-        .map(ManifestFile::normalized_path)
-        .map(|path| path.to_lowercase())
-        .collect();
-    let mut stale: Vec<String> = work
-        .iter()
+        .map(|file| {
+            let flags = DepotFileFlags::from_bits_retain(file.flags);
+            (file.normalized_path(), flags.is_directory())
+        })
+        .collect()
+}
+
+/// Paths the old manifests had and no current manifest names.
+fn stale_names(work: &[WorkDepot], current: &BTreeMap<String, bool>) -> BTreeSet<String> {
+    work.iter()
         .flat_map(|depot| depot.previous.iter().chain(&depot.abandoned))
         .flat_map(|previous| &previous.files)
         .filter(|file| !is_user_config(file))
         .map(ManifestFile::normalized_path)
-        .filter(|path| !current.contains(&path.to_lowercase()))
+        .filter(|path| !current.contains_key(path))
+        .collect()
+}
+
+/// The stale paths in the way of a queued one, either side of a file that
+/// became a directory or the reverse. `DepotJob` cannot land those.
+fn blockers(stale: &BTreeSet<String>, queued: &[Vec<ManifestFile>]) -> BTreeSet<String> {
+    let names: BTreeSet<String> = queued.iter().flatten().map(path_key).collect();
+    let ancestors = |path: &str| -> Vec<String> {
+        Path::new(path)
+            .ancestors()
+            .skip(1)
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .collect()
+    };
+    let queued_parents: BTreeSet<String> = names.iter().flat_map(|name| ancestors(name)).collect();
+    stale
+        .iter()
+        .filter(|path| {
+            let key = path.to_lowercase();
+            queued_parents.contains(&key)
+                || ancestors(&key).iter().any(|parent| names.contains(parent))
+        })
+        .cloned()
+        .collect()
+}
+
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Deletes `names`, then any directory that leaves empty. A file that will
+/// not go is left behind: it is harmless, and the depot is already correct.
+fn remove_entries(
+    install_dir: &Path,
+    names: &BTreeSet<String>,
+    current: &BTreeMap<String, bool>,
+) -> u64 {
+    let Ok(root) = fs::canonicalize(install_dir) else {
+        return 0;
+    };
+    // The volume decides what counts as one name: APFS folds case and Unicode
+    // form, more than any comparison here could, so a respelled file is
+    // found by identity. A file entry with a directory in its place is on
+    // its way out.
+    let live: HashSet<(u64, u64)> = current
+        .iter()
+        .map(|(name, is_dir)| (install_dir.join(name), *is_dir))
+        .filter(|(path, is_dir)| *is_dir || !path.is_dir() || path.is_symlink())
+        .filter_map(|(path, _)| file_identity(&path))
         .collect();
+    let is_live =
+        |path: &Path| file_identity(path).is_some_and(|identity| live.contains(&identity));
+    let mut names: Vec<&String> = names.iter().collect();
     // Longest first, so a directory entry follows the files inside it.
-    stale.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    names.sort_by_key(|name| std::cmp::Reverse(name.len()));
     let mut removed = 0;
-    for name in stale {
-        let path = install_dir.join(&name);
+    for name in names {
+        let path = install_dir.join(name);
+        if is_live(&path) || link_out_of(install_dir, &root, Path::new(name)).is_some() {
+            continue;
+        }
         let is_dir = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
         let gone = if is_dir {
             fs::remove_dir(&path)
@@ -1337,18 +1431,52 @@ fn remove_stale_files(install_dir: &Path, work: &[WorkDepot], kept: &[KeptDepot]
         if gone.is_ok() {
             removed += 1;
         }
-        for parent in Path::new(&name).ancestors().skip(1) {
+        for parent in Path::new(name).ancestors().skip(1) {
             // An explicit empty directory of the new manifest stays.
-            let listed = current.contains(&parent.to_string_lossy().to_lowercase());
-            if parent.as_os_str().is_empty()
-                || listed
-                || fs::remove_dir(install_dir.join(parent)).is_err()
-            {
+            let path = install_dir.join(parent);
+            if parent.as_os_str().is_empty() || is_live(&path) || fs::remove_dir(path).is_err() {
                 break;
             }
         }
     }
     removed
+}
+
+/// The first symlink on the way to `relative` that leads out of the install,
+/// with its target. `root` is the install directory, canonicalized.
+fn link_out_of(install_dir: &Path, root: &Path, relative: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut at = install_dir.to_owned();
+    for part in relative.parent()?.components() {
+        at.push(part);
+        let meta = fs::symlink_metadata(&at).ok()?;
+        if meta.is_symlink() && !fs::canonicalize(&at).is_ok_and(|real| real.starts_with(root)) {
+            let target = fs::read_link(&at).unwrap_or_default();
+            return Some((at, target));
+        }
+    }
+    None
+}
+
+/// Refuses a run that would write through a symlink out of the install, which
+/// a user or another tool made: `DepotJob` joins paths and follows them. A
+/// link the manifest lists stays inside, by [`check_paths`].
+fn refuse_links_out(install_dir: &Path, queued: &[Vec<ManifestFile>]) -> Result<(), Error> {
+    let Ok(root) = fs::canonicalize(install_dir) else {
+        return Ok(());
+    };
+    let staging = Path::new(STAGING_DIR).join("staging");
+    let mut parents: HashSet<PathBuf> = queued
+        .iter()
+        .flatten()
+        .filter_map(|file| Some(Path::new(&file.normalized_path()).parent()?.to_owned()))
+        .collect();
+    parents.insert(staging);
+    for parent in parents {
+        if let Some((link, target)) = link_out_of(install_dir, &root, &parent.join("file")) {
+            return Err(Error::LinkOutOfInstall { link, target });
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a manifest whose paths would land outside the install directory.
@@ -1460,8 +1588,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// A manifest stored earlier. A library can live on a shared or restored
+/// volume, so its paths get the same check as a fetched one.
 fn load_manifest(path: &Path) -> Option<DepotManifest> {
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
+    let manifest: DepotManifest = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    check_paths(&manifest).ok()?;
+    Some(manifest)
 }
 
 fn read_acf(paths: &LibraryPaths, appid: u32) -> Result<Option<(AppManifest, String)>, Error> {
@@ -1509,6 +1641,7 @@ pub fn verify_install(
     let mut app_lock = locks.app(appid, lock::Mode::NonBlocking)?;
     let _library_lock = app_lock.library(lock::Mode::NonBlocking)?;
     let (acf, _) = read_acf(paths, appid)?.ok_or(Error::NotInstalled { appid })?;
+    check_installdir(&acf.installdir)?;
     let install_dir = paths.install_dir(&acf.installdir);
 
     let mut manifests = Vec::new();
@@ -1559,6 +1692,11 @@ fn check_file(path: &Path, file: &ManifestFile) -> io::Result<bool> {
     }
     if is_user_config(file) {
         return Ok(true);
+    }
+    // `DepotJob` takes an empty file on its size, and what real manifests
+    // carry as its hash is unconfirmed.
+    if file.size == 0 && file.chunks.is_empty() && file.link_target.is_none() {
+        return Ok(meta.is_file() && meta.len() == 0);
     }
     if flags.is_symlink() || file.link_target.is_some() {
         let target = fs::read_link(path).ok();

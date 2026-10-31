@@ -57,6 +57,10 @@ pub enum Error {
     /// A name from Steam would land outside the install directory.
     #[error("refusing unsafe path from Steam: `{path}`")]
     UnsafePath { path: String },
+    /// A path runs through a symlink that leaves the install directory, or
+    /// the install directory of a title with no `.acf` is itself a symlink.
+    #[error("refusing to write through `{}`: it is a symlink to `{}`, outside the install", link.display(), target.display())]
+    LinkOutOfInstall { link: PathBuf, target: PathBuf },
     /// A Steam client runs in a prefix that maps this library, so the
     /// library is read-only.
     #[error("a Steam client is running against this library; app {appid} was not written")]
