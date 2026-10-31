@@ -513,7 +513,7 @@ public struct RejectedItem: Codable, Equatable, Sendable, Identifiable {
 /// did not accept launch overrides.
 public struct ConfigImportResult: Codable, Equatable, Sendable {
     public var applied: Bool
-    public var presetAppid: UInt32?
+    public var presetAppid: UInt32
     public var accepted: [ImportItem]
     public var rejected: [RejectedItem]
     public var confirmations: [ImportItem]

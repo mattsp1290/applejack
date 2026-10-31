@@ -13,6 +13,7 @@
   "MethodNotFound": -32601,
   "NotImplemented": 1002,
   "ParseError": -32700,
+  "PrefixBusy": 1011,
   "ProtocolMismatch": 1000,
   "UnsignedEngineRefused": 1010
 }

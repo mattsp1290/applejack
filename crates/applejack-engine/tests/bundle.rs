@@ -900,6 +900,39 @@ fn local_bundle_reads_the_version_out_of_an_archive_and_leaves_it_alone() {
     assert!(archive.is_file(), "an archive the user passed stays");
 }
 
+/// `tar -C tree .` is the usual way to make one, and names every entry `./x`.
+#[test]
+fn local_bundle_installs_an_archive_tarred_from_inside_its_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let tree = dir.path().join("tree");
+    write_bundle_tree(&tree, BUNDLE_TOML);
+    let tar = dir.path().join("bundle.tar");
+    let status = std::process::Command::new("/usr/bin/tar")
+        .env("COPYFILE_DISABLE", "1")
+        .arg("-cf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(&tree)
+        .arg(".")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let archive = dir.path().join("bundle.tar.zst");
+    zstd::stream::copy_encode(
+        fs::File::open(&tar).unwrap(),
+        fs::File::create(&archive).unwrap(),
+        0,
+    )
+    .unwrap();
+
+    let local =
+        applejack_engine::LocalBundle::prepare(&layout, rosetta(), &archive, &mut |_| {}).unwrap();
+    let installed =
+        applejack_engine::bundle::install(&layout, &local.request, &mut |_| {}).unwrap();
+    assert!(installed.root.join("BUNDLE.toml").is_file());
+}
+
 #[test]
 fn local_bundle_refuses_before_packing() {
     let dir = tempfile::tempdir().unwrap();

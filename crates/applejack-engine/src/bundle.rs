@@ -602,12 +602,15 @@ const MAX_DESCRIPTOR_BYTES: u64 = 1 << 20;
 
 const LOCK_FILE: &str = ".install.lock";
 
+const PACKED_SUFFIX: &str = ".local.tar.zst";
+
 /// Exclusive for one engine id across every applejack process, held from
 /// before a local bundle is packed until the install has been recorded, so
 /// two installs never share a `.partial`. Released on drop.
 #[derive(Debug)]
 pub struct InstallLock {
-    _file: File,
+    file: File,
+    root: PathBuf,
 }
 
 impl InstallLock {
@@ -628,10 +631,35 @@ impl InstallLock {
             .open(&path)
             .map_err(|error| Error::io(&path, error))?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file, root }),
             Err(rustix::io::Errno::WOULDBLOCK) => Err(Error::InstallInProgress { id }),
             Err(error) => Err(Error::io(path, error.into())),
         }
+    }
+
+    /// Clears the packed archives an interrupted install left, which only
+    /// the lock's holder can be using, except `from`, the input of this
+    /// install, which may be one of them.
+    pub fn sweep_packed(&self, from: &Path) {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        let input = fs::canonicalize(from).ok();
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(PACKED_SUFFIX)
+                && fs::canonicalize(entry.path()).ok() != input
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+impl Drop for InstallLock {
+    /// See [`crate::rosetta_wine::snapshot::PrefixLock`]: a child being
+    /// spawned elsewhere can hold a copy of the descriptor past a close.
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -663,8 +691,9 @@ impl LocalBundle {
     ///
     /// [`Error::BundleIdentityMismatch`] when the bundle names another
     /// engine, [`Error::AlreadyInstalled`] before anything is packed,
-    /// [`Error::InvalidArchive`] for an archive with no root
-    /// `BUNDLE.toml`, the descriptor's load errors, or [`Error::Io`].
+    /// [`Error::InvalidArchive`] for an archive with no root `BUNDLE.toml`,
+    /// [`Error::InvalidBundle`] for a directory with none, the descriptor's
+    /// load errors, or [`Error::Io`].
     pub fn prepare(
         layout: &EngineLayout,
         id: EngineId,
@@ -674,6 +703,12 @@ impl LocalBundle {
         let is_dir = fs::metadata(from)
             .map_err(|error| Error::io(from, error))?
             .is_dir();
+        if is_dir && !from.join(BUNDLE_FILE).is_file() {
+            return Err(Error::InvalidBundle(format!(
+                "`{}` has no {BUNDLE_FILE}",
+                from.display()
+            )));
+        }
         let bundle = if is_dir {
             BundleToml::load(from)?
         } else {
@@ -696,7 +731,7 @@ impl LocalBundle {
         let (archive, packed) = if is_dir {
             let root = layout.engine_root(id);
             fs::create_dir_all(&root).map_err(|error| Error::io(&root, error))?;
-            let archive = root.join(format!("{}.local.tar.zst", bundle.version));
+            let archive = root.join(format!("{}{PACKED_SUFFIX}", bundle.version));
             if let Err(error) = pack_dir(from, &archive, progress) {
                 let _ = fs::remove_file(&archive);
                 return Err(error);
@@ -705,7 +740,11 @@ impl LocalBundle {
         } else {
             (from.to_path_buf(), None)
         };
-        let sha256 = sha256_file(&archive)?;
+        let sha256 = sha256_file(&archive).inspect_err(|_| {
+            if let Some(path) = &packed {
+                let _ = fs::remove_file(path);
+            }
+        })?;
         Ok(Self {
             request: InstallRequest::local(id, bundle.version, archive, sha256),
             packed,
@@ -722,7 +761,10 @@ fn descriptor_in_archive(archive: &Path) -> Result<String> {
     for entry in tar.entries().map_err(|error| Error::io(archive, error))? {
         let entry = entry.map_err(|error| Error::io(archive, error))?;
         let path = entry.path().map_err(|error| Error::io(archive, error))?;
-        if path.components().ne(Path::new(BUNDLE_FILE).components()) {
+        let parts = path
+            .components()
+            .filter(|part| !matches!(part, PathComponent::CurDir));
+        if parts.ne(Path::new(BUNDLE_FILE).components()) {
             continue;
         }
         let mut text = String::new();

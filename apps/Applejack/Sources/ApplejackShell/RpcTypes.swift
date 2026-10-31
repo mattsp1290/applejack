@@ -165,6 +165,7 @@ public enum RpcErrorCode: Int, Codable, Sendable, CaseIterable {
     case diskFull = 1008
     case downloadFailed = 1009
     case unsignedEngineRefused = 1010
+    case prefixBusy = 1011
 }
 
 public struct HelloParams: Codable, Equatable, Sendable {

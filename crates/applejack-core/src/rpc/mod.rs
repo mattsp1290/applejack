@@ -165,11 +165,14 @@ impl Handler for CoreHandler {
                     .prefix_restore(&params.prefix, &params.timestamp)?,
             ),
             Method::PrefixReset(params) => {
-                let mut core = self.core()?.detached();
-                let (name, keep) = (params.prefix.clone(), params.keep_user_data);
+                let core = self.core()?;
+                let claim = core.claim_prefix(&params.prefix)?;
+                let mut core = core.detached();
+                let keep = params.keep_user_data;
                 to_result(&notifier.start_job(move |job| {
+                    let name = claim.name();
                     job.progress("reset", None, None, format!("rebuilding prefix {name}"));
-                    let safety = core.prefix_reset(&name, keep)?;
+                    let safety = core.prefix_reset_claimed(&claim, keep)?;
                     job.progress(
                         "reset",
                         None,
@@ -305,7 +308,8 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// the loop. Empty lines are skipped. Every message is flushed as one line
 /// by a writer thread, in the order queued, so a job's notifications never
 /// break a line. Before returning, the loop waits for running jobs to send
-/// their final notification.
+/// their final notification, also when `writer` has failed: the caller's
+/// exit would kill them.
 ///
 /// # Errors
 ///
@@ -326,19 +330,23 @@ pub fn serve<H: Handler + ?Sized>(
         let written = output
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("the writer thread panicked")));
-        // A failed writer also fails the loop's next send; its error is the
-        // cause.
         written.and(outcome)
     })
 }
 
+/// Runs until the last sender drops, whatever the writer does: `serve` waits
+/// for jobs by joining this thread. Lines after a failed write are dropped.
 fn write_lines(mut writer: impl Write, lines: &Receiver<String>) -> io::Result<()> {
+    let mut outcome = Ok(());
     for mut line in lines {
-        line.push('\n');
-        writer.write_all(line.as_bytes())?;
-        writer.flush()?;
+        if outcome.is_ok() {
+            line.push('\n');
+            outcome = writer
+                .write_all(line.as_bytes())
+                .and_then(|()| writer.flush());
+        }
     }
-    Ok(())
+    outcome
 }
 
 fn respond(notifier: &Notifier, response: &Response) -> io::Result<()> {

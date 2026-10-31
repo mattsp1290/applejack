@@ -21,7 +21,7 @@ enum Action {
     Install {
         /// Engine id, for example rosetta-wine
         id: String,
-        /// Bundle directory or `.tar.zst`; needs
+        /// Bundle directory or `.tar.zst`; debug builds only, with
         /// `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`
         #[arg(long)]
         from: Option<PathBuf>,

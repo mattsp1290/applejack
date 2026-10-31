@@ -1,0 +1,742 @@
+//! What a prefix survives: overlapping operations, a reader that dies under
+//! a job, a failed reset, and a removal. Over a stub bundle, through the
+//! operations the CLI and the RPC handler share. Lifted from the lifecycle
+//! review's probes.
+
+mod common;
+
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+
+use applejack_core::rpc::jobs::Notifier;
+use applejack_core::rpc::methods::Method;
+use applejack_core::rpc::wire::{ErrorCode, RpcError};
+use applejack_core::rpc::{self, CoreHandler, Handler};
+use applejack_core::{Core, CoreError};
+use applejack_engine::rosetta_wine::snapshot::PrefixLock;
+use applejack_engine::{EngineId, Error as EngineError, GraphicsBackend, HidrawMode, LocalBundle};
+use common::{script, write_stub_bundle};
+use serde_json::{Value, json};
+use tempfile::TempDir;
+
+const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":1}}"#;
+const LIST: &str = r#"{"jsonrpc":"2.0","id":2,"method":"engine.list","params":{}}"#;
+
+fn parse(output: &[u8]) -> Vec<Value> {
+    std::str::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn installed(dir: &TempDir) -> Core {
+    let tree = dir.path().join("tree");
+    write_stub_bundle(&tree, "10.0.0");
+    let mut core = Core::new(dir.path().join("data")).with_unsigned_installs(true);
+    core.plan_install("rosetta-wine", Some(&tree))
+        .unwrap()
+        .run(&mut |_| {})
+        .unwrap();
+    core.prefix_create("p", GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
+        .unwrap();
+    core
+}
+
+fn stub_wine(dir: &TempDir) -> PathBuf {
+    dir.path()
+        .join("data/engines/rosetta-wine/10.0.0/wine/bin/wine64")
+}
+
+fn save_file(data: &Path) -> PathBuf {
+    data.join("prefixes/p/drive_c/users/me/save.txt")
+}
+
+fn prefix_ok(core: &Core) -> bool {
+    core.prefix_list()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.name == "p" && entry.problem.is_none())
+}
+
+fn reset_line(id: u32) -> String {
+    json!({"jsonrpc":"2.0","id":id,"method":"prefix.reset","params":{"prefix":"p"}}).to_string()
+}
+
+/// One double click on reset, against a boot long enough for the second to
+/// land inside the first. Whatever the answers, the prefix must survive and
+/// the user's file must be in a snapshot.
+fn double_reset() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let wine = stub_wine(&dir);
+    let body = fs::read_to_string(&wine).unwrap();
+    let slow = body.replacen(
+        "name=$(basename \"$1\")",
+        "name=$(basename \"$1\")\n[ \"$name\" = wineboot ] && sleep 0.5",
+        1,
+    );
+    script(&wine, &slow);
+    let data = core.data_dir().to_path_buf();
+    fs::write(save_file(&data), "only copy").unwrap();
+    let check = Core::new(&data);
+
+    let input = format!("{HELLO}\n{}\n{}\n", reset_line(2), reset_line(3));
+    let mut output = Vec::new();
+    rpc::serve(input.as_bytes(), &mut output, &mut CoreHandler::new(core)).unwrap();
+
+    let messages = parse(&output);
+    let second = messages.iter().find(|m| m["id"] == json!(3)).unwrap();
+    assert_eq!(
+        second["error"]["code"],
+        json!(ErrorCode::PrefixBusy.code()),
+        "{messages:?}"
+    );
+    assert!(prefix_ok(&check), "no usable prefix: {messages:?}");
+    let snapshots = check.prefix_snapshots("p").unwrap();
+    assert!(
+        snapshots
+            .iter()
+            .any(|s| s.dir.join("drive_c/users/me/save.txt").is_file()),
+        "the user's file is in no snapshot: {messages:?}"
+    );
+}
+
+#[test]
+fn twelve_double_resets_leave_the_prefix_and_its_data() {
+    for _ in 0..12 {
+        double_reset();
+    }
+}
+
+fn busy<T: std::fmt::Debug>(outcome: Result<T, CoreError>) {
+    let error = outcome.unwrap_err();
+    assert!(
+        matches!(error, CoreError::Engine(EngineError::PrefixBusy { .. })),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), ErrorCode::PrefixBusy);
+}
+
+#[test]
+fn every_operation_refuses_a_prefix_someone_else_holds() {
+    let dir = TempDir::new().unwrap();
+    let mut core = installed(&dir);
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    let root = core.data_dir().join("prefixes");
+    let held = PrefixLock::acquire(&root.join("p"), &root.join(".snapshots"), "p").unwrap();
+
+    busy(core.prefix_snapshot("p"));
+    busy(core.prefix_restore("p", &snapshot.timestamp));
+    busy(core.prefix_reset("p", false));
+    busy(core.prefix_remove("p"));
+    busy(core.prefix_create("p", GraphicsBackend::Dxmt, None, HidrawMode::Disabled));
+    busy(core.prefix_exec(
+        "p",
+        Path::new("exit7.exe"),
+        &[OsString::from("x")],
+        &mut io::sink(),
+    ));
+    assert!(core.data_dir().join("prefixes/p").is_dir());
+
+    drop(held);
+    core.prefix_snapshot("p").unwrap();
+}
+
+#[test]
+fn a_reset_of_an_unknown_prefix_is_refused_before_a_job_starts() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let line = json!({"jsonrpc":"2.0","id":2,"method":"prefix.reset","params":{"prefix":"nope"}});
+    let input = format!("{HELLO}\n{line}\n");
+    let mut output = Vec::new();
+    rpc::serve(input.as_bytes(), &mut output, &mut CoreHandler::new(core)).unwrap();
+    let messages = parse(&output);
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(
+        messages[1]["error"]["code"],
+        json!(ErrorCode::InvalidParams.code())
+    );
+}
+
+/// A job that sets a flag when it completes, after 300 ms.
+struct Slow(Arc<AtomicBool>);
+
+impl Handler for Slow {
+    fn handle(&mut self, method: &Method, notifier: &Notifier) -> Result<Value, RpcError> {
+        if let Method::EngineList(_) = method {
+            let finished = self.0.clone();
+            return rpc::to_result(&notifier.start_job(move |job| {
+                job.progress("work", None, None, "first");
+                std::thread::sleep(Duration::from_millis(300));
+                job.progress("work", None, None, "second");
+                finished.store(true, Ordering::SeqCst);
+                Ok(())
+            })?);
+        }
+        Ok(json!({}))
+    }
+}
+
+/// Fails every write after the first `left` lines, as a closed pipe does.
+struct DiesAfter(usize);
+
+impl Write for DiesAfter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.0 == 0 {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        self.0 -= 1;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_dead_reader_does_not_abandon_a_running_job() {
+    let finished = Arc::new(AtomicBool::new(false));
+    let input = format!("{HELLO}\n{LIST}\n");
+    // `hello` and the job's start land, then the pipe is gone.
+    let error = rpc::serve(input.as_bytes(), DiesAfter(2), &mut Slow(finished.clone()));
+    assert_eq!(error.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "serve returned while the job still ran; the caller's exit kills it"
+    );
+}
+
+fn packed_archives(data: &Path) -> Vec<String> {
+    fs::read_dir(data.join("engines/rosetta-wine"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tar.zst"))
+        .collect()
+}
+
+#[test]
+fn an_install_finishes_under_a_dead_reader_and_leaves_no_archive() {
+    let dir = TempDir::new().unwrap();
+    let tree = dir.path().join("tree");
+    write_stub_bundle(&tree, "10.0.0");
+    let data = dir.path().join("data");
+    let core = Core::new(&data).with_unsigned_installs(true);
+    let line = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "engine.install",
+        "params": {"engine_id": "rosetta-wine", "from": tree}
+    });
+    let input = format!("{HELLO}\n{line}\n");
+    rpc::serve(input.as_bytes(), DiesAfter(1), &mut CoreHandler::new(core)).unwrap_err();
+    assert!(
+        data.join("engines/rosetta-wine/10.0.0/BUNDLE.toml")
+            .is_file()
+    );
+    assert_eq!(packed_archives(&data), Vec::<String>::new());
+}
+
+#[test]
+fn the_next_install_clears_the_archive_a_killed_one_left() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("data");
+    let root = data.join("engines/rosetta-wine");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("9.0.0.local.tar.zst"), "left by a killed install").unwrap();
+    let tree = dir.path().join("tree");
+    write_stub_bundle(&tree, "10.0.0");
+    let core = Core::new(&data).with_unsigned_installs(true);
+    core.plan_install("rosetta-wine", Some(&tree))
+        .unwrap()
+        .run(&mut |_| {})
+        .unwrap();
+    assert_eq!(packed_archives(&data), Vec::<String>::new());
+}
+
+/// A core, its data directory, and a packed archive of 10.0.0 where a killed
+/// install leaves one, beside a stale 9.0.0.
+fn left_by_a_killed_install(dir: &TempDir) -> (Core, PathBuf, PathBuf) {
+    let data = dir.path().join("data");
+    let tree = dir.path().join("tree");
+    write_stub_bundle(&tree, "10.0.0");
+    let core = Core::new(&data).with_unsigned_installs(true);
+    let archive = data.join("engines/rosetta-wine/10.0.0.local.tar.zst");
+    let kept = dir.path().join("kept.tar.zst");
+    let packed =
+        LocalBundle::prepare(core.layout(), EngineId::RosettaWine, &tree, &mut |_| {}).unwrap();
+    fs::copy(&archive, &kept).unwrap();
+    drop(packed);
+    fs::rename(&kept, &archive).unwrap();
+    let other = data.join("engines/rosetta-wine/9.0.0.local.tar.zst");
+    fs::write(&other, "left by another killed install").unwrap();
+    (core, data, archive)
+}
+
+/// Passing the file a killed install left is the obvious thing to reach for,
+/// and the sweep for such files runs before the input is read.
+#[test]
+fn an_archive_a_killed_install_left_can_be_the_input_of_the_next() {
+    let dir = TempDir::new().unwrap();
+    let (core, data, archive) = left_by_a_killed_install(&dir);
+
+    core.plan_install("rosetta-wine", Some(&archive))
+        .unwrap()
+        .run(&mut |_| {})
+        .unwrap();
+    assert!(
+        data.join("engines/rosetta-wine/10.0.0/BUNDLE.toml")
+            .is_file()
+    );
+    assert_eq!(
+        packed_archives(&data),
+        ["10.0.0.local.tar.zst"],
+        "the input stays, the other leftover goes"
+    );
+}
+
+#[test]
+fn a_link_to_the_archive_a_killed_install_left_can_be_the_input() {
+    let dir = TempDir::new().unwrap();
+    let (core, data, archive) = left_by_a_killed_install(&dir);
+    let link = dir.path().join("link.tar.zst");
+    std::os::unix::fs::symlink(&archive, &link).unwrap();
+
+    core.plan_install("rosetta-wine", Some(&link))
+        .unwrap()
+        .run(&mut |_| {})
+        .unwrap();
+    assert_eq!(packed_archives(&data), ["10.0.0.local.tar.zst"]);
+}
+
+#[test]
+fn a_removal_can_be_undone_from_its_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    fs::write(save_file(core.data_dir()), "kept").unwrap();
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    core.prefix_remove("p").unwrap();
+
+    let listed = core.prefix_snapshots("p").unwrap();
+    assert_eq!(
+        listed,
+        std::slice::from_ref(&snapshot),
+        "a removed prefix keeps its list"
+    );
+    let restored = core.prefix_restore("p", &snapshot.timestamp).unwrap();
+    assert_eq!(restored.timestamp, snapshot.timestamp);
+    assert!(prefix_ok(&core));
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "kept"
+    );
+    assert_eq!(
+        core.prefix_snapshots("p").unwrap().len(),
+        1,
+        "no safety copy"
+    );
+}
+
+#[test]
+fn restoring_a_gone_prefix_from_a_snapshot_it_lacks_fails_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    core.prefix_snapshot("p").unwrap();
+    core.prefix_remove("p").unwrap();
+    let error = core.prefix_restore("p", "19700101T000000Z").unwrap_err();
+    assert!(matches!(
+        error,
+        CoreError::Engine(EngineError::SnapshotNotFound { .. })
+    ));
+}
+
+#[test]
+fn restoring_a_name_with_no_prefix_and_no_snapshots_is_an_unknown_prefix() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let error = core.prefix_restore("typo", "19700101T000000Z").unwrap_err();
+    assert!(matches!(error, CoreError::UnknownPrefix { .. }), "{error}");
+}
+
+fn create_with_save(core: &mut Core, name: &str) -> PathBuf {
+    core.prefix_create(name, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
+        .unwrap();
+    let save = core
+        .data_dir()
+        .join("prefixes")
+        .join(name)
+        .join("drive_c/users/me/save.txt");
+    fs::write(&save, "the only copy").unwrap();
+    save
+}
+
+#[test]
+fn restoring_keeps_a_prefix_named_like_a_replaced_copy() {
+    let dir = TempDir::new().unwrap();
+    let mut core = installed(&dir);
+    let save = create_with_save(&mut core, "p.replaced");
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    core.prefix_restore("p", &snapshot.timestamp).unwrap();
+    assert!(save.is_file(), "restoring p deleted prefix p.replaced");
+}
+
+#[test]
+fn restoring_keeps_a_prefix_named_like_a_restoring_copy() {
+    let dir = TempDir::new().unwrap();
+    let mut core = installed(&dir);
+    let save = create_with_save(&mut core, "p.restoring");
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    core.prefix_restore("p", &snapshot.timestamp).unwrap();
+    assert!(save.is_file(), "restoring p deleted prefix p.restoring");
+}
+
+#[test]
+fn undoing_a_removal_keeps_a_prefix_named_like_a_restoring_copy() {
+    let dir = TempDir::new().unwrap();
+    let mut core = installed(&dir);
+    let save = create_with_save(&mut core, "p.restoring");
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    core.prefix_remove("p").unwrap();
+    core.prefix_restore("p", &snapshot.timestamp).unwrap();
+    assert!(
+        save.is_file(),
+        "undoing a removal of p deleted prefix p.restoring"
+    );
+}
+
+fn prefix_names(core: &Core) -> Vec<String> {
+    let list = core.prefix_list().unwrap();
+    list.into_iter().map(|entry| entry.name).collect()
+}
+
+fn working_dirs(core: &Core) -> Vec<String> {
+    fs::read_dir(core.data_dir().join("prefixes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".staging"))
+        .collect()
+}
+
+/// A kill between the two renames of a restore, built by hand because a real
+/// kill landing there cannot be reproduced on demand. The prefix holds "new"
+/// and the returned snapshot "old".
+fn killed_between_the_renames(core: &Core) -> String {
+    fs::write(save_file(core.data_dir()), "old").unwrap();
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    fs::write(save_file(core.data_dir()), "new").unwrap();
+    let root = core.data_dir().join("prefixes");
+    fs::create_dir(root.join(".staging-restoring-p")).unwrap();
+    fs::rename(root.join("p"), root.join(".staging-replaced-p")).unwrap();
+    assert_eq!(
+        prefix_names(core),
+        Vec::<String>::new(),
+        "listed after the kill"
+    );
+    snapshot.timestamp
+}
+
+#[test]
+fn a_restore_killed_between_its_renames_recovers_with_no_ghost() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let timestamp = killed_between_the_renames(&core);
+
+    core.prefix_restore("p", &timestamp).unwrap();
+    assert_eq!(prefix_names(&core), ["p"], "listed after recovery");
+    assert!(prefix_ok(&core));
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "old"
+    );
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+#[test]
+fn the_next_operation_puts_back_a_prefix_a_killed_restore_moved_aside() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    killed_between_the_renames(&core);
+
+    core.prefix_snapshot("p").unwrap();
+    assert_eq!(prefix_names(&core), ["p"]);
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "new"
+    );
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+/// The kill came after the swap, so the prefix is already the restored one.
+#[test]
+fn a_replaced_copy_beside_a_prefix_is_cleared_and_not_put_back() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    fs::write(save_file(core.data_dir()), "swapped in").unwrap();
+    let root = core.data_dir().join("prefixes");
+    fs::create_dir_all(root.join(".staging-replaced-p/drive_c")).unwrap();
+
+    core.prefix_snapshot("p").unwrap();
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "swapped in"
+    );
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+/// A deletion that stopped part way must not come back as the prefix.
+#[test]
+fn a_copy_being_discarded_never_comes_back_as_the_prefix() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let root = core.data_dir().join("prefixes");
+    fs::rename(root.join("p"), root.join(".staging-discarding-p")).unwrap();
+
+    assert!(matches!(
+        core.prefix_snapshot("p"),
+        Err(CoreError::UnknownPrefix { .. })
+    ));
+    assert!(!root.join("p").exists());
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+/// A deletion that fails part way must leave nothing under the name that
+/// `settle_restore` puts back.
+#[test]
+fn a_replaced_copy_that_will_not_delete_never_comes_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let root = core.data_dir().join("prefixes");
+    let replaced = root.join(".staging-replaced-p");
+    fs::create_dir_all(replaced.join("a/b")).unwrap();
+    fs::write(replaced.join("a/b/f"), "x").unwrap();
+    fs::set_permissions(replaced.join("a/b"), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let _ = core.prefix_snapshot("p");
+    core.prefix_remove("p").unwrap();
+    assert!(matches!(
+        core.prefix_snapshot("p"),
+        Err(CoreError::UnknownPrefix { .. })
+    ));
+    let ghost = root.join("p").exists();
+    for base in [replaced, root.join(".staging-discarding-p"), root.join("p")] {
+        let _ = fs::set_permissions(base.join("a/b"), fs::Permissions::from_mode(0o755));
+    }
+    assert!(!ghost, "a partly deleted copy came back as the prefix");
+}
+
+/// The longest name keeps every working name legal, including the way back
+/// from a removal; one byte more is refused before any data exists.
+#[test]
+fn a_prefix_name_stops_where_the_working_names_still_fit() {
+    let dir = TempDir::new().unwrap();
+    let mut core = installed(&dir);
+    let longest = "n".repeat(235);
+
+    core.prefix_create(&longest, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
+        .unwrap();
+    let snapshot = core.prefix_snapshot(&longest).unwrap();
+    core.prefix_restore(&longest, &snapshot.timestamp).unwrap();
+    core.prefix_remove(&longest).unwrap();
+    core.prefix_restore(&longest, &snapshot.timestamp).unwrap();
+
+    let too_long = "n".repeat(236);
+    assert!(matches!(
+        core.prefix_create(&too_long, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
+            .unwrap_err(),
+        CoreError::Engine(EngineError::InvalidSnapshotName { .. })
+    ));
+}
+
+/// A disk image of its own, detached on drop.
+struct Volume {
+    mount: PathBuf,
+}
+
+impl Volume {
+    /// `None` where `hdiutil` cannot make one, such as under a sandbox.
+    fn attach(dir: &Path) -> Option<Self> {
+        let image = dir.join("volume.dmg");
+        let mount = dir.join("volume");
+        fs::create_dir(&mount).unwrap();
+        let hdiutil = |args: &[&OsStr]| {
+            Command::new("/usr/bin/hdiutil")
+                .args(args)
+                .arg("-quiet")
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let created = hdiutil(&[
+            "create".as_ref(),
+            "-size".as_ref(),
+            "32m".as_ref(),
+            "-fs".as_ref(),
+            "APFS".as_ref(),
+            "-volname".as_ref(),
+            "applejack-test".as_ref(),
+            image.as_os_str(),
+        ]);
+        let attached = created
+            && hdiutil(&[
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-noverify".as_ref(),
+                "-noautoopen".as_ref(),
+                "-mountpoint".as_ref(),
+                mount.as_os_str(),
+                image.as_os_str(),
+            ]);
+        attached.then_some(Self { mount })
+    }
+}
+
+impl Drop for Volume {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-force", "-quiet"])
+            .arg(&self.mount)
+            .status();
+    }
+}
+
+/// A rename cannot cross a volume, and nothing else stops `.snapshots` being
+/// on another one: snapshots are plain copies.
+#[test]
+fn a_restore_works_with_the_snapshots_on_another_volume() {
+    let dir = TempDir::new().unwrap();
+    let Some(volume) = Volume::attach(dir.path()) else {
+        assert!(
+            std::env::var_os("APPLEJACK_ALLOW_NO_DISK_IMAGE").is_some_and(|value| value == "1"),
+            "hdiutil could not attach a disk image; set APPLEJACK_ALLOW_NO_DISK_IMAGE=1 to skip"
+        );
+        eprintln!("skipped: hdiutil could not attach a disk image");
+        return;
+    };
+    let core = installed(&dir);
+    let root = core.data_dir().join("prefixes");
+    let elsewhere = volume.mount.join("snapshots");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::remove_dir_all(root.join(".snapshots")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join(".snapshots")).unwrap();
+    assert_ne!(
+        fs::metadata(&elsewhere).unwrap().dev(),
+        fs::metadata(&root).unwrap().dev(),
+        "the test needs two volumes"
+    );
+    fs::write(save_file(core.data_dir()), "old").unwrap();
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    fs::write(save_file(core.data_dir()), "new").unwrap();
+
+    core.prefix_restore("p", &snapshot.timestamp).unwrap();
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "old"
+    );
+    core.prefix_remove("p").unwrap();
+    core.prefix_restore("p", &snapshot.timestamp).unwrap();
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "old"
+    );
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+#[test]
+fn a_failed_reset_names_its_snapshot_and_can_be_restored() {
+    let dir = TempDir::new().unwrap();
+    let mut core = installed(&dir);
+    fs::write(save_file(core.data_dir()), "only copy").unwrap();
+    script(&stub_wine(&dir), "#!/bin/sh\nexit 3\n");
+
+    let error = core.prefix_reset("p", true).unwrap_err();
+    assert!(core.prefix_list().unwrap().is_empty(), "the prefix is gone");
+    let snapshots = core.prefix_snapshots("p").unwrap();
+    assert_eq!(snapshots.len(), 1);
+    let stamp = &snapshots[0].timestamp;
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("applejack prefix restore p {stamp}")),
+        "{text}"
+    );
+
+    core.prefix_restore("p", stamp).unwrap();
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "only copy"
+    );
+}
+
+#[test]
+fn a_failed_reset_over_rpc_names_its_snapshot_in_job_failed() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    script(&stub_wine(&dir), "#!/bin/sh\nexit 3\n");
+    let check = Core::new(core.data_dir());
+    let input = format!("{HELLO}\n{}\n", reset_line(2));
+    let mut output = Vec::new();
+    rpc::serve(input.as_bytes(), &mut output, &mut CoreHandler::new(core)).unwrap();
+    let messages = parse(&output);
+    let failed = messages
+        .iter()
+        .find(|message| message["method"] == json!("job.failed"))
+        .unwrap();
+    let stamp = &check.prefix_snapshots("p").unwrap()[0].timestamp;
+    let text = failed["params"]["message"].as_str().unwrap();
+    assert!(text.contains(stamp.as_str()), "{text}");
+    assert_eq!(failed["params"]["code"], json!(1004));
+}
+
+fn await_job_end(lines: &Receiver<String>) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if let Ok(line) = lines.recv_timeout(Duration::from_secs(1)) {
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message["method"] == "job.done" || message["method"] == "job.failed" {
+                return message;
+            }
+        }
+    }
+    panic!("no job end");
+}
+
+/// A shell that acts on `job.done` must not meet a spurious `PrefixBusy`.
+#[test]
+fn the_lock_is_free_when_job_done_arrives() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let check = Core::new(core.data_dir());
+    let mut handler = CoreHandler::new(core);
+    let (notifier, lines) = Notifier::channel();
+    for round in 0..10 {
+        let reset: Method =
+            serde_json::from_value(json!({"method": "prefix.reset", "params": {"prefix": "p"}}))
+                .unwrap();
+        handler.handle(&reset, &notifier).unwrap();
+        let end = await_job_end(&lines);
+        assert_eq!(end["method"], "job.done", "{end}");
+        check
+            .prefix_snapshot("p")
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+    }
+}
+
+#[test]
+fn a_from_directory_and_an_archive_report_the_same_code_for_no_descriptor() {
+    let dir = TempDir::new().unwrap();
+    let empty = dir.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let core = Core::new(dir.path().join("data")).with_unsigned_installs(true);
+    let error = core
+        .plan_install("rosetta-wine", Some(&empty))
+        .unwrap()
+        .run(&mut |_| {})
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidBundle, "{error}");
+}

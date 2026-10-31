@@ -212,10 +212,12 @@ pub enum ErrorCode {
     DownloadFailed,
     /// A local bundle was requested without `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`.
     UnsignedEngineRefused,
+    /// Another operation is using the prefix.
+    PrefixBusy,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::ParseError,
         Self::InvalidRequest,
         Self::MethodNotFound,
@@ -232,6 +234,7 @@ impl ErrorCode {
         Self::DiskFull,
         Self::DownloadFailed,
         Self::UnsignedEngineRefused,
+        Self::PrefixBusy,
     ];
 
     #[must_use]
@@ -253,6 +256,7 @@ impl ErrorCode {
             Self::DiskFull => 1008,
             Self::DownloadFailed => 1009,
             Self::UnsignedEngineRefused => 1010,
+            Self::PrefixBusy => 1011,
         }
     }
 
@@ -282,6 +286,7 @@ impl ErrorCode {
             Self::DiskFull => "DiskFull",
             Self::DownloadFailed => "DownloadFailed",
             Self::UnsignedEngineRefused => "UnsignedEngineRefused",
+            Self::PrefixBusy => "PrefixBusy",
         }
     }
 
@@ -317,6 +322,7 @@ impl ErrorCode {
             Self::UnsignedEngineRefused => {
                 "A local bundle was requested without `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`."
             }
+            Self::PrefixBusy => "Another operation is using the prefix.",
         }
     }
 }

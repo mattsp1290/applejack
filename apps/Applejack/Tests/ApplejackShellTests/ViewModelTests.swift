@@ -165,6 +165,28 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
+    func testAPresetForAnotherTitleIsCalledOut() async throws {
+        // The fake answers `preset_appid` 730 for a path containing "foreign".
+        let app = makeApp()
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        await detail.importPreset(at: "/tmp/foreign.preset.json")
+        let pending = try XCTUnwrap(detail.pendingImport)
+        XCTAssertEqual(pending.presetAppid, 730)
+        XCTAssertEqual(
+            detail.presetMismatch(presetAppid: pending.presetAppid), "This preset was exported for app 730, not this game.")
+
+        await detail.confirmLaunchOverrides()
+        let applied = try XCTUnwrap(detail.importState.value)
+        XCTAssertTrue(applied.applied)
+        XCTAssertNotNil(detail.presetMismatch(presetAppid: applied.presetAppid), "the applied status keeps the warning")
+
+        await detail.importPreset(at: "/tmp/220.preset.json")
+        let own = try XCTUnwrap(detail.pendingImport)
+        XCTAssertEqual(own.presetAppid, 220)
+        XCTAssertNil(detail.presetMismatch(presetAppid: own.presetAppid))
+        await app.shutdown()
+    }
+
     func testConfirmingThroughTheAlertSurvivesItsDismissal() async throws {
         // The alert's confirm button holds the value it was presented with.
         // SwiftUI then writes `false` to `isPresented` (the view declines)

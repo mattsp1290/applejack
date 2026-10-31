@@ -60,6 +60,14 @@ const CHECK_STEPS: &[Step] = &[
         precondition: None,
     },
     Step {
+        // `cargo test` above is a debug build, which is the one build that
+        // honors the unsigned-install variable. No name filter: `cargo test`
+        // passes when a filter matches nothing, so a rename would empty it.
+        name: "release-lib",
+        command: |root| cargo(root, ["test", "-p", "applejack-core", "--release", "--lib"]),
+        precondition: None,
+    },
+    Step {
         name: "doc",
         command: |root| {
             let mut command = cargo(root, ["doc", "--workspace", "--no-deps"]);
