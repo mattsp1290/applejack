@@ -8,8 +8,7 @@ mod support;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use applejack_steam::Error;
@@ -1679,17 +1678,6 @@ fn staged_bytes(bench: &Bench, name: &str) -> usize {
     fs::read(staged).map_or(0, |bytes| bytes.iter().filter(|byte| **byte != 0).count())
 }
 
-/// Turns the ownership predicate true after `delay`.
-fn client_starts_after(delay: Duration) -> Arc<AtomicBool> {
-    let running = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&running);
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        flag.store(true, Ordering::Relaxed);
-    });
-    running
-}
-
 // From the install-safety review, probe p15b.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_chunk_task_outlives_a_client_running_stop() {
@@ -1702,17 +1690,14 @@ async fn no_chunk_task_outlives_a_client_running_stop() {
         chunks.fault(&chunk.id, Fault::Slow(Duration::from_millis(700)));
     }
     bench.session.add_manifest(DEPOT, manifest(V1, vec![big]));
-    let running = client_starts_after(Duration::from_millis(100));
-    let predicate = {
-        let running = Arc::clone(&running);
-        move || running.load(Ordering::Relaxed)
-    };
+    let predicate = || bench.session.chunks.fetches() > 0;
 
     let result = bench.installer(&predicate).install(&plan(V1, 11)).await;
     assert!(matches!(result, Err(Error::ClientRunning { .. })));
 
     let bytes_at_return = staged_bytes(&bench, "big.bin");
     let fetches_at_return = bench.session.chunks.fetches();
+    assert!(fetches_at_return > 0, "the stop came mid-download");
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(staged_bytes(&bench, "big.bin"), bytes_at_return);
     assert_eq!(bench.session.chunks.fetches(), fetches_at_return);
@@ -1727,13 +1712,10 @@ async fn a_stopped_run_cannot_reach_the_file_of_a_later_run() {
     let old = file(chunks, "big.bin", &[b"V1 V1 V1 V1 "]);
     chunks.fault(&chunk_of(&old, 0), Fault::Slow(Duration::from_millis(1800)));
     bench.session.add_manifest(DEPOT, manifest(V1, vec![old]));
-    let running = client_starts_after(Duration::from_millis(100));
-    let predicate = {
-        let running = Arc::clone(&running);
-        move || running.load(Ordering::Relaxed)
-    };
+    let predicate = || bench.session.chunks.fetches() > 0;
     let result = bench.installer(&predicate).install(&plan(V1, 11)).await;
     assert!(matches!(result, Err(Error::ClientRunning { .. })));
+    assert_eq!(bench.session.chunks.fetches(), 1, "the stop came mid-fetch");
 
     let new = file(chunks, "big.bin", &[b"V2 V2 V2 V2 "]);
     bench.session.add_manifest(DEPOT, manifest(V2, vec![new]));
@@ -1761,15 +1743,21 @@ async fn dropping_the_install_future_stops_its_chunk_tasks() {
 
     let plan = plan(V1, 11);
     let installer = bench.installer(&NOT_RUNNING);
-    let install = installer.install(&plan);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), install)
-            .await
-            .is_err()
-    );
+    let mut install = Box::pin(installer.install(&plan));
+    let fetching = async {
+        while bench.session.chunks.fetches() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        result = &mut install => panic!("the slow chunk finished first: {result:?}"),
+        () = fetching => {}
+    }
+    drop(install);
 
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(staged_bytes(&bench, "big.bin"), 0);
+    assert!(!bench.game().join("big.bin").exists());
     bench.session.chunks.clear_faults();
     bench.install(&plan).await.unwrap();
 }
