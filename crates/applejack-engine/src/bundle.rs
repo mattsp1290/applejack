@@ -610,12 +610,11 @@ const PACKED_SUFFIX: &str = ".local.tar.zst";
 #[derive(Debug)]
 pub struct InstallLock {
     file: File,
+    root: PathBuf,
 }
 
 impl InstallLock {
-    /// Takes `engines/<id>/.install.lock` without waiting, and clears the
-    /// packed archives an interrupted install left, which only the lock's
-    /// holder can be using.
+    /// Takes `engines/<id>/.install.lock` without waiting.
     ///
     /// # Errors
     ///
@@ -632,12 +631,26 @@ impl InstallLock {
             .open(&path)
             .map_err(|error| Error::io(&path, error))?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {
-                sweep_packed(&root);
-                Ok(Self { file })
-            }
+            Ok(()) => Ok(Self { file, root }),
             Err(rustix::io::Errno::WOULDBLOCK) => Err(Error::InstallInProgress { id }),
             Err(error) => Err(Error::io(path, error.into())),
+        }
+    }
+
+    /// Clears the packed archives an interrupted install left, which only
+    /// the lock's holder can be using, except `from`, the input of this
+    /// install, which may be one of them.
+    pub fn sweep_packed(&self, from: &Path) {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        let input = fs::canonicalize(from).ok();
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(PACKED_SUFFIX)
+                && fs::canonicalize(entry.path()).ok() != input
+            {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -647,17 +660,6 @@ impl Drop for InstallLock {
     /// spawned elsewhere can hold a copy of the descriptor past a close.
     fn drop(&mut self) {
         let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
-    }
-}
-
-fn sweep_packed(root: &Path) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().ends_with(PACKED_SUFFIX) {
-            let _ = fs::remove_file(entry.path());
-        }
     }
 }
 

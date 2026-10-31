@@ -541,10 +541,14 @@ D3DMetal is never committed, downloaded, or published.
 - `list(snapshots_root, name)` returns them oldest first.
 - `restore(prefix_dir, snapshots_root, name, timestamp)` takes a safety
   snapshot of the current prefix, copies the chosen one to
-  `<prefix_dir>.restoring`, and swaps it in with two renames; an interrupted
-  restore leaves the prefix as it was or fully restored. Returns the safety
-  snapshot. With `prefix_dir` gone there is nothing to protect: the chosen
-  snapshot is installed the same way and returned.
+  `.staging-restoring` beside the snapshots, and swaps it in with two renames,
+  moving the old prefix to `.staging-replaced`. Neither directory sits under a
+  name another prefix could have, and `prefix list` never shows them; the next
+  operation on the prefix clears what a kill left. A kill between the renames
+  leaves no prefix, with the replaced state in the safety snapshot, and
+  `restore` brings it back. Returns the safety snapshot. With `prefix_dir`
+  gone there is nothing to protect: the chosen snapshot is installed the same
+  way and returned.
 - `reset(prefix_dir, snapshots_root, name, keep_user_data, recreate)` takes
   a safety snapshot, removes the prefix, calls `recreate` (the core wraps
   `create_prefix`), and with `keep_user_data` copies `drive_c/users/` back
@@ -616,14 +620,15 @@ call the same ones. The `meta` and `engine_versions` writes are the core's.
 | `applejack prefix list` | Each `prefixes/<name>/applejack/prefix.toml` |
 | `applejack prefix snapshot <name>` / `restore` / `reset [--keep-user-data]` | `snapshot::{create, restore, reset}` under `prefixes/.snapshots/` |
 | `applejack prefix list-snapshots <name>` | `snapshot::list`, oldest first. Works for a prefix that is gone |
-| `applejack prefix remove <name>` | Deletes the prefix and Wine's `server-*` directory for it; snapshots stay, and `restore` undoes the removal |
+| `applejack prefix remove <name>` | Deletes the prefix and Wine's `server-*` directory for it; snapshots stay, and `restore` brings the prefix back from one. `remove` takes no snapshot of its own |
 | `applejack prefix exec <name> -- <exe> [args]` | `Engine::launch` with the bundle that last touched the prefix; streams the session log and exits with the child's code. Development only |
 | `applejack run <appid>` | `RosettaWine::launch`, then `Session::{wait, cancel, processes, wineserver_alive}` |
 
 A directory passed to `--from` is packed to
 `engines/<id>/<version>.local.tar.zst` first, so it takes the same hashing,
 extraction, and validation path as an archive; the packed file is removed
-afterwards, and `InstallLock::acquire` clears one a killed install left.
+afterwards, and `InstallLock::sweep_packed` clears one a killed install left,
+unless it is the `--from` of this install.
 `engines/<id>/.install.lock` keeps two installs of one engine apart across
 processes.
 

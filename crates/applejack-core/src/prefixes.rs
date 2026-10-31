@@ -266,13 +266,18 @@ impl Core {
     ///
     /// # Errors
     ///
-    /// [`EngineError::PrefixBusy`], [`EngineError::SnapshotNotFound`], a
-    /// server that does not leave, or the copy or swap failure.
+    /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`] for a name
+    /// with neither a prefix nor a snapshot, [`EngineError::SnapshotNotFound`],
+    /// a server that does not leave, or the copy or swap failure.
     pub fn prefix_restore(&self, name: &str, timestamp: &str) -> Result<SnapshotResult, CoreError> {
         let _lock = self.lock_prefix(name)?;
         let dir = self.prefix_dir(name)?;
         if dir.is_dir() {
             Self::settle(&dir)?;
+        } else if self.prefix_snapshots(name)?.is_empty() {
+            return Err(CoreError::UnknownPrefix {
+                name: name.to_owned(),
+            });
         }
         Ok(snapshot::restore(&dir, &self.snapshots_root(), name, timestamp)?.into())
     }
@@ -334,8 +339,9 @@ impl Core {
         Ok(safety.into())
     }
 
-    /// Deletes the prefix and the server directory Wine left for it.
-    /// Snapshots stay, so [`Core::prefix_restore`] can undo a removal.
+    /// Deletes the prefix and the server directory Wine left for it, with
+    /// no snapshot of its own. Snapshots stay, so [`Core::prefix_restore`]
+    /// can bring the prefix back from one, without anything newer.
     ///
     /// # Errors
     ///

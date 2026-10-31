@@ -218,6 +218,7 @@ fn prefix_commands_report_what_is_missing() {
         vec!["prefix", "reset", "x"],
         vec!["prefix", "remove", "x"],
         vec!["prefix", "exec", "x", "--", "cmd"],
+        vec!["prefix", "restore", "x", "20261031T000000Z"],
     ] {
         let output = with_data(data.path(), &args);
         assert_eq!(output.status.code(), Some(1), "`{}`", args.join(" "));
@@ -227,15 +228,6 @@ fn prefix_commands_report_what_is_missing() {
             stderr_of(&output)
         );
     }
-
-    // A restore does not need the prefix, only the snapshot.
-    let output = with_data(data.path(), &["prefix", "restore", "x", "20261031T000000Z"]);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        stderr_of(&output).contains("snapshot x/20261031T000000Z does not exist"),
-        "{}",
-        stderr_of(&output)
-    );
 }
 
 #[test]

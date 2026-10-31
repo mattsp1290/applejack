@@ -42,8 +42,10 @@ pub struct PrefixLock {
 
 impl PrefixLock {
     /// Takes `<snapshots_root>/.locks/<name>.lock` without waiting, and
-    /// clears the staging directories a killed snapshot left, which nothing
-    /// can still be using once the lock is held.
+    /// clears the staging directories a killed snapshot or restore left,
+    /// which nothing can still be using once the lock is held. What a restore
+    /// left is either the snapshot it was installing or state its safety
+    /// snapshot already holds.
     ///
     /// # Errors
     ///
@@ -212,15 +214,15 @@ pub fn list(snapshots_root: &Path, name: &str) -> Result<Vec<Snapshot>> {
 
 /// Replaces `prefix_dir` with the snapshot `<name>/<timestamp>` after
 /// taking a safety snapshot of the current state, which is returned. The
-/// snapshot is copied to `<prefix_dir>.restoring` first and swapped in with
-/// two renames, so an interrupted restore leaves the prefix either as it
-/// was or fully restored. With `prefix_dir` gone there is nothing to
-/// protect: the snapshot is installed and is itself returned. This is the
-/// recovery after a removal or a failed reset. Refused while a `wineserver`
-/// runs for the prefix:
-/// the swap gives the path a new inode, and Wine keys the server socket on
-/// the inode, so a running session would keep writing into the unlinked
-/// directory and `wineserver_alive` would no longer see it.
+/// snapshot is copied aside first and swapped in with two renames. A kill
+/// between them leaves no prefix, with the replaced state in the safety
+/// snapshot, and `restore` brings it back. With `prefix_dir` gone there is
+/// nothing to protect: the snapshot is installed and is itself returned.
+/// This is the recovery after a kill, a removal, or a failed reset. Refused
+/// while a `wineserver` runs for the prefix: the swap gives the path a new
+/// inode, and Wine keys the server socket on the inode, so a running session
+/// would keep writing into the unlinked directory and `wineserver_alive`
+/// would no longer see it.
 ///
 /// # Errors
 ///
@@ -233,7 +235,7 @@ pub fn restore(
     timestamp: &str,
 ) -> Result<Snapshot> {
     let source = find(snapshots_root, name, timestamp)?;
-    let staging = sibling(prefix_dir, ".restoring");
+    let staging = work_dir(snapshots_root, name, "restoring");
     let present = prefix_dir
         .try_exists()
         .map_err(|error| Error::io(prefix_dir, error))?;
@@ -248,7 +250,7 @@ pub fn restore(
     }
     refuse_if_running(prefix_dir)?;
     let safety = create(prefix_dir, snapshots_root, name)?;
-    let replaced = sibling(prefix_dir, ".replaced");
+    let replaced = work_dir(snapshots_root, name, "replaced");
     crate::bundle::remove_stale(&staging)?;
     crate::bundle::remove_stale(&replaced)?;
     copy_tree(&source.dir, &staging)?;
@@ -350,13 +352,13 @@ fn find(snapshots_root: &Path, name: &str, timestamp: &str) -> Result<Snapshot> 
         })
 }
 
-fn sibling(prefix_dir: &Path, suffix: &str) -> PathBuf {
-    let mut name = prefix_dir
-        .file_name()
-        .map(ToOwned::to_owned)
-        .unwrap_or_default();
-    name.push(suffix);
-    prefix_dir.with_file_name(name)
+/// A directory for `restore` to work in. Not beside the prefix: every name
+/// under `prefixes/` can be another prefix, and one a kill left there would
+/// be listed as one. This is on the same volume, so its renames stay atomic.
+fn work_dir(snapshots_root: &Path, name: &str, tag: &str) -> PathBuf {
+    snapshots_root
+        .join(name)
+        .join(format!("{STAGING_PREFIX}{tag}"))
 }
 
 /// Refuses a prefix name that cannot be a directory under `prefixes/`.

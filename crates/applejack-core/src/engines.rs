@@ -108,7 +108,8 @@ impl EngineInstall {
     /// Returns the first failure; a failed install leaves no `<version>/`.
     /// One killed partway leaves its packed archive until the next install.
     pub fn run(self, progress: &mut dyn FnMut(Progress)) -> Result<InstalledVersion, CoreError> {
-        let _lock = InstallLock::acquire(&self.layout, self.id)?;
+        let lock = InstallLock::acquire(&self.layout, self.id)?;
+        lock.sweep_packed(&self.from);
         let local = LocalBundle::prepare(&self.layout, self.id, &self.from, progress)?;
         let host = HostFacts::gather().engine_host();
         let installed = RosettaWine.install(&host, &self.layout, &local.request, progress)?;

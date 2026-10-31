@@ -205,7 +205,9 @@ beside `serve` counts. The loser does not wait: it answers `PrefixBusy`.
 an error response, not a job, and the job holds the lock until it ends.
 
 `prefix.restore` also works when the prefix directory is gone, which is the way
-back from a removal or a failed reset. The method needs only the snapshot.
+back from a failed reset, or from a removal to the last snapshot: `prefix.remove`
+takes none of its own. The method needs only the snapshot; a name with neither
+a prefix nor a snapshot is an unknown prefix.
 
 ## Jobs
 

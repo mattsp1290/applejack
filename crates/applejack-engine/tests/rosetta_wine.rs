@@ -831,8 +831,12 @@ fn snapshots_create_restore_reset_and_prune() {
         fs::read_to_string(safety.dir.join("system.reg")).unwrap(),
         "reg-v2"
     );
-    assert!(!dir.path().join("prefixes/steam.restoring").exists());
-    assert!(!dir.path().join("prefixes/steam.replaced").exists());
+    let working = fs::read_dir(root.join("steam"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with('.'))
+        .count();
+    assert_eq!(working, 0, "restore leaves no working directory");
     assert!(matches!(
         snapshot::restore(&prefix, &root, "steam", "19700101T000000Z").unwrap_err(),
         Error::SnapshotNotFound { .. }
