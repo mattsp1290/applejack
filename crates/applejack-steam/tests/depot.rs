@@ -1197,11 +1197,161 @@ async fn a_recorded_depot_the_acf_does_not_list_is_refused_and_the_record_kept()
             Error::UnfinishedDepot {
                 appid: APPID,
                 depot_id: OTHER,
+                ..
             }
         ),
         "{error}"
     );
     assert!(bench.paths().record(APPID).exists());
+}
+
+/// Installs `text.pak` from `DEPOT` and stops an update of `OTHER` that had
+/// already laid an overlay of it. `OTHER` is at manifest 70 in the `.acf`.
+async fn stop_after_an_abandoned_overlay(bench: &Bench) {
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "text.pak", &[b"base"])]),
+    );
+    bench.session.add_manifest(
+        OTHER,
+        manifest(70, vec![file(chunks, "other.txt", &[b"other"])]),
+    );
+    bench.install(&two_depot_plan(V1, 70, 11)).await.unwrap();
+    let failing = file(chunks, "z.txt", &[b"fails"]);
+    fail_on(bench, &failing);
+    bench.session.add_manifest(
+        OTHER,
+        manifest(71, vec![file(chunks, "text.pak", &[b"overlay"]), failing]),
+    );
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&two_depot_plan(V1, 71, 12))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(bench.game().join("text.pak")).unwrap(), b"overlay");
+}
+
+// From this unit's own review, probes p1_abandoned_overlay_kept_heir and
+// p6_rollback_overlay_heir: the kept depot owns the path, so nothing looked
+// at what the stopped run had left there.
+#[tokio::test]
+async fn an_abandoned_overlay_goes_when_the_target_moves_on() {
+    let bench = Bench::new();
+    stop_after_an_abandoned_overlay(&bench).await;
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        OTHER,
+        manifest(72, vec![file(chunks, "other.txt", &[b"other 2"])]),
+    );
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&two_depot_plan(V1, 72, 13))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("text.pak")).unwrap(), b"base");
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn an_abandoned_overlay_goes_on_a_rollback() {
+    let bench = Bench::new();
+    stop_after_an_abandoned_overlay(&bench).await;
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&two_depot_plan(V1, 70, 11))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("text.pak")).unwrap(), b"base");
+    assert!(!bench.paths().record(APPID).exists());
+}
+
+// From this unit's own review, probe p2_unreadable_record_unplanned_depot.
+#[tokio::test]
+async fn an_unreadable_record_also_rechecks_depots_the_plan_dropped() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![file(chunks, "a.txt", &[b"a one"])]),
+    );
+    bench.session.add_manifest(
+        OTHER,
+        manifest(
+            70,
+            vec![
+                file(chunks, "b1.txt", &[b"b1 old"]),
+                file(chunks, "b2.txt", &[b"b2 old"]),
+            ],
+        ),
+    );
+    bench.install(&two_depot_plan(V1, 70, 11)).await.unwrap();
+    let failing = file(chunks, "b2.txt", &[b"b2 mid"]);
+    fail_on(&bench, &failing);
+    bench.session.add_manifest(
+        OTHER,
+        manifest(71, vec![file(chunks, "b1.txt", &[b"b1 mid"]), failing]),
+    );
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&two_depot_plan(V1, 71, 12))
+            .await
+            .is_err()
+    );
+    fs::write(bench.paths().record(APPID), b"not json").unwrap();
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(bench.game().join("b1.txt")).unwrap(), b"b1 old");
+    assert!(
+        verify_install(&bench.paths(), bench.data(), APPID)
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn a_versioned_config_a_stopped_run_replaced_goes_back_on_a_rollback() {
+    let bench = Bench::new();
+    let chunks = &bench.session.chunks;
+    let config = flagged(file(chunks, "c.ini", &[b"one"]), VERSIONED_USER_CONFIG);
+    bench.session.add_manifest(
+        DEPOT,
+        manifest(V1, vec![config, file(chunks, "b.txt", &[b"b"])]),
+    );
+    bench.install(&plan(V1, 11)).await.unwrap();
+    let failing = file(chunks, "b.txt", &[b"fails"]);
+    fail_on(&bench, &failing);
+    let newer = flagged(file(chunks, "c.ini", &[b"two"]), VERSIONED_USER_CONFIG);
+    bench
+        .session
+        .add_manifest(DEPOT, manifest(V2, vec![newer, failing]));
+    assert!(
+        bench
+            .installer(&NOT_RUNNING)
+            .update(&plan(V2, 12))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(bench.game().join("c.ini")).unwrap(), b"two");
+
+    bench
+        .installer(&NOT_RUNNING)
+        .update(&plan(V1, 11))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(bench.game().join("c.ini")).unwrap(), b"one");
 }
 
 // From the install-safety review, probe p30.
@@ -1375,7 +1525,7 @@ async fn user_config_survives_updates_rescans_and_verify() {
         b"users keybinds"
     );
 
-    // Gone from disk, it is installed again.
+    // Gone from disk, verify says so.
     fs::remove_file(bench.game().join("settings.ini")).unwrap();
     let report = verify_install(&bench.paths(), bench.data(), APPID).unwrap();
     assert_eq!(report.missing, ["settings.ini"]);

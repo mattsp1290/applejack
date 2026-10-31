@@ -111,9 +111,13 @@ pub enum Error {
     /// A stopped run wrote into a depot the plan no longer selects, so
     /// finishing without it would leave mixed files under a good `.acf`.
     #[error(
-        "app {appid}: a stopped update touched depot {depot_id}, which this plan leaves out; rerun with a plan that selects it"
+        "app {appid}: a stopped update touched depot {depot_id}, which this plan leaves out; rerun with a plan that selects it, or if none can, delete {} and verify the title", record.display()
     )]
-    UnfinishedDepot { appid: u32, depot_id: u32 },
+    UnfinishedDepot {
+        appid: u32,
+        depot_id: u32,
+        record: PathBuf,
+    },
     /// `verify_install` found no stored manifest for an installed depot.
     #[error("app {appid} depot {depot_id}: manifest {manifest_id} is not stored")]
     ManifestNotStored {

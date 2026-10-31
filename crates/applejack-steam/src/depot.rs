@@ -340,13 +340,16 @@ impl Unfinished {
             .collect()
     }
 
-    /// Recorded depots the plan does not select.
-    fn unplanned<'u>(&'u self, planned: &'u [PlannedDepot]) -> impl Iterator<Item = u32> + use<'u> {
-        self.record
-            .iter()
-            .flat_map(|record| &record.depots)
-            .map(|depot| depot.depot_id)
+    /// Depots the stopped run may have touched that the plan does not select.
+    fn unplanned(&self, planned: &[PlannedDepot], installed: &HashMap<u32, u64>) -> Vec<u32> {
+        let touched: Vec<u32> = match &self.record {
+            Some(record) => record.depots.iter().map(|depot| depot.depot_id).collect(),
+            None => installed.keys().copied().collect(),
+        };
+        touched
+            .into_iter()
             .filter(|id| planned.iter().all(|depot| depot.depot_id != *id))
+            .collect()
     }
 }
 
@@ -419,12 +422,24 @@ impl From<KeptDepot> for WorkDepot {
 struct Layers<'m> {
     current: HashMap<String, (u32, &'m ManifestFile)>,
     before: HashMap<String, (u32, &'m ManifestFile)>,
+    /// What stopped runs may have left at each path, whichever depot owns it
+    /// now.
+    abandoned: HashMap<String, Vec<&'m ManifestFile>>,
 }
 
 impl<'m> Layers<'m> {
     fn new(work: &'m [WorkDepot], kept: &'m [KeptDepot]) -> Self {
         let kept_layers = || kept.iter().map(|depot| (depot.depot_id, &depot.manifest));
+        let mut abandoned: HashMap<String, Vec<&'m ManifestFile>> = HashMap::new();
+        for file in work
+            .iter()
+            .flat_map(|depot| &depot.abandoned)
+            .flat_map(|manifest| &manifest.files)
+        {
+            abandoned.entry(path_key(file)).or_default().push(file);
+        }
         Self {
+            abandoned,
             current: path_owners(
                 work.iter()
                     .map(|depot| (depot.depot_id, &depot.manifest))
@@ -447,9 +462,15 @@ impl<'m> Layers<'m> {
     /// The name matters as well as the content: on a case-sensitive volume a
     /// respelled path is a new file.
     fn changed(&self, file: &ManifestFile) -> bool {
-        self.before.get(&path_key(file)).is_none_or(|(_, before)| {
+        let key = path_key(file);
+        let moved = self.before.get(&key).is_none_or(|(_, before)| {
             before.normalized_path() != file.normalized_path() || !same_content(before, file)
-        })
+        });
+        moved
+            || self
+                .abandoned
+                .get(&key)
+                .is_some_and(|left| left.iter().any(|old| !same_content(old, file)))
     }
 
     /// The entries of `depot` this run has to write.
@@ -675,11 +696,16 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
             .filter(|_| existing.is_some())
             .and_then(|unfinished| {
                 unfinished
-                    .unplanned(&run.plan.depots)
+                    .unplanned(&run.plan.depots, &installed)
+                    .into_iter()
                     .find(|id| !installed.contains_key(id))
             })
         {
-            return Err(Error::UnfinishedDepot { appid, depot_id });
+            return Err(Error::UnfinishedDepot {
+                appid,
+                depot_id,
+                record: self.paths.record(appid),
+            });
         }
         if work.is_empty() {
             return Ok(InstallOutcome {
@@ -850,7 +876,7 @@ impl<S: SteamSession> Run<'_, '_, S> {
         let carried: Vec<PlannedDepot> = self
             .unfinished
             .iter()
-            .flat_map(|unfinished| unfinished.unplanned(&self.plan.depots))
+            .flat_map(|unfinished| unfinished.unplanned(&self.plan.depots, installed))
             .filter_map(|depot_id| {
                 Some(PlannedDepot {
                     depot_id,

@@ -136,9 +136,10 @@ the platforms the app lists.
 
 `OwnedApp::windows_depots(branch, filter)` picks what to fetch: depots whose
 `oslist` includes `windows` or is empty, on an app whose own `oslist` allows
-Windows; `osarch` 64 and neutral, or 32 when the app has no licensed 64-bit
-depot; the filter's language (`english` by default) or none; no `lowviolence`
-depots. A depot with no manifest on the branch is skipped.
+Windows; `osarch` 64 and neutral, or 32 when the app ships no 64-bit depot; the
+filter's language (`english` by default) or none; no `lowviolence` depots. A
+depot with no manifest on a branch the app has takes its `public` one, as under
+`DepotDownloader`, and its request code then names `public`.
 
 What the account may fetch follows `DepotDownloader`'s `AccountHasAccess`:
 `package_grants` reads both `appids` and `depotids` from every licensed
@@ -152,8 +153,8 @@ rest are left out and listed in `DepotSelection::not_licensed` and
 A `depotfromapp` depot with no manifests of its own lives in another app, often
 one the account does not own, such as 228980 for redistributables. `Library`
 reads that app's product info and takes the depot's manifests from it, one
-level, falling back to `public` as `DepotDownloader` does. Its manifest request
-and CDN token then name the parent, unless the title is free to download; the
+level. Its manifest request and CDN token then name the parent, unless the
+title is free to download; the
 depot key still names the title. Such a depot installs into the title's own
 directory, as under `DepotDownloader`, where the Windows client would use the
 parent's shared directory and list it under `SharedDepots`. A licensed one
@@ -226,7 +227,9 @@ a manifest trimmed to the files that still need writing.
   the `.acf` is what the stopped run did not move. A recorded depot the plan
   no longer selects goes back to its `.acf` manifest, or is refused with
   `Error::UnfinishedDepot` when the `.acf` does not list it, and the record
-  stays. Files only an abandoned target had are removed as stale. The rewrite
+  stays. A record that cannot be read counts as naming every depot the `.acf`
+  lists. Files only an abandoned target had are removed as stale, and a path
+  an abandoned target wrote is rewritten by whichever depot owns it now. The rewrite
   keeps every `.acf` key the writer does not model, and keeps depots the plan
   did not select. The caller re-syncs its `apps` row from the `.acf` first and
   afterwards.
@@ -236,7 +239,10 @@ a manifest trimmed to the files that still need writing.
   a map, so the buffer's own order is lost. A delta queues a path only for its
   owner, so it never overwrites a later depot's overlay, and a depot that drops
   an overlay brings the lower depot's file back, even when that depot did not
-  change.
+  change. One gap remains: a depot the plan does not select and whose manifest
+  is not stored, such as a language the client installed, has unknown paths, so
+  a lower depot can overwrite its overlay. Refusing would block every update of
+  such a title.
 - **Config files.** A manifest entry flagged `USER_CONFIG` (`userconfig` in a
   depot build script: "modified by the user or game", not overridden by an
   update, no verification error when it differs) is installed once and never
@@ -467,9 +473,6 @@ writer with whatever keys the client needs.
 - **Power loss.** Resume trusts a recorded file's size. `DepotJob` does not
   fsync before its rename, so after a power cut `verify_install` is the check.
 - **Repair.** `VerifyReport` only reports; `install` refuses an installed title.
-- **Non-public branches.** A depot of the title's own with no manifest on the
-  planned branch is left out. `DepotDownloader` falls back to `public` for
-  these too, and the Windows client's rule has not been observed.
 - **PICS over HTTP.** A reply can carry `http_host` and omit a large buffer.
   Such an app lands in `Library::skipped`. Whether Steam still does this for
   this request is unknown until a large account runs the spike.
@@ -584,7 +587,7 @@ never prints the token.
   Steam Guard surface as typed errors; retry after the floor or complete the
   factor rather than counting them as red.
 - `refresh logon ok` followed by `Steam EResult ...`, `rate limited by
-  Steam`, or `Steam refused the login` from the license list: the CM
+  Steam`, or `Steam denied the license list` from the license list: the CM
   accepted the logon but answered `CMsgClientLicenseList` with a non-OK
   `eresult`. Red for the decode path; record the EResult in the table.
 - `refresh logon ok` followed by `timed out waiting for CLIENT_LICENSE_LIST`:
