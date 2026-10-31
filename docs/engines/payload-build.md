@@ -565,8 +565,9 @@ macOS Background session cannot run it. It copies the DLLs into that prefix:
 DXMT's native half is already at `<payload>/wine/lib/wine/x86_64-unix/winemetal.so`
 next to Wine's own Unix libraries, where `assemble.sh` put it. Then
 `WINEDLLOVERRIDES="d3d11,dxgi,d3d10core,winemetal=n,b" <payload>/wine/bin/wine <payload>/probes/dx11-sample.exe --frames 60`.
-`WINEDEBUG=+loaddll` must show `d3d11.dll`, `dxgi.dll`, and `d3d10core.dll` as
-`native` from the prefix and `winemetal.dll` as `builtin`.
+`WINEDEBUG=+loaddll` must show `d3d11.dll` and `dxgi.dll` as `native` from the
+prefix and `winemetal.dll` as `builtin`. `dx11-sample` does not load
+`d3d10core.dll`, so this gate does not exercise it.
 
 ## Gates
 

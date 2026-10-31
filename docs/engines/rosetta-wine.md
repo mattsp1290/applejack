@@ -396,7 +396,7 @@ Limits:
   `dlsym(RTLD_DEFAULT)` sees.
 - One Metal view per window: `macdrv_view_create_metal_view` returns the view's
   existing one, so two live swap chains on one window share it, and releasing
-  either removes it from under the other. Wine 8.16 behaved the same.
+  either removes it from under the other.
 - A window owned by another process has no window data here, so DXMT reports
   `Failed to create metal view` instead of rendering.
 - The view is shown when a swap chain is created. A Vulkan surface presenting
