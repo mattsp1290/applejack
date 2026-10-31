@@ -425,6 +425,25 @@ fn prefix_hello32_dx11_sample_and_cpuid() {
         snapshot::restore(&prefix.dir, &live.snapshots, "test", &snap.timestamp).unwrap_err();
     eprintln!("[live] restore while the server runs: {refused}");
     assert!(matches!(refused, Error::PrefixUnusable { .. }));
+    let refused = RosettaWine
+        .apply_overrides(
+            engine,
+            prefix,
+            GraphicsBackend::Vkd3dProton,
+            SyncMode::None,
+            HidrawMode::Disabled,
+        )
+        .unwrap_err();
+    eprintln!("[live] apply while the server runs: {refused}");
+    assert!(matches!(refused, Error::PrefixUnusable { .. }));
+    assert!(
+        prefix
+            .dir
+            .join("drive_c/windows/system32/winemetal.dll")
+            .is_file(),
+        "the DXMT DLLs stayed in place"
+    );
+    assert!(session.wineserver_alive().unwrap(), "the session survived");
     session.cancel().expect("cancel");
     let alive_after = session.wineserver_alive().unwrap();
     eprintln!("[live] wineserver_alive after cancel: {alive_after}");

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bundle::{DllOverrides, Registry};
+use crate::bundle::DllOverrides;
 use crate::{
     BundleToml, EngineId, Error, GraphicsBackend, HidrawMode, InstalledEngine, Prefix, PrefixSpec,
     Result, SyncMode, Version,
@@ -267,7 +267,7 @@ pub fn render_registry_seeds(
             let _ = writeln!(out, "\"{stem}\"=-");
         }
     }
-    if let Some((key, value)) = bundle.registry.as_ref().and_then(Registry::hidraw_value) {
+    if let Some((key, value)) = bundle.registry.hidraw_value() {
         let disabled = match hidraw {
             HidrawMode::Enabled => 0,
             HidrawMode::Disabled => 1,
@@ -421,12 +421,18 @@ fn build(
     Ok(record.to_prefix(prefix_dir))
 }
 
-/// Re-applies overrides to an existing prefix of this engine. The record
-/// is rewritten as the DLLs change and before the registry is seeded, so a
-/// failed import leaves a record that still names every DLL on disk; the
-/// registry-backed settings (`hidraw`, `sync_mode`) keep their previous
-/// values in it until the seed has landed, so the record never claims a
-/// setting the registry does not hold. A failed seed also stops the
+/// Re-applies overrides to an existing prefix of this engine. Refused while
+/// a server runs for the prefix, before anything moves: the DLLs would
+/// change under the session, and a failed seed stops that server.
+///
+/// The record is rewritten as the DLLs change and before the registry is
+/// seeded, so a failed import leaves a record that still names every DLL on
+/// disk. `hidraw` and `sync_mode` keep their previous values in it until a
+/// seed has fully succeeded. `sync_mode` is not in the registry at all; it
+/// selects the environment of the import and of later launches. `hidraw`
+/// is, and `reg import` is not atomic, so after a failed import (or a
+/// failed final write of the record) the registry can be ahead of the
+/// record; the next apply makes them agree. A failed seed also stops the
 /// prefix's server, so nothing of the apply outlives the call.
 pub(crate) fn apply(
     installed: &InstalledEngine,
@@ -445,6 +451,13 @@ pub(crate) fn apply(
         });
     }
     backend_available(installed, backend)?;
+    if super::process::wineserver_alive(&prefix.dir)? {
+        return Err(Error::PrefixUnusable {
+            path: prefix.dir.clone(),
+            reason: "a wineserver is running for it, and overrides are swapped and the registry \
+                     re-seeded only in an idle prefix; cancel the session first",
+        });
+    }
     let previous = PrefixRecord::read(&prefix.dir)?;
     let mut record = PrefixRecord {
         engine: installed.id,

@@ -108,15 +108,17 @@ pub fn find_session(session_id: &str) -> Vec<Process> {
     found
 }
 
-/// The [`Process`] for `record` when it is owned by `uid` and carries the
-/// exact `APPLEJACK_SESSION=<session_id>` entry, in `environ` or (after
-/// Wine's argv rewrite, see the module doc) as the last `APPLEJACK_SESSION=`
-/// entry of `cmd`; `None` otherwise. Entries from that one on are not
-/// arguments and take no part in the executable name. A process of another
-/// session that was given this id as a literal argument is not matched: its
-/// own folded entry comes last. A same-uid process outside Wine that names
-/// the entry in its own arguments (`pgrep -f APPLEJACK_SESSION=<id>`) is,
-/// since nothing else tells it apart.
+/// The [`Process`] for `record` when it is owned by `uid` and belongs to
+/// `session_id`; `None` otherwise. An `APPLEJACK_SESSION=` entry in
+/// `environ` decides when there is one, and `cmd` is then all arguments.
+/// Without one (Wine's argv rewrite, see the module doc) the last
+/// `APPLEJACK_SESSION=` entry of `cmd` decides, and entries from it on are
+/// not arguments and take no part in the executable name. So a process of
+/// another session that was given this id as a literal argument is not
+/// matched: its `environ` or its own folded entry names that session. A
+/// same-uid process with no session of its own, under Wine (a sessionless
+/// `cmd.exe`) or not (`pgrep -f APPLEJACK_SESSION=<id>`), whose arguments
+/// end in the exact entry is matched, since nothing else tells it apart.
 #[must_use]
 pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> Option<Process> {
     if record.uid != Some(uid) {
@@ -126,20 +128,18 @@ pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> O
     wanted.extend_from_slice(SESSION_VARIABLE.as_bytes());
     wanted.push(b'=');
     wanted.extend_from_slice(session_id.as_bytes());
+    let names_a_session = |entry: &OsString| {
+        entry
+            .as_bytes()
+            .starts_with(&wanted[..=SESSION_VARIABLE.len()])
+    };
     let is_session = |entry: &OsString| entry.as_bytes() == wanted.as_slice();
-    let folded = record
-        .cmd
-        .iter()
-        .rposition(|entry| {
-            entry
-                .as_bytes()
-                .starts_with(&wanted[..=SESSION_VARIABLE.len()])
-        })
-        .filter(|&at| is_session(&record.cmd[at]));
-    if folded.is_none() && !record.environ.iter().any(is_session) {
-        return None;
-    }
-    let cmd = folded.map_or(record.cmd, |at| &record.cmd[..at]);
+    let cmd = if let Some(entry) = record.environ.iter().find(|entry| names_a_session(entry)) {
+        is_session(entry).then_some(record.cmd)?
+    } else {
+        let at = record.cmd.iter().rposition(names_a_session)?;
+        is_session(&record.cmd[at]).then_some(&record.cmd[..at])?
+    };
     Some(Process {
         pid: record.pid,
         exe: executable_name(cmd, record.exe),
@@ -150,10 +150,11 @@ pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> O
 /// The Windows executable's file name (Wine accepts both `\` and `/`
 /// separators): argv\[0\] when it names a `.exe` other than `start.exe`
 /// (after Wine's rewrite argv\[0\] is the process's own image, so
-/// `launcher.exe --run patcher.exe` is `launcher.exe`); else the last argv
-/// entry naming a `.exe` (`wine Z:\g\game.exe` before the rewrite, and
-/// `start.exe /exec title.exe`, which is about to become `title.exe`); else
-/// argv\[0\]'s file name; else the exec path's file name.
+/// `launcher.exe --run patcher.exe` is `launcher.exe`); else the first
+/// later argv entry naming a `.exe` (`wine Z:\g\game.exe` before the
+/// rewrite, and `start.exe /exec title.exe`, which is about to become
+/// `title.exe`), so a program's own arguments do not name it in those forms
+/// either; else argv\[0\]'s file name; else the exec path's file name.
 #[must_use]
 pub fn executable_name(cmd: &[OsString], exe: Option<&Path>) -> String {
     let is_exe = |arg: &OsString| {
@@ -164,7 +165,7 @@ pub fn executable_name(cmd: &[OsString], exe: Option<&Path>) -> String {
         .first()
         .filter(|arg| is_exe(arg) && !windows_file_name(arg).eq_ignore_ascii_case("start.exe"));
     let chosen = own_image
-        .or_else(|| cmd.iter().rev().find(|arg| is_exe(arg)))
+        .or_else(|| cmd.iter().skip(1).find(|arg| is_exe(arg)))
         .or_else(|| cmd.first())
         .map(|arg| windows_file_name(arg.as_os_str()))
         .or_else(|| {

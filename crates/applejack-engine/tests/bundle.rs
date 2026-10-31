@@ -52,8 +52,6 @@ fn fixture_bundle_validates() {
     assert!(
         bundle
             .registry
-            .as_ref()
-            .unwrap()
             .hidraw_key
             .ends_with("winebus\\Parameters\\DisableHidraw")
     );
@@ -122,6 +120,32 @@ fn validation_rejects_unknown_field() {
     assert!(matches!(error, Error::Toml(_)), "{error}");
 }
 
+/// From the contract review of 66fa6de: without the table no seed carries
+/// the HID toggle while the prefix record still claims it.
+#[test]
+fn validation_rejects_a_bundle_without_a_registry_table() {
+    let start = BUNDLE_TOML
+        .find("[registry]")
+        .expect("fixture has the table");
+    let rest = &BUNDLE_TOML[start..];
+    let end = rest[1..].find("\n[").map_or(rest.len(), |at| at + 2);
+    let text = BUNDLE_TOML.replace(&rest[..end], "");
+    assert!(!text.contains("registry"), "{text}");
+    let error = validate_text(&text).unwrap_err();
+    assert!(matches!(error, Error::Toml(_)), "{error}");
+    assert!(error.to_string().contains("registry"), "{error}");
+}
+
+/// `xtask/tests/fixtures/BUNDLE.toml` is the writer's output for
+/// `build/bundle-spec.toml`, so a field the reader requires must be one the
+/// writer fills in.
+#[test]
+fn xtask_fixture_parses_with_a_usable_registry_table() {
+    let bundle = BundleToml::parse(include_str!("../../../xtask/tests/fixtures/BUNDLE.toml"))
+        .expect("xtask fixture parses");
+    assert!(bundle.registry.hidraw_value().is_some());
+}
+
 /// From the process-and-prefix review of 8b5bfd9: `reg import` applies a
 /// well-formed file with an unknown root as a silent no-op, so the root of
 /// `hidraw_key` is checked with the bundle.
@@ -144,7 +168,7 @@ fn validation_rejects_a_hidraw_key_without_a_known_root() {
 
     let bundle = validate_variant("\"HKLM\\\\System", "\"HKEY_LOCAL_MACHINE\\\\System").unwrap();
     assert_eq!(
-        bundle.registry.unwrap().hidraw_value(),
+        bundle.registry.hidraw_value(),
         Some((
             "HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\winebus\\Parameters"
                 .to_owned(),
@@ -153,7 +177,7 @@ fn validation_rejects_a_hidraw_key_without_a_known_root() {
     );
     let fixture = validate_variant("", "").unwrap();
     assert_eq!(
-        fixture.registry.unwrap().hidraw_value().map(|(key, _)| key),
+        fixture.registry.hidraw_value().map(|(key, _)| key),
         Some(
             "HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\winebus\\Parameters"
                 .to_owned()
@@ -182,6 +206,15 @@ fn validation_rejects_a_hidraw_key_without_a_known_root() {
         "HKLM\\\\Key\\Value",
         "DisableHidraw",
         "",
+        "HKLM\\ \\Value",
+        "HKLM\\Key\\ ",
+        "HKLM\\Key\\Va\"lue",
+        "HKLM\\Key\\Val\nue",
+        "HKLM\\Key\r\\Value",
+        "HKLM\\Key\tName\\Value",
+        "HKLM\\Key]\n\n[HKXX\\Bad]\n\n[HKEY_LOCAL_MACHINE\\Other\\Value",
+        "HKLM\\Key]\\Value",
+        "HKLM\\[Key\\Value",
     ] {
         assert_eq!(split_registry_value(bad), None, "{bad:?}");
     }

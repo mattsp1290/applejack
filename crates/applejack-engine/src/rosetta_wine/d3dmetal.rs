@@ -195,6 +195,7 @@ pub fn named_payload_location(readme: &str) -> Option<&str> {
                     !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
                 })
                 .trim_end_matches(['/', '.'])
+                .trim_start_matches("./")
         })
         .find(|token| token.contains("lib/external") && !token.starts_with(PAYLOAD_DIR))
 }

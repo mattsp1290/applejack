@@ -144,13 +144,22 @@ pub const REGISTRY_ROOTS: [(&str, &str); 5] = [
 
 /// Splits `ROOT\Sub\Key\Value` into the full key name (the root expanded
 /// to its long form, case-insensitively) and the value name. `None` unless
-/// the root is one of [`REGISTRY_ROOTS`] and at least one non-empty key
-/// component and a non-empty value name follow it.
+/// the root is one of [`REGISTRY_ROOTS`] and at least one key component and
+/// a value name, none of them blank, follow it. A `"`, a bracket, or a
+/// control character is refused because the seed renders the path
+/// unescaped: on the real payload `reg import` exits 0 and drops a value
+/// whose name holds a `"`, and a newline starts further keys.
 #[must_use]
 pub fn split_registry_value(spec: &str) -> Option<(String, &str)> {
+    if spec
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '"' | '[' | ']'))
+    {
+        return None;
+    }
     let (key, value) = spec.rsplit_once('\\')?;
     let (root, rest) = key.split_once('\\')?;
-    if value.is_empty() || rest.split('\\').any(str::is_empty) {
+    if value.trim().is_empty() || rest.split('\\').any(|part| part.trim().is_empty()) {
         return None;
     }
     let upper = root.to_ascii_uppercase();
@@ -188,9 +197,9 @@ pub struct BundleToml {
     /// The `[probes]` table.
     #[serde(default)]
     pub probes: Option<Probes>,
-    /// The `[registry]` table.
-    #[serde(default)]
-    pub registry: Option<Registry>,
+    /// The `[registry]` table. Required: without `hidraw_key` no seed
+    /// carries the HID toggle, whatever the prefix records.
+    pub registry: Registry,
     /// Executable (relative path) to the code-signing entitlements it needs.
     #[serde(default)]
     pub entitlements: BTreeMap<String, Vec<String>>,
@@ -271,12 +280,10 @@ impl BundleToml {
         for executable in self.entitlements.keys() {
             relative("entitlements", Path::new(executable))?;
         }
-        if let Some(registry) = &self.registry
-            && registry.hidraw_value().is_none()
-        {
+        if self.registry.hidraw_value().is_none() {
             return Err(Error::InvalidBundle(format!(
-                "registry.hidraw_key: `{}` must be `<root>\\<key>\\...\\<value>` with the root one of HKLM, HKCU, HKCR, HKU, HKCC or its long form",
-                registry.hidraw_key
+                "registry.hidraw_key: `{}` must be `<root>\\<key>\\...\\<value>` with the root one of HKLM, HKCU, HKCR, HKU, HKCC or its long form, no blank component, and no quote, bracket, or control character",
+                self.registry.hidraw_key
             )));
         }
 

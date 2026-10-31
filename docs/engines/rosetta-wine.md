@@ -82,7 +82,7 @@ and may not contain `..`; absolute paths are rejected.
 | `[overrides.dxmt] x86_64`, `i386`; same for `[overrides.vkd3d]` and `[overrides.d3dmetal]` | lists of paths | DLLs a backend copies into the prefix and overrides, per Windows architecture (rules below) |
 | `[d3dmetal] overlay_dir` | path | where the user-supplied payload goes, relative to the `<version>.user/` overlay root; required when `[overrides.d3dmetal]` lists any DLL |
 | `[probes] cpuid`, `dx11_sample`, `xinput_check` | path | diagnostic executables in the bundle |
-| `[registry] hidraw_key` | string | the `winebus.sys` value that toggles raw HID access in the pinned Wine, as `<root>\<key>\...\<value>`; validation requires the root to be `HKLM`, `HKCU`, `HKCR`, `HKU`, `HKCC` or its long form and at least one key component before the value name, because `reg import` applies a well-formed file with an unknown root as a silent no-op |
+| `[registry] hidraw_key` | string | required: the `winebus.sys` value that toggles raw HID access in the pinned Wine, as `<root>\<key>\...\<value>`, and a `BUNDLE.toml` without the table does not parse, so every seed carries the toggle the prefix records; validation requires the root to be `HKLM`, `HKCU`, `HKCR`, `HKU`, `HKCC` or its long form, at least one key component before the value name, no blank component, and no `"`, bracket, or control character, because `reg import` applies a well-formed file with an unknown root as a silent no-op and the seed renders the path unescaped (a `"` drops the value silently, a newline starts further keys). An `HKU` path naming a user that does not exist is also silent and validation cannot see it |
 | `[entitlements]` | table of executable path to list of strings | code-signing entitlements each executable needs |
 
 The entitlements table is written as a table with quoted keys, one per
@@ -326,6 +326,11 @@ truncated file), the last `seeds.reg`, and the `reg-import.log` the applies
 append to. `RosettaWine::open_prefix(dir)`
 reads the record back into a `Prefix`; a record naming another engine is
 refused. `apply_overrides(installed, prefix, backend, sync_mode, hidraw)`
+is refused with `Error::PrefixUnusable` while `wineserver_alive(prefix.dir)`
+is true, before anything moves: the DLLs would change under the session, and
+a failed seed stops that server. Wine's server lingers a few seconds after
+its last process exits, so the core should wait for it or `cancel` the
+session rather than apply straight after a title closes. Otherwise it
 re-runs the `dll-overrides` and `registry-seeds` steps (removing the
 previously copied DLLs first, so a switch from DXMT to vkd3d-proton leaves no
 `winemetal.dll` behind) with the record rewritten as the DLLs change and
@@ -333,10 +338,14 @@ before the registry is seeded: a failed `reg import` leaves the new backend's
 DLLs on disk and a record that names them, so the next apply removes them
 (before this fix a stale `d3d12.dll` survived a switch back to DXMT for
 good). The record's `hidraw` and `sync_mode` keep their previous values
-until the seed has landed, so after a failed import `open_prefix` still
-reports what the registry holds, and a failed seed stops the prefix's
-server. It never re-runs `wineboot`. Wine runs its own prefix update when a
-newer Wine opens an older prefix; taking a snapshot before that (the plan's
+until a seed has fully succeeded, and a failed seed stops the prefix's
+server. `sync_mode` is not in the registry at all; it selects the
+environment. `hidraw` is, and `reg import` is not atomic: a failed import
+may have applied part of the file, so the registry can be ahead of the
+record (as it can after a failed final write of the record) until the next
+apply makes them agree. It never re-runs `wineboot`. Wine runs its own
+prefix update when a newer Wine opens an older prefix; taking a snapshot
+before that (the plan's
 "snapshot before an engine-version change") is the core's call, through the
 snapshot API below, since the engine does not know the snapshot root.
 
@@ -433,11 +442,11 @@ holds the exact `APPLEJACK_SESSION=<id>` entry, and reports
 names a `.exe` other than `start.exe` (Wine rewrites argv in place so
 argv[0] is the process's own image, and `KERN_PROCARGS2` reads the live
 argument area, so `ps` and this agree: `launcher.exe --run patcher.exe` is
-`launcher.exe`), else the last argv entry naming a `.exe` (the Unix form
-`wine Z:\g\game.exe` before the rewrite, and `start.exe /exec title.exe`,
-whose process is about to become `title.exe`), else argv[0]. The matching
-is `match_record`, unit-tested over a captured record. `ps -E` remains the
-debugging fallback.
+`launcher.exe`), else the first later argv entry naming a `.exe` (the Unix
+form `wine Z:\g\game.exe` before the rewrite, and `start.exe /exec
+title.exe`, whose process is about to become `title.exe`), else argv[0].
+The matching is `match_record`, unit-tested over a captured record. `ps -E`
+remains the debugging fallback.
 
 Wine rewrites each Windows process's argv in place: the Windows command
 line, then an empty slot the kernel's argument count still covers, then the
@@ -447,14 +456,17 @@ game, `steamwebhelper.exe`, `explorer.exe`, `services.exe`) it reports the
 first environment entry as the last `cmd` entry and leaves it out of
 `environ`; `std::process::Command` sorts the environment, and
 `APPLEJACK_SESSION` sorts first among the allowlisted names, so that entry
-is the session variable. `match_record` accepts the exact entry in
-`environ` or as the last `APPLEJACK_SESSION=` entry of `cmd` (the fold
-always follows the Windows arguments, so an earlier such entry is an
-argument the program was given, and a literal of another session's id in a
-game's argv does not attribute the process) and cuts argv at it before
-deriving `exe`. A same-uid process outside Wine whose own arguments carry
-the entry (`pgrep -f APPLEJACK_SESSION=<id>`) is reported; nothing in the
-record tells it apart. The loader process itself
+is the session variable. In `match_record` an `APPLEJACK_SESSION=` entry in
+`environ` decides when there is one (the loader keeps its environment, and
+its truncated argv can end in an argument). Only without one does the last
+`APPLEJACK_SESSION=` entry of `cmd` decide (the fold always follows the
+Windows arguments, so an earlier such entry is an argument the program was
+given), and argv is cut at it before deriving `exe`. Either way a literal of
+another session's id in a game's argv does not attribute the process. A
+same-uid process with no session of its own whose arguments end in the exact
+entry is reported, under Wine (a sessionless `cmd.exe`) or not
+(`pgrep -f APPLEJACK_SESSION=<id>`); nothing in the record tells it apart.
+The loader process itself
 (`session.pid`) keeps its Unix argv for the first moments, until Wine
 rewrites it too (to the title's Windows command line, or to
 `start.exe /exec <exe>` when Wine routes the launch through `start.exe`),

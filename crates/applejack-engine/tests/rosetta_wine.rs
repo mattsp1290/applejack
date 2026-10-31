@@ -9,6 +9,7 @@ use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use applejack_engine::rosetta_wine::launch::{
     HOST_PATH, MONO_GECKO_OVERRIDE, PeMachine, check_32bit, child_path, dll_overrides_value,
@@ -661,8 +662,39 @@ fn process_discovery_accepts_the_session_entry_wine_folds_into_argv() {
     );
 }
 
+/// From the process-and-prefix review of 66fa6de: a loader keeps `environ`
+/// and its truncated argv can end in a literal of another session's id. On
+/// the real payload session B's loader was listed under A as well as B.
 #[test]
-fn executable_name_is_argv0_when_it_names_an_exe_else_the_last_exe() {
+fn the_environ_entry_decides_the_session_when_it_is_present() {
+    let (a, b) = ("launch-a", "launch-b");
+    let literal = format!("{SESSION_VARIABLE}={a}");
+    let own = format!("{SESSION_VARIABLE}={b}");
+    let cmd = os(&[
+        "start.exe",
+        "/exec",
+        "cmd",
+        "/c",
+        "ping -n 20 127.0.0.1 & rem",
+        &literal,
+    ]);
+    let environ = os(&["HOME=/Users/me", &own, "PATH=/usr/bin"]);
+    let record = captured_record(&cmd, &environ);
+    assert_eq!(match_record(&record, a, 501), None);
+    assert!(match_record(&record, b, 501).is_some());
+
+    // With the session in `environ` the literal is an argument, so the
+    // entries after it still count: nothing here is Wine's fold.
+    let cmd = os(&["/x/wine/bin/wine", &literal, "Z:\\g\\Game.exe"]);
+    let environ = os(&[&literal]);
+    assert_eq!(
+        match_record(&captured_record(&cmd, &environ), a, 501).map(|p| p.exe),
+        Some("Game.exe".to_owned())
+    );
+}
+
+#[test]
+fn executable_name_is_argv0_when_it_names_an_exe_else_the_first_exe_after_it() {
     assert_eq!(
         executable_name(
             &os(&["C:\\Program Files\\Steam\\steam.exe", "-applaunch", "10"]),
@@ -705,6 +737,33 @@ fn executable_name_is_argv0_when_it_names_an_exe_else_the_last_exe() {
     assert_eq!(
         executable_name(&os(&["/payload/wine/bin/wine", "/games/Game.EXE"]), None),
         "Game.EXE"
+    );
+    // An exe given as an argument does not name the process in the forms
+    // from before the rewrite either (review of 66fa6de).
+    assert_eq!(
+        executable_name(
+            &os(&[
+                "/payload/wine/bin/wine",
+                "C:\\g\\launcher.exe",
+                "--run",
+                "C:\\g\\patcher.exe"
+            ]),
+            None
+        ),
+        "launcher.exe"
+    );
+    assert_eq!(
+        executable_name(
+            &os(&[
+                "C:\\windows\\system32\\start.exe",
+                "/unix",
+                "/g/launcher.exe",
+                "--run",
+                "patcher.exe"
+            ]),
+            None
+        ),
+        "launcher.exe"
     );
     assert_eq!(
         executable_name(&os(&["/payload/wine/bin/wineserver"]), None),
@@ -909,6 +968,14 @@ impl Drop for StubServer {
     }
 }
 
+/// Held by a test that binds under Wine's real base, so one test cannot
+/// create or remove `/tmp/.wine-<uid>` under another's before/after check.
+static REAL_BASE: Mutex<()> = Mutex::new(());
+
+fn real_base() -> MutexGuard<'static, ()> {
+    REAL_BASE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn mode_of(path: &Path) -> Option<u32> {
     fs::metadata(path)
         .ok()
@@ -988,6 +1055,7 @@ fn snapshot_restore_and_reset_refuse_a_prefix_with_a_live_wineserver() {
     let snap = snapshot::create(&prefix, &root, "steam").unwrap();
     fs::write(prefix.join("system.reg"), "v2").unwrap();
 
+    let _real_base = real_base();
     let wine_base =
         Path::new(SERVER_BASE).join(format!(".wine-{}", rustix::process::getuid().as_raw()));
     let base_before = mode_of(&wine_base);
@@ -1037,6 +1105,69 @@ fn snapshot_restore_and_reset_refuse_a_prefix_with_a_live_wineserver() {
     // A prefix directory that no longer exists has no server.
     fs::remove_dir_all(&prefix).unwrap();
     assert!(!wineserver_alive(&prefix).unwrap());
+}
+
+/// From the contract review of 66fa6de: an apply into a prefix with a live
+/// session would swap DLLs under the game and, on a failed seed, kill its
+/// server. Refused before anything moves. Goes through the real base since
+/// that is what `apply` consults; the guard leaves it as found.
+#[test]
+fn apply_overrides_refuses_a_prefix_with_a_live_wineserver() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = installed(dir.path());
+    let prefix_dir = dir.path().join("prefix");
+    let dll = prefix_dir.join("drive_c/windows/system32/d3d11.dll");
+    fs::create_dir_all(dll.parent().unwrap()).unwrap();
+    fs::write(&dll, "copied").unwrap();
+    let prefix = prefix_for(&engine, &prefix_dir);
+    let record = PrefixRecord {
+        engine: EngineId::RosettaWine,
+        engine_version: engine.version.clone(),
+        backend: GraphicsBackend::Dxmt,
+        sync_mode: SyncMode::Esync,
+        hidraw: HidrawMode::Enabled,
+        copied_dlls: vec![PathBuf::from("drive_c/windows/system32/d3d11.dll")],
+    };
+    record.write(&prefix_dir).unwrap();
+
+    let _real_base = real_base();
+    let wine_base =
+        Path::new(SERVER_BASE).join(format!(".wine-{}", rustix::process::getuid().as_raw()));
+    let base_before = mode_of(&wine_base);
+    let stub = StubServer::bind(Path::new(SERVER_BASE), &prefix_dir);
+    let refused = RosettaWine
+        .apply_overrides(
+            &engine,
+            &prefix,
+            GraphicsBackend::Vkd3dProton,
+            SyncMode::None,
+            HidrawMode::Disabled,
+        )
+        .unwrap_err();
+    drop(stub);
+    assert!(
+        matches!(&refused, Error::PrefixUnusable { path, .. } if *path == prefix_dir),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("cancel the session first"));
+    assert_eq!(fs::read_to_string(&dll).unwrap(), "copied");
+    assert_eq!(
+        listing_of(&prefix_dir.join("drive_c/windows/system32")),
+        ["d3d11.dll"]
+    );
+    assert_eq!(PrefixRecord::read(&prefix_dir).unwrap(), record);
+    assert!(
+        !prefix_dir.join(STATE_DIR).join("seeds.reg").exists(),
+        "no seed was written"
+    );
+    assert_eq!(mode_of(&wine_base), base_before);
+}
+
+fn listing_of(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 /// A GPTK volume as the import expects it.
@@ -1167,6 +1298,10 @@ fn d3dmetal_import_names_the_missing_readme_or_payload() {
                 if reason.contains("mentions `lib/external`") && reason.contains("README.md")
         ),
         "{error}"
+    );
+    assert_eq!(
+        d3dmetal::named_payload_location("see ./redist/lib/external/ for the files"),
+        None
     );
     assert_eq!(
         d3dmetal::named_payload_location("payload under redist/lib/external/."),

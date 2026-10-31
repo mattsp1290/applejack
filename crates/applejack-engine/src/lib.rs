@@ -497,8 +497,9 @@ pub trait Engine {
     /// # Errors
     ///
     /// Returns the failure, including a refusal when `backend` is not
-    /// available for the installed bundle or `prefix` belongs to another
-    /// engine.
+    /// available for the installed bundle, `prefix` belongs to another
+    /// engine, or ([`Error::PrefixUnusable`], before anything moves) a
+    /// session is still running in the prefix.
     fn apply_overrides(
         &self,
         installed: &InstalledEngine,
