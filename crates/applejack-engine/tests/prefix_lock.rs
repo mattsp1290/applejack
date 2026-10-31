@@ -30,7 +30,9 @@ fn refused_while_children_spawn(acquire: impl Fn() -> bool + Sync) -> usize {
 fn a_dropped_prefix_lock_is_free_at_once_while_children_spawn() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join(".snapshots");
-    let refused = refused_while_children_spawn(|| PrefixLock::acquire(&root, "steam").is_ok());
+    let prefix = dir.path().join("steam");
+    let refused =
+        refused_while_children_spawn(|| PrefixLock::acquire(&prefix, &root, "steam").is_ok());
     assert_eq!(refused, 0);
 }
 

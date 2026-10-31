@@ -831,12 +831,14 @@ fn snapshots_create_restore_reset_and_prune() {
         fs::read_to_string(safety.dir.join("system.reg")).unwrap(),
         "reg-v2"
     );
-    let working = fs::read_dir(root.join("steam"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .filter(|name| name.to_string_lossy().starts_with('.'))
-        .count();
-    assert_eq!(working, 0, "restore leaves no working directory");
+    for parent in [root.join("steam"), prefix.parent().unwrap().to_path_buf()] {
+        let working = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".staging"))
+            .count();
+        assert_eq!(working, 0, "restore leaves no working directory");
+    }
     assert!(matches!(
         snapshot::restore(&prefix, &root, "steam", "19700101T000000Z").unwrap_err(),
         Error::SnapshotNotFound { .. }
@@ -943,17 +945,18 @@ fn a_failed_snapshot_touches_no_other_and_is_not_listed() {
 fn a_prefix_lock_excludes_a_second_holder_until_it_drops() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join(".snapshots");
-    let held = snapshot::PrefixLock::acquire(&root, "steam").unwrap();
+    let prefix = dir.path().join("steam");
+    let held = snapshot::PrefixLock::acquire(&prefix, &root, "steam").unwrap();
     assert_eq!(held.name(), "steam");
     assert!(matches!(
-        snapshot::PrefixLock::acquire(&root, "steam").unwrap_err(),
+        snapshot::PrefixLock::acquire(&prefix, &root, "steam").unwrap_err(),
         Error::PrefixBusy { name } if name == "steam"
     ));
-    snapshot::PrefixLock::acquire(&root, "other").unwrap();
+    snapshot::PrefixLock::acquire(&prefix, &root, "other").unwrap();
     drop(held);
-    snapshot::PrefixLock::acquire(&root, "steam").unwrap();
+    snapshot::PrefixLock::acquire(&prefix, &root, "steam").unwrap();
     assert!(matches!(
-        snapshot::PrefixLock::acquire(&root, ".locks").unwrap_err(),
+        snapshot::PrefixLock::acquire(&prefix, &root, ".locks").unwrap_err(),
         Error::InvalidSnapshotName { .. }
     ));
 }
@@ -973,7 +976,7 @@ fn taking_a_prefix_lock_clears_what_a_killed_snapshot_left() {
         std::slice::from_ref(&kept)
     );
 
-    let _lock = snapshot::PrefixLock::acquire(&root, "steam").unwrap();
+    let _lock = snapshot::PrefixLock::acquire(&prefix, &root, "steam").unwrap();
     assert!(!stale.exists());
     assert!(kept.dir.is_dir());
 }

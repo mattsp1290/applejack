@@ -205,7 +205,7 @@ beside `serve` counts. The loser does not wait: it answers `PrefixBusy`.
 an error response, not a job, and the job holds the lock until it ends.
 
 `prefix.restore` also works when the prefix directory is gone, which is the way
-back from a failed reset, or from a removal to the last snapshot: `prefix.remove`
+back from a failed reset, or from a removal to a snapshot: `prefix.remove`
 takes none of its own. The method needs only the snapshot; a name with neither
 a prefix nor a snapshot is an unknown prefix.
 
@@ -234,8 +234,8 @@ their final notification. A reader that closes stdout does not change that:
 lines for it are dropped, the jobs run to the end, and the core then exits with
 the write error. `CoreClient.shutdown()` does not wait that long; a core
 terminated during an install leaves no `<version>/`, and the next install
-replaces the partial state and clears any packed `<version>.local.tar.zst`. Only
-one install of an engine runs at a time, across processes
+replaces the partial state and clears any packed `<version>.local.tar.zst` that
+is not its own `from`. Only one install of an engine runs at a time, across processes
 (`engines/<id>/.install.lock`); a second one ends in `job.failed` saying so.
 
 A core terminated during `prefix.reset` can leave the prefix missing or half

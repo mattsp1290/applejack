@@ -7,6 +7,7 @@
 //! a half-made copy never counts as one. [`PrefixLock`] serializes the
 //! callers of one prefix.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,12 @@ const LOCKS_DIR: &str = ".locks";
 
 const STAGING_PREFIX: &str = ".staging-";
 
+const RESTORING: &str = "restoring";
+
+const REPLACED: &str = "replaced";
+
+const DISCARDING: &str = "discarding";
+
 static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
 
 /// Exclusive for one prefix name across every thread and process, held for
@@ -42,16 +49,17 @@ pub struct PrefixLock {
 
 impl PrefixLock {
     /// Takes `<snapshots_root>/.locks/<name>.lock` without waiting, and
-    /// clears the staging directories a killed snapshot or restore left,
-    /// which nothing can still be using once the lock is held. What a restore
-    /// left is either the snapshot it was installing or state its safety
-    /// snapshot already holds.
+    /// settles what a killed snapshot or restore left, which nothing can
+    /// still be using once the lock is held: a restore killed between its
+    /// two renames has its prefix put back, and every working directory is
+    /// cleared. What goes is either the snapshot being installed or state
+    /// the safety snapshot already holds.
     ///
     /// # Errors
     ///
     /// Returns [`Error::PrefixBusy`] when another operation holds it,
     /// [`Error::InvalidSnapshotName`], or [`Error::Io`].
-    pub fn acquire(snapshots_root: &Path, name: &str) -> Result<Self> {
+    pub fn acquire(prefix_dir: &Path, snapshots_root: &Path, name: &str) -> Result<Self> {
         check_name(name)?;
         let dir = snapshots_root.join(LOCKS_DIR);
         fs::create_dir_all(&dir).map_err(|error| Error::io(&dir, error))?;
@@ -72,6 +80,7 @@ impl PrefixLock {
             Err(error) => return Err(Error::io(path, error.into())),
         }
         sweep_staging(&snapshots_root.join(name));
+        settle_restore(prefix_dir);
         Ok(Self {
             name: name.to_owned(),
             file,
@@ -106,6 +115,32 @@ fn sweep_staging(parent: &Path) {
         {
             let _ = fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+/// A `replaced` copy with no prefix means a kill fell between the renames of
+/// a restore: it is the whole prefix, so it goes back. In any other state
+/// the copy is finished with.
+fn settle_restore(prefix_dir: &Path) {
+    let gone = fs::symlink_metadata(prefix_dir)
+        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+    if gone {
+        let _ = fs::rename(work_dir(prefix_dir, REPLACED), prefix_dir);
+    }
+    let _ = discard_replaced(prefix_dir);
+    let _ = crate::bundle::remove_stale(&work_dir(prefix_dir, RESTORING));
+}
+
+/// Renames before deleting: a deletion can stop part way, and only a whole
+/// prefix may keep the name [`settle_restore`] puts back.
+fn discard_replaced(prefix_dir: &Path) -> Result<()> {
+    let replaced = work_dir(prefix_dir, REPLACED);
+    let discarding = work_dir(prefix_dir, DISCARDING);
+    crate::bundle::remove_stale(&discarding)?;
+    match fs::rename(&replaced, &discarding) {
+        Ok(()) => crate::bundle::remove_stale(&discarding),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::io(&replaced, error)),
     }
 }
 
@@ -214,10 +249,10 @@ pub fn list(snapshots_root: &Path, name: &str) -> Result<Vec<Snapshot>> {
 
 /// Replaces `prefix_dir` with the snapshot `<name>/<timestamp>` after
 /// taking a safety snapshot of the current state, which is returned. The
-/// snapshot is copied aside first and swapped in with two renames. A kill
-/// between them leaves no prefix, with the replaced state in the safety
-/// snapshot, and `restore` brings it back. With `prefix_dir` gone there is
-/// nothing to protect: the snapshot is installed and is itself returned.
+/// snapshot is copied aside first and swapped in with two renames. After a
+/// kill between them [`PrefixLock::acquire`] puts the replaced prefix back.
+/// With `prefix_dir` gone there is nothing to protect: the snapshot is
+/// installed and is itself returned.
 /// This is the recovery after a kill, a removal, or a failed reset. Refused
 /// while a `wineserver` runs for the prefix: the swap gives the path a new
 /// inode, and Wine keys the server socket on the inode, so a running session
@@ -235,7 +270,7 @@ pub fn restore(
     timestamp: &str,
 ) -> Result<Snapshot> {
     let source = find(snapshots_root, name, timestamp)?;
-    let staging = work_dir(snapshots_root, name, "restoring");
+    let staging = work_dir(prefix_dir, RESTORING);
     let present = prefix_dir
         .try_exists()
         .map_err(|error| Error::io(prefix_dir, error))?;
@@ -250,9 +285,9 @@ pub fn restore(
     }
     refuse_if_running(prefix_dir)?;
     let safety = create(prefix_dir, snapshots_root, name)?;
-    let replaced = work_dir(snapshots_root, name, "replaced");
+    let replaced = work_dir(prefix_dir, REPLACED);
     crate::bundle::remove_stale(&staging)?;
-    crate::bundle::remove_stale(&replaced)?;
+    discard_replaced(prefix_dir)?;
     copy_tree(&source.dir, &staging)?;
     fs::rename(prefix_dir, &replaced).map_err(|error| Error::io(prefix_dir, error))?;
     if let Err(error) = fs::rename(&staging, prefix_dir) {
@@ -260,7 +295,7 @@ pub fn restore(
         let _ = fs::remove_dir_all(&staging);
         return Err(Error::io(prefix_dir, error));
     }
-    fs::remove_dir_all(&replaced).map_err(|error| Error::io(&replaced, error))?;
+    discard_replaced(prefix_dir)?;
     Ok(safety)
 }
 
@@ -352,13 +387,13 @@ fn find(snapshots_root: &Path, name: &str, timestamp: &str) -> Result<Snapshot> 
         })
 }
 
-/// A directory for `restore` to work in. Not beside the prefix: every name
-/// under `prefixes/` can be another prefix, and one a kill left there would
-/// be listed as one. This is on the same volume, so its renames stay atomic.
-fn work_dir(snapshots_root: &Path, name: &str, tag: &str) -> PathBuf {
-    snapshots_root
-        .join(name)
-        .join(format!("{STAGING_PREFIX}{tag}"))
+/// A directory for `restore` to work in, beside the prefix because a rename
+/// cannot cross a volume and the snapshots may be on another. [`check_name`]
+/// refuses a leading dot, so no prefix has this name and none is listed.
+fn work_dir(prefix_dir: &Path, tag: &str) -> PathBuf {
+    let mut leaf = OsString::from(format!("{STAGING_PREFIX}{tag}-"));
+    leaf.push(prefix_dir.file_name().unwrap_or_default());
+    prefix_dir.with_file_name(leaf)
 }
 
 /// Refuses a prefix name that cannot be a directory under `prefixes/`.

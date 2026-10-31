@@ -100,7 +100,8 @@ impl Core {
     /// before anything looks at the directory: a reset in progress has
     /// removed it.
     fn lock_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
-        Ok(PrefixLock::acquire(&self.snapshots_root(), name)?)
+        let dir = self.prefix_dir(name)?;
+        Ok(PrefixLock::acquire(&dir, &self.snapshots_root(), name)?)
     }
 
     /// Locks a prefix that exists. The lock travels with the work, so a

@@ -761,7 +761,10 @@ fn descriptor_in_archive(archive: &Path) -> Result<String> {
     for entry in tar.entries().map_err(|error| Error::io(archive, error))? {
         let entry = entry.map_err(|error| Error::io(archive, error))?;
         let path = entry.path().map_err(|error| Error::io(archive, error))?;
-        if path.components().ne(Path::new(BUNDLE_FILE).components()) {
+        let parts = path
+            .components()
+            .filter(|part| !matches!(part, PathComponent::CurDir));
+        if parts.ne(Path::new(BUNDLE_FILE).components()) {
             continue;
         }
         let mut text = String::new();

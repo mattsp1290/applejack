@@ -107,7 +107,9 @@ fn engine_doctor_without_an_engine_reports_the_fix_and_exits_0() {
 fn a_prefix_held_by_another_process_is_refused() {
     let data = tempfile::tempdir().unwrap();
     let root = data.path().join("prefixes/.snapshots");
-    let held = applejack_engine::rosetta_wine::snapshot::PrefixLock::acquire(&root, "p").unwrap();
+    let prefix = data.path().join("prefixes/p");
+    let held =
+        applejack_engine::rosetta_wine::snapshot::PrefixLock::acquire(&prefix, &root, "p").unwrap();
     for args in [
         &["prefix", "snapshot", "p"][..],
         &["prefix", "restore", "p", "19700101T000000Z"],

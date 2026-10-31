@@ -541,14 +541,17 @@ D3DMetal is never committed, downloaded, or published.
 - `list(snapshots_root, name)` returns them oldest first.
 - `restore(prefix_dir, snapshots_root, name, timestamp)` takes a safety
   snapshot of the current prefix, copies the chosen one to
-  `.staging-restoring` beside the snapshots, and swaps it in with two renames,
-  moving the old prefix to `.staging-replaced`. Neither directory sits under a
-  name another prefix could have, and `prefix list` never shows them; the next
-  operation on the prefix clears what a kill left. A kill between the renames
-  leaves no prefix, with the replaced state in the safety snapshot, and
-  `restore` brings it back. Returns the safety snapshot. With `prefix_dir`
-  gone there is nothing to protect: the chosen snapshot is installed the same
-  way and returned.
+  `.staging-restoring-<name>` beside the prefix, and swaps it in with two
+  renames, moving the old prefix to `.staging-replaced-<name>`, which is
+  renamed to `.staging-discarding-<name>` before it is deleted. All three stay
+  beside the prefix so the renames work when the snapshots are on another
+  volume. No prefix can have those names, since a name may not start with a
+  dot, and `prefix list` never shows them. The next operation on the prefix
+  settles what a kill left: after a kill between the renames, `prefix list`
+  shows no prefix until then, and that operation renames
+  `.staging-replaced-<name>` back; every other leftover is cleared. Returns the
+  safety snapshot. With `prefix_dir` gone there is nothing to protect: the
+  chosen snapshot is installed the same way and returned.
 - `reset(prefix_dir, snapshots_root, name, keep_user_data, recreate)` takes
   a safety snapshot, removes the prefix, calls `recreate` (the core wraps
   `create_prefix`), and with `keep_user_data` copies `drive_c/users/` back
@@ -567,11 +570,11 @@ D3DMetal is never committed, downloaded, or published.
   is a point in time, not a lock: a launch between it and the rename is
   not prevented, which is why the core serializes prefix operations with
   `PrefixLock`.
-- `PrefixLock::acquire(snapshots_root, name)` takes
+- `PrefixLock::acquire(prefix_dir, snapshots_root, name)` takes
   `<snapshots_root>/.locks/<name>.lock` with `flock` and does not wait: a
   held lock is `Error::PrefixBusy`. It lives outside the prefix because the
   operations it guards delete the prefix. Holding it, the caller also knows
-  no snapshot is being copied, so `acquire` clears stale `.staging-*`
+  no snapshot is being copied, so `acquire` settles the stale `.staging-*`
   directories. Every `Core` prefix operation except `list` and
   `list-snapshots` holds it for its whole length, `exec` until the child
   exits. A dropped lock is released with an explicit `LOCK_UN`, because a

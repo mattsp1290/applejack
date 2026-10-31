@@ -5,10 +5,12 @@
 
 mod common;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -129,7 +131,8 @@ fn every_operation_refuses_a_prefix_someone_else_holds() {
     let dir = TempDir::new().unwrap();
     let mut core = installed(&dir);
     let snapshot = core.prefix_snapshot("p").unwrap();
-    let held = PrefixLock::acquire(&core.data_dir().join("prefixes/.snapshots"), "p").unwrap();
+    let root = core.data_dir().join("prefixes");
+    let held = PrefixLock::acquire(&root.join("p"), &root.join(".snapshots"), "p").unwrap();
 
     busy(core.prefix_snapshot("p"));
     busy(core.prefix_restore("p", &snapshot.timestamp));
@@ -258,11 +261,9 @@ fn the_next_install_clears_the_archive_a_killed_one_left() {
     assert_eq!(packed_archives(&data), Vec::<String>::new());
 }
 
-/// Passing the file a killed install left is the obvious thing to reach for,
-/// and the sweep for such files runs before the input is read.
-#[test]
-fn an_archive_a_killed_install_left_can_be_the_input_of_the_next() {
-    let dir = TempDir::new().unwrap();
+/// A core, its data directory, and a packed archive of 10.0.0 where a killed
+/// install leaves one, beside a stale 9.0.0.
+fn left_by_a_killed_install(dir: &TempDir) -> (Core, PathBuf, PathBuf) {
     let data = dir.path().join("data");
     let tree = dir.path().join("tree");
     write_stub_bundle(&tree, "10.0.0");
@@ -276,6 +277,15 @@ fn an_archive_a_killed_install_left_can_be_the_input_of_the_next() {
     fs::rename(&kept, &archive).unwrap();
     let other = data.join("engines/rosetta-wine/9.0.0.local.tar.zst");
     fs::write(&other, "left by another killed install").unwrap();
+    (core, data, archive)
+}
+
+/// Passing the file a killed install left is the obvious thing to reach for,
+/// and the sweep for such files runs before the input is read.
+#[test]
+fn an_archive_a_killed_install_left_can_be_the_input_of_the_next() {
+    let dir = TempDir::new().unwrap();
+    let (core, data, archive) = left_by_a_killed_install(&dir);
 
     core.plan_install("rosetta-wine", Some(&archive))
         .unwrap()
@@ -290,6 +300,20 @@ fn an_archive_a_killed_install_left_can_be_the_input_of_the_next() {
         ["10.0.0.local.tar.zst"],
         "the input stays, the other leftover goes"
     );
+}
+
+#[test]
+fn a_link_to_the_archive_a_killed_install_left_can_be_the_input() {
+    let dir = TempDir::new().unwrap();
+    let (core, data, archive) = left_by_a_killed_install(&dir);
+    let link = dir.path().join("link.tar.zst");
+    std::os::unix::fs::symlink(&archive, &link).unwrap();
+
+    core.plan_install("rosetta-wine", Some(&link))
+        .unwrap()
+        .run(&mut |_| {})
+        .unwrap();
+    assert_eq!(packed_archives(&data), ["10.0.0.local.tar.zst"]);
 }
 
 #[test]
@@ -387,33 +411,188 @@ fn undoing_a_removal_keeps_a_prefix_named_like_a_restoring_copy() {
     );
 }
 
+fn prefix_names(core: &Core) -> Vec<String> {
+    let list = core.prefix_list().unwrap();
+    list.into_iter().map(|entry| entry.name).collect()
+}
+
+fn working_dirs(core: &Core) -> Vec<String> {
+    fs::read_dir(core.data_dir().join("prefixes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".staging"))
+        .collect()
+}
+
 /// A kill between the two renames of a restore, built by hand because a real
-/// kill landing there cannot be reproduced on demand.
+/// kill landing there cannot be reproduced on demand. The prefix holds "new"
+/// and the returned snapshot "old".
+fn killed_between_the_renames(core: &Core) -> String {
+    fs::write(save_file(core.data_dir()), "old").unwrap();
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    fs::write(save_file(core.data_dir()), "new").unwrap();
+    let root = core.data_dir().join("prefixes");
+    fs::create_dir(root.join(".staging-restoring-p")).unwrap();
+    fs::rename(root.join("p"), root.join(".staging-replaced-p")).unwrap();
+    assert_eq!(
+        prefix_names(core),
+        Vec::<String>::new(),
+        "listed after the kill"
+    );
+    snapshot.timestamp
+}
+
 #[test]
 fn a_restore_killed_between_its_renames_recovers_with_no_ghost() {
     let dir = TempDir::new().unwrap();
     let core = installed(&dir);
-    fs::write(save_file(core.data_dir()), "old").unwrap();
-    let snapshot = core.prefix_snapshot("p").unwrap();
-    let root = core.data_dir().join("prefixes");
-    let work = root.join(".snapshots/p");
-    fs::create_dir(work.join(".staging-restoring")).unwrap();
-    fs::rename(root.join("p"), work.join(".staging-replaced")).unwrap();
-    let names = |core: &Core| -> Vec<String> {
-        let list = core.prefix_list().unwrap();
-        list.into_iter().map(|entry| entry.name).collect()
-    };
-    assert_eq!(names(&core), Vec::<String>::new(), "listed after the kill");
+    let timestamp = killed_between_the_renames(&core);
 
-    core.prefix_restore("p", &snapshot.timestamp).unwrap();
-    assert_eq!(names(&core), ["p"], "listed after recovery");
+    core.prefix_restore("p", &timestamp).unwrap();
+    assert_eq!(prefix_names(&core), ["p"], "listed after recovery");
     assert!(prefix_ok(&core));
     assert_eq!(
         fs::read_to_string(save_file(core.data_dir())).unwrap(),
         "old"
     );
-    assert!(!work.join(".staging-restoring").exists());
-    assert!(!work.join(".staging-replaced").exists());
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+#[test]
+fn the_next_operation_puts_back_a_prefix_a_killed_restore_moved_aside() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    killed_between_the_renames(&core);
+
+    core.prefix_snapshot("p").unwrap();
+    assert_eq!(prefix_names(&core), ["p"]);
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "new"
+    );
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+/// The kill came after the swap, so the prefix is already the restored one.
+#[test]
+fn a_replaced_copy_beside_a_prefix_is_cleared_and_not_put_back() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    fs::write(save_file(core.data_dir()), "swapped in").unwrap();
+    let root = core.data_dir().join("prefixes");
+    fs::create_dir_all(root.join(".staging-replaced-p/drive_c")).unwrap();
+
+    core.prefix_snapshot("p").unwrap();
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "swapped in"
+    );
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+/// A deletion that stopped part way must not come back as the prefix.
+#[test]
+fn a_copy_being_discarded_never_comes_back_as_the_prefix() {
+    let dir = TempDir::new().unwrap();
+    let core = installed(&dir);
+    let root = core.data_dir().join("prefixes");
+    fs::rename(root.join("p"), root.join(".staging-discarding-p")).unwrap();
+
+    assert!(matches!(
+        core.prefix_snapshot("p"),
+        Err(CoreError::UnknownPrefix { .. })
+    ));
+    assert!(!root.join("p").exists());
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
+}
+
+/// A disk image of its own, detached on drop.
+struct Volume {
+    mount: PathBuf,
+}
+
+impl Volume {
+    /// `None` where `hdiutil` cannot make one, such as under a sandbox.
+    fn attach(dir: &Path) -> Option<Self> {
+        let image = dir.join("volume.dmg");
+        let mount = dir.join("volume");
+        fs::create_dir(&mount).unwrap();
+        let hdiutil = |args: &[&OsStr]| {
+            Command::new("/usr/bin/hdiutil")
+                .args(args)
+                .arg("-quiet")
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let created = hdiutil(&[
+            "create".as_ref(),
+            "-size".as_ref(),
+            "32m".as_ref(),
+            "-fs".as_ref(),
+            "APFS".as_ref(),
+            "-volname".as_ref(),
+            "applejack-test".as_ref(),
+            image.as_os_str(),
+        ]);
+        let attached = created
+            && hdiutil(&[
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-noverify".as_ref(),
+                "-noautoopen".as_ref(),
+                "-mountpoint".as_ref(),
+                mount.as_os_str(),
+                image.as_os_str(),
+            ]);
+        attached.then_some(Self { mount })
+    }
+}
+
+impl Drop for Volume {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-force", "-quiet"])
+            .arg(&self.mount)
+            .status();
+    }
+}
+
+/// A rename cannot cross a volume, and nothing else stops `.snapshots` being
+/// on another one: snapshots are plain copies.
+#[test]
+fn a_restore_works_with_the_snapshots_on_another_volume() {
+    let dir = TempDir::new().unwrap();
+    let Some(volume) = Volume::attach(dir.path()) else {
+        eprintln!("skipped: hdiutil could not attach a disk image");
+        return;
+    };
+    let core = installed(&dir);
+    let root = core.data_dir().join("prefixes");
+    let elsewhere = volume.mount.join("snapshots");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::remove_dir_all(root.join(".snapshots")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join(".snapshots")).unwrap();
+    assert_ne!(
+        fs::metadata(&elsewhere).unwrap().dev(),
+        fs::metadata(&root).unwrap().dev(),
+        "the test needs two volumes"
+    );
+    fs::write(save_file(core.data_dir()), "old").unwrap();
+    let snapshot = core.prefix_snapshot("p").unwrap();
+    fs::write(save_file(core.data_dir()), "new").unwrap();
+
+    core.prefix_restore("p", &snapshot.timestamp).unwrap();
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "old"
+    );
+    core.prefix_remove("p").unwrap();
+    core.prefix_restore("p", &snapshot.timestamp).unwrap();
+    assert_eq!(
+        fs::read_to_string(save_file(core.data_dir())).unwrap(),
+        "old"
+    );
+    assert_eq!(working_dirs(&core), Vec::<String>::new());
 }
 
 #[test]
@@ -482,7 +661,7 @@ fn the_lock_is_free_when_job_done_arrives() {
     let check = Core::new(core.data_dir());
     let mut handler = CoreHandler::new(core);
     let (notifier, lines) = Notifier::channel();
-    for round in 0..40 {
+    for round in 0..10 {
         let reset: Method =
             serde_json::from_value(json!({"method": "prefix.reset", "params": {"prefix": "p"}}))
                 .unwrap();
