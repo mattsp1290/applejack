@@ -13,6 +13,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::engine_payload::is_macho;
 use crate::self_contained::Violation;
 
 const ARCH_DIRS: [&str; 2] = ["x86_64-windows", "i386-windows"];
@@ -100,12 +101,11 @@ pub fn violations(payload: &Path) -> Result<Vec<Violation>, String> {
             &mut violations,
         )?;
     }
-    if !fs::metadata(payload.join(WINEMETAL_SO)).is_ok_and(|so| so.is_file() && so.len() > 0) {
-        violations.push(Violation {
-            binary: WINEMETAL_SO.to_owned(),
-            reference: WINEMETAL.to_owned(),
-            reason: "missing; it is the native half winemetal.dll calls".to_owned(),
-        });
+    let winemetal_so = payload.join(WINEMETAL_SO);
+    if !fs::metadata(&winemetal_so).is_ok_and(|so| so.is_file() && so.len() > 0) {
+        violations.push(winemetal_so_violation("missing or empty"));
+    } else if !is_macho(&winemetal_so)? {
+        violations.push(winemetal_so_violation("not a Mach-O file"));
     }
     let winemac = payload.join(WINEMAC);
     if !winemac.is_file() || !exports(&winemac, MACDRV_FUNCTIONS)? {
@@ -120,7 +120,16 @@ pub fn violations(payload: &Path) -> Result<Vec<Violation>, String> {
     Ok(violations)
 }
 
-/// Whether the file carries the marker, or `None` when no PE image is there.
+fn winemetal_so_violation(problem: &str) -> Violation {
+    Violation {
+        binary: WINEMETAL_SO.to_owned(),
+        reference: WINEMETAL.to_owned(),
+        reason: format!("{problem}; it is the native half winemetal.dll calls"),
+    }
+}
+
+/// Whether the file carries the marker, or `None` when it is absent or lacks
+/// the `MZ` magic, which is the only part of a PE image this looks at.
 fn marked(payload: &Path, relative: &str) -> Result<Option<bool>, String> {
     let path = payload.join(relative);
     if !path.is_file() {
@@ -207,11 +216,14 @@ mod tests {
 
     /// A shared library defining `macdrv_functions` with this source line.
     fn winemac(payload: &Path, definition: &str) {
-        let path = payload.join(WINEMAC);
+        shared_library(&payload.join(WINEMAC), definition);
+    }
+
+    fn shared_library(path: &Path, definition: &str) {
         fs::create_dir_all(path.parent().expect("parent")).expect("unix dir");
         let mut cc = Command::new("cc")
             .args(["-shared", "-x", "c", "-", "-o"])
-            .arg(&path)
+            .arg(path)
             .stdin(Stdio::piped())
             .spawn()
             .expect("cc");
@@ -231,7 +243,7 @@ mod tests {
         fs::create_dir_all(loader.parent().expect("parent")).expect("bin");
         fs::write(loader, b"").expect("loader");
         winemac(payload, EXPORTED);
-        fs::write(payload.join(WINEMETAL_SO), b"Mach-O").expect("winemetal.so");
+        shared_library(&payload.join(WINEMETAL_SO), "const int winemetal = 1;\n");
     }
 
     fn unplaced_without_wine(payload: &Path) {
@@ -373,6 +385,33 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_mz_is_not_a_pe_image_for_either_kind() {
+        let payload = scratch("not-pe");
+        unplaced(&payload);
+        place(&payload).expect("place");
+        let copies = [
+            "dxmt/x86_64-windows/d3d11.dll".to_owned(),
+            format!("dxmt/i386-windows/{WINEMETAL}"),
+            format!("wine/lib/wine/x86_64-windows/{WINEMETAL}"),
+        ];
+        for relative in copies {
+            let path = payload.join(&relative);
+            let image = fs::read(&path).expect("dll");
+            fs::write(&path, b"not a dll").expect("text");
+            let found = violations(&payload).expect("violations");
+            assert_eq!(found.len(), 1, "{relative}");
+            assert_eq!(found[0].binary, relative);
+            assert!(
+                found[0].reason.contains("not a PE image"),
+                "{}",
+                found[0].reason
+            );
+            fs::write(&path, image).expect("restore");
+        }
+        let _ = fs::remove_dir_all(&payload);
+    }
+
+    #[test]
     fn every_winemetal_must_keep_its_marker() {
         let payload = scratch("unmarked");
         unplaced(&payload);
@@ -406,7 +445,31 @@ mod tests {
         unplaced(&payload);
         place(&payload).expect("place");
         fs::write(payload.join(WINEMETAL_SO), b"").expect("empty");
-        assert_eq!(reported(&payload), [WINEMETAL_SO]);
+        let found = violations(&payload).expect("violations");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].binary, WINEMETAL_SO);
+        assert!(
+            found[0].reason.contains("missing or empty"),
+            "{}",
+            found[0].reason
+        );
+        let _ = fs::remove_dir_all(&payload);
+    }
+
+    #[test]
+    fn a_winemetal_so_with_other_content_is_a_violation() {
+        let payload = scratch("text-so");
+        unplaced(&payload);
+        place(&payload).expect("place");
+        fs::write(payload.join(WINEMETAL_SO), b"hello").expect("text");
+        let found = violations(&payload).expect("violations");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].binary, WINEMETAL_SO);
+        assert!(
+            found[0].reason.contains("not a Mach-O file"),
+            "{}",
+            found[0].reason
+        );
         let _ = fs::remove_dir_all(&payload);
     }
 

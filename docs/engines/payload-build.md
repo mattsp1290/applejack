@@ -490,8 +490,8 @@ Environment knobs:
 9. `cargo xtask engine-payload --check <payload>` — fails on what it can see
    of the DXMT setup, for either architecture: a `d3d11`, `dxgi`, or `d3d10core`
    missing from `dxmt/` or still carrying the marker, a `winemetal.dll` missing
-   from `dxmt/` or `wine/lib/wine` or without the marker, a missing `winemetal.so`,
-   or a `winemac.so` with no exported `macdrv_functions` (`nm -gU`;
+   from `dxmt/` or `wine/lib/wine` or without the marker, a `winemetal.so` that
+   is missing, empty, or not Mach-O, or a `winemac.so` with no exported `macdrv_functions` (`nm -gU`;
    `build/wine/patches/`). Only a tree with `dxmt/` is judged, and the
    `wine/lib/wine` rules only with `wine/bin/wine` built. A pass does not prove
    DXMT renders: the check sees the name of the export, not the table or which

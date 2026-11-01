@@ -397,10 +397,11 @@ over the new bounds. The surface lives until the window is destroyed.
 A window has one Metal view, so two live swap chains on it share the view and
 its layer. The table's acquire and release slots count them: the view stays
 until the last chain is released, so a title can create the new chain before
-releasing the old one. Whichever chain presents last is what the window shows,
-as long as the chains share a size and format: they share one layer, and a
-surviving chain does not reassert its size or format until its next
-`ResizeBuffers`.
+releasing the old one, and once one is released the survivor is what the window
+shows, as long as the chains share a size and format: they share one layer, and
+a surviving chain does not reassert its size or format on `Present` alone. While
+both are live they present to that one layer; which one the window shows then
+has not been measured.
 
 A prefix created with an engine before 11.0-2 holds DXMT DLLs with the marker.
 Launching one is refused with `Error::PrefixUnusable`, since Wine would otherwise
