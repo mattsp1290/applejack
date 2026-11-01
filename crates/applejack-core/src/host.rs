@@ -1,5 +1,6 @@
 //! Host facts behind `applejack doctor`.
 
+use applejack_engine::{Arch, Host};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fmt;
@@ -55,6 +56,22 @@ impl HostFacts {
             )
             .filter(|captured| captured.success)
             .map(|captured| count_developer_id_identities(&captured.stdout)),
+        }
+    }
+}
+
+impl HostFacts {
+    /// The facts the engine takes. The chip reads as arm64 when the probe
+    /// failed: applejack builds only for Apple Silicon.
+    #[must_use]
+    pub fn engine_host(&self) -> Host {
+        Host {
+            macos_version: self.macos_version.clone(),
+            arch: match self.arch.as_deref() {
+                Some("x86_64") => Arch::X86_64,
+                _ => Arch::Arm64,
+            },
+            rosetta_present: self.rosetta_present,
         }
     }
 }

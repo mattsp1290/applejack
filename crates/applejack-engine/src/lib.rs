@@ -26,7 +26,10 @@ pub mod rosetta_wine;
 pub mod versions;
 
 pub use applejack_manifest::{Arch, Sha256};
-pub use bundle::{ArchiveSource, BundleToml, Capabilities, InstallRequest, InstalledEngine};
+pub use bundle::{
+    ArchiveSource, BundleToml, Capabilities, InstallLock, InstallRequest, InstalledEngine,
+    LocalBundle,
+};
 pub use error::{Error, Result};
 pub use launch::{LaunchSpec, Session};
 pub use manifest::embedded_manifest;
@@ -420,6 +423,12 @@ pub struct Prefix {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Progress {
+    /// Packing a local bundle directory into an archive; `written` counts
+    /// compressed bytes so far.
+    Packing {
+        /// Compressed bytes written.
+        written: u64,
+    },
     /// Bytes of the archive received so far; `total` when the server said.
     Downloading {
         /// Bytes received.

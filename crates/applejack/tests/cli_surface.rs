@@ -4,7 +4,7 @@ const SUBCOMMANDS: [&str; 9] = [
     "engine", "steam", "install", "run", "config", "prefix", "runtime", "serve", "doctor",
 ];
 
-const STUBS: [&str; 6] = ["engine", "steam", "install", "run", "prefix", "runtime"];
+const STUBS: [&str; 4] = ["steam", "install", "run", "runtime"];
 
 const DOCTOR_KEYS: [&str; 6] = [
     "macos_version",
@@ -53,7 +53,7 @@ fn stubs_exit_with_ex_unavailable() {
 
 #[test]
 fn stubs_ignore_trailing_arguments() {
-    assert_not_implemented("prefix", &["snapshot"]);
+    assert_not_implemented("runtime", &["install"]);
     assert_not_implemented("steam", &["login"]);
 }
 
@@ -67,6 +67,169 @@ fn assert_not_implemented(name: &str, args: &[&str]) {
     );
     let stderr = String::from_utf8(output.stderr).expect("utf-8");
     assert_eq!(stderr.trim(), format!("applejack {name}: not implemented"));
+}
+
+fn with_data(data_dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    applejack()
+        .env("APPLEJACK_DATA_DIR", data_dir)
+        .env_remove("APPLEJACK_ALLOW_UNSIGNED_ENGINE")
+        .args(args)
+        .output()
+        .expect("runs")
+}
+
+fn stderr_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn stdout_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn engine_doctor_without_an_engine_reports_the_fix_and_exits_0() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["engine", "doctor"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let text = stdout_of(&output);
+    assert!(text.contains("runnable: no"), "{text}");
+    assert!(text.contains("--from"), "{text}");
+    let output = with_data(data.path(), &["engine", "doctor", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["runnable"], serde_json::json!(false));
+    assert!(
+        !data.path().join("db.sqlite").exists(),
+        "doctor is read-only"
+    );
+}
+
+#[test]
+fn a_prefix_held_by_another_process_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+    let root = data.path().join("prefixes/.snapshots");
+    let prefix = data.path().join("prefixes/p");
+    let held =
+        applejack_engine::rosetta_wine::snapshot::PrefixLock::acquire(&prefix, &root, "p").unwrap();
+    for args in [
+        &["prefix", "snapshot", "p"][..],
+        &["prefix", "restore", "p", "19700101T000000Z"],
+        &["prefix", "reset", "p"],
+        &["prefix", "remove", "p"],
+        &["prefix", "exec", "p", "--", "cmd"],
+    ] {
+        let output = with_data(data.path(), args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr_of(&output).contains("another operation is using prefix p"),
+            "{args:?}: {}",
+            stderr_of(&output)
+        );
+    }
+    drop(held);
+    let output = with_data(data.path(), &["prefix", "snapshot", "p"]);
+    assert!(stderr_of(&output).contains("no prefix named"), "{output:?}");
+}
+
+#[test]
+fn list_snapshots_answers_for_a_prefix_that_is_gone() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["prefix", "list-snapshots", "p"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(stdout_of(&output).trim(), "no snapshots of p");
+
+    let snapshots = data.path().join("prefixes/.snapshots/p");
+    std::fs::create_dir_all(snapshots.join("20261031T120000Z")).unwrap();
+    std::fs::create_dir_all(snapshots.join("20261031T120000Z-001")).unwrap();
+    std::fs::create_dir_all(snapshots.join(".staging-1-0")).unwrap();
+    let output = with_data(data.path(), &["prefix", "list-snapshots", "p"]);
+    assert_eq!(
+        stdout_of(&output).trim(),
+        "20261031T120000Z\n20261031T120000Z-001"
+    );
+}
+
+#[test]
+fn engine_install_without_from_names_the_flag_on_an_empty_manifest() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["engine", "install", "rosetta-wine"]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stderr_of(&output);
+    assert!(text.contains("no published version"), "{text}");
+    assert!(text.contains("--from"), "{text}");
+}
+
+#[test]
+fn engine_install_from_is_refused_without_the_opt_in() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(
+        data.path(),
+        &["engine", "install", "rosetta-wine", "--from", "/nowhere"],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr_of(&output).contains("APPLEJACK_ALLOW_UNSIGNED_ENGINE=1"),
+        "{}",
+        stderr_of(&output)
+    );
+    let refused = applejack()
+        .env("APPLEJACK_DATA_DIR", data.path())
+        .env("APPLEJACK_ALLOW_UNSIGNED_ENGINE", "0")
+        .args(["engine", "install", "rosetta-wine", "--from", "/nowhere"])
+        .output()
+        .expect("runs");
+    assert!(
+        stderr_of(&refused).contains("refusing"),
+        "only 1 opts in: {}",
+        stderr_of(&refused)
+    );
+}
+
+#[test]
+fn engine_and_prefix_subcommands_reject_usage_errors() {
+    let data = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["engine"],
+        vec!["engine", "bogus"],
+        vec!["engine", "use", "rosetta-wine"],
+        vec!["engine", "d3dmetal"],
+        vec!["prefix"],
+        vec!["prefix", "create"],
+        vec!["prefix", "create", "x", "--backend", "d3d9"],
+        vec!["prefix", "create", "x", "--sync", "fsync"],
+        vec!["prefix", "exec", "x"],
+        vec!["prefix", "exec", "x", "--"],
+    ] {
+        let output = with_data(data.path(), &args);
+        assert_eq!(output.status.code(), Some(2), "`{}`", args.join(" "));
+    }
+}
+
+#[test]
+fn prefix_commands_report_what_is_missing() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["prefix", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_of(&output).trim(), "no prefixes");
+
+    let output = with_data(data.path(), &["prefix", "create", "x"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_of(&output).contains("no engine is active"));
+
+    for args in [
+        vec!["prefix", "snapshot", "x"],
+        vec!["prefix", "reset", "x"],
+        vec!["prefix", "remove", "x"],
+        vec!["prefix", "exec", "x", "--", "cmd"],
+        vec!["prefix", "restore", "x", "20261031T000000Z"],
+    ] {
+        let output = with_data(data.path(), &args);
+        assert_eq!(output.status.code(), Some(1), "`{}`", args.join(" "));
+        assert!(
+            stderr_of(&output).contains("no prefix named `x`"),
+            "{}",
+            stderr_of(&output)
+        );
+    }
 }
 
 #[test]

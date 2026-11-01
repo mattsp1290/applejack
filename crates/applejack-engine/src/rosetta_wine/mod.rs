@@ -32,6 +32,12 @@ pub use prefix::{PREFIX_STEPS, PrefixRecord, PrefixStep};
 pub use process::Process;
 pub use snapshot::Snapshot;
 
+/// Now as `YYYY-MM-DDTHH:MM:SSZ`, the timestamp text the core records.
+#[must_use]
+pub fn utc_now() -> String {
+    clock::Utc::now().rfc3339()
+}
+
 /// The engine. Stateless: everything it needs arrives as an
 /// [`InstalledEngine`], a [`Prefix`], or a spec.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

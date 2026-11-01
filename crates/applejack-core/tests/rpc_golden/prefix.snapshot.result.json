@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "dir": "/data/prefixes/.snapshots/220/20261031T120000Z",
+    "prefix": "220",
+    "timestamp": "20261031T120000Z"
+  }
+}

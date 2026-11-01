@@ -9,9 +9,11 @@ database, controller handling, and the signing and notarization pipeline.
 
 ## Status
 
-Scaffold only. The Cargo workspace, the CLI surface, and the quality gate
-exist; nothing runs games yet. Every subcommand except `doctor` exits with
-code 69 (`EX_UNAVAILABLE`) until its work package lands.
+The engine half works: `applejack engine` and `applejack prefix` install a
+local Rosetta engine bundle, build prefixes, and run Windows executables in
+them, and `applejack serve --stdio` answers the same operations for the shell.
+No game runs yet. `steam`, `install`, `run`, and `runtime` exit with code 69
+(`EX_UNAVAILABLE`) until their work packages land.
 
 ## Requirements
 
@@ -37,8 +39,9 @@ identities.
 ## Verification
 
 `cargo xtask check` runs `cargo fmt --all --check`, Clippy with `-D warnings`
-and the workspace lints, `cargo test --workspace`, rustdoc with
-`RUSTDOCFLAGS=-D warnings`, `cargo xtask manifest-verify` on
+and the workspace lints, `cargo test --workspace`, the library tests of
+`applejack-core` under `--release`, which hold the unsigned-install refusal,
+rustdoc with `RUSTDOCFLAGS=-D warnings`, `cargo xtask manifest-verify` on
 `engines/manifest.toml`, then the Swift package build and tests with
 `APPLEJACK_CORE_BIN` pointing at the freshly built core binary. It stops at
 the first failure. CI runs the same

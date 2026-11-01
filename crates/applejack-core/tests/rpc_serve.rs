@@ -1,9 +1,12 @@
 //! The serve loop over in-memory pipes.
 
+use applejack_core::Core;
+use applejack_core::rpc::jobs::Notifier;
 use applejack_core::rpc::methods::{EmptyResult, LoginMode, Method, MethodStatus};
 use applejack_core::rpc::wire::{Body, ErrorCode, Id, Response, RpcError};
 use applejack_core::rpc::{self, CoreHandler, ExitStatus, Handler, Logged, PROTOCOL_VERSION};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 
 const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":1}}"#;
 const DOCTOR: &str = r#"{"jsonrpc":"2.0","id":2,"method":"host.doctor","params":{}}"#;
@@ -20,7 +23,7 @@ struct Echo {
 }
 
 impl Handler for Echo {
-    fn handle(&mut self, method: &Method) -> Result<Value, RpcError> {
+    fn handle(&mut self, method: &Method, _: &Notifier) -> Result<Value, RpcError> {
         self.seen.push(method.name().to_owned());
         match method {
             Method::SteamLoginStart(params) => {
@@ -41,6 +44,13 @@ impl Handler for Echo {
         }
         Ok(json!({"method": method.name(), "params": method.params()}))
     }
+}
+
+/// A handler over a throwaway data directory; tests never see the real one.
+fn core_handler() -> (TempDir, CoreHandler) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let handler = CoreHandler::new(Core::new(dir.path()));
+    (dir, handler)
 }
 
 fn run<H: Handler>(input: &str, handler: &mut H) -> (Vec<Response>, ExitStatus) {
@@ -71,7 +81,8 @@ fn result_of(response: &Response) -> &Value {
 #[test]
 fn hello_then_host_doctor_round_trip() {
     let input = format!("{HELLO}\n{DOCTOR}\n");
-    let (responses, status) = run(&input, &mut CoreHandler);
+    let (_dir, mut handler) = core_handler();
+    let (responses, status) = run(&input, &mut handler);
     assert_eq!(status, ExitStatus::Eof);
     assert_eq!(status.code(), 0);
     assert_eq!(responses.len(), 2);
@@ -280,7 +291,8 @@ fn pending_methods_answer_not_implemented_naming_the_work_package() {
         input.push_str(&request.to_string());
         input.push('\n');
     }
-    let (responses, status) = run(&input, &mut CoreHandler);
+    let (_dir, mut handler) = core_handler();
+    let (responses, status) = run(&input, &mut handler);
     assert_eq!(status, ExitStatus::Eof);
     assert_eq!(responses.len(), pending.len() + 1);
     for (method, response) in pending.iter().zip(&responses[1..]) {
@@ -308,8 +320,18 @@ fn string_ids_are_echoed() {
 /// a work package that lands a method flips exactly one row in the table.
 #[test]
 fn core_handler_answers_not_implemented_exactly_for_pending_methods() {
+    let (dir, mut handler) = core_handler();
+    let (notifier, _lines) = Notifier::channel();
     for method in Method::examples() {
-        let outcome = CoreHandler.handle(&method);
+        // The example's path is for the goldens; do not write to it.
+        let method = match method {
+            Method::ConfigExport(mut params) => {
+                params.path = dir.path().join("preset.json");
+                Method::ConfigExport(params)
+            }
+            other => other,
+        };
+        let outcome = handler.handle(&method, &notifier);
         let pending = matches!(method.status(), MethodStatus::Pending { .. });
         assert_eq!(
             matches!(&outcome, Err(error) if error.code == ErrorCode::NotImplemented),
@@ -434,7 +456,7 @@ fn logged_handler_writes_redacted_lines_to_the_sink_only() {
 fn unit_results_are_answered_as_empty_objects_never_null() {
     struct Unit;
     impl Handler for Unit {
-        fn handle(&mut self, method: &Method) -> Result<Value, RpcError> {
+        fn handle(&mut self, method: &Method, _: &Notifier) -> Result<Value, RpcError> {
             match method {
                 Method::Hello(_) => rpc::to_result(&()),
                 Method::HostDoctor(_) => Ok(Value::Null),
@@ -543,7 +565,7 @@ fn logged_handler_writes_a_protocol_mismatch_refusal() {
 fn handler_errors_become_error_responses() {
     struct Failing;
     impl Handler for Failing {
-        fn handle(&mut self, _: &Method) -> Result<Value, RpcError> {
+        fn handle(&mut self, _: &Method, _: &Notifier) -> Result<Value, RpcError> {
             Err(RpcError::new(ErrorCode::Internal, "boom"))
         }
     }

@@ -106,8 +106,10 @@ name = "applejack"
 version = "0.1.0"
 dependencies = [
  "applejack-core",
+ "applejack-engine",
  "clap",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -131,6 +133,8 @@ dependencies = [
  "applejack-steam",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

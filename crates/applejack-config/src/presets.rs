@@ -288,14 +288,14 @@ pub struct ImportOptions {
 }
 
 /// An item the import will write.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Accepted {
     pub field: String,
     pub value: String,
 }
 
 /// An item the import refuses, with the reason shown to the user.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejected {
     pub field: String,
     pub value: String,
@@ -303,7 +303,7 @@ pub struct Rejected {
 }
 
 /// An item that is written only once the user confirms it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
     pub field: String,
     pub value: String,

@@ -1,0 +1,14 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "engines": [
+      {
+        "active": true,
+        "engine_id": "rosetta-wine",
+        "installed": true,
+        "version": "11.0-1"
+      }
+    ]
+  }
+}

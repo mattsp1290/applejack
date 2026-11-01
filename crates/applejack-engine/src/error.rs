@@ -111,6 +111,13 @@ pub enum Error {
         version: Version,
     },
 
+    /// Another install of `id` holds `engines/<id>/.install.lock`.
+    #[error("another install of engine {id} is running")]
+    InstallInProgress {
+        /// The engine.
+        id: EngineId,
+    },
+
     /// The archive's `BUNDLE.toml` describes a different engine or version
     /// than the one being installed.
     #[error(
@@ -260,6 +267,28 @@ pub enum Error {
     D3DMetalUnsupported {
         /// The bundle version.
         version: Version,
+    },
+
+    /// Another operation holds the prefix's lock.
+    #[error("another operation is using prefix {name}")]
+    PrefixBusy {
+        /// The prefix name.
+        name: String,
+    },
+
+    /// A reset failed after it took its safety snapshot, which is what is
+    /// left to restore: the prefix may be gone.
+    #[error(
+        "resetting prefix {name} failed; `applejack prefix restore {name} {timestamp}` brings it back: {source}"
+    )]
+    ResetFailed {
+        /// The prefix name.
+        name: String,
+        /// The safety snapshot's timestamp.
+        timestamp: String,
+        /// What stopped the reset.
+        #[source]
+        source: Box<Error>,
     },
 
     /// No snapshot `<name>/<timestamp>` exists.

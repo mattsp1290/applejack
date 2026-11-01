@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "accepted_at": "2026-10-31T12:00:00Z",
+    "engine_version": "11.0-1",
+    "gptk_version": "3.0",
+    "imported_from": "/Volumes/Game Porting Toolkit",
+    "overlay_dir": "/data/engines/rosetta-wine/11.0-1.user/wine/lib/external"
+  }
+}

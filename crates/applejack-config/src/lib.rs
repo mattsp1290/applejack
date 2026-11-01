@@ -4,6 +4,7 @@
 //! on it.
 
 mod apps;
+mod engine_versions;
 mod error;
 mod game_config;
 mod migrations;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior};
 
 pub use apps::{AppRow, Drm};
+pub use engine_versions::EngineVersionRow;
 pub use error::Error;
 pub use game_config::{Field, GameConfig, GraphicsBackend, LaunchMode, SyncMode};
 pub use presets::{EnvPolicy, ImportOptions, ImportPlan, Preset, ValueCheck};
@@ -151,6 +153,20 @@ impl ConfigDb {
              gptk_version = excluded.gptk_version, \
              accepted_at = excluded.accepted_at",
             columns.map(|(_, value)| value),
+        )?;
+        Ok(())
+    }
+
+    /// Drops the `d3dmetal` row for `engine_version`, if any: the overlay it
+    /// described was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlite`] when the write fails.
+    pub fn d3dmetal_forget(&self, engine_version: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "DELETE FROM d3dmetal WHERE engine_version = ?1",
+            [engine_version],
         )?;
         Ok(())
     }

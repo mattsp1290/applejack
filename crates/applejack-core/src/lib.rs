@@ -4,5 +4,13 @@
 //! only crate that depends on `applejack-config`.
 
 pub mod config;
+pub mod engines;
+pub mod error;
+pub mod game_config;
 pub mod host;
+pub mod prefixes;
 pub mod rpc;
+pub mod state;
+
+pub use error::CoreError;
+pub use state::Core;

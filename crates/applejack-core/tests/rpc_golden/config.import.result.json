@@ -1,0 +1,27 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "accepted": [
+      {
+        "field": "launch_exe_override",
+        "value": "game.exe"
+      }
+    ],
+    "applied": false,
+    "confirmations": [
+      {
+        "field": "launch_exe_override",
+        "value": "game.exe"
+      }
+    ],
+    "preset_appid": 220,
+    "rejected": [
+      {
+        "field": "extra_env.PATH",
+        "reason": "host-owned",
+        "value": "/tmp"
+      }
+    ]
+  }
+}
