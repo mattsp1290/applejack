@@ -14,7 +14,10 @@
 # The second line of .patches-applied is the digest of the set the tree carries;
 # a different set in build/wine/patches stops here, since patches only go on
 # pristine source. .stage-patches is its copy for what build/work/wine/stage
-# holds, written once the stage is installed, for build/assemble.sh.
+# holds, written once the stage is installed, for build/assemble.sh, with a third
+# line naming the wine and wine-msync pins. build/work/wine/build/.source-pins
+# names the pins its objects come from; when it is absent or differs, the
+# directory is cleared and the build starts over.
 set -eu
 . "$(dirname "$0")/../lib.sh"
 
@@ -37,6 +40,8 @@ LOG="$WORK/wine/build.log"
 MSYNC_STAMP="$WORK/wine/.msync-applied"
 PATCHES_STAMP="$WORK/wine/.patches-applied"
 STAGE_STAMP="$WORK/wine/.stage-patches"
+BUILD_PINS="$BUILD/.source-pins"
+SOURCE_PINS=$(source_pins)
 # The devel package supplies headers and .pc files to configure; the staged,
 # thinned libraries are what the link references point at, so the closure
 # step rewrites them to what ships.
@@ -352,12 +357,21 @@ fi
 # logged <cmd...>: run under arch -x86_64 in $BUILD, append to $LOG, and keep
 # the command's exit status (sh has no pipefail, so `cmd | tee` would hide it).
 logged() {
+  rm -f "$WORK/wine/.status"
   (set +e; cd "$BUILD" && arch -x86_64 "$@" 2>&1; echo "$?" >"$WORK/wine/.status") | tee -a "$LOG"
   status=$(cat "$WORK/wine/.status")
   [ "$status" -eq 0 ] || { echo "$1 failed ($status); see $LOG" >&2; exit 1; }
 }
 
+# Restored source keeps the archive's mtimes, so objects from other pins would
+# look newer than it and survive. The record sits with the objects it describes,
+# so a failed build keeps it, unlike .stage-patches.
+if [ "$(cat "$BUILD_PINS" 2>/dev/null)" != "$SOURCE_PINS" ]; then
+  [ ! -e "$BUILD" ] || echo "clearing $BUILD: not built from the wine and wine-msync pins as they are now"
+  rm -rf "$BUILD"
+fi
 mkdir -p "$BUILD"
+printf '%s\n' "$SOURCE_PINS" >"$BUILD_PINS"
 : >"$LOG"
 echo "configure: $* (log: $LOG)"
 logged "$WINE_SRC/configure" "$@" CC="$HOST_CC" CXX="$HOST_CXX" BISON="$BISON" FLEX="$FLEX" GSTREAMER_CFLAGS="$GSTREAMER_CFLAGS" GSTREAMER_LIBS="$GSTREAMER_LIBS"
@@ -366,6 +380,6 @@ logged make -j"$JOBS"
 rm -f "$STAGE_STAMP"
 rm -rf "$STAGE"
 logged make install-lib
-cp "$PATCHES_STAMP" "$STAGE_STAMP"
+{ cat "$PATCHES_STAMP"; printf '%s\n' "$SOURCE_PINS"; } >"$STAGE_STAMP"
 echo "wine installed into $STAGE"
 echo "next: sh build/assemble.sh copies it into $PAYLOAD/wine and strips it"

@@ -15,22 +15,25 @@ rm -f "$WORK/wine/.msync-applied" "$WORK/wine/.patches-applied"
 # file a patch changed would go back to being older than its object and a
 # dropped hunk would stay compiled. Those files are the ones newer than the last
 # extract (the archive stands in for a tree extracted before this stamp existed).
-reset=""
+# The list stays on disk until the refresh is done: extract destroys what it was
+# read from, so a fetch killed here could not work it out again.
+PENDING="$WORK/wine/.refresh-pending"
 if [ -d "$WINE_SRC" ]; then
   since=$archive
   [ ! -f "$EXTRACTED" ] || since=$EXTRACTED
-  reset=$(find "$WINE_SRC" -type f -newer "$since")
+  find "$WINE_SRC" -type f -newer "$since" >>"$PENDING"
 fi
 extract "$archive" "$SRC"
 # Before the refresh, so a refreshed file stays newer than the stamp and a second
 # fetch before the build lists it again.
 touch "$EXTRACTED"
-if [ -n "$reset" ]; then
-  printf '%s\n' "$reset" | while IFS= read -r file; do
+if [ -s "$PENDING" ]; then
+  while IFS= read -r file; do
     [ ! -f "$file" ] || touch "$file"
-  done
-  echo "wine source: $(printf '%s\n' "$reset" | wc -l | tr -d ' ') file(s) restored from the archive will rebuild"
+  done <"$PENDING"
+  echo "wine source: $(sort -u "$PENDING" | wc -l | tr -d ' ') file(s) restored from the archive will rebuild"
 fi
+rm -f "$PENDING"
 [ -f "$WINE_SRC/configure.ac" ] || { echo "wine source not at $WINE_SRC" >&2; exit 1; }
 
 msync=$(fetch_pin wine-msync)

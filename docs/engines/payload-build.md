@@ -64,7 +64,10 @@ Environment knobs:
    nine pins.
 3. `sh build/wine/fetch.sh` — extracts Wine and the msync patch set (the
    loader in step 2 scanned both archives; the scripts do not scan again),
-   removes the patch stamps, and refreshes the mtime of files it reset. `build.sh` adds `--with-metal` to
+   removes `.msync-applied` and `.patches-applied` (`.stage-patches` stays,
+   since it describes the stage), and refreshes the mtime of files it reset,
+   keeping their list in `build/work/wine/.refresh-pending` until that is done,
+   so an interrupted fetch does not lose it. `build.sh` adds `--with-metal` to
    `configure` when `configure.ac` offers it; at wine-11.0 it does not:
    Metal support is detected automatically (`configure.ac` checks
    `MTLDevice.registryID` and defines `HAVE_MTLDEVICE_REGISTRYID`), so there
@@ -175,7 +178,11 @@ Environment knobs:
    change there, `build.sh` stops until `sh build/wine/fetch.sh` has reset the
    tree, because a patch goes on pristine source. `fetch.sh` refreshes the mtime
    of every file it restores, since tar would put them back older than their
-   objects in the persisted `build/work/wine/build`.
+   objects in the persisted `build/work/wine/build`. A file in that directory,
+   `.source-pins`, names the `wine` and `wine-msync` pins its objects come from;
+   when it is absent or differs, `build.sh` clears the directory before
+   `configure`, since restored source keeps archive mtimes and old objects
+   would look newer. A changed pin therefore costs one full build.
    `sh build/wine/build.sh --preflight` runs everything up to `configure`
    without changing the tree: it reports the msync dry runs, the project-patch
    trial (on the tree without msync applied, since preflight applies nothing),
@@ -422,8 +429,11 @@ Environment knobs:
    revision of `build/wine/patches/` the notices link; `assemble.sh` passes the
    last commit that touched it, refuses uncommitted patches, and refuses a
    stage unless `build/work/wine/.stage-patches`, which `build.sh` writes after
-   `make install-lib`, names the set in `build/wine/patches`, so a failed build
-   cannot ship the last good stage under new notices. The checked-in fixtures
+   `make install-lib`, names the set in `build/wine/patches` and, on its third
+   line, the `sha256` of the `wine` and `wine-msync` pins, so neither a failed
+   build nor a pin change can ship the last good stage under new notices. It
+   also refuses a stage directory with no `bin/wine`, which a failed install
+   leaves, before the payload is replaced. The checked-in fixtures
    carry `main`.
    Any change to what ships bumps `version`: `engine install` refuses a version
    already installed, so a rebuilt payload under the old version cannot reach

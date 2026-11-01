@@ -84,6 +84,13 @@ patch_set_digest() {
   ) | shasum -a 256 | cut -d' ' -f1
 }
 
+# source_pins: one line naming the archives a Wine tree comes from.
+source_pins() {
+  wine_pin=$(pin_field wine sha256) || return 1
+  msync_pin=$(pin_field wine-msync sha256) || return 1
+  printf '%s %s\n' "$wine_pin" "$msync_pin"
+}
+
 # bison_accepts <bison>: true when <bison> takes the grammar wine-11.0's
 # configure feeds it (wine_cv_recent_bison); Apple's bison 2.3 does not.
 bison_accepts() {
