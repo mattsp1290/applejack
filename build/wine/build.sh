@@ -386,6 +386,9 @@ logged make -j"$JOBS"
 # The stage is replaced only after make succeeded, so a failed rerun keeps the last good one.
 rm -f "$STAGE_STAMP"
 rm -rf "$STAGE"
+# Make walks the whole tree before the first install creates this; assemble.sh must
+# still see that an install started and refuse, not take it for a Wine never built.
+mkdir -p "$STAGE"
 logged make install-lib
 { cat "$PATCHES_STAMP"; printf '%s\n' "$SOURCE_PINS"; } >"$STAGE_STAMP"
 echo "wine installed into $STAGE"

@@ -549,8 +549,9 @@ const BUILTIN_MARKER_OFFSET: usize = 0x40;
 /// placeholder and quietly loads its own, so the title would otherwise fail in
 /// `D3D11CreateDeviceAndSwapChain` with nothing naming the cause. A file that
 /// cannot be read or is too short to hold the marker passes, since this check
-/// is about stale copies only. Wine has no builtin fallback there: its loader
-/// fails on `d3d11.dll` and logs that itself.
+/// is about stale copies only. Wine has no builtin fallback there: the load
+/// fails. An import names `d3d11.dll` in the log; a `LoadLibrary` only returns
+/// the error to the title, with nothing logged at the default `WINEDEBUG`.
 ///
 /// # Errors
 ///

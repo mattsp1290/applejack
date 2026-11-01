@@ -64,7 +64,7 @@ Environment knobs:
    nine pins.
 3. `sh build/wine/fetch.sh` — extracts Wine and the msync patch set (the
    loader in step 2 scanned both archives; the scripts do not scan again),
-   removes `.msync-applied` and `.patches-applied` (`.stage-patches` stays,
+   removes `.msync-applied`, `.patches-applied`, and `.fetched-pins` (`.stage-patches` stays,
    since it describes the stage), and refreshes the mtime of files it reset,
    keeping their list in `build/work/wine/.refresh-pending` until that is done,
    so an interrupted fetch does not lose it. `build.sh` adds `--with-metal` to
@@ -177,8 +177,8 @@ Environment knobs:
    `.patches-applied` also holds a digest of `build/wine/patches/`: after any
    change there, `build.sh` stops until `sh build/wine/fetch.sh` has reset the
    tree, because a patch goes on pristine source. `fetch.sh` refreshes the mtime
-   of every file it restores, since tar would put them back older than their
-   objects in the persisted `build/work/wine/build`. A file in that directory,
+   of each file changed since the last extract, since tar would put those back
+   older than their objects in the persisted `build/work/wine/build`. A file in that directory,
    `.source-pins`, names the `wine` and `wine-msync` pins its objects come from;
    when it is absent or differs, `build.sh` clears the directory before
    `configure`, since restored source keeps archive mtimes and old objects
@@ -195,8 +195,8 @@ Environment knobs:
    can start, 3 when the only gaps are ones `sh build/bootstrap.sh` installs
    (llvm-mingw, the Homebrew bison, flex, pkgconf, molten-vk, and the
    packages the report misses), and 1 for anything else (Rosetta, the x86-64
-   Homebrew, the msync patch set, the GStreamer stage or devel tree, a
-   project patch that does not apply, a host compiler that cannot link, a
+   Homebrew, the msync patch set, a Wine tree not fetched from the current
+   pins, the GStreamer stage or devel tree, a project patch that does not apply, a host compiler that cannot link, a
    prefixed mingw tool shadowed on PATH or missing from the extracted
    llvm-mingw), so CI can run it before bootstrap and
    still catch a recipe defect.
