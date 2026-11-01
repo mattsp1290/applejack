@@ -17,7 +17,9 @@
 # holds, written once the stage is installed, for build/assemble.sh, with a third
 # line naming the wine and wine-msync pins. build/work/wine/build/.source-pins
 # names the pins its objects come from; when it is absent or differs, the
-# directory is cleared and the build starts over.
+# directory is cleared and the build starts over. fetch.sh writes
+# build/work/wine/.fetched-pins last, and a tree without the current pins there
+# stops here.
 set -eu
 . "$(dirname "$0")/../lib.sh"
 
@@ -242,6 +244,11 @@ apply_patch() {
 write_stamp() {
   [ "$PREFLIGHT" = 1 ] || printf '%s\n' "$2" >"$1"
 }
+
+# The pins read from pins.toml say nothing about the tree until fetch.sh has
+# extracted them, and every stamp below would repeat them.
+[ "$(cat "$WORK/wine/.fetched-pins" 2>/dev/null)" = "$SOURCE_PINS" ] \
+  || fail "the Wine tree from the wine and wine-msync pins as they are now (sh build/wine/fetch.sh)"
 
 # Gate G4b: msync. The first candidate whose dry run is clean is applied; when
 # none is, the tree stays untouched and the gate records "deferred". No

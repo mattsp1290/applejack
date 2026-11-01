@@ -10,7 +10,7 @@ WINE_SRC="$SRC/wine-$WINE_VERSION"
 EXTRACTED="$WORK/wine/.extracted"
 # A fresh tree has no patches; build.sh's stamps must not claim otherwise, not
 # even over a tree an interrupted run left behind.
-rm -f "$WORK/wine/.msync-applied" "$WORK/wine/.patches-applied"
+rm -f "$WORK/wine/.msync-applied" "$WORK/wine/.patches-applied" "$WORK/wine/.fetched-pins"
 # tar restores the archive's mtimes, and build/work/wine/build persists, so a
 # file a patch changed would go back to being older than its object and a
 # dropped hunk would stay compiled. Those files are the ones newer than the last
@@ -41,4 +41,5 @@ extract "$msync" "$WORK/wine/msync"
 echo "msync patches:"
 ls "$WORK"/wine/msync/*/*.patch
 
+source_pins >"$WORK/wine/.fetched-pins"
 echo "wine source: $WINE_SRC"

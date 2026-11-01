@@ -183,6 +183,9 @@ Environment knobs:
    when it is absent or differs, `build.sh` clears the directory before
    `configure`, since restored source keeps archive mtimes and old objects
    would look newer. A changed pin therefore costs one full build.
+   `fetch.sh` writes `build/work/wine/.fetched-pins` as its last step, and
+   `build.sh` stops unless it names the current pins, so a pin moved without a
+   fetch cannot be stamped over the old tree.
    `sh build/wine/build.sh --preflight` runs everything up to `configure`
    without changing the tree: it reports the msync dry runs, the project-patch
    trial (on the tree without msync applied, since preflight applies nothing),
