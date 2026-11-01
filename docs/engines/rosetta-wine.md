@@ -22,7 +22,7 @@ BUNDLE.toml                    descriptor (below)
 THIRD_PARTY_NOTICES.md         generated from BUNDLE.toml
 wine/                          x86-64 Wine: bin/, lib/, lib/wine/{x86_64-unix,x86_64-windows,i386-windows}, share/wine/
 wine/lib/GStreamer.framework   signed framework
-dxmt/                          DXMT DLLs and native component for the pinned Wine
+dxmt/                          DXMT DLLs for the pinned Wine; its Wine-side files are under wine/lib/wine (winemetal.so, winemetal.dll)
 vkd3d/                         vkd3d-proton x86-64 DLLs
 vulkan/                        MoltenVK ICD JSON and dylib; KosmicKrisp ICD when shipped
 probes/                        cpuid (x86-64 Mach-O), dx11-sample (PE), xinput-check (PE)
@@ -366,6 +366,62 @@ snapshot API below, since the engine does not know the snapshot root.
   `apply_overrides` refuse with `Error::BackendUnavailable` before touching
   anything.
 
+### DXMT under Wine 11.0
+
+DXMT 0.80 targets a Wine 8.16 fork. Three things make it work here. `--check`
+reads what it can of them: each DLL's presence and marker, `winemetal.so`, and
+the name `macdrv_functions` in `winemac.so`. It cannot see which revision of the
+patch that export came from or what the table does; only running `dx11-sample`
+(gate G4c, "Running the built Wine" in `payload-build.md`) proves that.
+
+- `d3d11`, `dxgi`, and `d3d10core` under `dxmt/` have Wine's builtin marker
+  cleared, so they load as native from the prefix. Wine's own remain under
+  `wine/lib/wine`, which is why one bundle serves every backend: a `wined3d`
+  prefix has neither the copies nor the overrides.
+- `winemetal.dll` is a builtin, under `wine/lib/wine/<arch>-windows`, so it
+  reaches `winemetal.so`. The prefix copy keeps its marker, so it is a
+  placeholder for that file.
+- `build/wine/patches/0001-dxmt-macdrv-abi.patch` exports `macdrv_functions`
+  from `winemac.so`. Its `get_win_data` gives a window a client surface the
+  first time, and hands out that surface's view in DXMT's struct layout. DXMT
+  finds the table with `dlsym(RTLD_DEFAULT)`, which sees a Unix library without
+  any change to how Wine opens it, because `dlopen` defaults to `RTLD_GLOBAL`
+  on macOS.
+
+The view follows the window: win32u moves and sizes a client surface's view
+with the client area on every position change, and the Metal view autoresizes
+inside it. Rendering at the new size is still the title's job through
+`ResizeBuffers`; until it calls that, Core Animation stretches the old drawable
+over the new bounds. The surface lives until the window is destroyed.
+
+A window has one Metal view, so two live swap chains on it share the view and
+its layer. The table's acquire and release slots count them: the view stays
+until the last chain is released, so a title can create the new chain before
+releasing the old one, and once one is released the survivor is what the window
+shows, as long as the chains share a size and format: they share one layer, and
+a surviving chain does not reassert its size or format on `Present` alone. While
+both are live they present to that one layer; which one the window shows then
+has not been measured.
+
+A prefix created with an engine before 11.0-2 holds DXMT DLLs with the marker.
+Launching one is refused with `Error::PrefixUnusable`, since Wine would otherwise
+fall back to its own `d3d11` and the title would fail with `0x80004005`. Activate
+a newer engine and run `applejack prefix reset <name>`, which snapshots the prefix
+first; `--keep-user-data` keeps `drive_c/users/`.
+
+Limits:
+
+- DXMT refuses a swap chain on a window of another process: `CreateSwapChain`
+  logs "cross-process swapchain not supported yet" and returns `E_FAIL`.
+- A window with no window data gets an empty struct, so DXMT logs `Failed to
+  create metal view` and aborts rather than faulting on a NULL pointer.
+- The view is shown when a swap chain is created. A Vulkan or OpenGL surface
+  presenting on the same window afterwards hides it until the next swap chain.
+- This rests on DXMT's private layout, so a DXMT pin bump must recheck
+  `macdrv_functions` and `struct macdrv_win_data` in `winemetal_unix.c`, and a
+  Wine pin bump must rebase the patch. `build/wine/build.sh` fails if it stops
+  applying; a layout change fails only at run time.
+
 ## The environment the children see
 
 Every Wine process the engine starts (wineboot, reg import, wineserver, a
@@ -613,7 +669,7 @@ call the same ones. The `meta` and `engine_versions` writes are the core's.
 
 | Command | Calls |
 | --- | --- |
-| `applejack engine install <id> --from <dir-or-archive>` | `LocalBundle::prepare`, then `RosettaWine::install`; needs `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`, in a debug build. The first version installed turns active |
+| `applejack engine install <id> --from <dir-or-archive>` | `LocalBundle::prepare`, then `RosettaWine::install`; needs `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`, in a debug build. The first version installed turns active. A version already installed is refused and there is no replace, so a changed payload bumps `version` in `build/bundle-spec.toml` |
 | `applejack engine install <id>` | The manifest decides; while it is empty, an error naming `--from` |
 | `applejack engine use <id> <version>` | Sets `engine_versions.active` |
 | `applejack engine list` | `versions::list`, the manifest, `engine_versions` |

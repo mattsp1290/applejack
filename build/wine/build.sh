@@ -11,6 +11,15 @@
 #   WINE_SKIP_MSYNC=1      do not attempt the msync patches (gate G4b)
 # Reruns skip the patch steps through the stamps build/work/wine/.msync-applied
 # and .patches-applied, which build/wine/fetch.sh removes when it re-extracts.
+# The second line of .patches-applied is the digest of the set the tree carries;
+# a different set in build/wine/patches stops here, since patches only go on
+# pristine source. .stage-patches is its copy for what build/work/wine/stage
+# holds, written once the stage is installed, for build/assemble.sh, with a third
+# line naming the wine and wine-msync pins. build/work/wine/build/.source-pins
+# names the pins its objects come from; when it is absent or differs, the
+# directory is cleared and the build starts over. fetch.sh writes
+# build/work/wine/.fetched-pins last, and a tree without the current pins there
+# stops here.
 set -eu
 . "$(dirname "$0")/../lib.sh"
 
@@ -32,6 +41,9 @@ X86_BREW=/usr/local/bin/brew
 LOG="$WORK/wine/build.log"
 MSYNC_STAMP="$WORK/wine/.msync-applied"
 PATCHES_STAMP="$WORK/wine/.patches-applied"
+STAGE_STAMP="$WORK/wine/.stage-patches"
+BUILD_PINS="$BUILD/.source-pins"
+SOURCE_PINS=$(source_pins)
 # The devel package supplies headers and .pc files to configure; the staged,
 # thinned libraries are what the link references point at, so the closure
 # step rewrites them to what ships.
@@ -233,6 +245,11 @@ write_stamp() {
   [ "$PREFLIGHT" = 1 ] || printf '%s\n' "$2" >"$1"
 }
 
+# The pins read from pins.toml say nothing about the tree until fetch.sh has
+# extracted them, and every stamp below would repeat them.
+[ "$(cat "$WORK/wine/.fetched-pins" 2>/dev/null)" = "$SOURCE_PINS" ] \
+  || fail "the Wine tree from the wine and wine-msync pins as they are now (sh build/wine/fetch.sh)"
+
 # Gate G4b: msync. The first candidate whose dry run is clean is applied; when
 # none is, the tree stays untouched and the gate records "deferred". No
 # candidate at all is a missing prerequisite (build/wine/fetch.sh), not a gate result.
@@ -272,8 +289,13 @@ fi
 # tree only when every patch applied there, so a failing set never leaves the
 # tree half patched. In preflight the clone is the unpatched tree, since msync
 # is only "would apply" there; the real run patches after msync.
+PATCH_SET_DIGEST=$(patch_set_digest)
 if [ -f "$PATCHES_STAMP" ]; then
-  echo "project patches: stamp present; step skipped"
+  if [ "$(sed -n 2p "$PATCHES_STAMP")" = "$PATCH_SET_DIGEST" ]; then
+    echo "project patches: stamp matches build/wine/patches; step skipped"
+  else
+    fail "a tree patched with build/wine/patches as they are now: the set changed since $WINE_SRC was patched (sh build/wine/fetch.sh, then rerun)"
+  fi
 else
   set -- "$ROOT"/build/wine/patches/*.patch
   if [ -f "$1" ]; then
@@ -304,11 +326,13 @@ else
       else
         echo "applied $# project patch(es):$names"
       fi
-      write_stamp "$PATCHES_STAMP" "${names# }"
+      write_stamp "$PATCHES_STAMP" "${names# }
+$PATCH_SET_DIGEST"
     fi
   else
     echo "project patches: none"
-    write_stamp "$PATCHES_STAMP" ""
+    write_stamp "$PATCHES_STAMP" "
+$PATCH_SET_DIGEST"
   fi
 fi
 
@@ -340,18 +364,32 @@ fi
 # logged <cmd...>: run under arch -x86_64 in $BUILD, append to $LOG, and keep
 # the command's exit status (sh has no pipefail, so `cmd | tee` would hide it).
 logged() {
+  rm -f "$WORK/wine/.status"
   (set +e; cd "$BUILD" && arch -x86_64 "$@" 2>&1; echo "$?" >"$WORK/wine/.status") | tee -a "$LOG"
   status=$(cat "$WORK/wine/.status")
   [ "$status" -eq 0 ] || { echo "$1 failed ($status); see $LOG" >&2; exit 1; }
 }
 
+# Restored source keeps the archive's mtimes, so objects from other pins would
+# look newer than it and survive. The record sits with the objects it describes,
+# so a failed build keeps it, unlike .stage-patches.
+if [ "$(cat "$BUILD_PINS" 2>/dev/null)" != "$SOURCE_PINS" ]; then
+  [ ! -e "$BUILD" ] || echo "clearing $BUILD: not built from the wine and wine-msync pins as they are now"
+  rm -rf "$BUILD"
+fi
 mkdir -p "$BUILD"
+printf '%s\n' "$SOURCE_PINS" >"$BUILD_PINS"
 : >"$LOG"
 echo "configure: $* (log: $LOG)"
 logged "$WINE_SRC/configure" "$@" CC="$HOST_CC" CXX="$HOST_CXX" BISON="$BISON" FLEX="$FLEX" GSTREAMER_CFLAGS="$GSTREAMER_CFLAGS" GSTREAMER_LIBS="$GSTREAMER_LIBS"
 logged make -j"$JOBS"
 # The stage is replaced only after make succeeded, so a failed rerun keeps the last good one.
+rm -f "$STAGE_STAMP"
 rm -rf "$STAGE"
+# Make walks the whole tree before the first install creates this; assemble.sh must
+# still see that an install started and refuse, not take it for a Wine never built.
+mkdir -p "$STAGE"
 logged make install-lib
+{ cat "$PATCHES_STAMP"; printf '%s\n' "$SOURCE_PINS"; } >"$STAGE_STAMP"
 echo "wine installed into $STAGE"
 echo "next: sh build/assemble.sh copies it into $PAYLOAD/wine and strips it"

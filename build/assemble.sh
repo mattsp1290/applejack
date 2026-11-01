@@ -2,8 +2,9 @@
 # Copies the staged components into the plan 02 payload layout:
 #   wine/                                   build/work/wine/stage (build/wine/build.sh), stripped; skipped with a message when not built
 #   wine/lib/wine/x86_64-unix/winemetal.so  DXMT's native half
+#   wine/lib/wine/*-windows/winemetal.dll   its PE half, a builtin (xtask engine-payload --place-dxmt)
 #   wine/lib/GStreamer.framework            the staged, x86_64-thinned framework
-#   dxmt/{x86_64-windows,i386-windows}      DXMT DLLs
+#   dxmt/{x86_64-windows,i386-windows}      DXMT DLLs, the ones that load as native without Wine's builtin marker
 #   vkd3d/{x64,x86}                         vkd3d-proton DLLs
 #   vulkan/                                 libMoltenVK.dylib (x86_64) and MoltenVK_icd.json
 #   probes/                                 hello32.exe, dx11-sample.exe, xinput-check.exe, cpuid, osslsigncode (host-arch)
@@ -55,6 +56,9 @@ if [ -x "$wine_stage/bin/wine" ]; then
     fi
   done
   echo "assemble: wine/ from $wine_stage (stripped)"
+elif [ -e "$wine_stage" ]; then
+  echo "assemble: $wine_stage has no bin/wine: an install did not finish (sh build/wine/build.sh)" >&2
+  exit 1
 else
   echo "assemble: no built wine at $wine_stage (sh build/wine/build.sh); wine/ skipped"
 fi
@@ -63,6 +67,7 @@ mkdir -p "$T/dxmt/x86_64-windows" "$T/dxmt/i386-windows" "$T/vkd3d/x64" "$T/vkd3
 cp "$dxmt"/x86_64-windows/*.dll "$T/dxmt/x86_64-windows/"
 cp "$dxmt"/i386-windows/*.dll "$T/dxmt/i386-windows/"
 cp "$dxmt/x86_64-unix/winemetal.so" "$T/wine/lib/wine/x86_64-unix/winemetal.so"
+xtask engine-payload --place-dxmt "$T"
 cp "$vkd3d"/x64/*.dll "$T/vkd3d/x64/"
 cp "$vkd3d"/x86/*.dll "$T/vkd3d/x86/"
 cp "$vulkan/libMoltenVK.dylib" "$vulkan/MoltenVK_icd.json" "$T/vulkan/"
@@ -85,7 +90,17 @@ copy_probe "$probes/xinput-check-x86_64.exe" xinput-check.exe "sh crates/appleja
 copy_probe "$probes/cpuid" cpuid "sh crates/applejack-engine/probes/cpuid/build.sh"
 copy_probe "$WORK/osslsigncode/osslsigncode" osslsigncode "sh build/osslsigncode/build.sh"
 
-xtask engine-payload --write-bundle-toml "$ROOT/build/bundle-spec.toml" "$T/BUNDLE.toml"
+# The notices name the revision of the patches this Wine carries, so a built
+# Wine must come from the committed set.
+patches_rev=""
+if [ -x "$T/wine/bin/wine" ]; then
+  [ "$(sed -n 2p "$WORK/wine/.stage-patches" 2>/dev/null)" = "$(patch_set_digest)" ] || { echo "assemble: build/work/wine/stage does not carry build/wine/patches as they are now (sh build/wine/fetch.sh && sh build/wine/build.sh)" >&2; exit 1; }
+  [ "$(sed -n 3p "$WORK/wine/.stage-patches" 2>/dev/null)" = "$(source_pins)" ] || { echo "assemble: build/work/wine/stage was not built from the wine and wine-msync pins as they are now (sh build/wine/fetch.sh && sh build/wine/build.sh)" >&2; exit 1; }
+  [ -z "$(git -C "$ROOT" status --porcelain -- build/wine/patches)" ] || { echo "assemble: commit build/wine/patches first; the notices name their revision" >&2; exit 1; }
+  patches_rev=$(git -C "$ROOT" log -1 --format=%H -- build/wine/patches)
+  [ -n "$patches_rev" ] || { echo "assemble: no commit touches build/wine/patches" >&2; exit 1; }
+fi
+xtask engine-payload --write-bundle-toml "$ROOT/build/bundle-spec.toml" "$T/BUNDLE.toml" ${patches_rev:+"$patches_rev"}
 
 # Last, so a reassembly never loses it: the closure reads BUNDLE.toml for the
 # library rows it records provenance against, and checks the closed tree.

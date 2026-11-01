@@ -12,6 +12,7 @@ mod app_bundle;
 mod bundle_toml;
 mod closure;
 mod denylist;
+mod dxmt;
 mod engine_payload;
 mod pins;
 mod self_contained;

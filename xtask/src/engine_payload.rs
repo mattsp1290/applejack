@@ -12,9 +12,10 @@ use std::process::{Command, ExitCode};
 
 use sha2::{Digest, Sha256};
 
-use crate::bundle_toml::{BundleSpec, SHIPPED_ELSEWHERE, elsewhere_matches};
+use crate::bundle_toml::{BundleSpec, DEFAULT_PATCHES_REV, SHIPPED_ELSEWHERE, elsewhere_matches};
 use crate::closure;
 use crate::denylist::{Denylist, Hit};
+use crate::dxmt;
 use crate::pins::{Pin, Pins};
 use crate::self_contained::{
     Search, Violation, binary_dir, check_otool_listing, check_references_resolve, check_rpaths,
@@ -25,10 +26,12 @@ use crate::self_contained::{
 pub const USAGE: &str = "\
 usage: cargo xtask engine-payload <mode>
   --fetch [id ...]                    download every pin (or the named ones) into build/work/, verify SHA-256, and denylist-scan the listing
-  --check <payload-dir>               denylist scan plus self-containment of every Mach-O and symlink; references resolve along the load chains of the executables <payload-dir>/BUNDLE.toml declares and of every executable under wine/
+  --check <payload-dir>               denylist scan plus self-containment of every Mach-O and symlink, and that DXMT can load under this Wine; references resolve along the load chains of the executables <payload-dir>/BUNDLE.toml declares and of every executable under wine/
+  --place-dxmt <payload-dir>          clear Wine's builtin marker on the DXMT DLLs that load as native and copy winemetal.dll among Wine's builtins, for both architectures
   --close <payload-dir>               the dylib closure: copy the x86-64 Homebrew libraries Wine links or dlopens into wine/lib/, rewrite install names and references to @rpath, add the run paths, re-sign, repeat until stable, then --check
   --check-listing <file|->            denylist scan of an archive listing, one path per line (an empty listing fails)
-  --write-bundle-toml <spec> <out>    render BUNDLE.toml from a typed spec file, plus THIRD_PARTY_NOTICES.md beside it
+  --write-bundle-toml <spec> <out> [patches-rev]
+                                      render BUNDLE.toml from a typed spec file, plus THIRD_PARTY_NOTICES.md beside it, naming that revision of build/wine/patches
   --print-pin <id> [field]            print a pin (all fields as key=value, or one field)
   --build                             run the build scripts under build/ in order (assemble.sh ends with --close), then --check the payload";
 
@@ -58,9 +61,15 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     let result = match args.as_slice() {
         ["--fetch", ids @ ..] => fetch(root, ids),
         ["--check", payload] => check(root, Path::new(payload)),
+        ["--place-dxmt", payload] => dxmt::place(Path::new(payload)),
         ["--close", payload] => closure::close(root, Path::new(payload)),
         ["--check-listing", listing] => check_listing(root, listing),
-        ["--write-bundle-toml", spec, out] => write_bundle_toml(Path::new(spec), Path::new(out)),
+        ["--write-bundle-toml", spec, out] => {
+            write_bundle_toml(Path::new(spec), Path::new(out), DEFAULT_PATCHES_REV)
+        }
+        ["--write-bundle-toml", spec, out, patches_rev] => {
+            write_bundle_toml(Path::new(spec), Path::new(out), patches_rev)
+        }
         ["--print-pin", id] => print_pin(root, id, None),
         ["--print-pin", id, field] => print_pin(root, id, Some(field)),
         ["--build"] => build(root),
@@ -560,6 +569,7 @@ fn inspect(root: &Path, payload: &Path) -> Result<Report, String> {
     let targets: Vec<&str> = targets.targets.iter().map(String::as_str).collect();
     let chained = resolve_along_chains(&machos, &targets, &resolves);
     violations.extend(chained.violations);
+    violations.extend(dxmt::violations(&payload)?);
     Ok(Report {
         payload,
         paths: entries.len(),
@@ -933,7 +943,7 @@ fn check_listing(root: &Path, listing: &str) -> Result<(), String> {
 const NOTICES_FILE: &str = "THIRD_PARTY_NOTICES.md";
 
 /// Renders `BUNDLE.toml` to `out` and `THIRD_PARTY_NOTICES.md` beside it.
-fn write_bundle_toml(spec: &Path, out: &Path) -> Result<(), String> {
+fn write_bundle_toml(spec: &Path, out: &Path, patches_rev: &str) -> Result<(), String> {
     let text = fs::read_to_string(spec).map_err(|error| format!("{}: {error}", spec.display()))?;
     let parsed =
         BundleSpec::parse(&text).map_err(|error| format!("{}: {error}", spec.display()))?;
@@ -947,7 +957,7 @@ fn write_bundle_toml(spec: &Path, out: &Path) -> Result<(), String> {
     println!("[xtask] wrote {}", out.display());
     let notices = out.with_file_name(NOTICES_FILE);
     let rendered = parsed
-        .to_notices()
+        .to_notices(patches_rev)
         .map_err(|error| format!("{}: {error}", spec.display()))?;
     fs::write(&notices, rendered).map_err(|error| format!("{}: {error}", notices.display()))?;
     println!("[xtask] wrote {}", notices.display());

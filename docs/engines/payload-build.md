@@ -63,8 +63,11 @@ Environment knobs:
    run. `--fetch <id>` fetches one pin. Verified on the planning host for all
    nine pins.
 3. `sh build/wine/fetch.sh` — extracts Wine and the msync patch set (the
-   loader in step 2 scanned both archives; the scripts do not scan again)
-   and removes the patch stamps. `build.sh` adds `--with-metal` to
+   loader in step 2 scanned both archives; the scripts do not scan again),
+   removes `.msync-applied`, `.patches-applied`, and `.fetched-pins` (`.stage-patches` stays,
+   since it describes the stage), and refreshes the mtime of files it reset,
+   keeping their list in `build/work/wine/.refresh-pending` until that is done,
+   so an interrupted fetch does not lose it. `build.sh` adds `--with-metal` to
    `configure` when `configure.ac` offers it; at wine-11.0 it does not:
    Metal support is detected automatically (`configure.ac` checks
    `MTLDevice.registryID` and defines `HAVE_MTLDEVICE_REGISTRYID`), so there
@@ -171,6 +174,18 @@ Environment knobs:
    result. The stamps `build/work/wine/.msync-applied` and
    `.patches-applied` make a rerun after a failed `make` skip the patch
    steps, and the stage is replaced only after `make` succeeded.
+   `.patches-applied` also holds a digest of `build/wine/patches/`: after any
+   change there, `build.sh` stops until `sh build/wine/fetch.sh` has reset the
+   tree, because a patch goes on pristine source. `fetch.sh` refreshes the mtime
+   of each file changed since the last extract, since tar would put those back
+   older than their objects in the persisted `build/work/wine/build`. A file in that directory,
+   `.source-pins`, names the `wine` and `wine-msync` pins its objects come from;
+   when it is absent or differs, `build.sh` clears the directory before
+   `configure`, since restored source keeps archive mtimes and old objects
+   would look newer. A changed pin therefore costs one full build.
+   `fetch.sh` writes `build/work/wine/.fetched-pins` as its last step, and
+   `build.sh` stops unless it names the current pins, so a pin moved without a
+   fetch cannot be stamped over the old tree.
    `sh build/wine/build.sh --preflight` runs everything up to `configure`
    without changing the tree: it reports the msync dry runs, the project-patch
    trial (on the tree without msync applied, since preflight applies nothing),
@@ -180,8 +195,8 @@ Environment knobs:
    can start, 3 when the only gaps are ones `sh build/bootstrap.sh` installs
    (llvm-mingw, the Homebrew bison, flex, pkgconf, molten-vk, and the
    packages the report misses), and 1 for anything else (Rosetta, the x86-64
-   Homebrew, the msync patch set, the GStreamer stage or devel tree, a
-   project patch that does not apply, a host compiler that cannot link, a
+   Homebrew, the msync patch set, a Wine tree not fetched from the current
+   pins, the GStreamer stage or devel tree, a project patch that does not apply, a host compiler that cannot link, a
    prefixed mingw tool shadowed on PATH or missing from the extracted
    llvm-mingw), so CI can run it before bootstrap and
    still catch a recipe defect.
@@ -197,11 +212,25 @@ Environment knobs:
    survives and a failed run leaves the previous payload untouched: `wine/`
    from `build/work/wine/stage` (stripped, a `strip` failure is fatal;
    skipped with a message when no built Wine exists),
-   `wine/lib/wine/x86_64-unix/winemetal.so`, `wine/lib/GStreamer.framework`,
+   `wine/lib/wine/x86_64-unix/winemetal.so`,
+   `wine/lib/wine/{x86_64,i386}-windows/winemetal.dll`,
+   `wine/lib/GStreamer.framework`,
    `dxmt/{x86_64-windows,i386-windows}`, `vkd3d/{x64,x86}`, `vulkan/`,
    `probes/` (the three PE probes, `cpuid`, and `osslsigncode` as a host-arch
    tool; GPL-3.0, listed in the notices), then `BUNDLE.toml` and
    `THIRD_PARTY_NOTICES.md` rendered from `build/bundle-spec.toml` (step 8).
+   `cargo xtask engine-payload --place-dxmt <payload>` (`xtask/src/dxmt.rs`)
+   does the DXMT part: DXMT's release DLLs carry the `Wine builtin DLL` marker
+   at offset 0x40, and Wine treats a marked DLL in `system32` as a placeholder
+   and loads its own from `wine/lib/wine` (`set_dll_path` puts `dll_dir` before
+   `WINEDLLPATH`, so `WINEDLLPATH` cannot shadow it). The command zeroes the
+   marker on `d3d11`, `dxgi`, and `d3d10core` for both architectures, so they
+   load as native from the prefix, and copies `winemetal.dll` to
+   `wine/lib/wine/<arch>-windows/` with its marker, since it must be a builtin
+   to reach `winemetal.so`. The `dxmt/` copy of `winemetal.dll` stays: the
+   override table names it and the prefix builder copies it. Wine's own
+   `d3d11`, `dxgi`, and `d3d10core` are not touched, so a prefix with another
+   backend still loads them.
    `ASSEMBLE_PARTIAL=1` tolerates unbuilt probes and an unbuilt
    `osslsigncode`. The script's last step, inside the `.tmp` tree so a
    failure leaves the previous payload untouched, is the dylib closure,
@@ -399,13 +428,25 @@ Environment knobs:
    per `[components]` entry plus Wine, with version, SPDX license, and
    location) from the committed spec, which has the same shape as the output
    and carries the real pin values; `assemble.sh` runs this, so the step is
-   only rerun after editing the spec. The engine crate's reader parses the
+   only rerun after editing the spec. An optional last argument names the
+   revision of `build/wine/patches/` the notices link; `assemble.sh` passes the
+   last commit that touched it, refuses uncommitted patches, and refuses a
+   stage unless `build/work/wine/.stage-patches`, which `build.sh` writes after
+   `make install-lib`, names the set in `build/wine/patches` and, on its third
+   line, the `sha256` of the `wine` and `wine-msync` pins, so neither a failed
+   build nor a pin change can ship the last good stage under new notices. It
+   also refuses a stage directory with no `bin/wine`, which a failed install
+   leaves, before the payload is replaced. The checked-in fixtures
+   carry `main`.
+   Any change to what ships bumps `version`: `engine install` refuses a version
+   already installed, so a rebuilt payload under the old version cannot reach
+   a data dir that holds it. The engine crate's reader parses the
    rendered file, and `xtask/tests/fixtures/BUNDLE.toml` is the committed
    rendering of the spec, which a test keeps in sync. The shape, abridged:
 
    ```toml
    id = "rosetta-wine"          # the reader's engine set; arch must match it
-   version = "11.0-1"           # lowercase [0-9a-z._+-], leading digit, no layout suffix
+   version = "11.0-2"           # lowercase [0-9a-z._+-], leading digit, no layout suffix
    arch = "x86_64"
    min_macos = "14.0"
    sync_modes = ["esync", "none"]   # ordered, first is the default, no duplicates
@@ -438,8 +479,9 @@ Environment knobs:
    ```
 
    The DXMT 0.80 override set is `d3d11`, `dxgi`, `d3d10core`, and
-   `winemetal` (the bridge to its native half); `nvapi64` and `nvngx` are
-   optional and not shipped. vkd3d-proton 3.1 is `d3d12` and `d3d12core`.
+   `winemetal` (the bridge to its native half). `nvapi64.dll` and `nvngx.dll`
+   ship under `dxmt/x86_64-windows`, since the release has them, but are not
+   overridden and keep the marker. vkd3d-proton 3.1 is `d3d12` and `d3d12core`.
    `registry.hidraw_key` at wine-11.0 is the `DisableHidraw` DWORD under
    `HKLM\System\CurrentControlSet\Services\WineBus` (`dlls/winebus.sys/main.c`,
    `check_bus_option`). Every path must be relative without `.` or `..`. The
@@ -448,7 +490,16 @@ Environment knobs:
    entry without `.dll` or with a stem already listed for that architecture,
    an `i386` list under `wow64 = "none"`, and a non-empty `overrides.d3dmetal`
    without the `[d3dmetal]` table.
-9. `cargo xtask engine-payload --check <payload>` — denylist scan of every
+9. `cargo xtask engine-payload --check <payload>` — fails on what it can see
+   of the DXMT setup, for either architecture: a `d3d11`, `dxgi`, or `d3d10core`
+   missing from `dxmt/` or still carrying the marker, a `winemetal.dll` missing
+   from `dxmt/` or `wine/lib/wine` or without the marker, a `winemetal.so` that
+   is missing, empty, or not Mach-O, or a `winemac.so` with no exported `macdrv_functions` (`nm -gU`;
+   `build/wine/patches/`). Only a tree with `dxmt/` is judged, and the
+   `wine/lib/wine` rules only with `wine/bin/wine` built. A pass does not prove
+   DXMT renders: the check sees the name of the export, not the table or which
+   revision of the patch produced it, so only gate G4c proves that. Then a
+   denylist scan of every
    path and every symlink target (case-insensitive, as APFS resolves them),
    plus the self-containment check of every Mach-O (by magic number, fat and
    fat64 included, then `otool -L` and the load commands from `otool -l`; an
@@ -538,13 +589,17 @@ sleep 5; lsof -p "$(pgrep -f xinput-check.exe | head -1)" | grep -E 'dylib|\.so'
 `arch -x86_64` strips `DYLD_*` from the environment, so pass it through
 `/usr/bin/env` after `arch` or run the (thin x86-64) loader directly.
 
-Gate G4c (DXMT) copies the DLLs into that prefix:
+Gate G4c (DXMT) needs a GUI session (a window, and Metal), so a shell in the
+macOS Background session cannot run it. It copies the DLLs into that prefix:
 `<payload>/dxmt/x86_64-windows/{d3d11,dxgi,d3d10core,winemetal}.dll` into
 `$WINEPREFIX/drive_c/windows/system32/` and
 `<payload>/dxmt/i386-windows/*.dll` into `$WINEPREFIX/drive_c/windows/syswow64/`;
 DXMT's native half is already at `<payload>/wine/lib/wine/x86_64-unix/winemetal.so`
 next to Wine's own Unix libraries, where `assemble.sh` put it. Then
-`WINEDLLOVERRIDES="d3d11,dxgi,d3d10core=n,b" <payload>/wine/bin/wine <payload>/probes/dx11-sample.exe --frames 60`.
+`WINEDLLOVERRIDES="d3d11,dxgi,d3d10core,winemetal=n,b" <payload>/wine/bin/wine <payload>/probes/dx11-sample.exe --frames 60`.
+`WINEDEBUG=+loaddll` must show `d3d11.dll` and `dxgi.dll` as `native` from the
+prefix and `winemetal.dll` as `builtin`. `dx11-sample` does not load
+`d3d10core.dll`, so this gate does not exercise it.
 
 ## Gates
 
@@ -552,7 +607,7 @@ next to Wine's own Unix libraries, where `assemble.sh` put it. Then
 | --- | --- | --- |
 | G4a source choice | ADR-0010 | decided: Wine 11.0 stable (Option A) |
 | G4b msync | `build/wine/build.sh` dry-runs `msync-devel.patch` then `msync-staging.patch` from the pin and applies the first clean one; `WINEMSYNC=1 wine wineboot --init` in a temp prefix must pass | dry run done on the planning host (`--preflight`): neither patch applies to wine-11.0 (the pin targets Wine 9.15), the script records "deferred" and leaves the tree untouched; expect `sync_modes = ["esync", "none"]` |
-| G4c DXMT ABI (A6) | see "Running the built Wine"; `dx11-sample.exe --frames 60` prints the adapter and exits 0 | not yet run |
+| G4c DXMT ABI (A6) | see "Running the built Wine"; `dx11-sample.exe --frames 120` prints the adapter and exits 0 | passed on the planning host (2026-10-31, Apple M4 Max, macOS 26.6.2) through `applejack prefix exec` in the GUI session, 64-bit and 32-bit (the 32-bit probe is `PROBE_ARCH=i686`, not in the payload): feature level 11_1, `d3d11` and `dxgi` native, `winemetal` builtin, the clear colour on screen. Needs `build/wine/patches/0001-dxmt-macdrv-abi.patch` |
 | G4d D3DMetal (A5) | host only, never CI: import the overlay with `applejack engine d3dmetal import`, run `dx11-sample` with the D3DMetal backend | not yet run |
 | G4e 32-bit and Steam client | `wine probes/hello32.exe` prints `hello32 ok`; `SteamSetup.exe` (Authenticode-verified per work package 5) installs and `steam.exe` reaches its login window | not yet run |
 | G4 overall | payload from `engine-payload.yml` or from the host boots `wineboot` and renders `dx11-sample` with `/usr/local` and `/opt/homebrew` hidden; `--check` passes | not yet run |
