@@ -60,9 +60,9 @@ public struct AppCancelParams: Codable, Equatable, Sendable {
 /// `AppRunResult` in `rpc/methods.rs`: the `sessions` row, its log, and the
 /// job that reports the session's states and ends with it.
 public struct AppRunResult: Codable, Equatable, Sendable {
-    public var id: JSONValue?
-    public var logPath: String?
-    public var jobId: UInt64?
+    public var id: Int64
+    public var logPath: String
+    public var jobId: UInt64
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -70,9 +70,10 @@ public struct AppRunResult: Codable, Equatable, Sendable {
         case jobId = "job_id"
     }
 
-    public init(id: JSONValue? = nil, logPath: String? = nil) {
+    public init(id: Int64, logPath: String, jobId: UInt64) {
         self.id = id
         self.logPath = logPath
+        self.jobId = jobId
     }
 }
 

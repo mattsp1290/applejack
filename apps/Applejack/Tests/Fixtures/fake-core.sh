@@ -110,7 +110,7 @@ implemented() {
       job 7
       ;;
     app.run)
-      response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":"fake-session","log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
+      response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":41,"job_id":12,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
       if [ -n "${FAKE_CORE_RUN_DELAY_MS:-}" ]; then
         seconds=$(awk -v ms="$FAKE_CORE_RUN_DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
         ( sleep "$seconds"; write "$response" ) &
