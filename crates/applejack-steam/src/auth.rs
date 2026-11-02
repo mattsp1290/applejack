@@ -39,8 +39,20 @@ pub enum LoginStep {
     /// Collect a code and call [`Authenticator::submit_guard_code`], or for
     /// [`GuardFactor::DeviceConfirmation`] call [`Authenticator::finish`].
     GuardRequired { factor: GuardFactor },
+    /// Steam has the answer and has not issued tokens yet; poll again.
+    Waiting,
     /// The refresh token is stored.
     Done { account_name: String },
+}
+
+/// One look at a pending auth session.
+#[derive(Debug, Clone)]
+pub enum AuthPoll {
+    /// Not approved yet. `challenge` is a rotated QR payload to render.
+    Pending {
+        challenge: Option<String>,
+    },
+    Approved(Tokens),
 }
 
 /// Failures while talking to Steam. Never carries a token or password.
@@ -64,13 +76,6 @@ pub enum AuthError {
     /// The Steam Guard code was wrong; the session is still open.
     #[error("Steam Guard code rejected")]
     InvalidGuardCode,
-    /// `DuplicateRequest`: the sign-in was approved in the Steam mobile app
-    /// and a code was typed as well. `steamroom-client` 0.3.0 cannot continue
-    /// from there, so the login is over; begin again with one factor.
-    #[error(
-        "Steam saw this sign-in approved twice; log in again and either enter a code or approve in the app, not both"
-    )]
-    DuplicateGuardApproval,
     /// No refresh token is stored; the user must log in.
     #[error("no stored Steam refresh token")]
     NoStoredToken,
@@ -173,10 +178,12 @@ impl fmt::Debug for License {
 }
 
 /// The auth flow, which needs no logged-in session. Each method advances one
-/// connection's state; the order is `begin_qr` or `begin_credentials`,
-/// optionally `submit_guard_code`, then `wait_for_tokens`. `logon` turns a
-/// refresh token into a [`SteamSession`]. A call made in the wrong state is
-/// [`AuthError::OutOfOrder`] and leaves the state unchanged.
+/// connection's state; the order is `begin_qr` or `begin_credentials`, then
+/// `poll_tokens` every [`poll_interval`](Self::poll_interval), with
+/// `submit_guard_code` in between when a code arrives. Polling during a code
+/// prompt is what lets an approval in the Steam mobile app finish the login.
+/// `logon` turns a refresh token into a [`SteamSession`]. A call made in the
+/// wrong state is [`AuthError::OutOfOrder`] and leaves the state unchanged.
 pub trait SteamConnection {
     /// What a successful `logon` yields.
     type Session: SteamSession;
@@ -191,14 +198,20 @@ pub trait SteamConnection {
         credentials: &Credentials,
     ) -> impl Future<Output = Result<Option<GuardFactor>, AuthError>> + Send;
 
-    /// Submits a Steam Guard code for the pending credentials session.
+    /// Submits a Steam Guard code for the pending credentials session. A
+    /// session approved in the mobile app while the code was on its way
+    /// succeeds here: the next poll has the tokens.
     fn submit_guard_code(
         &mut self,
         code: &str,
     ) -> impl Future<Output = Result<(), AuthError>> + Send;
 
-    /// Polls until Steam issues tokens for the pending session.
-    fn wait_for_tokens(&mut self) -> impl Future<Output = Result<Tokens, AuthError>> + Send;
+    /// One poll of the pending session. Valid while a code is awaited too.
+    /// Any error ends the session.
+    fn poll_tokens(&mut self) -> impl Future<Output = Result<AuthPoll, AuthError>> + Send;
+
+    /// How often Steam asked to be polled.
+    fn poll_interval(&self) -> Duration;
 
     /// Opens a logged-in session from a refresh token.
     fn logon(
@@ -208,8 +221,10 @@ pub trait SteamConnection {
     ) -> impl Future<Output = Result<Self::Session, AuthError>> + Send;
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Pending {
+/// Where a login stands. Copy it out with [`Authenticator::state`] to keep a
+/// login across calls, and hand it to [`Authenticator::resume`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginState {
     Idle,
     AwaitingTokens,
     AwaitingGuardCode(GuardFactor),
@@ -220,16 +235,26 @@ enum Pending {
 pub struct Authenticator<'a, C, S: ?Sized> {
     connection: &'a mut C,
     store: &'a S,
-    pending: Pending,
+    state: LoginState,
 }
 
 impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C, S> {
     pub fn new(connection: &'a mut C, store: &'a S) -> Self {
+        Self::resume(connection, store, LoginState::Idle)
+    }
+
+    /// Picks up a login at `state`, over the connection that started it.
+    pub fn resume(connection: &'a mut C, store: &'a S, state: LoginState) -> Self {
         Self {
             connection,
             store,
-            pending: Pending::Idle,
+            state,
         }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> LoginState {
+        self.state
     }
 
     /// Starts a login. [`AuthMode::Credentials`] needs `credentials`.
@@ -246,7 +271,7 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
         match mode {
             AuthMode::Qr => {
                 let payload = self.connection.begin_qr().await?;
-                self.pending = Pending::AwaitingTokens;
+                self.state = LoginState::AwaitingTokens;
                 Ok(LoginStep::QrReady { payload })
             }
             AuthMode::Credentials => {
@@ -255,17 +280,17 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
                 ))?;
                 match self.connection.begin_credentials(credentials).await? {
                     Some(GuardFactor::DeviceConfirmation) => {
-                        self.pending = Pending::AwaitingTokens;
+                        self.state = LoginState::AwaitingTokens;
                         Ok(LoginStep::GuardRequired {
                             factor: GuardFactor::DeviceConfirmation,
                         })
                     }
                     Some(factor) => {
-                        self.pending = Pending::AwaitingGuardCode(factor);
+                        self.state = LoginState::AwaitingGuardCode(factor);
                         Ok(LoginStep::GuardRequired { factor })
                     }
                     None => {
-                        self.pending = Pending::AwaitingTokens;
+                        self.state = LoginState::AwaitingTokens;
                         self.finish().await
                     }
                 }
@@ -273,7 +298,8 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
         }
     }
 
-    /// Submits a Steam Guard code and completes the login.
+    /// Submits a Steam Guard code and polls once. [`LoginStep::Waiting`]
+    /// means the code was taken and the tokens are still on their way.
     ///
     /// # Errors
     ///
@@ -284,7 +310,7 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
     /// [`Authenticator::begin`], and `finish` or `submit_guard_code` before
     /// that is [`AuthError::OutOfOrder`].
     pub async fn submit_guard_code(&mut self, code: &str) -> Result<LoginStep, Error> {
-        let Pending::AwaitingGuardCode(_) = self.pending else {
+        let LoginState::AwaitingGuardCode(_) = self.state else {
             return Err(AuthError::OutOfOrder("no Steam Guard code is pending").into());
         };
         match self.connection.submit_guard_code(code).await {
@@ -293,40 +319,68 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
             // session, and a driver that kept asking for codes would loop.
             Err(AuthError::InvalidGuardCode) => return Err(AuthError::InvalidGuardCode.into()),
             Err(error) => {
-                self.pending = Pending::Idle;
+                self.state = LoginState::Idle;
                 return Err(error.into());
             }
         }
-        self.pending = Pending::AwaitingTokens;
-        self.finish().await
+        self.state = LoginState::AwaitingTokens;
+        self.poll().await
     }
 
-    /// Waits for Steam to issue tokens, stores the refresh token, and returns
-    /// [`LoginStep::Done`].
+    /// One look at the pending login, valid while a code is awaited: an
+    /// approval in the Steam mobile app finishes the login from here.
+    /// Stores the refresh token when Steam issues it.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::OutOfOrder`] when no login is in progress. Any other
+    /// error ends the login, as the auth flow is consumed on failure, so the
+    /// next call must be [`Authenticator::begin`].
+    pub async fn poll(&mut self) -> Result<LoginStep, Error> {
+        if self.state == LoginState::Idle {
+            return Err(AuthError::OutOfOrder("no login in progress").into());
+        }
+        match self.connection.poll_tokens().await {
+            Ok(AuthPoll::Pending { challenge }) => Ok(match (challenge, self.state) {
+                (Some(payload), _) => LoginStep::QrReady { payload },
+                (None, LoginState::AwaitingGuardCode(factor)) => {
+                    LoginStep::GuardRequired { factor }
+                }
+                (None, _) => LoginStep::Waiting,
+            }),
+            Ok(AuthPoll::Approved(tokens)) => {
+                self.state = LoginState::Idle;
+                self.store.put(&tokens.refresh_token)?;
+                Ok(LoginStep::Done {
+                    account_name: tokens.account_name,
+                })
+            }
+            Err(error) => {
+                self.state = LoginState::Idle;
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Polls at Steam's interval until the login ends, for a driver with no
+    /// code to wait for.
     ///
     /// # Errors
     ///
     /// [`AuthError::GuardRequired`] from the driver's own state (a code is
-    /// still pending) and [`AuthError::OutOfOrder`] when no login is in
-    /// progress; both leave the login where it was. Any other error, from
-    /// the connection (including a `GuardRequired` the connection itself
-    /// reports) or from storing the token, ends the login: the auth flow is
-    /// consumed on failure, so the next call must be [`Authenticator::begin`].
+    /// still pending), which leaves the login where it was, and what
+    /// [`poll`](Self::poll) reports.
     pub async fn finish(&mut self) -> Result<LoginStep, Error> {
-        match self.pending {
-            Pending::AwaitingTokens => {}
-            Pending::AwaitingGuardCode(factor) => {
-                return Err(AuthError::GuardRequired { factor }.into());
-            }
-            Pending::Idle => return Err(AuthError::OutOfOrder("no login in progress").into()),
+        if let LoginState::AwaitingGuardCode(factor) = self.state {
+            return Err(AuthError::GuardRequired { factor }.into());
         }
-        // The flow is consumed whether `wait_for_tokens` succeeds or fails.
-        self.pending = Pending::Idle;
-        let tokens = self.connection.wait_for_tokens().await?;
-        self.store.put(&tokens.refresh_token)?;
-        Ok(LoginStep::Done {
-            account_name: tokens.account_name,
-        })
+        loop {
+            let step = self.poll().await?;
+            if matches!(step, LoginStep::Done { .. }) {
+                return Ok(step);
+            }
+            tokio::time::sleep(self.connection.poll_interval()).await;
+        }
     }
 
     /// Opens a session from the stored refresh token. The account name is not

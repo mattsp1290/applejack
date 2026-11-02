@@ -35,17 +35,18 @@ pub mod vdf;
 
 pub use acf::{AcfWriter, AppManifest, InstalledDepot};
 pub use auth::{
-    AccessToken, AuthError, AuthMode, Authenticator, Credentials, GuardFactor, License, LoginStep,
-    Password, SteamConnection, Tokens,
+    AccessToken, AuthError, AuthMode, AuthPoll, Authenticator, Credentials, GuardFactor, License,
+    LoginState, LoginStep, Password, SteamConnection, Tokens,
 };
 pub use depot::{
-    ClientRunning, DepotInstaller, DownloadRecord, InstallOptions, InstallOutcome, InstallPlan,
-    InstallProgress, LibraryPaths, VerifyReport, verify_install,
+    CancelRequested, ClientRunning, DepotInstaller, DownloadRecord, InstallOptions, InstallOutcome,
+    InstallPlan, InstallProgress, LibraryPaths, VerifyReport, verify_install,
 };
 pub use error::Error;
 pub use keychain::{InMemoryStore, RefreshToken, RefreshTokenStore, SecurityFrameworkStore};
 pub use library::{
-    DepotFilter, DepotInfo, DepotSelection, Library, ManifestRef, OwnedApp, PlannedDepot,
+    DepotFilter, DepotInfo, DepotSelection, LaunchChoice, LaunchEntry, Library, ManifestRef,
+    OwnedApp, PlannedDepot, fetch_owned_app,
 };
 pub use lock::{AppLock, Holder, LibraryLock, Lock, LockDir, Mode};
 pub use session::{AppInfo, PackageGrants, SteamSession};

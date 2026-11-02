@@ -84,6 +84,10 @@ pub enum Error {
     /// There is no `.acf` for this app.
     #[error("app {appid} is not installed")]
     NotInstalled { appid: u32 },
+    /// The caller asked the install to stop. The partial state is kept, so
+    /// the next run resumes.
+    #[error("install of app {appid} was cancelled; partial state kept")]
+    Cancelled { appid: u32 },
     /// The title is already fully installed; update or verify it instead.
     #[error("app {appid} is already installed; update or verify it instead")]
     AlreadyInstalled { appid: u32 },

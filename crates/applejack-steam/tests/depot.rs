@@ -2099,6 +2099,50 @@ async fn a_client_that_starts_mid_download_stops_the_run_with_its_record() {
     assert!(bench.acf().is_fully_installed());
 }
 
+/// Red without the cancel check in the download loop: the run finishes.
+#[tokio::test]
+async fn a_cancel_mid_download_stops_the_run_with_its_record() {
+    let bench = Bench::new();
+    let files = bench.v1_files();
+    let slow = chunk_of(&files[2], 0);
+    bench
+        .session
+        .chunks
+        .fault(&slow, Fault::Slow(Duration::from_millis(2500)));
+    bench.session.add_manifest(DEPOT, manifest(V1, files));
+    let chunks = &bench.session.chunks;
+    let running = || false;
+    let cancel = || chunks.fetches() > 0;
+    let result = bench
+        .installer(&running)
+        .with_cancel(&cancel)
+        .install(&plan(V1, 11))
+        .await;
+    assert!(matches!(result, Err(Error::Cancelled { appid: APPID })));
+    assert!(!bench.paths().acf(APPID).exists());
+    assert!(bench.paths().record(APPID).exists());
+
+    bench.session.chunks.clear_faults();
+    bench.install(&plan(V1, 11)).await.unwrap();
+    assert!(bench.acf().is_fully_installed());
+}
+
+#[tokio::test]
+async fn a_cancel_before_the_first_write_writes_nothing() {
+    let bench = Bench::new();
+    bench.add_v1();
+    let running = || false;
+    let cancel = || true;
+    let result = bench
+        .installer(&running)
+        .with_cancel(&cancel)
+        .install(&plan(V1, 11))
+        .await;
+    assert!(matches!(result, Err(Error::Cancelled { .. })));
+    assert!(!bench.game().exists());
+    assert!(!bench.paths().record(APPID).exists());
+}
+
 fn staged_bytes(bench: &Bench, name: &str) -> usize {
     let staged = bench.game().join(".DepotDownloader/staging").join(name);
     fs::read(staged).map_or(0, |bytes| bytes.iter().filter(|byte| **byte != 0).count())

@@ -8,16 +8,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use applejack_steam::auth::AuthError;
-use applejack_steam::keychain::RefreshToken;
-use applejack_steam::live::SteamroomSession;
+use applejack_steam::Error;
+use applejack_steam::auth::{
+    AuthError, AuthMode, Authenticator, Credentials, GuardFactor, LoginStep, Password,
+};
+use applejack_steam::keychain::{InMemoryStore, RefreshToken, RefreshTokenStore};
+use applejack_steam::live::{SteamroomConnection, SteamroomSession};
 use applejack_steam::session::SteamSession;
 use bytes::Bytes;
 use prost::Message;
+use steamroom::auth::GuardType;
 use steamroom::client::msg::ClientMsg;
 use steamroom::client::{Ready, SteamClient};
 use steamroom::error::{ConnectionError, Error as SteamError};
 use steamroom::generated::{
+    CAuthenticationAllowedConfirmation, CAuthenticationBeginAuthSessionViaCredentialsRequest,
+    CAuthenticationBeginAuthSessionViaCredentialsResponse,
+    CAuthenticationGetPasswordRsaPublicKeyResponse, CAuthenticationPollAuthSessionStatusResponse,
     CContentServerDirectoryGetManifestRequestCodeRequest,
     CContentServerDirectoryGetManifestRequestCodeResponse,
     CContentServerDirectoryGetServersForSteamPipeResponse, CContentServerDirectoryServerInfo,
@@ -828,4 +835,207 @@ async fn a_failed_job_ends_its_call_at_once() {
     assert!(error.to_string().contains("could not deliver"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(session.heartbeat_interval().is_some());
+}
+
+impl Cm {
+    /// Answers a service call with `eresult` in the header.
+    fn answer(&self, to: &Received, eresult: i32, body: &[u8]) {
+        let mut msg = ClientMsg::with_body(EMsg::SERVICE_METHOD_RESPONSE, body);
+        msg.header.jobid_target = to.header.jobid_source;
+        msg.header.eresult = Some(eresult);
+        self.send(msg.to_bytes());
+    }
+
+    async fn expect_call(&mut self, method: &str) -> Received {
+        let received = self.recv().await;
+        assert_eq!(received.header.target_job_name.as_deref(), Some(method));
+        received
+    }
+
+    /// Plays the two calls that open a credentials session.
+    async fn open_credentials_session(&mut self) {
+        let key = self
+            .expect_call("Authentication.GetPasswordRSAPublicKey#1")
+            .await;
+        let body = CAuthenticationGetPasswordRsaPublicKeyResponse {
+            publickey_mod: Some(format!("c{}7", "5".repeat(254))),
+            publickey_exp: Some("010001".to_owned()),
+            timestamp: Some(1),
+        }
+        .encode_to_vec();
+        self.answer(&key, 1, &body);
+        let begin = self
+            .expect_call("Authentication.BeginAuthSessionViaCredentials#1")
+            .await;
+        let request =
+            CAuthenticationBeginAuthSessionViaCredentialsRequest::decode(begin.body.clone())
+                .unwrap();
+        assert_ne!(
+            request.encrypted_password.as_deref(),
+            Some("not-a-real-password")
+        );
+        let body = CAuthenticationBeginAuthSessionViaCredentialsResponse {
+            client_id: Some(11),
+            request_id: Some(vec![1, 2, 3]),
+            interval: Some(0.01),
+            allowed_confirmations: vec![
+                CAuthenticationAllowedConfirmation {
+                    confirmation_type: Some(GuardType::DeviceCode.to_proto()),
+                    ..Default::default()
+                },
+                CAuthenticationAllowedConfirmation {
+                    confirmation_type: Some(GuardType::DeviceConfirmation.to_proto()),
+                    ..Default::default()
+                },
+            ],
+            steamid: Some(STEAM_ID),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        self.answer(&begin, 1, &body);
+    }
+
+    async fn answer_poll(&mut self, tokens: bool) {
+        let poll = self
+            .expect_call("Authentication.PollAuthSessionStatus#1")
+            .await;
+        let body = if tokens {
+            CAuthenticationPollAuthSessionStatusResponse {
+                refresh_token: Some(FIXTURE_TOKEN.to_owned()),
+                access_token: Some("access-fixture".to_owned()),
+                account_name: Some("fixture-user".to_owned()),
+                ..Default::default()
+            }
+        } else {
+            CAuthenticationPollAuthSessionStatusResponse::default()
+        };
+        self.answer(&poll, 1, &body.encode_to_vec());
+    }
+}
+
+fn fixture_credentials() -> Credentials {
+    Credentials {
+        account_name: "fixture-user".to_owned(),
+        password: Password::new("not-a-real-password"),
+    }
+}
+
+/// Gate G2's failure: the phone approved, then a code arrived, and Steam
+/// answered `DuplicateRequest`. Red when the submit treats that as fatal.
+#[tokio::test]
+async fn a_code_that_loses_the_race_with_an_approval_still_logs_in() {
+    let (client, mut cm) = prepared().await;
+    let script = tokio::spawn(async move {
+        cm.open_credentials_session().await;
+        cm.answer_poll(false).await;
+        let submit = cm
+            .expect_call("Authentication.UpdateAuthSessionWithSteamGuardCode#1")
+            .await;
+        cm.answer(&submit, 29, &[]);
+        cm.answer_poll(true).await;
+    });
+    let store = InMemoryStore::default();
+    let mut connection = SteamroomConnection::over(client);
+    let mut auth = Authenticator::new(&mut connection, &store);
+    let prompt = LoginStep::GuardRequired {
+        factor: GuardFactor::DeviceCode,
+    };
+    let credentials = fixture_credentials();
+    let step = auth
+        .begin(AuthMode::Credentials, Some(&credentials))
+        .await
+        .unwrap();
+    assert_eq!(step, prompt);
+    assert_eq!(auth.poll().await.unwrap(), prompt);
+    let step = auth.submit_guard_code("ABCDE").await.unwrap();
+    assert_eq!(
+        step,
+        LoginStep::Done {
+            account_name: "fixture-user".to_owned()
+        }
+    );
+    assert_eq!(
+        store.get().unwrap().as_ref().map(RefreshToken::expose),
+        Some(FIXTURE_TOKEN)
+    );
+    script.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_approval_while_the_prompt_is_up_needs_no_code() {
+    let (client, mut cm) = prepared().await;
+    let script = tokio::spawn(async move {
+        cm.open_credentials_session().await;
+        cm.answer_poll(true).await;
+    });
+    let store = InMemoryStore::default();
+    let mut connection = SteamroomConnection::over(client);
+    let mut auth = Authenticator::new(&mut connection, &store);
+    let credentials = fixture_credentials();
+    auth.begin(AuthMode::Credentials, Some(&credentials))
+        .await
+        .unwrap();
+    assert!(matches!(auth.poll().await.unwrap(), LoginStep::Done { .. }));
+    script.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_wrong_code_keeps_the_session_open() {
+    let (client, mut cm) = prepared().await;
+    let script = tokio::spawn(async move {
+        cm.open_credentials_session().await;
+        let submit = cm
+            .expect_call("Authentication.UpdateAuthSessionWithSteamGuardCode#1")
+            .await;
+        cm.answer(&submit, 88, &[]);
+        cm.answer_poll(false).await;
+        let submit = cm
+            .expect_call("Authentication.UpdateAuthSessionWithSteamGuardCode#1")
+            .await;
+        cm.answer(&submit, 1, &[]);
+        cm.answer_poll(true).await;
+    });
+    let store = InMemoryStore::default();
+    let mut connection = SteamroomConnection::over(client);
+    let mut auth = Authenticator::new(&mut connection, &store);
+    let credentials = fixture_credentials();
+    auth.begin(AuthMode::Credentials, Some(&credentials))
+        .await
+        .unwrap();
+    assert!(matches!(
+        auth.submit_guard_code("WRONG").await.unwrap_err(),
+        Error::Auth(AuthError::InvalidGuardCode)
+    ));
+    auth.poll().await.unwrap();
+    let step = auth.submit_guard_code("ABCDE").await.unwrap();
+    assert!(matches!(step, LoginStep::Done { .. }));
+    script.await.unwrap();
+}
+
+#[tokio::test]
+async fn any_other_submit_failure_ends_the_login() {
+    let (client, mut cm) = prepared().await;
+    let script = tokio::spawn(async move {
+        cm.open_credentials_session().await;
+        let submit = cm
+            .expect_call("Authentication.UpdateAuthSessionWithSteamGuardCode#1")
+            .await;
+        cm.answer(&submit, 84, &[]);
+    });
+    let store = InMemoryStore::default();
+    let mut connection = SteamroomConnection::over(client);
+    let mut auth = Authenticator::new(&mut connection, &store);
+    let credentials = fixture_credentials();
+    auth.begin(AuthMode::Credentials, Some(&credentials))
+        .await
+        .unwrap();
+    assert!(matches!(
+        auth.submit_guard_code("ABCDE").await.unwrap_err(),
+        Error::Auth(AuthError::RateLimited { .. })
+    ));
+    assert!(matches!(
+        auth.poll().await.unwrap_err(),
+        Error::Auth(AuthError::OutOfOrder(_))
+    ));
+    script.await.unwrap();
 }

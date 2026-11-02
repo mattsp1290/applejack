@@ -226,6 +226,10 @@ impl Default for InstallOptions {
 /// `applejack-engine` and this crate does not depend on it.
 pub type ClientRunning<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 
+/// True once the caller wants the install to stop. Read once a second during
+/// a download.
+pub type CancelRequested<'a> = &'a (dyn Fn() -> bool + Send + Sync);
+
 /// Receives [`InstallProgress`].
 pub type ProgressSink<'a> = &'a (dyn Fn(&InstallProgress) + Send + Sync);
 
@@ -569,6 +573,7 @@ pub struct DepotInstaller<'a, S> {
     client_running: ClientRunning<'a>,
     options: InstallOptions,
     progress: Option<ProgressSink<'a>>,
+    cancel: Option<CancelRequested<'a>>,
 }
 
 impl<S> std::fmt::Debug for DepotInstaller<'_, S> {
@@ -597,6 +602,7 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
             client_running,
             options: InstallOptions::default(),
             progress: None,
+            cancel: None,
         }
     }
 
@@ -609,6 +615,15 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
     #[must_use]
     pub fn with_progress(mut self, progress: ProgressSink<'a>) -> Self {
         self.progress = Some(progress);
+        self
+    }
+
+    /// `cancel` is consulted wherever the ownership predicate is. A stop
+    /// keeps the record, like any other stop, and answers
+    /// [`Error::Cancelled`].
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelRequested<'a>) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 
@@ -721,11 +736,15 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
         Ok(outcome)
     }
 
-    fn refuse_while_client_runs(&self, appid: u32) -> Result<(), Error> {
-        if (self.client_running)() {
-            return Err(Error::ClientRunning { appid });
+    fn halted(&self, appid: u32) -> Option<Error> {
+        if self.cancel.is_some_and(|cancel| cancel()) {
+            return Some(Error::Cancelled { appid });
         }
-        Ok(())
+        (self.client_running)().then_some(Error::ClientRunning { appid })
+    }
+
+    fn refuse_while_client_runs(&self, appid: u32) -> Result<(), Error> {
+        self.halted(appid).map_or(Ok(()), Err)
     }
 }
 
@@ -1173,9 +1192,9 @@ impl<S: SteamSession> Run<'_, '_, S> {
                     }
                 }
                 _ = client_check.tick(), if halted.is_none() => {
-                    if (self.installer.client_running)() {
+                    if let Some(error) = self.installer.halted(appid) {
                         stop.stop();
-                        halted = Some(Error::ClientRunning { appid });
+                        halted = Some(error);
                     }
                 }
                 joined = &mut download => break joined,
