@@ -12,7 +12,7 @@ mod support;
 
 use std::future::{Future, ready};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -786,14 +786,26 @@ fn a_dead_sessions_row_does_not_hold_an_install_back() {
     assert_eq!(fixture.db().open_session(APP).unwrap(), None);
 }
 
-fn helper(name: &str, data: &Path) -> std::process::Child {
-    Command::new(env::current_exe().unwrap())
-        .args([name, "--exact", "--ignored", "--nocapture"])
-        .env(HELPER_DATA, data)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+/// The other process, which a failed assertion must not leave behind.
+struct Helper(Child);
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn helper(name: &str, data: &Path) -> Helper {
+    Helper(
+        Command::new(env::current_exe().unwrap())
+            .args([name, "--exact", "--ignored", "--nocapture"])
+            .env(HELPER_DATA, data)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
 }
 
 const HELPER_DATA: &str = "APPLEJACK_TEST_INSTALL_DATA";
@@ -835,8 +847,8 @@ fn a_killed_install_blocks_runs_and_resumes() {
         fixture.record().exists() && exe.exists()
     });
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
     let error = fixture.core().plan_run(APP, true).unwrap_err();
     assert_eq!(error.code(), ErrorCode::DownloadInProgress);
     assert!(error.to_string().contains("applejack install"), "{error}");
@@ -872,7 +884,7 @@ fn a_running_install_holds_the_title_against_other_processes_until_cancelled() {
     assert_eq!(error.code(), ErrorCode::DownloadInProgress, "{error}");
 
     assert!(fixture.core().cancel_install(APP).unwrap());
-    let status = child.wait().unwrap();
+    let status = child.0.wait().unwrap();
     assert!(status.success(), "the helper did not see InstallCancelled");
     assert!(fixture.record().exists(), "a stop keeps the record");
     assert!(!fixture.core().cancel_install(APP).unwrap());
@@ -892,8 +904,24 @@ fn a_second_session_is_refused_at_once_naming_the_lock() {
     assert!(error.to_string().contains("steam-session"), "{error}");
     assert_eq!(host.script.lock().unwrap().logons.len(), 0);
     fixture.core().cancel_install(APP).unwrap();
-    child.wait().unwrap();
+    child.0.wait().unwrap();
     assert!(fixture.core().steam_library_refresh(&host).is_ok());
+}
+
+/// The ownership rule: a server up in the client's prefix makes the library
+/// read-only. Red if the plan stops asking.
+#[test]
+fn an_install_refuses_while_a_windows_client_runs() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let prefix = fixture.data().join("prefixes/steam-client");
+    fs::create_dir_all(&prefix).unwrap();
+    let mut server = common::spawn_stub_server("client-under-test", &prefix);
+    let error = fixture.core().plan_title_install(request()).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::SteamClientOwnsTitle, "{error}");
+    fs::write(prefix.join("server-quit"), b"").unwrap();
+    server.wait().unwrap();
+    assert!(fixture.core().plan_title_install(request()).is_ok());
 }
 
 /// The prefix lock, held the way a run holds it: nothing here is an install,

@@ -571,8 +571,10 @@ to file; the local copies in `live.rs` stay until they land:
    discards the sibling messages of the `MULTI` that carries the logon
    response; applejack avoids `login` entirely (see "Session").
 4. `GuardChallenge::submit_code` (`steamroom-client-0.3.0/src/login/credentials.rs:167-187`)
-   treats `DuplicateRequest` as fatal, and `GuardChallenge` exposes no poll,
-   so a caller cannot continue after the user approved in the app.
+   treats `DuplicateRequest` as fatal, and `GuardChallenge` exposes no poll.
+   `live.rs` makes the same `SteamClient<Ready>` calls itself instead, and
+   `poll_auth_session` drops `new_client_id` and `new_challenge_url`, so it
+   calls `PollAuthSessionStatus` itself too.
 5. Each `SteamClient<LoggedIn>` call runs its own receive loop, so they cannot
    share a connection with anything else that reads. A receive buffer in
    `ClientInner`, or a dispatcher, would let applejack drop the wire copies in
@@ -630,14 +632,10 @@ real ones are listed in the unit report's DEVIATIONS.
 | Plan name | Real name | File:line |
 |-----------|-----------|-----------|
 | credential auth begin | `SteamClient<Ready>::begin_auth_session_via_credentials` | `steamroom-0.3.0/src/client/mod.rs:422` |
-| (wrapper used) | `LoginBuilder::with_credentials` / `CredentialsLogin::begin` | `steamroom-client-0.3.0/src/login/mod.rs:292`, `src/login/credentials.rs:58` |
 | QR auth begin | `SteamClient<Ready>::begin_auth_session_via_qr` | `steamroom-0.3.0/src/client/mod.rs:446` |
-| (wrapper used) | `LoginBuilder::with_qr` / `QrLogin::begin` / `QrLoginFlow::challenge_url` / `wait_for_scan` | `steamroom-client-0.3.0/src/login/mod.rs:305`, `src/login/qr.rs:37,73,85` |
-| poll | `SteamClient<Ready>::poll_auth_session` | `steamroom-0.3.0/src/client/mod.rs:470` |
-| (wrapper used) | `poll_until_tokens` (via `wait_for_scan`, `wait_for_confirmation`, `submit_code`) | `steamroom-client-0.3.0/src/login/credentials.rs:226` |
+| poll | `SteamClient<Ready>::call_service_method_non_authed` with `Authentication.PollAuthSessionStatus#1`, as `poll_auth_session` does | `steamroom-0.3.0/src/client/mod.rs:370,470` |
 | Steam Guard submit | `SteamClient<Ready>::submit_steam_guard_code` | `steamroom-0.3.0/src/client/mod.rs:499` |
-| (wrapper used) | `GuardChallenge::submit_code`, `MobileChallenge::wait_for_confirmation` | `steamroom-client-0.3.0/src/login/credentials.rs:167,207` |
-| tokens after approval | `ApprovedAuth::tokens` → `steamroom::auth::AuthTokens { access_token, refresh_token, account_name }` | `steamroom-client-0.3.0/src/login/terminal.rs:83`, `steamroom-0.3.0/src/auth/mod.rs:23` (line 22 is its `#[non_exhaustive]`) |
+| tokens after approval | `CAuthenticationPollAuthSessionStatusResponse { access_token, refresh_token, account_name, new_client_id, new_challenge_url }` | generated from `steamroom-0.3.0/proto` |
 | refresh-token logon | `SteamClient<Ready>::send_msg` with `CMsgClientLogon { account_name, access_token, obfuscated_private_ip, .. }`, the reply routed by the session's receive loop (`login` drops `MULTI` siblings) | `steamroom-0.3.0/src/client/mod.rs:362`; proto `steammessages_clientserver_login.proto` (`account_name`=50, `access_token`=108, `obfuscated_private_ip`=11) |
 | (reference) | `TokenLogin::login` builds the same message without a logon id and without `supports_rate_limit_response`, both of which applejack adds | `steamroom-client-0.3.0/src/login/terminal.rs:55` |
 | logon response | `CMsgClientLogonResponse { eresult, heartbeat_seconds, .. }` from the `IncomingMsg` that `login` returns; `SteamClient<LoggedIn>::send_heartbeat` | proto `steammessages_clientserver_login.proto:97`; `steamroom-0.3.0/src/client/mod.rs:289,537` |

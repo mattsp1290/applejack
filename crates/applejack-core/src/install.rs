@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use applejack_engine::rosetta_wine::process::wineserver_alive;
+use applejack_engine::rosetta_wine::process::wineserver_running;
 use applejack_engine::rosetta_wine::snapshot::PrefixLock;
 use applejack_steam::{
     AppManifest, DepotInstaller, Error as SteamError, InstallPlan, InstallProgress, LaunchChoice,
@@ -219,11 +219,13 @@ fn refuse_title_on_disk(paths: &LibraryPaths, appid: u32) -> Result<(), CoreErro
     })
 }
 
-/// The ownership rule in `docs/steam-layer.md`. A server that cannot be
-/// checked counts as running: the library is read-only then, which is the
-/// side a wrong answer can afford.
+/// The ownership rule in `docs/steam-layer.md`, with the server's last act
+/// counted too: it saves the registry after it stops listening, and the
+/// client may still be writing. A server that cannot be checked counts as
+/// running: the library is read-only then, which is the side a wrong answer
+/// can afford.
 fn client_running(prefix: &Path) -> bool {
-    prefix.is_dir() && wineserver_alive(prefix).unwrap_or(true)
+    prefix.is_dir() && wineserver_running(prefix).unwrap_or(true)
 }
 
 /// Whether a run of this title needs the exe at all. A title the client

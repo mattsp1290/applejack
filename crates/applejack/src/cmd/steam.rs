@@ -229,13 +229,13 @@ mod tests {
     fn a_library_row_lines_up_and_names_its_state() {
         let line = row(&LibraryEntry {
             appid: 480,
-            name: "Spacewar".to_owned(),
-            installdir: "Spacewar".to_owned(),
+            name: "Example".to_owned(),
+            installdir: "Example".to_owned(),
             size_bytes: 2_500_000_000,
             drm: Drm::Unknown,
             default_branch: "public".to_owned(),
             install_state: InstallState::UpdateAvailable,
         });
-        assert_eq!(line, "     480      2.5 GB  unknown  update     Spacewar");
+        assert_eq!(line, "     480      2.5 GB  unknown  update     Example");
     }
 }
