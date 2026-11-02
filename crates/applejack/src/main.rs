@@ -35,9 +35,9 @@ enum Command {
     /// Install, inspect, and roll back engines
     Engine(cmd::engine::EngineArgs),
     /// Sign in to Steam and list the owned library
-    Steam(Pending),
-    /// Download a title's Windows depot
-    Install(Pending),
+    Steam(cmd::steam::SteamArgs),
+    /// Download a title's Windows depots, update them, or verify them
+    Install(cmd::install::InstallArgs),
     /// Launch an installed title; `app run` under its plan name
     Run(cmd::app::RunArgs),
     /// Run, cancel, and register titles
@@ -89,7 +89,9 @@ fn main() -> ExitCode {
         Command::Run(args) => cmd::app::run_title(&args),
         Command::App(args) => cmd::app::run(args),
         Command::Session(args) => cmd::session::run(&args),
-        stub => not_implemented(stub.name()),
+        Command::Steam(args) => cmd::steam::run(&args),
+        Command::Install(args) => cmd::install::run(args),
+        stub @ Command::Runtime(_) => not_implemented(stub.name()),
     }
 }
 

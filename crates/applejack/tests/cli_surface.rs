@@ -5,7 +5,7 @@ const SUBCOMMANDS: [&str; 11] = [
     "doctor",
 ];
 
-const STUBS: [&str; 3] = ["steam", "install", "runtime"];
+const STUBS: [&str; 1] = ["runtime"];
 
 const DOCTOR_KEYS: [&str; 6] = [
     "macos_version",
@@ -55,7 +55,6 @@ fn stubs_exit_with_ex_unavailable() {
 #[test]
 fn stubs_ignore_trailing_arguments() {
     assert_not_implemented("runtime", &["install"]);
-    assert_not_implemented("steam", &["login"]);
 }
 
 fn assert_not_implemented(name: &str, args: &[&str]) {
@@ -732,4 +731,39 @@ fn serve_stdio_exits_non_zero_on_protocol_mismatch() {
     assert_eq!(code, Some(65));
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0]["error"]["code"], 1000);
+}
+
+/// With no account on record neither reaches the Keychain or the network.
+#[test]
+fn a_command_that_needs_a_login_exits_3() {
+    let data = tempfile::tempdir().unwrap();
+    for args in [
+        &["install", "480"][..],
+        &["steam", "library"],
+        &["steam", "library", "--refresh", "--json"],
+    ] {
+        let output = with_data(data.path(), args);
+        assert_eq!(output.status.code(), Some(3), "{args:?}");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.contains("applejack steam login"), "{args:?}: {text}");
+    }
+}
+
+#[test]
+fn update_and_verify_cannot_go_together() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["install", "480", "--update", "--verify"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn no_secret_is_an_argument() {
+    let data = tempfile::tempdir().unwrap();
+    for args in [
+        &["steam", "login", "--password", "x"][..],
+        &["steam", "login", "--code", "x"],
+    ] {
+        let output = with_data(data.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
 }

@@ -126,7 +126,8 @@ The core implements only `hello` and `host.doctor` today, so in the running
 app every flow but Host shows the unavailable state. The view models are
 tested against `Tests/Fixtures/fake-core.sh`, which answers every flow
 method with results shaped like the Rust types when `FAKE_CORE_IMPLEMENTED=1`
-is set and runs `engine.install` and `app.install` as jobs. The result
+is set and runs `engine.install`, `app.install`, and a `steam.library` refresh as
+jobs. The result
 mirrors for pending methods (`ShellTypes.swift`: `SteamLibraryResult`,
 `EngineListResult`, `DoctorReport`, `LoginSession`, `SessionListResult`,
 `GameConfig`, `ConfigImportResult`) are provisional until the methods land

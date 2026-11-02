@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "session_id": "login-19a-1f-0",
+    "step": {
+      "factor": "device_code",
+      "kind": "guard_required"
+    }
+  }
+}

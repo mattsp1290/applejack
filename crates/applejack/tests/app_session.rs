@@ -358,3 +358,50 @@ fn register_needs_a_manifest_and_session_list_starts_empty() {
     let text = fixture.refused(&["app", "cancel", APP]);
     assert!(text.contains("not running"), "{text}");
 }
+
+/// Red if an install takes no prefix lock: nothing else stops it writing
+/// under a running title. It refuses before it looks for an account, so no
+/// Steam is needed to get this far.
+#[test]
+fn an_install_refuses_while_the_title_runs_in_another_process() {
+    let fixture = Fixture::new();
+    let mut run = fixture.attached_run();
+    let refused = fixture.refused(&["install", APP, "--update"]);
+    assert!(refused.contains("already running"), "{refused}");
+    let output = fixture.output(&["install", APP, "--verify"]);
+    assert_eq!(output.status.code(), Some(1));
+    fixture.ok(&["app", "cancel", APP]);
+    run.wait().unwrap();
+}
+
+/// Red if the run stops looking for the record. The record is the only thing
+/// left of a process that was killed, so nothing else can refuse this.
+#[test]
+fn a_run_refuses_while_a_download_record_exists() {
+    let fixture = Fixture::new();
+    let records = fixture.data().join("library/applejack");
+    fs::create_dir_all(&records).unwrap();
+    fs::write(records.join(format!("{APP}.download.json")), "{}").unwrap();
+    let refused = fixture.refused(&["run", APP]);
+    assert!(refused.contains("applejack install"), "{refused}");
+    fs::remove_file(records.join(format!("{APP}.download.json"))).unwrap();
+}
+
+/// A title on disk is `--update`'s, and `drm` is how a run gets past the
+/// client: both answers work from a second process, offline.
+#[test]
+fn a_title_on_disk_is_not_installed_over_and_drm_is_a_setting() {
+    let fixture = Fixture::new();
+    let refused = fixture.refused(&["install", APP]);
+    assert!(refused.contains("already installed"), "{refused}");
+    fixture.ok(&["config", APP, "set", "drm", "unknown"]);
+    let refused = fixture.refused(&["run", APP]);
+    assert!(
+        refused.contains(&format!("config {APP} set drm none")),
+        "{refused}"
+    );
+    fixture.ok(&["config", APP, "set", "drm", "none"]);
+    let mut run = fixture.attached_run();
+    fixture.ok(&["app", "cancel", APP]);
+    run.wait().unwrap();
+}

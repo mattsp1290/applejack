@@ -263,7 +263,11 @@ impl OwnedApp {
 
     /// The launch entry for a Windows install of `branch`. Plan 05 names the
     /// source: the app info's launch options filtered to `oslist = windows`.
-    /// The rest follows what the fields mean on Steam's launch-options page:
+    /// Steamworks' uploading page grounds the OS and DLC filters: an option
+    /// shows only on its OS and, with a DLC set, to its owners. It says
+    /// nothing of `type`, `osarch`, or `betakey`, so steps 2 and 3 and the
+    /// branch half of step 1 are a reading of the field names. The rule errs
+    /// towards refusing: anything it cannot rank goes to the user.
     ///
     /// 1. Keep an entry with an executable whose `oslist` allows Windows,
     ///    whose `betakey` is empty or names `branch`, and whose `ownsdlc`, if

@@ -58,7 +58,8 @@ pub fn resolve_launch(
         .filter(|text| !text.trim().is_empty())
         .ok_or_else(|| {
             refuse(format!(
-                "none is recorded; run `applejack app register {appid} --exe <file>`"
+                "none is recorded; set one with \
+                 `applejack config {appid} set launch_exe_override <file>`"
             ))
         })?;
     let relative = Path::new(relative);
@@ -207,6 +208,9 @@ mod tests {
             assert!(matches!(error, CoreError::NoLaunchExe { .. }), "{value}");
         }
         let error = resolve_launch(10, &install, &GameConfig::default()).unwrap_err();
-        assert!(error.to_string().contains("app register 10"), "{error}");
+        assert!(
+            error.to_string().contains("set launch_exe_override"),
+            "{error}"
+        );
     }
 }

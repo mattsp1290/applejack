@@ -1,0 +1,19 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "apps": [
+      {
+        "appid": 220,
+        "default_branch": "public",
+        "drm": "unknown",
+        "install_state": "update_available",
+        "installdir": "Example Title",
+        "name": "Example Title",
+        "size_bytes": 4096
+      }
+    ],
+    "fetched_at": "2026-11-02T00:00:00Z",
+    "job_id": 8
+  }
+}

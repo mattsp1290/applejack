@@ -6,6 +6,7 @@ use std::io;
 use std::path::PathBuf;
 
 use applejack_engine::{EngineId, Error as EngineError, SyncMode};
+use applejack_steam::{AuthError, Error as SteamError};
 
 use crate::config::{ALLOW_UNSIGNED_ENV, DataDirError, Drm, Error as ConfigError};
 use crate::rpc::wire::{ErrorCode, RpcError};
@@ -18,6 +19,37 @@ pub enum CoreError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     DataDir(#[from] DataDirError),
+    #[error(transparent)]
+    Steam(#[from] SteamError),
+    /// Only a login answers this; the CLI exits 3.
+    #[error("not signed in to Steam ({reason}); run `applejack steam login`")]
+    SteamLoginRequired { reason: String },
+    /// The silent logon with the stored token failed for another reason, so
+    /// a new login may not help. The CLI exits 3 here too.
+    #[error("could not sign in to Steam with the stored token: {0}")]
+    SteamRefreshFailed(SteamError),
+    /// `steam.login.complete` for a login that is not the pending one.
+    #[error("no such Steam login in progress; begin again")]
+    NoSuchLogin,
+    /// A request whose fields cannot go together.
+    #[error("{0}")]
+    InvalidRequest(String),
+    #[error(
+        "title {appid} has several launch entries and none outranks the rest ({}); pick one \
+         with `applejack config {appid} set launch_exe_override <file>`",
+        candidates.join(", ")
+    )]
+    LaunchExeAmbiguous { appid: u32, candidates: Vec<String> },
+    #[error(
+        "title {appid} differs from its manifest: {mismatched} files changed, {missing} missing \
+         (first: {first})"
+    )]
+    VerifyFailed {
+        appid: u32,
+        mismatched: usize,
+        missing: usize,
+        first: String,
+    },
     /// A local bundle was requested without the opt-in.
     #[error("{}", unsigned_refused_message())]
     UnsignedRefused,
@@ -41,14 +73,19 @@ pub enum CoreError {
     #[error("title {appid} is not installed: {reason}")]
     TitleNotInstalled { appid: u32, reason: String },
     /// `applejack/<appid>.download.json` exists: the files are mid-write.
-    #[error("title {appid} has a download record; its files are not complete until it finishes")]
+    #[error(
+        "title {appid} has a download in progress or a stopped one; its files are not complete \
+         until `applejack install {appid}` finishes it"
+    )]
     DownloadInProgress { appid: u32 },
     #[error("title {appid} is already running")]
     AlreadyRunning { appid: u32 },
     /// The title takes the client path, which does not exist yet.
     #[error(
         "title {appid} (drm = {drm}) launches through the Steam client, and the client runtime \
-         is not available yet; only client-free titles run, or try --probe-direct"
+         is not available yet. Nothing marks a title client-free for you: try it with \
+         `applejack run {appid} --probe-direct`, and if it runs, record that with \
+         `applejack config {appid} set drm none`"
     )]
     ClientRuntimeUnavailable { appid: u32, drm: Drm },
     #[error("title {appid} has no usable launch executable: {reason}")]
@@ -133,6 +170,11 @@ impl CoreError {
             Self::Config(ConfigError::UnknownField(_) | ConfigError::InvalidValue { .. }) => {
                 ErrorCode::InvalidParams
             }
+            Self::Steam(error) | Self::SteamRefreshFailed(error) => steam_code(error),
+            Self::SteamLoginRequired { .. } => ErrorCode::SteamLoginRequired,
+            Self::NoSuchLogin => ErrorCode::SteamLoginFailed,
+            Self::LaunchExeAmbiguous { .. } => ErrorCode::LaunchExeAmbiguous,
+            Self::VerifyFailed { .. } => ErrorCode::VerifyFailed,
             Self::UnsignedRefused => ErrorCode::UnsignedEngineRefused,
             Self::NoPublishedVersion { .. } | Self::DownloadUnavailable { .. } => {
                 ErrorCode::DownloadFailed
@@ -146,7 +188,8 @@ impl CoreError {
             Self::NotRunning { .. } => ErrorCode::NotRunning,
             Self::TitleExitedEarly { .. } => ErrorCode::TitleExitedEarly,
             Self::Io { source, .. } => io_code(source),
-            Self::UnknownPrefix { .. }
+            Self::InvalidRequest(_)
+            | Self::UnknownPrefix { .. }
             | Self::SyncUnavailable { .. }
             | Self::PathOutsideData { .. }
             | Self::EngineUnavailable { .. } => ErrorCode::InvalidParams,
@@ -162,6 +205,43 @@ fn io_code(error: &io::Error) -> ErrorCode {
         ErrorCode::DiskFull
     } else {
         ErrorCode::Internal
+    }
+}
+
+fn auth_code(error: &AuthError) -> ErrorCode {
+    match error {
+        AuthError::RateLimited { .. } => ErrorCode::SteamRateLimited,
+        AuthError::InvalidGuardCode => ErrorCode::SteamGuardRejected,
+        AuthError::NoStoredToken => ErrorCode::SteamLoginRequired,
+        AuthError::Connection(_) | AuthError::CmUnavailable(_) | AuthError::CallDenied { .. } => {
+            ErrorCode::SteamUnavailable
+        }
+        _ => ErrorCode::SteamLoginFailed,
+    }
+}
+
+fn steam_code(error: &SteamError) -> ErrorCode {
+    match error {
+        SteamError::Auth(error) => auth_code(error),
+        SteamError::AppNotOwned { .. } => ErrorCode::AppNotOwned,
+        SteamError::NoWindowsDepot { .. }
+        | SteamError::NoManifestForBranch { .. }
+        | SteamError::NoLicensedDepot { .. }
+        | SteamError::UnresolvedSharedDepot { .. } => ErrorCode::TitleNotInstallable,
+        SteamError::LockHeld { .. } => ErrorCode::LockHeld,
+        SteamError::ClientRunning { .. } | SteamError::ClientOwned { .. } => {
+            ErrorCode::SteamClientOwnsTitle
+        }
+        SteamError::AlreadyInstalled { .. } => ErrorCode::AlreadyInstalled,
+        SteamError::NotInstalled { .. } => ErrorCode::TitleNotInstalled,
+        SteamError::Cancelled { .. } => ErrorCode::InstallCancelled,
+        SteamError::DiskFull { .. } => ErrorCode::DiskFull,
+        SteamError::CorruptChunk { .. } => ErrorCode::ChecksumMismatch,
+        SteamError::ManifestChanged { .. }
+        | SteamError::ManifestNotServed { .. }
+        | SteamError::Depot { .. } => ErrorCode::DownloadFailed,
+        SteamError::Io { source, .. } => io_code(source),
+        _ => ErrorCode::Internal,
     }
 }
 

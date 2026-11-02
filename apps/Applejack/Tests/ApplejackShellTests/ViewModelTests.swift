@@ -92,7 +92,7 @@ final class ViewModelTests: XCTestCase {
         await library.install(440)
         XCTAssertNil(library.installs[440], "a finished install hands the row back to the library's install state")
         XCTAssertTrue(try requests(for: "app.install")[0].contains("\"params\":{\"appid\":440,\"update\":false,\"verify\":false}"))
-        XCTAssertEqual(try requests(for: "steam.library").count, 2, "a finished install reloads the library")
+        XCTAssertEqual(try requests(for: "steam.library").count, 3, "a refresh is a job and a read; a finished install reloads the library")
         await app.shutdown()
     }
 
@@ -336,6 +336,18 @@ final class ViewModelTests: XCTestCase {
         await steam.signOut()
         XCTAssertEqual(steam.login, .idle)
         XCTAssertEqual(steam.logout, .ready(.object([:])))
+        await app.shutdown()
+    }
+
+    func testLoginPollsUntilSteamIssuesTheTokens() async throws {
+        setenv("FAKE_CORE_LOGIN_POLLS", "1", 1)
+        defer { unsetenv("FAKE_CORE_LOGIN_POLLS") }
+        let app = makeApp()
+        let steam = SteamAccountViewModel(app: app)
+        await steam.startQrLogin()
+        await steam.complete()
+        XCTAssertEqual(steam.signedInAccount, "fake-account")
+        XCTAssertEqual(try requests(for: "steam.login.complete").count, 2)
         await app.shutdown()
     }
 

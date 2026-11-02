@@ -44,7 +44,7 @@ Response, success or failure:
 
 ```json
 {"jsonrpc":"2.0","id":1,"result":{"protocol_version":1,"core_version":"0.1.0"}}
-{"jsonrpc":"2.0","id":2,"error":{"code":1002,"message":"`app.install` is pending (work package 4)","data":{"method":"app.install"}}}
+{"jsonrpc":"2.0","id":2,"error":{"code":1002,"message":"`runtime.steam.stop` is pending (work package 5)","data":{"method":"runtime.steam.stop"}}}
 ```
 
 A success never carries `"result": null`. A method with nothing to return
@@ -113,6 +113,19 @@ Swift case; do not edit the table by hand.
 | 1017 | `NotRunning` | `app.cancel` for a title with no open session. |
 | 1018 | `TitleExitedEarly` | A direct launch ended within five seconds; the title may require the Steam client. |
 | 1019 | `PrefixUnusable` | A prefix cannot be used for the operation: it is stale, broken, or a `wineserver` will not leave it. |
+| 1020 | `SteamLoginRequired` | No usable sign-in: no account, no stored token, or Steam refused the token. The CLI exits 3. |
+| 1021 | `SteamLoginFailed` | A login step failed and the login is over; begin again. |
+| 1022 | `SteamGuardRejected` | The Steam Guard code was wrong. The login stays open for another code. |
+| 1023 | `SteamRateLimited` | Steam throttled the request. The message says when to retry; nothing retries on its own. |
+| 1024 | `SteamUnavailable` | Steam could not be reached or denied one call on a healthy session. |
+| 1025 | `AppNotOwned` | `app.install` for a title this account does not own. |
+| 1026 | `TitleNotInstallable` | The title has no Windows depot, none on the branch, or none this account licenses. |
+| 1027 | `LaunchExeAmbiguous` | Several launch entries fit and none outranks the rest. `launch_exe_override` is the way out. |
+| 1028 | `InstallCancelled` | The install stopped on request. Its download record stays, and the next install resumes. |
+| 1029 | `LockHeld` | Another process holds this title's install lock. |
+| 1030 | `AlreadyInstalled` | `app.install` for a title that is whole on disk. Use `update` or `verify`. |
+| 1031 | `SteamClientOwnsTitle` | A Windows Steam client is running against the library, or owns this title's update. |
+| 1032 | `VerifyFailed` | `app.install` with `verify` found files that differ from the manifest. |
 <!-- error-table:end -->
 
 A `job.failed` carries the reason code of its failure when it has one
@@ -144,11 +157,11 @@ by hand.
 | `engine.probe_cpuid` | implemented |
 | `engine.d3dmetal.import` | implemented |
 | `engine.d3dmetal.remove` | implemented |
-| `steam.login.start` | pending (work package 4) |
-| `steam.login.complete` | pending (work package 4) |
-| `steam.logout` | pending (work package 4) |
-| `steam.library` | pending (work package 4) |
-| `app.install` | pending (work package 4) |
+| `steam.login.start` | implemented |
+| `steam.login.complete` | implemented |
+| `steam.logout` | implemented |
+| `steam.library` | implemented |
+| `app.install` | implemented |
 | `app.run` | implemented |
 | `app.cancel` | implemented |
 | `runtime.steam.install` | pending (work package 5) |
@@ -183,6 +196,11 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `engine.probe_cpuid` | `{plain, advertised, changes_bits}`; also stored in `meta.cpuid_probe` |
 | `engine.d3dmetal.import` | `{engine_version, overlay_dir, imported_from, gptk_version, accepted_at}` |
 | `engine.d3dmetal.remove` | `{}` |
+| `steam.login.start` | `{session_id, step}`; see [Steam](#steam) |
+| `steam.login.complete` | `{session_id, step}`; see [Steam](#steam) |
+| `steam.logout` | `{}`. Deletes the token, the cached library, and the account name, and drops a pending login. Titles on disk stay |
+| `steam.library` | `{apps: [LibraryEntry], fetched_at, job_id}`; see [Steam](#steam) |
+| `app.install` | `JobStarted`; see [Steam](#steam) |
 | `app.run` | `{id, log_path, job_id}`; see [Sessions](#sessions) |
 | `app.cancel` | `JobStarted`; see [Sessions](#sessions) |
 | `session.list` | `{"sessions": [SessionRow]}`, newest first; `appid` narrows it to one title |
@@ -190,7 +208,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `prefix.restore` | The same shape, naming the safety snapshot of the replaced state, or the restored snapshot when the prefix was gone and there was nothing to replace |
 | `prefix.reset` | `JobStarted`. A `job.progress` message names the safety snapshot |
 | `config.get` | `GameConfig`; every member `null` for an appid with no row |
-| `config.set` | `{}`. `value` is a string, a boolean, a number, an object for `extra_env`, or `null` to clear. `direct_verified_at` is refused: only a direct probe records it |
+| `config.set` | `{}`. `value` is a string, a boolean, a number, an object for `extra_env`, or `null` to clear. `direct_verified_at` is refused: only a direct probe records it. Key `drm` sets the title's `drm` in the `apps` row, and is how a title becomes client-free; `TitleNotInstalled` when it has no row |
 | `config.export` | `{path}` |
 | `config.import` | `{applied, preset_appid, accepted, rejected, confirmations}` |
 
@@ -328,6 +346,50 @@ notifications. The CLI does not take over, since it would have to stay: its
 starts or `app cancel` ends it. `serve` waits for its jobs at EOF, so a shell
 that closes stdin leaves a core behind until the title exits; one that kills the
 core leaves this recovery to the next start.
+
+## Steam
+
+A login is a series of short requests. `steam.login.start` takes `{"mode":
+{"kind": "qr"}}` or `{"mode": {"kind": "credentials", "account_name", "password"}}`,
+connects, and answers `{session_id, step}`. `steam.login.complete` takes
+`session_id` and an optional `steam_guard_code`, and answers the same shape after
+one submit, or one poll when there is no code. `step.kind` is:
+
+| `kind` | Members | The shell |
+|---|---|---|
+| `qr_ready` | `payload` | Renders it, and renders it again when it changes |
+| `guard_required` | `factor`: `email_code`, `device_code`, `device_confirmation` | Shows a code field unless the factor is `device_confirmation`, and goes on polling |
+| `waiting` | | Goes on polling |
+| `done` | `account_name` | Stops; the refresh token is stored |
+
+Call `steam.login.complete` with no code every couple of seconds while a step is
+pending, so an approval in the Steam mobile app ends the login as a typed code
+does. A poll sooner than Steam's interval answers the current step without
+reaching Steam. A code that arrives once none is wanted is dropped. A wrong code
+answers `SteamGuardRejected` and the login stays open; any other error ends it,
+and a later `complete` answers `SteamLoginFailed`. One login is pending at a time:
+`steam.login.start` drops the last. These requests block the loop for one Steam
+call, bounded at 30 s, or longer while `start` tries up to three CMs. Their params
+and results never reach a log.
+
+`steam.library` answers from the cache and touches nothing else. With
+`refresh: true` it answers the cache as it stood plus `job_id`, and fetches on that
+job; read again after `job.done`. `LibraryEntry` is `{appid, name, installdir,
+size_bytes, drm, default_branch, install_state}`, and `install_state` is `installed`,
+`not_installed`, or `update_available`.
+
+`app.install` takes `{appid, branch?, update, verify, library?}`. Every refusal is
+an error response and starts no job: `LockHeld`, `AlreadyRunning`,
+`AlreadyInstalled`, `SteamClientOwnsTitle`, `InvalidParams`. The job's
+`job.progress` phases are `login`, `resolve`, `download` with byte counts, `verify`,
+and `register`, whose message names the launch exe. `app.cancel` stops an install,
+in this core or another process: the install's job ends in `job.failed` with
+`InstallCancelled`, the download record stays, and the next `app.install` resumes.
+
+A Steam failure that needs the user keeps its code through `job.failed`:
+`SteamLoginRequired`, `AppNotOwned`, `TitleNotInstallable`, `LaunchExeAmbiguous`,
+`NoLaunchExe`, `VerifyFailed`. `LockHeld` also answers a second logged-in session,
+since two would displace each other; the message names the holder.
 
 ## Jobs
 

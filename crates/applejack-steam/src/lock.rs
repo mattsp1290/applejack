@@ -4,7 +4,8 @@
 //!
 //! An install job holds [`LockDir::install_job`] for its whole life, login
 //! included, so another process can tell one is running and ask it to stop.
-//! It comes before everything else.
+//! It comes before everything else. [`LockDir::steam_session`] is held for as
+//! long as a logged-in session exists, and comes before the per-appid lock.
 //!
 //! Lock order is per-appid first, then the library. Within one process the
 //! types enforce it: [`LockDir::app`] borrows the [`LockDir`] mutably for as
@@ -75,6 +76,8 @@ const WAIT_POLL: Duration = Duration::from_millis(25);
 const REPLACED_RETRIES: u32 = 8;
 
 const LIBRARY_LOCK_NAME: &str = "library";
+
+const STEAM_SESSION_LOCK_NAME: &str = "steam-session";
 
 /// `LOCK_SH` or `LOCK_EX`.
 #[derive(Debug, Clone, Copy)]
@@ -338,6 +341,23 @@ impl LockDir {
         Lock::acquire(
             &self.root,
             &install_job_lock_name(appid),
+            Kind::Exclusive,
+            mode,
+            &self.command,
+        )
+    }
+
+    /// Takes the lock held for as long as a logged-in session exists. Every
+    /// applejack process logs on with one logon id, so two sessions of one
+    /// account would displace each other.
+    ///
+    /// # Errors
+    ///
+    /// See [`LockDir::app`].
+    pub fn steam_session(&self, mode: Mode) -> Result<Lock, Error> {
+        Lock::acquire(
+            &self.root,
+            STEAM_SESSION_LOCK_NAME,
             Kind::Exclusive,
             mode,
             &self.command,

@@ -517,7 +517,7 @@ mod tests {
             .unwrap();
         db.clear_library_cache().unwrap();
         assert_eq!(db.app(12).unwrap(), None);
-        assert!(db.cached_library().unwrap().is_empty());
+        assert_eq!(db.cached_library().unwrap().len(), 0);
         let kept = db.app(10).unwrap().unwrap();
         assert_eq!(kept.drm, Drm::None);
         assert_eq!(kept.fetched_at, None);

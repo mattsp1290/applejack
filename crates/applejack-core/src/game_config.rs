@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{
-    self, Accepted, Confirmation, DefaultEnvPolicy, Error, Field, GameConfig, ImportOptions,
+    self, Accepted, Confirmation, DefaultEnvPolicy, Drm, Error, Field, GameConfig, ImportOptions,
     Preset, Rejected,
 };
 use crate::error::CoreError;
@@ -20,6 +20,9 @@ use crate::state::Core;
 /// and echoed back, so the read stops one byte past the cap and the file is
 /// refused.
 pub const MAX_PRESET_BYTES: u64 = 1 << 20;
+
+/// The one `config set` key that is not a `game_config` column.
+const DRM_KEY: &str = "drm";
 
 /// The result of `config.import`. `applied` is false while `confirmations`
 /// holds items the request did not accept, and when nothing was acceptable.
@@ -62,6 +65,9 @@ impl Core {
     /// [`Error::UnknownField`] or [`Error::InvalidValue`], before the
     /// database is created.
     pub fn config_set(&mut self, appid: u32, key: &str, value: &str) -> Result<(), CoreError> {
+        if key == DRM_KEY {
+            return self.set_drm(appid, value);
+        }
         let field = Field::parse(key).ok_or_else(|| Error::UnknownField(key.to_owned()))?;
         if key == "direct_verified_at" {
             return Err(Error::InvalidValue {
@@ -73,6 +79,29 @@ impl Core {
         }
         GameConfig::default().set(field, value)?;
         self.db()?.set_field(appid, key, value)?;
+        Ok(())
+    }
+
+    /// `drm` is the user's word and lives on the title, not in the per-game
+    /// configuration, so a preset cannot carry it. An empty value goes back
+    /// to `unknown`.
+    fn set_drm(&mut self, appid: u32, value: &str) -> Result<(), CoreError> {
+        let drm = if value.is_empty() {
+            Drm::Unknown
+        } else {
+            value.parse().map_err(|reason| Error::InvalidValue {
+                field: DRM_KEY,
+                value: value.to_owned(),
+                reason,
+            })?
+        };
+        let found = self.reading(|db| Ok(db.app(appid)?))?.is_some();
+        if !found || !self.db()?.set_app_drm(appid, drm)? {
+            return Err(CoreError::TitleNotInstalled {
+                appid,
+                reason: "it has no record; run `applejack install` first".to_owned(),
+            });
+        }
         Ok(())
     }
 

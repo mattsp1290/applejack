@@ -11,6 +11,7 @@ use applejack_steam::library::{
 };
 use applejack_steam::session::{AppInfo, PackageGrants};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use support::FakeSession;
 
 fn info(appid: u32, text: &str) -> AppInfo {
@@ -865,9 +866,10 @@ fn the_same_command_twice_is_one_choice() {
 
 #[test]
 fn entries_keep_their_numeric_order() {
-    let entries: String = (0..11)
-        .map(|index| format!(r#""{index}" {{ "executable" "e{index}.exe" }}"#))
-        .collect();
+    let mut entries = String::new();
+    for index in 0..11 {
+        write!(entries, r#""{index}" {{ "executable" "e{index}.exe" }}"#).unwrap();
+    }
     let app = launchy(&entries);
     assert_eq!(app.launch[9].executable, "e9.exe");
     assert_eq!(app.launch[10].executable, "e10.exe");

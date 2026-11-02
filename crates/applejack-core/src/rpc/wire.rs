@@ -230,10 +230,36 @@ pub enum ErrorCode {
     TitleExitedEarly,
     /// A prefix cannot be used for the operation.
     PrefixUnusable,
+    /// Nothing is signed in, or Steam refused the stored token.
+    SteamLoginRequired,
+    /// A login step failed and the login is over.
+    SteamLoginFailed,
+    /// The Steam Guard code was wrong; the login stays open.
+    SteamGuardRejected,
+    /// Steam throttled the request.
+    SteamRateLimited,
+    /// Steam could not be reached or denied one call.
+    SteamUnavailable,
+    /// `app.install` for a title this account does not own.
+    AppNotOwned,
+    /// The title has nothing this account can install.
+    TitleNotInstallable,
+    /// Several launch entries fit; `launch_exe_override` decides.
+    LaunchExeAmbiguous,
+    /// The install stopped on request and can resume.
+    InstallCancelled,
+    /// Another applejack holds this title's install or the Steam session.
+    LockHeld,
+    /// `app.install` for a title that is whole on disk.
+    AlreadyInstalled,
+    /// A Windows Steam client owns the library or this title.
+    SteamClientOwnsTitle,
+    /// Files differ from the manifest.
+    VerifyFailed,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 38] = [
         Self::ParseError,
         Self::InvalidRequest,
         Self::MethodNotFound,
@@ -259,6 +285,19 @@ impl ErrorCode {
         Self::NotRunning,
         Self::TitleExitedEarly,
         Self::PrefixUnusable,
+        Self::SteamLoginRequired,
+        Self::SteamLoginFailed,
+        Self::SteamGuardRejected,
+        Self::SteamRateLimited,
+        Self::SteamUnavailable,
+        Self::AppNotOwned,
+        Self::TitleNotInstallable,
+        Self::LaunchExeAmbiguous,
+        Self::InstallCancelled,
+        Self::LockHeld,
+        Self::AlreadyInstalled,
+        Self::SteamClientOwnsTitle,
+        Self::VerifyFailed,
     ];
 
     #[must_use]
@@ -289,6 +328,19 @@ impl ErrorCode {
             Self::NotRunning => 1017,
             Self::TitleExitedEarly => 1018,
             Self::PrefixUnusable => 1019,
+            Self::SteamLoginRequired => 1020,
+            Self::SteamLoginFailed => 1021,
+            Self::SteamGuardRejected => 1022,
+            Self::SteamRateLimited => 1023,
+            Self::SteamUnavailable => 1024,
+            Self::AppNotOwned => 1025,
+            Self::TitleNotInstallable => 1026,
+            Self::LaunchExeAmbiguous => 1027,
+            Self::InstallCancelled => 1028,
+            Self::LockHeld => 1029,
+            Self::AlreadyInstalled => 1030,
+            Self::SteamClientOwnsTitle => 1031,
+            Self::VerifyFailed => 1032,
         }
     }
 
@@ -327,6 +379,19 @@ impl ErrorCode {
             Self::NotRunning => "NotRunning",
             Self::TitleExitedEarly => "TitleExitedEarly",
             Self::PrefixUnusable => "PrefixUnusable",
+            Self::SteamLoginRequired => "SteamLoginRequired",
+            Self::SteamLoginFailed => "SteamLoginFailed",
+            Self::SteamGuardRejected => "SteamGuardRejected",
+            Self::SteamRateLimited => "SteamRateLimited",
+            Self::SteamUnavailable => "SteamUnavailable",
+            Self::AppNotOwned => "AppNotOwned",
+            Self::TitleNotInstallable => "TitleNotInstallable",
+            Self::LaunchExeAmbiguous => "LaunchExeAmbiguous",
+            Self::InstallCancelled => "InstallCancelled",
+            Self::LockHeld => "LockHeld",
+            Self::AlreadyInstalled => "AlreadyInstalled",
+            Self::SteamClientOwnsTitle => "SteamClientOwnsTitle",
+            Self::VerifyFailed => "VerifyFailed",
         }
     }
 
@@ -380,6 +445,39 @@ impl ErrorCode {
             }
             Self::PrefixUnusable => {
                 "A prefix cannot be used for the operation: it is stale, broken, or a `wineserver` will not leave it."
+            }
+            Self::SteamLoginRequired => {
+                "No usable sign-in: no account, no stored token, or Steam refused the token. The CLI exits 3."
+            }
+            Self::SteamLoginFailed => "A login step failed and the login is over; begin again.",
+            Self::SteamGuardRejected => {
+                "The Steam Guard code was wrong. The login stays open for another code."
+            }
+            Self::SteamRateLimited => {
+                "Steam throttled the request. The message says when to retry; nothing retries on its own."
+            }
+            Self::SteamUnavailable => {
+                "Steam could not be reached or denied one call on a healthy session."
+            }
+            Self::AppNotOwned => "`app.install` for a title this account does not own.",
+            Self::TitleNotInstallable => {
+                "The title has no Windows depot, none on the branch, or none this account licenses."
+            }
+            Self::LaunchExeAmbiguous => {
+                "Several launch entries fit and none outranks the rest. `launch_exe_override` is the way out."
+            }
+            Self::InstallCancelled => {
+                "The install stopped on request. Its download record stays, and the next install resumes."
+            }
+            Self::LockHeld => "Another process holds this title's install lock.",
+            Self::AlreadyInstalled => {
+                "`app.install` for a title that is whole on disk. Use `update` or `verify`."
+            }
+            Self::SteamClientOwnsTitle => {
+                "A Windows Steam client is running against the library, or owns this title's update."
+            }
+            Self::VerifyFailed => {
+                "`app.install` with `verify` found files that differ from the manifest."
             }
         }
     }

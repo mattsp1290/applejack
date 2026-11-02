@@ -16,9 +16,11 @@ public struct SteamAccountView: View {
                     QRCodeView(payload: payload).frame(width: 240, height: 240)
                     Button("Done") { Task { await model.complete() } }
                 case .guardRequired(let factor):
-                    Text("Steam Guard (\(factor)) code:")
+                    Text("Steam Guard (\(factor)): type the code, or approve in the Steam mobile app, then press Submit.")
                     TextField("Code", text: $model.guardCode).frame(maxWidth: 160)
                     Button("Submit") { Task { await model.complete() } }
+                case .waiting:
+                    Text("Waiting for Steam.")
                 case .done(let accountName):
                     Label("Signed in as \(accountName)", systemImage: "checkmark.circle")
                 }

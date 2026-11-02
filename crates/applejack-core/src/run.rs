@@ -6,6 +6,7 @@
 //! and belongs on a job thread or the CLI's main one. The lock travels with
 //! the plan.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,7 @@ use applejack_engine::{
     Engine, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec, Prefix, Session, SyncMode,
     Version,
 };
-use applejack_steam::{AppManifest, LibraryPaths};
+use applejack_steam::{AppManifest, InstallPlan, LaunchEntry, LibraryPaths};
 
 use crate::config::presets::is_unsafe_char;
 use crate::config::{AppRow, Drm, GameConfig, NewSession, SessionEnd, SessionRow, SessionState};
@@ -26,7 +27,7 @@ use crate::error::CoreError;
 use crate::prefixes::pick_sync;
 use crate::runtime::direct::{DirectLaunch, resolve_launch, takes_direct_path};
 use crate::runtime::session::{
-    NOTE_EARLY, NOTE_LINGERED, OwnedProbe, WatchEnd, WatchEvent, busy, log_line, watch,
+    NOTE_EARLY, NOTE_LINGERED, OwnedProbe, WatchEnd, WatchEvent, log_line, watch,
 };
 use crate::state::Core;
 
@@ -356,9 +357,9 @@ impl Core {
     /// [`CoreError::NoActiveEngine`], [`CoreError::AlreadyRunning`],
     /// `PrefixBusy`, `PrefixUnusable`.
     pub fn plan_run(&mut self, appid: u32, probe_direct: bool) -> Result<PlannedRun, CoreError> {
-        let app = self.reading(|db| Ok(db.app(appid)?))?.ok_or_else(|| {
-            not_installed(appid, "it has no record; run `applejack app register`")
-        })?;
+        let app = self
+            .reading(|db| Ok(db.app(appid)?))?
+            .ok_or_else(|| not_installed(appid, NOT_INSTALLED))?;
         let config = self.config_get(appid)?;
         let install_dir = installed_dir(&app)?;
         if !takes_direct_path(&app, &config, probe_direct) {
@@ -369,11 +370,14 @@ impl Core {
         }
         // The exe stays inside the install directory and that inside the
         // title's library, which may be on another volume (plan 02).
-        let launch = resolve_launch(appid, &install_dir, &config)?;
+        let launch = resolve_launch(appid, &install_dir, &launch_config(&app, &config))?;
         let installed = self.run_engine(&config)?;
         let wish = PrefixWish::of(&config)?;
         let name = appid.to_string();
         let lock = self.claim_session_prefix(appid, &name)?;
+        // An install that took the lock after the look above has gone by
+        // now; one that got there first left its record.
+        installed_dir(&app)?;
         let key = new_session_id("run");
         let log_path = self.log_dir().join(&key).join("wine.log");
         let log_text = log_path.to_string_lossy().into_owned();
@@ -417,28 +421,10 @@ impl Core {
         )?)
     }
 
-    /// The prefix lock, once nothing else can claim the title: a busy lock
-    /// with an open row is this title running, and an open row behind a free
-    /// lock is a dead owner's. A prefix a launch would refuse is refused
-    /// here, while a request can still say so.
+    /// The prefix lock, once nothing else can claim the title. A prefix a
+    /// launch would refuse is refused here, while a request can still say so.
     fn claim_session_prefix(&mut self, appid: u32, name: &str) -> Result<PrefixLock, CoreError> {
-        let lock = match self.lock_prefix(name) {
-            Ok(lock) => lock,
-            Err(error) if busy(&error) => {
-                let open = self.reading(|db| Ok(db.open_session(appid)?))?;
-                return Err(if open.is_some() {
-                    CoreError::AlreadyRunning { appid }
-                } else {
-                    error
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        if let Some(row) = self.reading(|db| Ok(db.open_session(appid)?))?
-            && self.settle_orphan(&row)?
-        {
-            return Err(CoreError::AlreadyRunning { appid });
-        }
+        let lock = self.claim_idle_title(appid, name, false)?;
         let dir = self.prefix_dir(name)?;
         if dir.is_dir() {
             let (_, prefix) = self.open_prefix(name)?;
@@ -473,10 +459,11 @@ impl Core {
     }
 
     /// Writes the `apps` row and launch exe of a title already on disk, from
-    /// its `appmanifest_<appid>.acf`. This is the stand-in for `app.install`,
-    /// which writes the same row and takes the exe from the app info. `drm`
-    /// is the caller's word: nothing here can probe it. The manifest is not
-    /// trusted: an appid that is not this title's, an unusable `installdir`,
+    /// its `appmanifest_<appid>.acf`. This is for what `app.install` did not
+    /// put there: a library copied in, a title the Windows client installed,
+    /// or one a `.acf` adopts; `record_title` is the one write both
+    /// go through. `drm` is the caller's word: nothing here can probe it. The
+    /// manifest is not trusted: an appid that is not this title's, an unusable `installdir`,
     /// and an `exe` a run would refuse are refused here, with nothing
     /// written. The rest of what a run checks of the disk, such as a complete
     /// manifest and no download record, is left to the run.
@@ -512,22 +499,71 @@ impl Core {
             };
             resolve_launch(appid, &paths.install_dir(&manifest.installdir), &config)?;
         }
+        let row = self.record_title(appid, &manifest, &library, request.drm, None)?;
+        if let Some(exe) = &request.exe {
+            self.db()?.set_field(appid, "launch_exe_override", exe)?;
+        }
+        Ok(row)
+    }
+
+    /// Writes what `.acf` says into the `apps` row, keeping what the row
+    /// knows and the manifest does not. `drm` of `None` and `launch` of
+    /// `None` leave those as they are. The one write of an installed title,
+    /// for `app install` and `app register` alike.
+    pub(crate) fn record_title(
+        &mut self,
+        appid: u32,
+        manifest: &AppManifest,
+        library: &Path,
+        drm: Option<Drm>,
+        launch: Option<&LaunchEntry>,
+    ) -> Result<AppRow, CoreError> {
         let existing = self.reading(|db| Ok(db.app(appid)?))?.unwrap_or_default();
         let row = AppRow {
             appid,
             name: Some(printable(&manifest.name)),
-            installdir: Some(manifest.installdir),
-            drm: request.drm.unwrap_or(existing.drm),
+            installdir: Some(manifest.installdir.clone()),
+            drm: drm.unwrap_or(existing.drm),
             library_dir: Some(library.to_string_lossy().into_owned()),
             last_installed_buildid: Some(manifest.buildid),
+            last_manifest_ids: manifest
+                .installed_depots
+                .iter()
+                .map(|depot| (depot.depot_id.to_string(), depot.manifest_id.to_string()))
+                .collect(),
+            launch_exe: launch
+                .map(|entry| entry.executable.clone())
+                .or(existing.launch_exe),
+            launch_args: match launch {
+                Some(entry) => entry.arguments.clone(),
+                None => existing.launch_args,
+            },
             ..existing
         };
-        let db = self.db()?;
-        db.upsert_app(&row)?;
-        if let Some(exe) = &request.exe {
-            db.set_field(appid, "launch_exe_override", exe)?;
-        }
+        self.db()?.upsert_app(&row)?;
         Ok(row)
+    }
+
+    /// What a run needs to find the download record of a first install. The
+    /// missing build id is what says the title is not whole.
+    pub(crate) fn note_install_started(
+        &mut self,
+        plan: &InstallPlan,
+        library: &Path,
+    ) -> Result<(), CoreError> {
+        let existing = self
+            .reading(|db| Ok(db.app(plan.appid)?))?
+            .unwrap_or_default();
+        self.db()?.upsert_app(&AppRow {
+            appid: plan.appid,
+            name: Some(printable(&plan.name)),
+            installdir: Some(plan.installdir.clone()),
+            library_dir: Some(library.to_string_lossy().into_owned()),
+            last_installed_buildid: None,
+            last_manifest_ids: BTreeMap::new(),
+            ..existing
+        })?;
+        Ok(())
     }
 
     /// The canonical library of a registration, which is what a run and the
@@ -542,12 +578,18 @@ impl Core {
                     &format!("the library {} is not an absolute path", library.display()),
                 ));
             }
-            None => self.data_dir().join("library"),
+            None => self
+                .detached()
+                .reading(|db| Ok(db.app(appid)?))?
+                .and_then(|row| row.library_dir)
+                .map_or_else(|| self.data_dir().join("library"), PathBuf::from),
         };
         std::fs::canonicalize(&library)
             .map_err(|error| not_installed(appid, &format!("{}: {error}", library.display())))
     }
 }
+
+const NOT_INSTALLED: &str = "it has no record; run `applejack install` first";
 
 const UNUSABLE_INSTALLDIR: &str = "its manifest names an unusable install directory";
 
@@ -561,8 +603,25 @@ fn plain_installdir(text: &str) -> bool {
         && !text.chars().any(char::is_control)
 }
 
+/// What a run launches: the override when the configuration has one, else
+/// what the app info chose at install.
+fn launch_config(app: &AppRow, config: &GameConfig) -> GameConfig {
+    let mut merged = config.clone();
+    let has_override = config
+        .launch_exe_override
+        .as_deref()
+        .is_some_and(|exe| !exe.trim().is_empty());
+    if !has_override {
+        merged.launch_exe_override.clone_from(&app.launch_exe);
+        if merged.launch_args_override.is_none() {
+            merged.launch_args_override.clone_from(&app.launch_args);
+        }
+    }
+    merged
+}
+
 /// A manifest's `name` reaches terminals and logs.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars().filter(|c| !is_unsafe_char(*c)).collect()
 }
 
@@ -578,7 +637,7 @@ fn not_installed(appid: u32, reason: &str) -> CoreError {
 fn installed_dir(app: &AppRow) -> Result<PathBuf, CoreError> {
     let appid = app.appid;
     let (Some(library), Some(installdir)) = (&app.library_dir, &app.installdir) else {
-        return Err(not_installed(appid, "its record names no library location"));
+        return Err(not_installed(appid, NOT_INSTALLED));
     };
     if !plain_installdir(installdir) {
         return Err(not_installed(appid, UNUSABLE_INSTALLDIR));

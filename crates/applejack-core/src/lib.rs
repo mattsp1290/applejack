@@ -8,11 +8,13 @@ pub mod engines;
 pub mod error;
 pub mod game_config;
 pub mod host;
+pub mod install;
 pub mod prefixes;
 pub mod rpc;
 pub mod run;
 pub mod runtime;
 pub mod state;
+pub mod steam;
 
 pub use error::CoreError;
 pub use state::Core;

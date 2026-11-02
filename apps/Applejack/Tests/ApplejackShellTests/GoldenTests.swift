@@ -45,12 +45,13 @@ final class GoldenTests: XCTestCase {
         XCTAssertEqual(
             results.map(\.lastPathComponent),
             [
-                "app.cancel.result.json", "app.run.result.json",
+                "app.cancel.result.json", "app.install.result.json", "app.run.result.json",
                 "config.export.result.json", "config.get.result.json", "config.import.result.json",
                 "empty.result.json", "engine.d3dmetal.import.result.json", "engine.doctor.result.json",
                 "engine.install.result.json", "engine.list.result.json", "engine.probe_cpuid.result.json",
                 "hello.result.json", "host.doctor.result.json", "prefix.snapshot.result.json",
-                "session.list.result.json",
+                "session.list.result.json", "steam.library.result.json",
+                "steam.login.complete.result.json", "steam.login.start.result.json",
             ]
         )
         for file in results {
@@ -136,6 +137,14 @@ final class GoldenTests: XCTestCase {
         let sessions = try typedResult("session.list.result.json", as: SessionListResult.self)
         XCTAssertEqual(sessions.sessions.first?.state, .exited)
         XCTAssertEqual(sessions.sessions.first?.exitCode, 0)
+        let login = try typedResult("steam.login.start.result.json", as: LoginSession.self)
+        XCTAssertEqual(login.step, .guardRequired(factor: "device_code"))
+        let done = try typedResult("steam.login.complete.result.json", as: LoginSession.self)
+        XCTAssertEqual(done.step, .done(accountName: "fixture-user"))
+        let steamLibrary = try typedResult("steam.library.result.json", as: SteamLibraryResult.self)
+        XCTAssertEqual(steamLibrary.apps.first?.installState, .updateAvailable)
+        XCTAssertEqual(steamLibrary.jobId, 8)
+        _ = try typedResult("app.install.result.json", as: JobStarted.self)
         let plan = try typedResult("config.import.result.json", as: ConfigImportResult.self)
         XCTAssertTrue(plan.needsConfirmation)
         XCTAssertEqual(plan.rejected.first?.field, "extra_env.PATH")
