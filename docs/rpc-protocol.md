@@ -307,7 +307,7 @@ run; a second one stops the CLI waiting and leaves the row open.
 no open session. It sends `SIGTERM` to the title, `SIGKILL` three seconds later,
 then waits for the rest of the session and stops the prefix's server if that
 does not leave within ten seconds. `kill_prefix` skips to `<server> -k`. Three
-seconds after a stop, any process still carrying the session id gets `SIGKILL`,
+seconds after a stop, any process still found under the session id gets `SIGKILL`,
 so a session whose helpers never exit has this way out. That repeats for three
 more seconds, so a process forked meanwhile goes too, and again while the job
 waits for the owner. The server of a session with no process is left alone: the

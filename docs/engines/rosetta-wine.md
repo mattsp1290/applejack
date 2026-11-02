@@ -565,7 +565,7 @@ first entry, and the Windows processes of a live `prefix exec` on 11.0-2
 them) keep it, while a `pgrep -f APPLEJACK_SESSION=<id>` with no such variable
 does not, and a cancel kills what is matched. A same-uid process with
 `WINEPREFIX` set and no session of its own (a sessionless `cmd.exe`, or a shell
-with the variable exported) whose arguments end in the exact entry is matched;
+with the variable exported) whose last such entry is the exact one is matched;
 nothing in the record tells it apart.
 The loader process itself
 (`session.pid`) keeps its Unix argv for the first moments, until Wine
