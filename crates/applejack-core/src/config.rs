@@ -15,8 +15,8 @@ pub use applejack_config::presets::{
 };
 pub use applejack_config::{
     AppRow, ConfigDb, Drm, EnvPolicy, Error, Field, GameConfig, GraphicsBackend, ImportOptions,
-    ImportPlan, LaunchMode, NewSession, Preset, Resolved, SessionEnd, SessionRow, SessionState,
-    SyncMode, resolve,
+    ImportPlan, LaunchMode, LibraryRow, NewSession, Preset, Resolved, SessionEnd, SessionRow,
+    SessionState, SyncMode, resolve,
 };
 
 /// Environment variable that overrides the data directory.
