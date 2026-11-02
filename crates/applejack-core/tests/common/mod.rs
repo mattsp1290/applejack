@@ -28,9 +28,10 @@ const BUNDLE_FILES: &[&str] = &[
 /// line and exits 7, standing in for a console probe; `title.exe` becomes
 /// [`stub_title`], a game whose argv names its exe; `stubborn.exe` the same
 /// with `SIGTERM` ignored; `quick.exe` exits at once; `launcher.exe` leaves
-/// `game.exe` running and exits, and `immortal.exe` leaves a helper no server
-/// stop or `quit` file ends. The arguments go to `$WINEPREFIX/args`, so a test
-/// can see them without the log having to.
+/// `game.exe` running and exits, `immortal.exe` leaves a helper no server stop
+/// or `quit` file ends, and `forking.exe` is a launcher that takes a second
+/// before it starts `helper.exe`. The arguments go to `$WINEPREFIX/args`, so a
+/// test can see them without the log having to.
 ///
 /// The title is this test binary and not the shell: macOS hides the
 /// environment of platform binaries such as `/bin/sh` from `KERN_PROCARGS2`,
@@ -54,6 +55,11 @@ if [ "$name" = immortal.exe ]; then
   "@HELPER@" common::stub_title --exact --ignored --nocapture helper.exe &
   exec "@HELPER@" common::stub_title --exact --ignored --nocapture immortal.exe
 fi
+if [ "$name" = forking.exe ]; then
+  sleep 1
+  "@HELPER@" common::stub_title --exact --ignored --nocapture helper.exe &
+  exit 3
+fi
 if [ "$name" = quick.exe ]; then
   exit 0
 fi
@@ -67,10 +73,11 @@ fi
 exit 0
 "#;
 
-/// `-k` ends the stub title, as a real server ends everything in its prefix,
-/// and a [`stub_server`].
+/// With a [`stub_server`] up, `-k` ends it and the stub title, as a real server
+/// ends everything in its prefix. With none up it does nothing, as Wine's does
+/// in the window before a loader has started one.
 const SERVER: &str = r#"#!/bin/sh
-if [ "$1" = -k ] && [ -d "$WINEPREFIX" ]; then
+if [ "$1" = -k ] && [ -e "$WINEPREFIX/server-up" ]; then
   echo 99 > "$WINEPREFIX/quit"
   : > "$WINEPREFIX/server-quit"
 fi
@@ -131,6 +138,7 @@ fn stub_server() {
     while prefix.is_dir() && !prefix.join("server-quit").exists() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let _ = fs::remove_file(prefix.join("server-up"));
     let _ = fs::remove_dir_all(dir);
 }
 

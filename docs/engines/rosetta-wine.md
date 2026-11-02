@@ -558,10 +558,14 @@ its truncated argv can end in an argument). Only without one does the last
 `APPLEJACK_SESSION=` entry of `cmd` decide (the fold always follows the
 Windows arguments, so an earlier such entry is an argument the program was
 given), and argv is cut at it before deriving `exe`. Either way a literal of
-another session's id in a game's argv does not attribute the process. A
-same-uid process with no session of its own whose arguments end in the exact
-entry is reported, under Wine (a sessionless `cmd.exe`) or not
-(`pgrep -f APPLEJACK_SESSION=<id>`); nothing in the record tells it apart.
+another session's id in a game's argv does not attribute the process. A match
+through `cmd` also needs `WINEPREFIX=` in `environ`: the fold hides only the
+first entry, and all ten Windows processes of a live `prefix exec` on 11.0-2
+(`services.exe`, `explorer.exe`, `cmd.exe`, and the `ping` it started among
+them) keep it, while `pgrep -f APPLEJACK_SESSION=<id>` does not have it and a
+cancel kills what is matched. A same-uid Wine process with no session of its
+own (a sessionless `cmd.exe`) whose arguments end in the exact entry is
+reported; nothing in the record tells it apart.
 The loader process itself
 (`session.pid`) keeps its Unix argv for the first moments, until Wine
 rewrites it too (to the title's Windows command line, or to
@@ -725,7 +729,7 @@ call the same ones. The `meta` and `engine_versions` writes are the core's.
 | `applejack prefix exec <name> -- <exe> [args]` | `Engine::launch` with the bundle that last touched the prefix; streams the session log and exits with the child's code. Development only |
 | `applejack app run <appid> [--probe-direct]`, or `applejack run <appid>` | `Core::plan_run`, then `PlannedRun::run`, which stays until the session ends. Exits with the launch exe's status, with 1 when none is known, and with 1 for an early exit, which still prints the row on stdout. `SIGINT` and `SIGTERM` cancel it. Progress goes to stderr, and a closed pipe does not end the run |
 | `applejack app cancel <appid> [--kill-prefix]` | `Core::plan_cancel`, then `PlannedCancel::run`, for a session started anywhere |
-| `applejack app register <appid> [--drm d] [--exe <file>] [--library <dir>]` | Writes the `apps` row from `<library>/steamapps/appmanifest_<appid>.acf` and `launch_exe_override`, until `app.install` writes both. The library is canonicalized, may be on any volume, must be absolute and exist, and defaults to `<data>/library`. The manifest is not trusted: its `appid` must match, its `installdir` must be one plain directory name, control characters leave its `name`, and `--exe` must pass what a run checks. `--drm` is the caller's word, and a title registered again keeps its value without it |
+| `applejack app register <appid> [--drm d] [--exe <file>] [--library <dir>]` | Writes the `apps` row from `<library>/steamapps/appmanifest_<appid>.acf` and `launch_exe_override`, until `app.install` writes both. The library is canonicalized, may be on any volume, must be absolute and exist, and defaults to `<data>/library`. The manifest is not trusted: its `appid` must match, its `installdir` must be one plain directory name, control and bidirectional formatting characters leave its `name`, and `--exe` must pass the checks a run makes of the exe. The rest of what a run checks, such as a complete manifest and no download record, is left to the run. `--drm` is the caller's word, and a title registered again keeps its value without it |
 | `applejack session list [--appid n] [--json]` | `Core::session_list`, after settling sessions nobody owns |
 
 A directory passed to `--from` is packed to

@@ -242,7 +242,9 @@ impl ConfigDb {
         rows.into_iter().map(RawSession::into_row).collect()
     }
 
-    /// Moves an open row to [`SessionState::Running`] and restamps its start.
+    /// Moves a [`SessionState::Starting`] row to [`SessionState::Running`] and
+    /// stamps its start. Any other row keeps the start it has, so a retry or
+    /// a late stamp cannot move it.
     ///
     /// # Errors
     ///
@@ -251,8 +253,13 @@ impl ConfigDb {
         self.write_locked(|db| {
             db.conn.execute(
                 "UPDATE sessions SET state = ?1, started_at = ?2 \
-                 WHERE id = ?3 AND ended_at IS NULL",
-                params![SessionState::Running.as_str(), at, id],
+                 WHERE id = ?3 AND ended_at IS NULL AND state = ?4",
+                params![
+                    SessionState::Running.as_str(),
+                    at,
+                    id,
+                    SessionState::Starting.as_str(),
+                ],
             )?;
             Ok(())
         })
@@ -394,6 +401,17 @@ mod tests {
         assert!(db.end_session(id, &END).unwrap());
         assert!(db.open_session(10).unwrap().is_none());
         assert!(db.insert_session(&new(10)).unwrap().is_some());
+    }
+
+    #[test]
+    fn only_a_starting_row_takes_a_start_time() {
+        let db = ConfigDb::open_in_memory().unwrap();
+        let id = db.insert_session(&new(10)).unwrap().unwrap();
+        db.mark_session_running(id, "2026-11-01T00:00:05Z").unwrap();
+        db.mark_session_running(id, "2026-11-01T02:00:00Z").unwrap();
+        let row = db.session(id).unwrap().unwrap();
+        assert_eq!(row.state, SessionState::Running);
+        assert_eq!(row.started_at, "2026-11-01T00:00:05Z");
     }
 
     #[test]

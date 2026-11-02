@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! starting -> running -> exited | cancelled
-//! starting -> failed  | cancelled
+//! starting -> exited | failed | cancelled
 //! running -> failed, when the watch failed and nothing of the session is left
 //! starting | running -> lost
 //! ```
@@ -360,20 +360,22 @@ impl PlannedCancel {
     }
 
     /// Ends the title, then the rest of the session, then waits for the
-    /// owner to close the row and let go of the prefix. When there is no
-    /// owner the row is closed here. On return no process with the session's
-    /// id is left and the lock is free. This is the way out of a session
-    /// that will not drain: what the server stop leaves is killed by pid, and
-    /// a server stop that fails does not stop that.
+    /// owner to close the row and let go of the prefix, ending what it finds
+    /// of the session as it waits. When there is no owner the row is closed
+    /// here. On return no process with the session's id is left and the lock
+    /// is free. This is the way out of a session that will not drain: what
+    /// the server stop leaves is killed by pid, and a server stop that fails
+    /// does not stop that.
     ///
-    /// A session still `starting` with no process is the owner building the
-    /// prefix: its server is left alone, and the owner sees the request
-    /// before the spawn.
+    /// A session with no process has no server of its own: the owner may be
+    /// building the prefix, and sees the request before the spawn, or the
+    /// server may be `prefix exec`'s. It is left alone.
     ///
     /// # Errors
     ///
     /// Returns a message when the owner holds on past
-    /// [`RunTuning::cancel_wait`] or a process survived.
+    /// [`RunTuning::cancel_wait`], or when a process survived, which leaves a
+    /// row this call would have closed open for the next cancel.
     pub fn run(mut self, report: &mut dyn FnMut(&str, String)) -> Result<SessionRow, CoreError> {
         let row = self.session.clone();
         let tuning = self.core.tuning;
@@ -402,16 +404,6 @@ impl PlannedCancel {
         }
         end_stragglers(&row, &tuning)?;
         let lock = self.wait_for_owner(&row)?;
-        self.core.db()?.end_session(
-            row.id,
-            &SessionEnd {
-                ended_at: &utc_now(),
-                state: SessionState::Cancelled,
-                exit_code: None,
-                note: Some(NOTE_LOST),
-            },
-        )?;
-        drop(lock);
         let left = find_session(&row.session_key);
         if !left.is_empty() {
             let mut names = String::new();
@@ -423,25 +415,38 @@ impl PlannedCancel {
                 row.id
             )));
         }
+        self.core.db()?.end_session(
+            row.id,
+            &SessionEnd {
+                ended_at: &utc_now(),
+                state: SessionState::Cancelled,
+                exit_code: None,
+                note: Some(NOTE_LOST),
+            },
+        )?;
+        drop(lock);
         report("cancelled", format!("session {} ended", row.id));
         self.core.session_row(row.id)
     }
 
-    /// False once the row has closed, since the prefix may then be another
-    /// session's, and while the owner is still building the prefix.
+    /// An open row with a process left. Once the row has closed the prefix
+    /// may be another session's, and with no process the server is not this
+    /// session's to stop.
     fn has_a_session_to_stop(&mut self, row: &SessionRow) -> Result<bool, CoreError> {
         let now = self.core.session_row(row.id)?;
-        Ok(now.ended_at.is_none()
-            && (now.state != SessionState::Starting || !find_session(&row.session_key).is_empty()))
+        Ok(now.ended_at.is_none() && !find_session(&row.session_key).is_empty())
     }
 
     fn wait_for_owner(&self, row: &SessionRow) -> Result<PrefixLock, CoreError> {
-        let deadline = Instant::now() + self.core.tuning.cancel_wait;
+        let tuning = self.core.tuning;
+        let deadline = Instant::now() + tuning.cancel_wait;
         loop {
             match self.core.lock_prefix(&row.prefix) {
                 Ok(lock) => return Ok(lock),
                 Err(error) if busy(&error) && Instant::now() < deadline => {
-                    std::thread::sleep(self.core.tuning.tick);
+                    // A launcher can still fork while its owner waits on it.
+                    end_stragglers(row, &tuning)?;
+                    std::thread::sleep(tuning.tick);
                 }
                 Err(error) if busy(&error) => {
                     return Err(CoreError::Message(format!(
@@ -501,19 +506,22 @@ fn end_title(row: &SessionRow, tuning: &RunTuning) -> Result<(), CoreError> {
 
 /// `SIGKILL` to whatever of the session is left once a server stop has had
 /// [`RunTuning::term_wait`]: a helper that is no client of the server, or
-/// the server itself when it would not stop.
+/// the server itself when it would not stop. Each look kills what it finds,
+/// so what was forked after the last one goes too, until the list is empty
+/// or another [`RunTuning::term_wait`] has passed. What the final look found
+/// is still running, for the caller to report.
 fn end_stragglers(row: &SessionRow, tuning: &RunTuning) -> Result<(), CoreError> {
-    let deadline = Instant::now() + tuning.term_wait;
+    let started = Instant::now();
     loop {
         let left = find_session(&row.session_key);
-        if left.is_empty() {
+        let waited = started.elapsed();
+        if left.is_empty() || waited >= tuning.term_wait * 2 {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if waited >= tuning.term_wait {
             for process in left {
                 process::signal(process.pid, true)?;
             }
-            return Ok(());
         }
         std::thread::sleep(tuning.tick);
     }

@@ -234,9 +234,10 @@ closed: `session.list` has its `exit_code`. The job of `app.cancel` reports
 
 A title's registered `library_dir` is an allowed root at run, so a Steam library
 on another volume works: the exe stays inside the title's install directory,
-that stays inside the library, and `S:` of the title's prefix is the library.
-Everything else Wine is handed stays inside the data directory, and `prefix.exec`
-is still confined to it.
+that stays strictly inside the library, and `S:` of the title's prefix is the
+library the prefix was created with. Everything else Wine is handed stays inside
+the data directory. `prefix exec`, a CLI command and no RPC method, refuses only
+an absolute Unix path outside the data directory.
 
 Only client-free titles run. A title takes the direct path with `drm = none`,
 with `launch_mode = direct` and a `direct_verified_at`, or with `probe_direct`.
@@ -252,7 +253,7 @@ Refused with an error response, before anything starts or any row is written:
 | `NoLaunchExe` | `launch_exe_override` is empty, is not a PE image, or leaves the install directory |
 | `EngineNotInstalled` | No active engine, and none pinned by the game configuration |
 | `AlreadyRunning` | The title has an open session, in this core or another process |
-| `PrefixBusy` | Another operation holds the prefix, or a session whose owner died still runs in it |
+| `PrefixBusy` | Another operation holds the prefix |
 | `PrefixUnusable` | The prefix cannot be opened, or holds DLLs an older engine left |
 
 After the answer, a failure is a `job.failed`: a session that could not start
@@ -307,10 +308,13 @@ no open session. It sends `SIGTERM` to the title, `SIGKILL` three seconds later,
 then waits for the rest of the session and stops the prefix's server if that
 does not leave within ten seconds. `kill_prefix` skips to `<server> -k`. Three
 seconds after a stop, any process still carrying the session id gets `SIGKILL`,
-so a session whose helpers never exit has this way out. The server of a session
-still `starting` with no process is left alone: the owner is building the prefix
-and sees the request before the spawn. When the job ends, no process carries the
-session's `APPLEJACK_SESSION` and the lock is free.
+so a session whose helpers never exit has this way out. That repeats for three
+more seconds, so a process forked meanwhile goes too, and again while the job
+waits for the owner. The server of a session with no process is left alone: the
+owner may be building the prefix, and sees the request before the spawn, or the
+server may be `prefix exec`'s. When the job succeeds, no process carries the
+session's `APPLEJACK_SESSION` and the lock is free. When one survives, the job
+fails and a row with no owner stays open for the next cancel.
 
 The kernel drops the lock when an owner dies, so an open row with a free lock
 is a dead owner's. `hello` and `session.list` settle those rows. A session with

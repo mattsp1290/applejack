@@ -9,6 +9,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -23,7 +25,8 @@ use applejack_core::rpc::{CoreHandler, Handler, PROTOCOL_VERSION};
 use applejack_core::run::{AppRegistration, NOTE_PROBE};
 use applejack_core::runtime::session::{NOTE_ADOPTED, NOTE_LINGERED, NOTE_LOST, RunTuning};
 use applejack_core::{Core, CoreError};
-use applejack_engine::rosetta_wine::process::find_session;
+use applejack_engine::rosetta_wine::process::{find_session, signal};
+use applejack_engine::rosetta_wine::utc_now;
 use applejack_engine::{Error as EngineError, GraphicsBackend, HidrawMode};
 use common::{script, spawn_stub_server, spawn_stub_title, write_stub_bundle, write_title};
 use serde_json::{Value, json};
@@ -73,6 +76,7 @@ impl Fixture {
                 "quick.exe",
                 "launcher.exe",
                 "immortal.exe",
+                "forking.exe",
             ],
         );
         fixture.register(Drm::None, Some("title.exe"));
@@ -363,7 +367,9 @@ fn registration(exe: Option<&str>, library: Option<PathBuf>) -> AppRegistration 
 #[test]
 fn an_installdir_that_is_not_one_name_is_refused_at_register_and_at_run() {
     let fixture = Fixture::new();
-    for bad in ["..", "../..", ".", "/etc", "a/b", "Title/", "a\\\\b"] {
+    for bad in [
+        "", "..", "../..", ".", "/etc", "a/b", "Title/", "a\\\\b", "a\u{1}b",
+    ] {
         manifest_with(
             &fixture,
             "\"installdir\"\t\t\"Title\"",
@@ -384,13 +390,30 @@ fn an_installdir_that_is_not_one_name_is_refused_at_register_and_at_run() {
 fn a_stored_installdir_that_is_not_one_name_is_refused_at_run() {
     let fixture = Fixture::new();
     let mut row = fixture.db().app(APP).unwrap().unwrap();
-    row.installdir = Some("../..".to_owned());
-    fixture.db().upsert_app(&row).unwrap();
+    for bad in ["../..", "", "a\0b", "a\u{1}b"] {
+        row.installdir = Some(bad.to_owned());
+        fixture.db().upsert_app(&row).unwrap();
+        assert_refused(&fixture, ErrorCode::TitleNotInstalled);
+        assert!(
+            plan_error(&fixture)
+                .to_string()
+                .contains("install directory"),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn an_install_dir_that_is_the_library_is_refused_at_run() {
+    let fixture = Fixture::new();
+    let title = fixture.library().join("steamapps/common/Title");
+    fs::remove_dir_all(&title).unwrap();
+    std::os::unix::fs::symlink(fixture.library(), &title).unwrap();
     assert_refused(&fixture, ErrorCode::TitleNotInstalled);
     assert!(
+        plan_error(&fixture).to_string().contains("nothing usable"),
+        "{}",
         plan_error(&fixture)
-            .to_string()
-            .contains("install directory")
     );
 }
 
@@ -451,7 +474,7 @@ fn control_characters_in_a_manifest_name_are_not_stored() {
     manifest_with(
         &fixture,
         "\"name\"\t\t\"Title\"",
-        "\"name\"\t\t\"Ti\u{1b}[31mtle\u{7}\"",
+        "\"name\"\t\t\"Ti\u{1b}[31m\u{202e}tle\u{7}\u{2066}\"",
     );
     let row = fixture
         .core()
@@ -860,6 +883,13 @@ fn a_title_that_ignores_sigterm_is_killed() {
 fn kill_prefix_stops_the_server() {
     let fixture = Fixture::new();
     let running = fixture.start();
+    let key = fixture
+        .db()
+        .session(running.id)
+        .unwrap()
+        .unwrap()
+        .session_key;
+    let mut server = spawn_stub_server(&key, &fixture.prefix_dir());
     let row = fixture
         .core()
         .plan_cancel(APP, true)
@@ -869,6 +899,7 @@ fn kill_prefix_stops_the_server() {
     assert_eq!(row.state, SessionState::Cancelled);
     assert_eq!(row.exit_code, Some(99), "the stub server ended the title");
     assert_eq!(find_session(&row.session_key), []);
+    assert!(server.wait().unwrap().success());
     fixture.assert_lock_free();
     running.finish();
 }
@@ -935,10 +966,41 @@ fn a_cancel_inside_the_launch_window_ends_the_title_it_just_started() {
     });
     let (row, phases) = finish_or_fail(&fixture, running);
     assert_eq!(row.state, SessionState::Cancelled);
-    assert_eq!(row.exit_code, Some(99), "the server stop ended it");
+    assert_eq!(
+        row.exit_code,
+        Some(137),
+        "no server is up yet, so the loader's kill ended it"
+    );
     assert_eq!(phases.last().map(String::as_str), Some("cancelled"));
     assert_eq!(find_session(&row.session_key), []);
     fixture.assert_lock_free();
+}
+
+#[test]
+fn a_cancel_ends_what_a_launcher_forks_while_it_waits_for_the_owner() {
+    let fixture = Fixture::new();
+    fixture.register(Drm::None, Some("forking.exe"));
+    let data = fixture.data();
+    let (sender, starting) = std::sync::mpsc::channel();
+    let running = start_watching(&fixture, FAST, move |phase, id| {
+        if phase == "starting" {
+            let db = ConfigDb::open(&data.join("db.sqlite")).unwrap();
+            db.request_session_cancel(id).unwrap();
+            sender.send(()).unwrap();
+        }
+    });
+    starting.recv_timeout(Duration::from_secs(10)).unwrap();
+    let row = fixture
+        .core()
+        .with_run_tuning(FAST)
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert_eq!(row.state, SessionState::Cancelled);
+    assert_eq!(find_session(&row.session_key), []);
+    fixture.assert_lock_free();
+    finish_or_fail(&fixture, running);
 }
 
 #[test]
@@ -1006,6 +1068,31 @@ fn a_cancel_leaves_the_server_of_a_prefix_still_being_built() {
     let row = plan.run(&mut |_, _| {}).unwrap();
     assert_eq!(row.id, id);
     assert_eq!(row.state, SessionState::Cancelled);
+}
+
+#[test]
+fn a_cancel_of_a_row_with_no_process_leaves_the_server_alone() {
+    let fixture = Fixture::new();
+    let id = orphan_row(&fixture, "run-dead-row");
+    fixture
+        .db()
+        .mark_session_running(id, "2026-11-01T00:00:01Z")
+        .unwrap();
+    let mut server = spawn_stub_server("prefix-exec", &fixture.prefix_dir());
+    let row = fixture
+        .core()
+        .with_run_tuning(SHORT_DRAIN)
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert_eq!(row.state, SessionState::Cancelled);
+    assert!(
+        !fixture.prefix_dir().join("server-quit").exists(),
+        "a cancel stopped a server the session has no part in"
+    );
+    fs::write(fixture.prefix_dir().join("server-quit"), "").unwrap();
+    server.wait().unwrap();
 }
 
 #[test]
@@ -1126,6 +1213,42 @@ fn a_session_that_outlives_its_launcher_stays_open_and_locked_until_it_drains() 
 }
 
 #[test]
+fn a_lingering_session_keeps_its_start_and_ends_when_it_drains() {
+    // Stamps have one second of resolution.
+    const PAST_A_STAMP: Duration = Duration::from_millis(1100);
+    let fixture = Fixture::new();
+    fixture.register(Drm::None, Some("immortal.exe"));
+    let (sender, lingering) = std::sync::mpsc::channel();
+    let running = start_watching(&fixture, SHORT_DRAIN, move |phase, _| {
+        if phase == "lingering" {
+            sender.send(utc_now()).unwrap();
+        }
+    });
+    fixture.wait_for(running.id, SessionState::Running);
+    let at_marker = fixture.db().session(running.id).unwrap().unwrap();
+    thread::sleep(PAST_A_STAMP);
+    fixture.quit(0);
+    let lingered_at = lingering.recv_timeout(Duration::from_secs(10)).unwrap();
+    let row = fixture.db().session(running.id).unwrap().unwrap();
+    assert_eq!(row.state, SessionState::Running);
+    assert_eq!(row.started_at, at_marker.started_at, "the marker's time");
+    thread::sleep(PAST_A_STAMP);
+    for process in find_session(&row.session_key) {
+        signal(process.pid, true).unwrap();
+    }
+    let (end, _) = finish_or_fail(&fixture, running);
+    assert_eq!(end.state, SessionState::Exited);
+    assert_eq!(end.exit_code, Some(0));
+    assert_eq!(end.note.as_deref(), Some(NOTE_LINGERED));
+    assert_eq!(end.started_at, at_marker.started_at);
+    let ended_at = end.ended_at.expect("the row closed");
+    assert!(
+        ended_at > lingered_at,
+        "{ended_at} is when it drained, later than {lingered_at}"
+    );
+}
+
+#[test]
 fn cancel_reaches_the_game_a_launcher_left() {
     let fixture = Fixture::new();
     fixture.register(Drm::None, Some("launcher.exe"));
@@ -1218,6 +1341,7 @@ fn orphan_row(fixture: &Fixture, key: &str) -> i64 {
         .core()
         .prefix_create(PREFIX, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
         .unwrap();
+    let log = fixture.data().join(format!("{key}.log"));
     fixture
         .db()
         .insert_session(&NewSession {
@@ -1225,7 +1349,7 @@ fn orphan_row(fixture: &Fixture, key: &str) -> i64 {
             started_at: "2026-11-01T00:00:00Z",
             engine_id: "rosetta-wine",
             engine_version: "10.0.0",
-            log_path: "/nonexistent/wine.log",
+            log_path: log.to_str().unwrap(),
             session_key: key,
             prefix: PREFIX,
             launch_exe: "title.exe",
@@ -1387,6 +1511,91 @@ fn cancel_ends_a_title_nobody_owns() {
     assert_eq!(find_session("run-cancel-orphan"), []);
     drop(reaper.join().unwrap());
     fixture.assert_lock_free();
+}
+
+/// Keeps starting helpers of the session on its own thread, the way a
+/// watchdog no list has seen yet would, until it is dropped or `for_how_long`
+/// has passed.
+struct Respawner {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Respawner {
+    fn start(fixture: &Fixture, key: &str, for_how_long: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let prefix = fixture.prefix_dir();
+        let key = key.to_owned();
+        let thread = thread::spawn(move || {
+            let mut children: Vec<Child> = Vec::new();
+            let until = Instant::now() + for_how_long;
+            while !stopping.load(Ordering::Relaxed) {
+                if Instant::now() < until {
+                    children.push(spawn_stub_title(&key, &prefix, "helper.exe"));
+                }
+                children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+                thread::sleep(Duration::from_millis(20));
+            }
+            for child in &mut children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Respawner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[test]
+fn cancel_keeps_killing_until_the_session_is_empty() {
+    let fixture = Fixture::new();
+    let id = orphan_row(&fixture, "run-respawn-ends");
+    let mut tuning = SHORT_DRAIN;
+    tuning.term_wait = Duration::from_secs(1);
+    let respawner = Respawner::start(&fixture, "run-respawn-ends", Duration::from_millis(1600));
+    let row = fixture
+        .core()
+        .with_run_tuning(tuning)
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert_eq!(row.id, id);
+    assert_eq!(row.state, SessionState::Cancelled);
+    assert_eq!(find_session("run-respawn-ends"), []);
+    drop(respawner);
+    fixture.assert_lock_free();
+}
+
+#[test]
+fn a_cancel_that_cannot_empty_the_session_leaves_the_row_open() {
+    let fixture = Fixture::new();
+    let id = orphan_row(&fixture, "run-respawn-stays");
+    let respawner = Respawner::start(&fixture, "run-respawn-stays", Duration::from_secs(60));
+    let error = fixture
+        .core()
+        .with_run_tuning(SHORT_DRAIN)
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("still has processes"), "{error}");
+    let row = fixture.db().session(id).unwrap().unwrap();
+    assert_eq!(row.ended_at, None);
+    assert!(row.cancel_requested);
+    drop(respawner);
 }
 
 // Over RPC.

@@ -19,6 +19,7 @@ use applejack_engine::{
 };
 use applejack_steam::{AppManifest, LibraryPaths};
 
+use crate::config::presets::is_unsafe_char;
 use crate::config::{AppRow, Drm, GameConfig, NewSession, SessionEnd, SessionRow, SessionState};
 use crate::engines::META_CPUID_PROBE;
 use crate::error::CoreError;
@@ -475,8 +476,10 @@ impl Core {
     /// its `appmanifest_<appid>.acf`. This is the stand-in for `app.install`,
     /// which writes the same row and takes the exe from the app info. `drm`
     /// is the caller's word: nothing here can probe it. The manifest is not
-    /// trusted, and everything a run would refuse is refused here, with
-    /// nothing written.
+    /// trusted: an appid that is not this title's, an unusable `installdir`,
+    /// and an `exe` a run would refuse are refused here, with nothing
+    /// written. The rest of what a run checks of the disk, such as a complete
+    /// manifest and no download record, is left to the run.
     ///
     /// # Errors
     ///
@@ -560,7 +563,7 @@ fn plain_installdir(text: &str) -> bool {
 
 /// A manifest's `name` reaches terminals and logs.
 fn printable(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).collect()
+    text.chars().filter(|c| !is_unsafe_char(*c)).collect()
 }
 
 fn not_installed(appid: u32, reason: &str) -> CoreError {
@@ -612,9 +615,11 @@ fn installed_dir(app: &AppRow) -> Result<PathBuf, CoreError> {
     Ok(dir)
 }
 
+/// Strictly inside: an install dir linked to the library would make every
+/// title's directory the exe root.
 fn inside(path: &Path, root: &Path) -> bool {
     match (std::fs::canonicalize(path), std::fs::canonicalize(root)) {
-        (Ok(path), Ok(root)) => path.starts_with(root),
+        (Ok(path), Ok(root)) => path != root && path.starts_with(root),
         _ => false,
     }
 }

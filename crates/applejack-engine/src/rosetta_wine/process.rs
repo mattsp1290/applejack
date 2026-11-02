@@ -20,7 +20,9 @@
 //! the exact `NAME=value` entry in `environ` or as the last
 //! `APPLEJACK_SESSION=` entry of `cmd` (the fold always follows the Windows
 //! arguments, so an earlier one is an argument the program was given) and
-//! cuts argv at it before deriving the executable name.
+//! cuts argv at it before deriving the executable name. The fold only hides
+//! that first entry: every Windows process on the payload still has
+//! `WINEPREFIX=` in `environ`, so a match through `cmd` requires it.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -36,6 +38,9 @@ use crate::{Error, Result};
 
 /// The variable process discovery keys on.
 pub const SESSION_VARIABLE: &str = "APPLEJACK_SESSION";
+
+/// In the environment of every process Wine starts.
+const WINE_PREFIX_ENTRY: &[u8] = b"WINEPREFIX=";
 
 /// One Unix process that belongs to a session.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -116,9 +121,11 @@ pub fn find_session(session_id: &str) -> Vec<Process> {
 /// not arguments and take no part in the executable name. So a process of
 /// another session that was given this id as a literal argument is not
 /// matched: its `environ` or its own folded entry names that session. A
-/// same-uid process with no session of its own, under Wine (a sessionless
-/// `cmd.exe`) or not (`pgrep -f APPLEJACK_SESSION=<id>`), whose arguments
-/// end in the exact entry is matched, since nothing else tells it apart.
+/// match through `cmd` also needs `WINEPREFIX=` in `environ`, so a process
+/// outside Wine that names the key (`pgrep -f APPLEJACK_SESSION=<id>`) is
+/// no match, and a cancel cannot kill it. A same-uid Wine process with no
+/// session of its own (a sessionless `cmd.exe`) whose arguments end in the
+/// exact entry is matched, since nothing else tells it apart.
 #[must_use]
 pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> Option<Process> {
     if record.uid != Some(uid) {
@@ -138,7 +145,11 @@ pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> O
         is_session(entry).then_some(record.cmd)?
     } else {
         let at = record.cmd.iter().rposition(names_a_session)?;
-        is_session(&record.cmd[at]).then_some(&record.cmd[..at])?
+        let under_wine = record
+            .environ
+            .iter()
+            .any(|entry| entry.as_bytes().starts_with(WINE_PREFIX_ENTRY));
+        (under_wine && is_session(&record.cmd[at])).then_some(&record.cmd[..at])?
     };
     Some(Process {
         pid: record.pid,

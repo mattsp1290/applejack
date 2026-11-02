@@ -663,7 +663,7 @@ fn process_discovery_accepts_the_session_entry_wine_folds_into_argv() {
         "HOME=/Users/me",
         "STEAM_COMPAT_TOOL=C:\\tool.exe",
     ]);
-    let environ = os(&["PATH=/usr/bin"]);
+    let environ = os(&["PATH=/usr/bin", "WINEPREFIX=/data/prefixes/test"]);
     assert_eq!(
         match_record(&captured_record(&cmd, &environ), id, 501).map(|p| p.exe),
         Some("Game.exe".to_owned())
@@ -689,7 +689,7 @@ fn process_discovery_accepts_the_session_entry_wine_folds_into_argv() {
         &folded,
         "APPLEJACK_SESSION=launch-other",
     ]);
-    let environ = os(&["PATH=/usr/bin"]);
+    let environ = os(&["PATH=/usr/bin", "WINEPREFIX=/data/prefixes/test"]);
     assert_eq!(
         match_record(&captured_record(&cmd, &environ), id, 501),
         None,
@@ -703,6 +703,52 @@ fn process_discovery_accepts_the_session_entry_wine_folds_into_argv() {
     assert_eq!(
         match_record(&captured_record(&cmd, &environ), id, 501).map(|p| p.exe),
         Some("Game.exe".to_owned())
+    );
+}
+
+/// `cmd` holds the fold only for a process of Wine's, and Wine keeps
+/// `WINEPREFIX` in the environment of each process it starts: this is `ping`,
+/// started by `cmd.exe` under a real `prefix exec` (11.0-2, U13c). A process
+/// that only names the key in its arguments is a bystander, and a cancel
+/// kills what is matched here.
+#[test]
+fn a_session_entry_in_argv_counts_only_for_a_process_with_a_wine_prefix() {
+    let id = "launch-18e45b1c653df458-10bb2-0";
+    let folded = format!("{SESSION_VARIABLE}={id}");
+    let cmd = os(&["ping", "-n", "20", "127.0.0.1", &folded]);
+    let environ = os(&[
+        "HOME=/Users/me",
+        "PATH=/data/engines/rosetta-wine/11.0-2/wine/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "TMPDIR=/var/folders/3s/T/",
+        "WINEDLLOVERRIDES=mscoree=;mshtml=;d3d10core,d3d11,dxgi=n,b",
+        "WINEESYNC=1",
+        "WINEPREFIX=/data/prefixes/smoke-wd",
+        "__CF_USER_TEXT_ENCODING=0x1F5:0:0",
+        "WINEPRELOADRESERVE=7ff000000000-7fff00000000",
+        "WINESERVERSOCKET=14",
+        "WINELOADERNOEXEC=1",
+        "ptr_munge=",
+    ]);
+    assert_eq!(
+        match_record(&captured_record(&cmd, &environ), id, 501).map(|p| p.exe),
+        Some("ping".to_owned())
+    );
+
+    let bystander = os(&["/bin/sh", "-c", "sleep 8; echo done", &folded]);
+    assert_eq!(
+        match_record(&captured_record(&bystander, &[]), id, 501),
+        None
+    );
+    let pgrep = os(&["pgrep", "-f", &folded]);
+    let shell = os(&["HOME=/Users/me", "PATH=/usr/bin"]);
+    assert_eq!(
+        match_record(&captured_record(&pgrep, &shell), id, 501),
+        None
+    );
+    let lookalike = os(&["HOME=/Users/me", "WINEPREFIX_OLD=/data/prefixes/test"]);
+    assert_eq!(
+        match_record(&captured_record(&pgrep, &lookalike), id, 501),
+        None
     );
 }
 

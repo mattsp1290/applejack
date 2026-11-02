@@ -505,7 +505,8 @@ const UNSAFE_CHARS: &str =
 /// character (`U+200E`, `U+200F`, `U+202A` to `U+202E`, `U+2066` to
 /// `U+2069`). Either can move the cursor, reverse a line, or forge a report
 /// line, so import refuses them; `Debug` formatting escapes them all.
-fn is_unsafe_char(c: char) -> bool {
+#[must_use]
+pub fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
