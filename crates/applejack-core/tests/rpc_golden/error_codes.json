@@ -1,7 +1,10 @@
 {
+  "AlreadyRunning": 1014,
   "ChecksumMismatch": 1006,
+  "ClientRuntimeUnavailable": 1015,
   "DiskFull": 1008,
   "DownloadFailed": 1009,
+  "DownloadInProgress": 1013,
   "EngineNotInstalled": 1005,
   "HelloRequired": 1001,
   "Internal": 1003,
@@ -11,9 +14,14 @@
   "InvalidRequest": -32600,
   "JobFailed": 1004,
   "MethodNotFound": -32601,
+  "NoLaunchExe": 1016,
   "NotImplemented": 1002,
+  "NotRunning": 1017,
   "ParseError": -32700,
   "PrefixBusy": 1011,
+  "PrefixUnusable": 1019,
   "ProtocolMismatch": 1000,
+  "TitleExitedEarly": 1018,
+  "TitleNotInstalled": 1012,
   "UnsignedEngineRefused": 1010
 }

@@ -14,7 +14,10 @@ use crate::game_config::config_value_text;
 use crate::host::HostFacts;
 use crate::state::Core;
 use jobs::Notifier;
-use methods::{ConfigExportResult, EmptyResult, HelloResult, Method, MethodStatus};
+use methods::{
+    AppCancelParams, AppRunParams, AppRunResult, ConfigExportResult, EmptyResult, HelloResult,
+    Method, MethodStatus, SessionListResult,
+};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 use std::sync::mpsc::Receiver;
@@ -94,15 +97,60 @@ impl CoreHandler {
             .as_mut()
             .map_err(|error| CoreError::DataDir(error.clone()).into())
     }
+
+    fn app_run(&mut self, params: &AppRunParams, notifier: &Notifier) -> Result<Value, RpcError> {
+        let plan = self.core()?.plan_run(params.appid, params.probe_direct)?;
+        let id = plan.session_id();
+        let log_path = plan.log_path().to_owned();
+        let started = notifier.start_job(move |job| {
+            plan.run(&mut |phase, message| job.progress(phase, None, None, message))?;
+            Ok(())
+        })?;
+        to_result(&AppRunResult {
+            id,
+            log_path,
+            job_id: started.job_id,
+        })
+    }
+
+    fn app_cancel(
+        &mut self,
+        params: &AppCancelParams,
+        notifier: &Notifier,
+    ) -> Result<Value, RpcError> {
+        let plan = self.core()?.plan_cancel(params.appid, params.kill_prefix)?;
+        to_result(&notifier.start_job(move |job| {
+            plan.run(&mut |phase, message| job.progress(phase, None, None, message))?;
+            Ok(())
+        })?)
+    }
+
+    /// Closes sessions whose core died and takes over those whose title
+    /// still runs. Best effort: `hello` must answer with a broken data
+    /// directory, and the rows wait for the next call.
+    fn adopt_sessions(&mut self, notifier: &Notifier) {
+        let Ok(core) = self.core.as_mut() else {
+            return;
+        };
+        for adopted in core.reconcile_sessions().unwrap_or_default() {
+            let _ = notifier.start_job(move |job| {
+                adopted.watch(&mut |phase, message| job.progress(phase, None, None, message))?;
+                Ok(())
+            });
+        }
+    }
 }
 
 impl Handler for CoreHandler {
     fn handle(&mut self, method: &Method, notifier: &Notifier) -> Result<Value, RpcError> {
         match method {
-            Method::Hello(_) => to_result(&HelloResult {
-                protocol_version: PROTOCOL_VERSION,
-                core_version: env!("CARGO_PKG_VERSION").to_owned(),
-            }),
+            Method::Hello(_) => {
+                self.adopt_sessions(notifier);
+                to_result(&HelloResult {
+                    protocol_version: PROTOCOL_VERSION,
+                    core_version: env!("CARGO_PKG_VERSION").to_owned(),
+                })
+            }
             Method::HostDoctor(_) => to_result(&HostFacts::gather()),
             Method::EngineList(_) => to_result(&self.core()?.engine_list()?),
             Method::EngineInstall(params) => {
@@ -181,6 +229,14 @@ impl Handler for CoreHandler {
                     );
                     Ok(())
                 })?)
+            }
+            Method::AppRun(params) => self.app_run(params, notifier),
+            Method::AppCancel(params) => self.app_cancel(params, notifier),
+            Method::SessionList(params) => {
+                self.adopt_sessions(notifier);
+                to_result(&SessionListResult {
+                    sessions: self.core()?.session_list(params.appid)?,
+                })
             }
             pending => Err(not_implemented(pending)),
         }

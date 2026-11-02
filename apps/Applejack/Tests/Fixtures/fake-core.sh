@@ -110,7 +110,7 @@ implemented() {
       job 7
       ;;
     app.run)
-      response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":"fake-session","log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
+      response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":41,"job_id":12,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
       if [ -n "${FAKE_CORE_RUN_DELAY_MS:-}" ]; then
         seconds=$(awk -v ms="$FAKE_CORE_RUN_DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
         ( sleep "$seconds"; write "$response" ) &
@@ -164,7 +164,7 @@ implemented() {
       esac
       ;;
     session.list)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"sessions":[{"id":1,"appid":220,"started_at":"2026-10-30T00:00:00Z","ended_at":null,"engine_id":"rosetta-wine","engine_version":"10.0.1","exit_code":null,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}]}}'
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"sessions":[{"id":1,"appid":220,"started_at":"2026-10-30T00:00:00Z","ended_at":null,"engine_id":"rosetta-wine","engine_version":"10.0.1","exit_code":null,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'","state":"running","session_key":"fake-session","prefix":"220","launch_exe":"hl2.exe","note":null,"cancel_requested":false}]}}'
       ;;
     *)
       return 1

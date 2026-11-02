@@ -1,10 +1,12 @@
 //! Subcommand implementations. Each module exposes a clap `Args` type and a
 //! `run` function returning the process exit code.
 
+pub mod app;
 pub mod config;
 pub mod engine;
 pub mod prefix;
 pub mod serve;
+pub mod session;
 
 use std::io::{self, Write};
 use std::process::ExitCode;

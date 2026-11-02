@@ -481,6 +481,46 @@ Dropping a `Session` reaps the loader if it has already exited and does not
 wait otherwise; the core keeps a session until `wait` or `cancel` has
 returned.
 
+`spec.session_id` names the session when the caller has to know it before the
+spawn; the core writes it to the `sessions` row first. A launch with none gets
+a fresh id. A process that holds no `Session`, because another process launched
+the title or the launcher died, stops a prefix with
+`RosettaWine::stop_server(installed, prefix_dir, log)`, the same `-k` and `-w`.
+
+The launch header in `wine.log` gives a title's argument count and never the
+arguments, which come from a per-game setting and are where passwords go. It
+names a dropped variable and never its value, a rejected path included.
+
+### Sessions in the core
+
+`applejack app run <appid>` (`applejack run` is the same command) launches a
+client-free title in its own prefix, named after the appid and created on
+first use with drive `S:` on the title's library. The exe is the absolute Unix
+path, reached through `Z:`, with the cwd in its directory. Before the launch
+the core waits out a server from the last run and applies any setting the
+configuration changed, since `apply_overrides` refuses while a server is up; an
+engine change takes a snapshot first.
+
+The game-running marker in direct mode is a process of the session whose
+executable name is the launch exe, case-insensitively, looked for twice a second.
+Two looks in a row without it end the title: a read can miss a process
+mid-`exec`. The `wineserver` and Wine's own services (`services.exe`,
+`explorer.exe`, ...) carry the session id too, so they are not the marker; they
+are what the end then waits for before the row closes and the lock goes. That
+wait has no bound, so a launcher that starts the game and exits leaves a session
+that is still open, locked, and cancellable. Past ten seconds it reports
+`lingering`, and it closes with a note and no early-exit verdict. `exit_code`
+stays the launch exe's status. A session whose helpers never exit stays open
+until `app cancel`, which ends with `SIGKILL` for what a server stop leaves.
+
+The process table cannot be read for platform binaries: macOS hides their
+environment from `KERN_PROCARGS2`, so `/bin/sh` and `/bin/sleep` never show up
+under a session, which is why the tests' stub title is a test binary.
+
+`sessions` rows, states, and what each process sees of the others are in
+`docs/rpc-protocol.md` under Sessions, and in
+`crates/applejack-core/src/runtime/session.rs`.
+
 ## Process discovery
 
 Wine passes the environment to every Windows process it starts, so
@@ -518,10 +558,15 @@ its truncated argv can end in an argument). Only without one does the last
 `APPLEJACK_SESSION=` entry of `cmd` decide (the fold always follows the
 Windows arguments, so an earlier such entry is an argument the program was
 given), and argv is cut at it before deriving `exe`. Either way a literal of
-another session's id in a game's argv does not attribute the process. A
-same-uid process with no session of its own whose arguments end in the exact
-entry is reported, under Wine (a sessionless `cmd.exe`) or not
-(`pgrep -f APPLEJACK_SESSION=<id>`); nothing in the record tells it apart.
+another session's id in a game's argv does not attribute the process. A match
+through `cmd` also needs `WINEPREFIX=` in `environ`: the fold hides only the
+first entry, and the Windows processes of a live `prefix exec` on 11.0-2
+(`services.exe`, `explorer.exe`, `cmd.exe`, and the `ping` it started among
+them) keep it, while a `pgrep -f APPLEJACK_SESSION=<id>` with no such variable
+does not, and a cancel kills what is matched. A same-uid process with
+`WINEPREFIX` set and no session of its own (a sessionless `cmd.exe`, or a shell
+with the variable exported) whose last such entry is the exact one is matched;
+nothing in the record tells it apart.
 The loader process itself
 (`session.pid`) keeps its Unix argv for the first moments, until Wine
 rewrites it too (to the title's Windows command line, or to
@@ -683,7 +728,10 @@ call the same ones. The `meta` and `engine_versions` writes are the core's.
 | `applejack prefix list-snapshots <name>` | `snapshot::list`, oldest first. Works for a prefix that is gone |
 | `applejack prefix remove <name>` | Deletes the prefix and Wine's `server-*` directory for it; snapshots stay, and `restore` brings the prefix back from one. `remove` takes no snapshot of its own |
 | `applejack prefix exec <name> -- <exe> [args]` | `Engine::launch` with the bundle that last touched the prefix; streams the session log and exits with the child's code. Development only |
-| `applejack run <appid>` | `RosettaWine::launch`, then `Session::{wait, cancel, processes, wineserver_alive}` |
+| `applejack app run <appid> [--probe-direct]`, or `applejack run <appid>` | `Core::plan_run`, then `PlannedRun::run`, which stays until the session ends. Exits with the launch exe's status, with 1 when none is known, and with 1 for an early exit, which still prints the row on stdout. `SIGINT` and `SIGTERM` cancel it. Progress goes to stderr, and a closed pipe does not end the run |
+| `applejack app cancel <appid> [--kill-prefix]` | `Core::plan_cancel`, then `PlannedCancel::run`, for a session started anywhere |
+| `applejack app register <appid> [--drm d] [--exe <file>] [--library <dir>]` | Writes the `apps` row from `<library>/steamapps/appmanifest_<appid>.acf` and `launch_exe_override`, until `app.install` writes both. The library is canonicalized, may be on any volume, must be absolute and exist, and defaults to `<data>/library`. The manifest is not trusted: its `appid` must match, its `installdir` must be one plain directory name, control and bidirectional formatting characters leave its `name`, and `--exe` must pass the checks a run makes of the exe. The rest of what a run checks, such as a complete manifest and no download record, is left to the run. `--drm` is the caller's word, and a title registered again keeps its value without it |
+| `applejack session list [--appid n] [--json]` | `Core::session_list`, after settling sessions nobody owns |
 
 A directory passed to `--from` is packed to
 `engines/<id>/<version>.local.tar.zst` first, so it takes the same hashing,
@@ -709,6 +757,15 @@ behind.
 
 ## Known limits
 
+- `--probe-direct` runs a title but never writes `direct_verified_at`: that
+  takes the frame probe's game-owned window, and a title can stay up behind a
+  "start Steam" dialog. The early-exit check has no window to look at either, so
+  it is by time alone.
+- The direct marker follows the launch exe only, so a launcher that exits and
+  leaves its game running gives the launcher's `exit_code`, and the row reports
+  `lingering` while the game plays.
+- A running title holds its prefix, not its files: nothing stops a depot update
+  of a running direct title until `app.install` checks for an open session.
 - Wine Mono and Gecko are never installed; .NET titles and embedded
   browsers that need them do not work in this engine.
 - msync is not in the payload: the payload build's gate G4b (the msync

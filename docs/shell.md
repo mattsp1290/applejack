@@ -156,14 +156,13 @@ Flows that need an answer before the core sends a request:
   preset's overrides.
 
 Run with log tail: "Run" in the game detail sends `app.run` (`AppRunResult`:
-`id` and `log_path`, the shell's proposal until work package 5 defines the
-result, named after the engine's `Session` fields). One run is in flight
-per title at a time; the button is disabled meanwhile. When the result
-names a `log_path` and the user is still on the detail, the shell switches
+`id`, `log_path`, and the `job_id` that reports the session). The button is
+disabled only until the core answers, which it does before the title is on
+screen. If the user is still on the detail then, the shell switches
 to Logs and follows it; the library's navigation path lives in
-`ShellModels`, so returning to Library lands on the same detail. `app.run`
-is `NotImplemented` until work package 5, so today the action renders the
-unavailable state.
+`ShellModels`, so returning to Library lands on the same detail. The core
+refuses a second launch of a running title with `AlreadyRunning`. The shell
+does not yet follow the job or offer `app.cancel`.
 
 Logs: `session.list` names each session's `log_path`; `LogsViewModel`
 follows it with `LogTailer` (a polling file reader, so a log that does not

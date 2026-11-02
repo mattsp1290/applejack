@@ -2,7 +2,9 @@
 //! parameters, and whether its work package has landed. Adding a method means
 //! adding one row to `methods!` and one example to [`Method::examples`].
 
+use super::jobs::JobId;
 use super::wire::{ErrorCode, RpcError};
+use crate::config::SessionRow;
 pub use crate::engines::{CpuidProbeResult, D3dmetalImportResult, EngineEntry, EngineListResult};
 pub use crate::game_config::ConfigImportResult;
 use crate::host::HostFacts;
@@ -68,8 +70,8 @@ methods! {
     SteamLogout = "steam.logout": SteamLogoutParams => pending("4");
     SteamLibrary = "steam.library": SteamLibraryParams => pending("4");
     AppInstall = "app.install": AppInstallParams => pending("4");
-    AppRun = "app.run": AppRunParams => pending("5");
-    AppCancel = "app.cancel": AppCancelParams => pending("5");
+    AppRun = "app.run": AppRunParams => IMPLEMENTED;
+    AppCancel = "app.cancel": AppCancelParams => IMPLEMENTED;
     RuntimeSteamInstall = "runtime.steam.install": RuntimeSteamInstallParams => pending("5");
     RuntimeSteamUpdate = "runtime.steam.update": RuntimeSteamUpdateParams => pending("5");
     RuntimeSteamRepair = "runtime.steam.repair": RuntimeSteamRepairParams => pending("5");
@@ -81,7 +83,7 @@ methods! {
     PrefixSnapshot = "prefix.snapshot": PrefixSnapshotParams => IMPLEMENTED;
     PrefixRestore = "prefix.restore": PrefixRestoreParams => IMPLEMENTED;
     PrefixReset = "prefix.reset": PrefixResetParams => IMPLEMENTED;
-    SessionList = "session.list": SessionListParams => pending("5");
+    SessionList = "session.list": SessionListParams => IMPLEMENTED;
 }
 
 impl Method {
@@ -332,6 +334,18 @@ pub struct AppRunParams {
     pub probe_direct: bool,
 }
 
+/// The answer to `app.run`, once the session is claimed and before the title
+/// is on screen. The session's state changes arrive as `job.progress` on
+/// `job_id`, and its end as `job.done` or `job.failed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppRunResult {
+    /// The `sessions` row.
+    pub id: i64,
+    pub log_path: String,
+    pub job_id: JobId,
+}
+
 /// Ends a running title; the whole prefix (`wineserver -k`) only on request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -415,6 +429,13 @@ pub struct PrefixResetParams {
 #[serde(deny_unknown_fields)]
 pub struct SessionListParams {
     pub appid: Option<u32>,
+}
+
+/// The result of `session.list`, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionListResult {
+    pub sessions: Vec<SessionRow>,
 }
 
 #[cfg(test)]

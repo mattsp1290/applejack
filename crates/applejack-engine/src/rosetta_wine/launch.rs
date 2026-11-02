@@ -145,7 +145,8 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `<kind>-<unix-nanos hex>-<pid hex>-<counter>`: unique on the host, so
 /// process discovery never matches a stale environment.
-pub(crate) fn new_session_id(kind: &str) -> String {
+#[must_use]
+pub fn new_session_id(kind: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
@@ -176,16 +177,23 @@ fn render(program: &Path, args: &[&OsStr]) -> String {
     text
 }
 
+/// `shown` replaces the arguments in the log line: a title's arguments come
+/// from a per-game setting, and passwords and tokens go there in practice.
 fn spawn_logged(
     program: &Path,
     args: &[&OsStr],
+    shown: Option<&str>,
     env: &[EnvPair],
     cwd: &Path,
     log: &Path,
     header: &[String],
 ) -> Result<std::process::Child> {
     let mut file = open_log(log)?;
-    let mut lines = vec![format!("[applejack] run: {}", render(program, args))];
+    let line = shown.map_or_else(
+        || render(program, args),
+        |text| format!("{} {text}", program.display()),
+    );
+    let mut lines = vec![format!("[applejack] run: {line}")];
     lines.extend(header.iter().cloned());
     for line in lines {
         writeln!(file, "{line}").map_err(|error| Error::io(log, error))?;
@@ -256,7 +264,7 @@ pub(crate) fn run_loader(
 ) -> Result<()> {
     let loader = installed.root.join(&installed.bundle.wine.loader);
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    let mut child = spawn_logged(&loader, &args, env, cwd, log, &[])?;
+    let mut child = spawn_logged(&loader, &args, None, env, cwd, log, &[])?;
     let pid = child.id();
     let Some(status) = wait_bounded(&mut child, &loader, timeout)? else {
         return Err(timed_out(render(&loader, &args), timeout, log, pid));
@@ -317,7 +325,15 @@ fn server_command(
             prefix_dir.as_os_str().to_owned(),
         ),
     ];
-    spawn_logged(server, &[OsStr::new(flag)], &env, prefix_dir, log, &[])
+    spawn_logged(
+        server,
+        &[OsStr::new(flag)],
+        None,
+        &env,
+        prefix_dir,
+        log,
+        &[],
+    )
 }
 
 /// `<server> -k` then `<server> -w` bounded by [`KILL_WAIT`], so the caller
@@ -367,7 +383,10 @@ pub(crate) fn spawn(
     }
     check_32bit(installed, &prefix.dir, &spec.cwd, &spec.exe)?;
     check_dxmt_copies(&prefix.dir, prefix.backend)?;
-    let id = new_session_id("launch");
+    let id = spec
+        .session_id
+        .clone()
+        .unwrap_or_else(|| new_session_id("launch"));
     let log_path = spec.log_dir.join(&id).join("wine.log");
     let rows = engine_rows(
         installed,
@@ -387,18 +406,32 @@ pub(crate) fn spawn(
             drop.from != env::Owner::Host || drop.reason != env::DropReason::NotAllowlisted
         })
         .map(|drop| {
+            // Names only: the value of a rejected path variable came from a
+            // per-game setting, and this file gets pasted into bug reports.
+            let reason = match drop.reason {
+                env::DropReason::OutsideRoots { .. } => "fails the row's path check".to_owned(),
+                ref other => other.to_string(),
+            };
             format!(
-                "[applejack] dropped {} from {:?} tier: {}",
+                "[applejack] dropped {} from {:?} tier: {reason}",
                 drop.name.to_string_lossy(),
                 drop.from,
-                drop.reason
             )
         })
         .collect();
     let loader = installed.root.join(&installed.bundle.wine.loader);
     let mut args: Vec<&OsStr> = vec![spec.exe.as_os_str()];
     args.extend(spec.args.iter().map(OsString::as_os_str));
-    let child = spawn_logged(&loader, &args, &env, &spec.cwd, &log_path, &header)?;
+    let shown = format!("{} ({} arguments)", spec.exe.display(), spec.args.len());
+    let child = spawn_logged(
+        &loader,
+        &args,
+        Some(&shown),
+        &env,
+        &spec.cwd,
+        &log_path,
+        &header,
+    )?;
     let path = env
         .iter()
         .find(|(name, _)| name == "PATH")

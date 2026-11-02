@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::prefix::{LIBRARY_DRIVE, backend_available};
-use applejack_engine::rosetta_wine::process::{server_socket, wineserver_running};
+use applejack_engine::rosetta_wine::process::{find_session, server_socket, wineserver_running};
 use applejack_engine::rosetta_wine::snapshot::PrefixLock;
 use applejack_engine::rosetta_wine::{Snapshot, snapshot};
 use applejack_engine::{
@@ -87,11 +87,11 @@ impl Core {
         self.data_dir().join(PREFIXES_DIR)
     }
 
-    fn snapshots_root(&self) -> PathBuf {
+    pub(crate) fn snapshots_root(&self) -> PathBuf {
         self.prefixes_root().join(SNAPSHOTS_DIR)
     }
 
-    fn prefix_dir(&self, name: &str) -> Result<PathBuf, CoreError> {
+    pub(crate) fn prefix_dir(&self, name: &str) -> Result<PathBuf, CoreError> {
         snapshot::check_name(name)?;
         Ok(self.prefixes_root().join(name))
     }
@@ -99,9 +99,28 @@ impl Core {
     /// Taken first by every operation that changes or runs in a prefix,
     /// before anything looks at the directory: a reset in progress has
     /// removed it.
-    fn lock_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
+    pub(crate) fn lock_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
         let dir = self.prefix_dir(name)?;
         Ok(PrefixLock::acquire(&dir, &self.snapshots_root(), name)?)
+    }
+
+    /// [`Core::lock_prefix`] for the operations that are not sessions. A free
+    /// lock is not enough: a session whose owner died still runs in the
+    /// prefix, and without this each operation would stall in
+    /// [`Core::settle`] and answer `PrefixUnusable`.
+    pub(crate) fn lock_idle_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
+        let lock = self.lock_prefix(name)?;
+        let open = self.detached().reading(|db| Ok(db.open_sessions()?))?;
+        let live = open
+            .iter()
+            .any(|row| row.prefix == name && !find_session(&row.session_key).is_empty());
+        if live {
+            return Err(EngineError::PrefixBusy {
+                name: name.to_owned(),
+            }
+            .into());
+        }
+        Ok(lock)
     }
 
     /// Locks a prefix that exists. The lock travels with the work, so a
@@ -113,12 +132,12 @@ impl Core {
     /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], or a
     /// prefix that does not open.
     pub fn claim_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
-        let lock = self.lock_prefix(name)?;
+        let lock = self.lock_idle_prefix(name)?;
         self.open_prefix(name)?;
         Ok(lock)
     }
 
-    fn open_prefix(&self, name: &str) -> Result<(PathBuf, Prefix), CoreError> {
+    pub(crate) fn open_prefix(&self, name: &str) -> Result<(PathBuf, Prefix), CoreError> {
         let dir = self.prefix_dir(name)?;
         if !dir.is_dir() {
             return Err(CoreError::UnknownPrefix {
@@ -138,7 +157,7 @@ impl Core {
 
     /// Waits out a lingering `wineserver`; a server still there after
     /// [`SERVER_SETTLE`] belongs to something running.
-    fn settle(dir: &Path) -> Result<(), CoreError> {
+    pub(crate) fn settle(dir: &Path) -> Result<(), CoreError> {
         let deadline = Instant::now() + SERVER_SETTLE;
         while wineserver_running(dir)? {
             if Instant::now() >= deadline {
@@ -168,16 +187,30 @@ impl Core {
         sync_mode: Option<SyncMode>,
         hidraw: HidrawMode,
     ) -> Result<PrefixEntry, CoreError> {
-        let _lock = self.lock_prefix(name)?;
-        let dir = self.prefix_dir(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let installed = self.require_active_engine()?;
-        let sync_mode = pick_sync(&installed, sync_mode)?;
         let library = self.library_dir()?;
+        let prefix = self.build_prefix(name, &installed, backend, sync_mode, hidraw, library)?;
+        Ok(PrefixEntry::of(name, &prefix.dir, &prefix))
+    }
+
+    /// Builds a prefix the caller holds the lock of, with `library` as drive
+    /// `S:`.
+    pub(crate) fn build_prefix(
+        &self,
+        name: &str,
+        installed: &InstalledEngine,
+        backend: GraphicsBackend,
+        sync_mode: Option<SyncMode>,
+        hidraw: HidrawMode,
+        library: PathBuf,
+    ) -> Result<Prefix, CoreError> {
+        let dir = self.prefix_dir(name)?;
+        let sync_mode = pick_sync(installed, sync_mode)?;
         let root = self.prefixes_root();
         fs::create_dir_all(&root).map_err(|error| CoreError::io(&root, error))?;
         let spec = self.prefix_spec(backend, sync_mode, hidraw, library);
-        let prefix = self.engine.create_prefix(&installed, &dir, &spec)?;
-        Ok(PrefixEntry::of(name, &dir, &prefix))
+        Ok(self.engine.create_prefix(installed, &dir, &spec)?)
     }
 
     fn prefix_spec(
@@ -255,7 +288,7 @@ impl Core {
     /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], a server
     /// that does not leave, or the copy failure.
     pub fn prefix_snapshot(&self, name: &str) -> Result<SnapshotResult, CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let (dir, _) = self.open_prefix(name)?;
         Self::settle(&dir)?;
         Ok(snapshot::create(&dir, &self.snapshots_root(), name)?.into())
@@ -271,7 +304,7 @@ impl Core {
     /// with neither a prefix nor a snapshot, [`EngineError::SnapshotNotFound`],
     /// a server that does not leave, or the copy or swap failure.
     pub fn prefix_restore(&self, name: &str, timestamp: &str) -> Result<SnapshotResult, CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let dir = self.prefix_dir(name)?;
         if dir.is_dir() {
             Self::settle(&dir)?;
@@ -349,7 +382,7 @@ impl Core {
     /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], a server
     /// that does not leave, or the removal failure.
     pub fn prefix_remove(&self, name: &str) -> Result<(), CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let dir = self.prefix_dir(name)?;
         if !dir.is_dir() {
             return Err(CoreError::UnknownPrefix {
@@ -384,11 +417,12 @@ impl Core {
         args: &[OsString],
         out: &mut dyn Write,
     ) -> Result<i32, CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let (dir, prefix) = self.open_prefix(name)?;
         self.check_inside_data(exe)?;
         let installed = self.prefix_engine(&prefix)?;
         let spec = LaunchSpec {
+            session_id: None,
             exe: exe.to_path_buf(),
             args: args.to_vec(),
             env_extras: Vec::new(),
@@ -419,7 +453,7 @@ impl Core {
         )?)
     }
 
-    fn check_inside_data(&self, exe: &Path) -> Result<(), CoreError> {
+    pub(crate) fn check_inside_data(&self, exe: &Path) -> Result<(), CoreError> {
         if !exe.is_absolute() {
             return Ok(());
         }
@@ -434,7 +468,7 @@ impl Core {
     }
 }
 
-fn pick_sync(
+pub(crate) fn pick_sync(
     installed: &InstalledEngine,
     requested: Option<SyncMode>,
 ) -> Result<SyncMode, CoreError> {
@@ -466,7 +500,7 @@ fn copy_new(log: &Path, offset: &mut u64, out: &mut dyn Write) -> Result<(), Cor
     Ok(())
 }
 
-fn exit_code(status: std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
         .code()

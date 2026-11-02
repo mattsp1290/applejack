@@ -14,6 +14,10 @@ pub mod env;
 /// What to run inside a prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
+    /// Value of `APPLEJACK_SESSION`, for a caller that has to know it before
+    /// the spawn (the core writes it to the session row first); a fresh one
+    /// when `None`. Must be unique on the host.
+    pub session_id: Option<String>,
     /// Windows executable path (Wine path syntax or a path under a mapped
     /// drive) or the Steam client when `args` select it.
     pub exe: PathBuf,

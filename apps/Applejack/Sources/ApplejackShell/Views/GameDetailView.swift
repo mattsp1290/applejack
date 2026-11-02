@@ -126,11 +126,7 @@ public struct GameDetailView: View {
     @ViewBuilder
     private var runStatus: some View {
         FlowStateView(model.runState, idle: "", retry: { Task { await runAndFollowLog() } }) { result in
-            if let path = result.logPath {
-                Text("Launched; the log is at \(path).").foregroundStyle(.secondary)
-            } else {
-                Text("Launched.").foregroundStyle(.secondary)
-            }
+            Text("Launched; the log is at \(result.logPath).").foregroundStyle(.secondary)
         }
     }
 }

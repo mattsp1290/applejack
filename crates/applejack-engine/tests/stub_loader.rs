@@ -79,6 +79,7 @@ fn spec(dir: &Path, backend: GraphicsBackend) -> PrefixSpec {
 
 fn launch_spec(prefix_dir: &Path, logs: &Path, extras: &[(&str, &str)]) -> LaunchSpec {
     LaunchSpec {
+        session_id: None,
         exe: PathBuf::from("game.exe"),
         args: Vec::new(),
         env_extras: extras

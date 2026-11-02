@@ -1,10 +1,11 @@
 use std::process::Command;
 
-const SUBCOMMANDS: [&str; 9] = [
-    "engine", "steam", "install", "run", "config", "prefix", "runtime", "serve", "doctor",
+const SUBCOMMANDS: [&str; 11] = [
+    "engine", "steam", "install", "run", "app", "session", "config", "prefix", "runtime", "serve",
+    "doctor",
 ];
 
-const STUBS: [&str; 4] = ["steam", "install", "run", "runtime"];
+const STUBS: [&str; 3] = ["steam", "install", "runtime"];
 
 const DOCTOR_KEYS: [&str; 6] = [
     "macos_version",

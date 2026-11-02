@@ -2,13 +2,14 @@
 //! `docs/rpc-protocol.md` are generated from the Rust types and must match
 //! what is committed. `APPLEJACK_UPDATE_GOLDENS=1` rewrites both.
 
-use applejack_core::config::{GameConfig, GraphicsBackend, SyncMode};
+use applejack_core::config::{GameConfig, GraphicsBackend, SessionRow, SessionState, SyncMode};
 use applejack_core::host::{HostFacts, ScreenRecordingState};
 use applejack_core::rpc::PROTOCOL_VERSION;
 use applejack_core::rpc::jobs::{JobDone, JobFailed, JobId, JobProgress, JobStarted};
 use applejack_core::rpc::methods::{
-    ConfigExportResult, ConfigImportResult, CpuidProbeResult, D3dmetalImportResult, EmptyResult,
-    EngineEntry, EngineListResult, HelloResult, Method, MethodStatus, SnapshotResult,
+    AppRunResult, ConfigExportResult, ConfigImportResult, CpuidProbeResult, D3dmetalImportResult,
+    EmptyResult, EngineEntry, EngineListResult, HelloResult, Method, MethodStatus,
+    SessionListResult, SnapshotResult,
 };
 use applejack_core::rpc::wire::{ErrorCode, Id, Notification, Request, Response};
 use applejack_engine::rosetta_wine::{CpuidFeatures, CpuidProbe};
@@ -83,6 +84,7 @@ fn expected() -> BTreeMap<String, String> {
     );
     files.insert("empty.result.json".to_owned(), pretty(&empty));
     results(&mut files);
+    session_results(&mut files);
     notifications(&mut files);
     let codes: BTreeMap<&str, i64> = ErrorCode::ALL
         .into_iter()
@@ -195,6 +197,45 @@ fn results(files: &mut BTreeMap<String, String>) {
             confirmations: vec![applejack_core::config::Confirmation {
                 field: "launch_exe_override".to_owned(),
                 value: "game.exe".to_owned(),
+            }],
+        }),
+    );
+}
+
+fn session_results(files: &mut BTreeMap<String, String>) {
+    let mut add = |name: &str, response: &Response| {
+        files.insert(format!("{name}.result.json"), pretty(response));
+    };
+    add(
+        "app.run",
+        &result_response(&AppRunResult {
+            id: 12,
+            log_path: "/data/logs/run-19a-1f-0/wine.log".to_owned(),
+            job_id: JobId(7),
+        }),
+    );
+    add(
+        "app.cancel",
+        &result_response(&JobStarted { job_id: JobId(8) }),
+    );
+    add(
+        "session.list",
+        &result_response(&SessionListResult {
+            sessions: vec![SessionRow {
+                id: 12,
+                appid: 220,
+                started_at: "2026-11-01T12:00:05Z".to_owned(),
+                ended_at: Some("2026-11-01T13:00:00Z".to_owned()),
+                engine_id: "rosetta-wine".to_owned(),
+                engine_version: "11.0-2".to_owned(),
+                exit_code: Some(0),
+                log_path: "/data/logs/run-19a-1f-0/wine.log".to_owned(),
+                state: SessionState::Exited,
+                session_key: "run-19a-1f-0".to_owned(),
+                prefix: "220".to_owned(),
+                launch_exe: "hl2.exe".to_owned(),
+                note: Some("exited early: the title may require the Steam client".to_owned()),
+                cancel_requested: false,
             }],
         }),
     );

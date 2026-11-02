@@ -225,7 +225,7 @@ final class ViewModelTests: XCTestCase {
         let app = makeApp(environment: ["FAKE_CORE_SESSION_LOG": log.path])
         let detail = GameDetailViewModel(app: app, appid: 220)
         await detail.run()
-        XCTAssertEqual(detail.runState.value, AppRunResult(id: .string("fake-session"), logPath: log.path))
+        XCTAssertEqual(detail.runState.value, AppRunResult(id: 41, logPath: log.path, jobId: 12))
         XCTAssertTrue(try requests(for: "app.run")[0].contains("\"params\":{\"appid\":220,\"probe_direct\":false}"))
         await app.shutdown()
 
