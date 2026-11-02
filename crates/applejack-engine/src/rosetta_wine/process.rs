@@ -150,11 +150,14 @@ pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> O
 /// The Windows executable's file name (Wine accepts both `\` and `/`
 /// separators): argv\[0\] when it names a `.exe` other than `start.exe`
 /// (after Wine's rewrite argv\[0\] is the process's own image, so
-/// `launcher.exe --run patcher.exe` is `launcher.exe`); else the first
-/// later argv entry naming a `.exe` (`wine Z:\g\game.exe` before the
-/// rewrite, and `start.exe /exec title.exe`, which is about to become
-/// `title.exe`), so a program's own arguments do not name it in those forms
-/// either; else argv\[0\]'s file name; else the exec path's file name.
+/// `launcher.exe --run patcher.exe` is `launcher.exe`); else, when argv\[0\]
+/// is a Unix path or `start.exe`, the first later argv entry naming a `.exe`
+/// (`wine Z:\g\game.exe` before the rewrite, and `start.exe /exec
+/// title.exe`, which is about to become `title.exe`), so a program's own
+/// arguments do not name it in those forms either; else argv\[0\]'s file
+/// name; else the exec path's file name. A process Wine started by a bare
+/// name (`ping -n 8 Title.exe`) is `ping`: this name is the game-running
+/// marker, and an argument must not pass for the title.
 #[must_use]
 pub fn executable_name(cmd: &[OsString], exe: Option<&Path>) -> String {
     let is_exe = |arg: &OsString| {
@@ -164,8 +167,16 @@ pub fn executable_name(cmd: &[OsString], exe: Option<&Path>) -> String {
     let own_image = cmd
         .first()
         .filter(|arg| is_exe(arg) && !windows_file_name(arg).eq_ignore_ascii_case("start.exe"));
+    let names_a_later_exe = cmd.first().is_some_and(|arg| {
+        arg.as_bytes().first() == Some(&b'/')
+            || windows_file_name(arg).eq_ignore_ascii_case("start.exe")
+    });
     let chosen = own_image
-        .or_else(|| cmd.iter().skip(1).find(|arg| is_exe(arg)))
+        .or_else(|| {
+            cmd.iter()
+                .skip(1)
+                .find(|arg| names_a_later_exe && is_exe(arg))
+        })
         .or_else(|| cmd.first())
         .map(|arg| windows_file_name(arg.as_os_str()))
         .or_else(|| {
@@ -182,6 +193,30 @@ fn windows_file_name(arg: &OsStr) -> String {
         .rposition(|byte| *byte == b'\\' || *byte == b'/')
         .map_or(0, |index| index + 1);
     String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+/// Asks a process to stop: `SIGTERM`, or `SIGKILL` with `force`. A process
+/// that left in the meantime is what was wanted.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] for anything else the kernel refused.
+pub fn signal(pid: u32, force: bool) -> Result<()> {
+    let target = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw);
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let signal = if force {
+        rustix::process::Signal::KILL
+    } else {
+        rustix::process::Signal::TERM
+    };
+    match rustix::process::kill_process(target, signal) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(Error::io(format!("pid {pid}"), error.into())),
+    }
 }
 
 /// Where Wine keeps its server directories: `<SERVER_BASE>/.wine-<uid>/`.

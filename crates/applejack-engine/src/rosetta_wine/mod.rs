@@ -56,6 +56,24 @@ impl RosettaWine {
         cpuid::run(installed)
     }
 
+    /// `<server> -k` for a prefix, for a caller that holds no [`Session`]:
+    /// another process launched the title, or the launcher that did has
+    /// died. Returns once the server and every process of the prefix are
+    /// gone, with [`launch::KILL_WAIT`] as the bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns the spawn or wait failure, or [`Error::WineCommandFailed`]
+    /// when a server is still running after the bound.
+    pub fn stop_server(
+        &self,
+        installed: &InstalledEngine,
+        prefix_dir: &Path,
+        log: &Path,
+    ) -> Result<()> {
+        launch::kill_prefix_server(installed, prefix_dir, log)
+    }
+
     /// Reads back a prefix this engine made from its record.
     ///
     /// # Errors

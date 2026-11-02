@@ -225,6 +225,7 @@ fn launch_and_discover(
 
 fn launch_spec(live: &Live, exe: PathBuf, args: &[&str]) -> LaunchSpec {
     LaunchSpec {
+        session_id: None,
         exe,
         args: args.iter().map(OsString::from).collect(),
         env_extras: vec![(OsString::from("WINEDEBUG"), OsString::from("-all"))],

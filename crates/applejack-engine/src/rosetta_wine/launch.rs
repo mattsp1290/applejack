@@ -145,7 +145,8 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `<kind>-<unix-nanos hex>-<pid hex>-<counter>`: unique on the host, so
 /// process discovery never matches a stale environment.
-pub(crate) fn new_session_id(kind: &str) -> String {
+#[must_use]
+pub fn new_session_id(kind: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
@@ -367,7 +368,10 @@ pub(crate) fn spawn(
     }
     check_32bit(installed, &prefix.dir, &spec.cwd, &spec.exe)?;
     check_dxmt_copies(&prefix.dir, prefix.backend)?;
-    let id = new_session_id("launch");
+    let id = spec
+        .session_id
+        .clone()
+        .unwrap_or_else(|| new_session_id("launch"));
     let log_path = spec.log_dir.join(&id).join("wine.log");
     let rows = engine_rows(
         installed,
@@ -387,11 +391,16 @@ pub(crate) fn spawn(
             drop.from != env::Owner::Host || drop.reason != env::DropReason::NotAllowlisted
         })
         .map(|drop| {
+            // Names only: the value of a rejected path variable came from a
+            // per-game setting, and this file gets pasted into bug reports.
+            let reason = match drop.reason {
+                env::DropReason::OutsideRoots { .. } => "fails the row's path check".to_owned(),
+                ref other => other.to_string(),
+            };
             format!(
-                "[applejack] dropped {} from {:?} tier: {}",
+                "[applejack] dropped {} from {:?} tier: {reason}",
                 drop.name.to_string_lossy(),
                 drop.from,
-                drop.reason
             )
         })
         .collect();

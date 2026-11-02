@@ -467,6 +467,7 @@ fn thirty_two_bit_title_is_refused_on_a_64_bit_only_bundle() {
 
     // `launch` refuses before spawning anything.
     let spec = LaunchSpec {
+        session_id: None,
         exe: i386.clone(),
         args: Vec::new(),
         env_extras: Vec::new(),
@@ -495,6 +496,7 @@ fn launch_refuses_a_prefix_of_another_engine() {
     let mut prefix = prefix_for(&engine, &dir.path().join("prefix"));
     prefix.engine = EngineId::NativeArm64;
     let spec = LaunchSpec {
+        session_id: None,
         exe: PathBuf::from("C:\\x.exe"),
         args: Vec::new(),
         env_extras: Vec::new(),
@@ -527,6 +529,7 @@ fn a_dxmt_prefix_with_marked_dlls_is_refused_and_says_what_to_do() {
     fs::write(&d3d11, dll_with_marker(b"Wine builtin DLL\0")).unwrap();
     let mut prefix = prefix_for(&engine, &prefix_dir);
     let spec = LaunchSpec {
+        session_id: None,
         exe: PathBuf::from("C:\\x.exe"),
         args: Vec::new(),
         env_extras: Vec::new(),
@@ -755,6 +758,12 @@ fn executable_name_is_argv0_when_it_names_an_exe_else_the_first_exe_after_it() {
             None
         ),
         "launcher.exe"
+    );
+    // A process started by a bare name is not the `.exe` it was handed
+    // (U6h): this name is the game-running marker.
+    assert_eq!(
+        executable_name(&os(&["ping", "-n", "8", "Title.exe"]), None),
+        "ping"
     );
     // `start.exe` is about to become the exe it was given.
     assert_eq!(
