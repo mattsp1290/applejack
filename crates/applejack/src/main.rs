@@ -38,8 +38,12 @@ enum Command {
     Steam(Pending),
     /// Download a title's Windows depot
     Install(Pending),
-    /// Launch an installed title
-    Run(Pending),
+    /// Launch an installed title; `app run` under its plan name
+    Run(cmd::app::RunArgs),
+    /// Run, cancel, and register titles
+    App(cmd::app::AppArgs),
+    /// List past and running sessions
+    Session(cmd::session::SessionArgs),
     /// Read and write per-game configuration
     Config(cmd::config::ConfigArgs),
     /// Create, snapshot, and reset Wine prefixes
@@ -63,6 +67,8 @@ impl Command {
             Self::Steam(_) => "steam",
             Self::Install(_) => "install",
             Self::Run(_) => "run",
+            Self::App(_) => "app",
+            Self::Session(_) => "session",
             Self::Config(_) => "config",
             Self::Prefix(_) => "prefix",
             Self::Runtime(_) => "runtime",
@@ -80,6 +86,9 @@ fn main() -> ExitCode {
         Command::Engine(args) => cmd::engine::run(args),
         Command::Prefix(args) => cmd::prefix::run(args),
         Command::Serve(args) => cmd::serve::run(args),
+        Command::Run(args) => cmd::app::run_title(&args),
+        Command::App(args) => cmd::app::run(args),
+        Command::Session(args) => cmd::session::run(&args),
         stub => not_implemented(stub.name()),
     }
 }

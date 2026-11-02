@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use applejack_engine::rosetta_wine::process::find_session;
 use serde_json::{Value, json};
 
 const FIXTURE_PAYLOAD: &str = "fixtures/payloads/rosetta-wine-11.0";
@@ -164,6 +165,91 @@ fn install_doctor_prefix_exec_probe_snapshot_reset() {
     assert!(exec.contains("hello32 ok"), "after a double reset: {exec}");
     ok(&data, &["prefix", "remove", "test"]);
     stop_servers(&data);
+}
+
+/// A session end to end against real Wine, with no Steam and no window: a
+/// probe as a title that ends on its own, then Wine's `cmd.exe` as one that
+/// stays until it is cancelled.
+#[test]
+fn a_session_runs_holds_its_prefix_and_cancels() {
+    if !enabled() {
+        eprintln!("[live] skipped: set APPLEJACK_LIVE_ENGINE=1");
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let data = scratch.path().join("data");
+    let payload = payload_dir();
+    let from = payload.to_str().unwrap();
+    ok(
+        &data,
+        &["engine", "install", "rosetta-wine", "--from", from],
+    );
+    let library = data.join("library");
+    let common = library.join("steamapps/common/Title");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::write(
+        library.join("steamapps/appmanifest_1234.acf"),
+        "\"AppState\"\n{\n\"appid\" \"1234\"\n\"name\" \"Title\"\n\"StateFlags\" \"4\"\n\
+         \"installdir\" \"Title\"\n\"buildid\" \"1\"\n\"LastUpdated\" \"0\"\n\
+         \"SizeOnDisk\" \"1\"\n}\n",
+    )
+    .unwrap();
+    let list = ok(&data, &["engine", "list"]);
+    let version = list.split_whitespace().nth(1).unwrap();
+    let hello = data.join(format!("engines/rosetta-wine/{version}/probes/hello32.exe"));
+    std::fs::copy(hello, common.join("hello32.exe")).unwrap();
+    let register = ["app", "register", "1234", "--drm", "none", "--exe"];
+    ok(&data, &[&register[..], &["hello32.exe"]].concat());
+
+    let quick = run(&data, &["app", "run", "1234"]);
+    let text = String::from_utf8_lossy(&quick.stderr);
+    assert!(text.contains("may require the Steam client"), "{text}");
+    let row = session(&data);
+    assert_eq!(row["state"], json!("exited"));
+    assert_eq!(row["exit_code"], json!(0));
+    let log = std::fs::read_to_string(row["log_path"].as_str().unwrap()).unwrap();
+    assert!(log.contains("hello32 ok"), "{log}");
+
+    let cmd = data.join("prefixes/1234/drive_c/windows/system32/cmd.exe");
+    std::fs::copy(cmd, common.join("cmd.exe")).unwrap();
+    ok(&data, &[&register[..], &["cmd.exe"]].concat());
+    ok(
+        &data,
+        &[
+            "config",
+            "1234",
+            "set",
+            "launch_args_override",
+            "/c ping -n 120 127.0.0.1",
+        ],
+    );
+    let mut attached = applejack(&data)
+        .args(["app", "run", "1234"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while session(&data)["state"] != json!("running") {
+        assert!(std::time::Instant::now() < deadline, "the title never ran");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let key = session(&data)["session_key"].as_str().unwrap().to_owned();
+    assert_ne!(find_session(&key), []);
+    assert!(!run(&data, &["prefix", "snapshot", "1234"]).status.success());
+    assert!(!run(&data, &["app", "run", "1234"]).status.success());
+
+    let cancelled = ok(&data, &["app", "cancel", "1234"]);
+    assert!(cancelled.contains("cancelled"), "{cancelled}");
+    assert_eq!(find_session(&key), []);
+    attached.wait().unwrap();
+    assert_eq!(session(&data)["state"], json!("cancelled"));
+    ok(&data, &["prefix", "snapshot", "1234"]);
+}
+
+fn session(data: &Path) -> Value {
+    let rows: Value = serde_json::from_str(&ok(data, &["session", "list", "--json"])).unwrap();
+    rows[0].clone()
 }
 
 /// Two `prefix.reset` lines, as a double click sends them, against real Wine:
