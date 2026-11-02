@@ -312,8 +312,10 @@ so a session whose helpers never exit has this way out. That repeats for three
 more seconds, so a process forked meanwhile goes too, and again while the job
 waits for the owner. The server of a session with no process is left alone: the
 owner may be building the prefix, and sees the request before the spawn, or the
-server may be `prefix exec`'s. When the job succeeds, no process carries the
-session's `APPLEJACK_SESSION` and the lock is free. When one survives, the job
+server may be `prefix exec`'s. `kill_prefix` is the exception: it asks for the
+whole prefix and stops that server too, which is the way out of a cancel a server
+under another key holds up. When the job succeeds, no process found under the
+session's `APPLEJACK_SESSION` is left and the lock is free. When one survives, the job
 fails and a row with no owner stays open for the next cancel.
 
 The kernel drops the lock when an owner dies, so an open row with a free lock

@@ -31,7 +31,8 @@
 //! The marker ends the title, not the session: the row stays open and the
 //! lock stays held until the session drains, so a game a launcher left
 //! behind can still be cancelled and its prefix cannot be pulled away. That
-//! wait has no bound. A session that will not drain is ended by `app.cancel`.
+//! wait has no bound. A session that will not drain is ended by `app.cancel`,
+//! or by `kill_prefix` when a server under another key holds it up.
 //! `exit_code` stays what plan 05 says: the status of the launch exe, however
 //! long its children ran on.
 //!
@@ -362,14 +363,15 @@ impl PlannedCancel {
     /// Ends the title, then the rest of the session, then waits for the
     /// owner to close the row and let go of the prefix, ending what it finds
     /// of the session as it waits. When there is no owner the row is closed
-    /// here. On return no process with the session's id is left and the lock
-    /// is free. This is the way out of a session that will not drain: what
+    /// here. On return no process found under the session's id is left and
+    /// the lock is free. This is the way out of a session that will not drain: what
     /// the server stop leaves is killed by pid, and a server stop that fails
     /// does not stop that.
     ///
     /// A session with no process has no server of its own: the owner may be
     /// building the prefix, and sees the request before the spawn, or the
-    /// server may be `prefix exec`'s. It is left alone.
+    /// server may be `prefix exec`'s. It is left alone unless `kill_prefix`
+    /// asks for the whole prefix, which stops it either way.
     ///
     /// # Errors
     ///
@@ -450,7 +452,8 @@ impl PlannedCancel {
                 }
                 Err(error) if busy(&error) => {
                     return Err(CoreError::Message(format!(
-                        "the owner of session {} did not let go of prefix {}",
+                        "the owner of session {} did not let go of prefix {}; \
+                         cancel again, or with kill_prefix to stop the whole prefix",
                         row.id, row.prefix
                     )));
                 }

@@ -123,9 +123,10 @@ pub fn find_session(session_id: &str) -> Vec<Process> {
 /// matched: its `environ` or its own folded entry names that session. A
 /// match through `cmd` also needs `WINEPREFIX=` in `environ`, so a process
 /// outside Wine that names the key (`pgrep -f APPLEJACK_SESSION=<id>`) is
-/// no match, and a cancel cannot kill it. A same-uid Wine process with no
-/// session of its own (a sessionless `cmd.exe`) whose arguments end in the
-/// exact entry is matched, since nothing else tells it apart.
+/// no match. A same-uid process with `WINEPREFIX` set and no session of its
+/// own whose arguments end in the exact entry, a sessionless `cmd.exe` or a
+/// shell with the variable exported, is matched, since nothing else tells
+/// it apart, and a cancel kills it.
 #[must_use]
 pub fn match_record(record: &ProcessRecord<'_>, session_id: &str, uid: u32) -> Option<Process> {
     if record.uid != Some(uid) {

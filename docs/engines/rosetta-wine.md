@@ -560,12 +560,13 @@ Windows arguments, so an earlier such entry is an argument the program was
 given), and argv is cut at it before deriving `exe`. Either way a literal of
 another session's id in a game's argv does not attribute the process. A match
 through `cmd` also needs `WINEPREFIX=` in `environ`: the fold hides only the
-first entry, and all ten Windows processes of a live `prefix exec` on 11.0-2
+first entry, and the Windows processes of a live `prefix exec` on 11.0-2
 (`services.exe`, `explorer.exe`, `cmd.exe`, and the `ping` it started among
-them) keep it, while `pgrep -f APPLEJACK_SESSION=<id>` does not have it and a
-cancel kills what is matched. A same-uid Wine process with no session of its
-own (a sessionless `cmd.exe`) whose arguments end in the exact entry is
-reported; nothing in the record tells it apart.
+them) keep it, while a `pgrep -f APPLEJACK_SESSION=<id>` with no such variable
+does not, and a cancel kills what is matched. A same-uid process with
+`WINEPREFIX` set and no session of its own (a sessionless `cmd.exe`, or a shell
+with the variable exported) whose arguments end in the exact entry is matched;
+nothing in the record tells it apart.
 The loader process itself
 (`session.pid`) keeps its Unix argv for the first moments, until Wine
 rewrites it too (to the title's Windows command line, or to
