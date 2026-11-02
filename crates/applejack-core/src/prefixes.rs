@@ -87,11 +87,11 @@ impl Core {
         self.data_dir().join(PREFIXES_DIR)
     }
 
-    fn snapshots_root(&self) -> PathBuf {
+    pub(crate) fn snapshots_root(&self) -> PathBuf {
         self.prefixes_root().join(SNAPSHOTS_DIR)
     }
 
-    fn prefix_dir(&self, name: &str) -> Result<PathBuf, CoreError> {
+    pub(crate) fn prefix_dir(&self, name: &str) -> Result<PathBuf, CoreError> {
         snapshot::check_name(name)?;
         Ok(self.prefixes_root().join(name))
     }
@@ -99,7 +99,7 @@ impl Core {
     /// Taken first by every operation that changes or runs in a prefix,
     /// before anything looks at the directory: a reset in progress has
     /// removed it.
-    fn lock_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
+    pub(crate) fn lock_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
         let dir = self.prefix_dir(name)?;
         Ok(PrefixLock::acquire(&dir, &self.snapshots_root(), name)?)
     }
@@ -118,7 +118,7 @@ impl Core {
         Ok(lock)
     }
 
-    fn open_prefix(&self, name: &str) -> Result<(PathBuf, Prefix), CoreError> {
+    pub(crate) fn open_prefix(&self, name: &str) -> Result<(PathBuf, Prefix), CoreError> {
         let dir = self.prefix_dir(name)?;
         if !dir.is_dir() {
             return Err(CoreError::UnknownPrefix {
@@ -138,7 +138,7 @@ impl Core {
 
     /// Waits out a lingering `wineserver`; a server still there after
     /// [`SERVER_SETTLE`] belongs to something running.
-    fn settle(dir: &Path) -> Result<(), CoreError> {
+    pub(crate) fn settle(dir: &Path) -> Result<(), CoreError> {
         let deadline = Instant::now() + SERVER_SETTLE;
         while wineserver_running(dir)? {
             if Instant::now() >= deadline {
@@ -169,15 +169,29 @@ impl Core {
         hidraw: HidrawMode,
     ) -> Result<PrefixEntry, CoreError> {
         let _lock = self.lock_prefix(name)?;
-        let dir = self.prefix_dir(name)?;
         let installed = self.require_active_engine()?;
-        let sync_mode = pick_sync(&installed, sync_mode)?;
         let library = self.library_dir()?;
+        let prefix = self.build_prefix(name, &installed, backend, sync_mode, hidraw, library)?;
+        Ok(PrefixEntry::of(name, &prefix.dir, &prefix))
+    }
+
+    /// Builds a prefix the caller holds the lock of, with `library` as drive
+    /// `S:`.
+    pub(crate) fn build_prefix(
+        &self,
+        name: &str,
+        installed: &InstalledEngine,
+        backend: GraphicsBackend,
+        sync_mode: Option<SyncMode>,
+        hidraw: HidrawMode,
+        library: PathBuf,
+    ) -> Result<Prefix, CoreError> {
+        let dir = self.prefix_dir(name)?;
+        let sync_mode = pick_sync(installed, sync_mode)?;
         let root = self.prefixes_root();
         fs::create_dir_all(&root).map_err(|error| CoreError::io(&root, error))?;
         let spec = self.prefix_spec(backend, sync_mode, hidraw, library);
-        let prefix = self.engine.create_prefix(&installed, &dir, &spec)?;
-        Ok(PrefixEntry::of(name, &dir, &prefix))
+        Ok(self.engine.create_prefix(installed, &dir, &spec)?)
     }
 
     fn prefix_spec(
@@ -389,6 +403,7 @@ impl Core {
         self.check_inside_data(exe)?;
         let installed = self.prefix_engine(&prefix)?;
         let spec = LaunchSpec {
+            session_id: None,
             exe: exe.to_path_buf(),
             args: args.to_vec(),
             env_extras: Vec::new(),
@@ -419,7 +434,7 @@ impl Core {
         )?)
     }
 
-    fn check_inside_data(&self, exe: &Path) -> Result<(), CoreError> {
+    pub(crate) fn check_inside_data(&self, exe: &Path) -> Result<(), CoreError> {
         if !exe.is_absolute() {
             return Ok(());
         }
@@ -434,7 +449,7 @@ impl Core {
     }
 }
 
-fn pick_sync(
+pub(crate) fn pick_sync(
     installed: &InstalledEngine,
     requested: Option<SyncMode>,
 ) -> Result<SyncMode, CoreError> {
@@ -466,7 +481,7 @@ fn copy_new(log: &Path, offset: &mut u64, out: &mut dyn Write) -> Result<(), Cor
     Ok(())
 }
 
-fn exit_code(status: std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
         .code()

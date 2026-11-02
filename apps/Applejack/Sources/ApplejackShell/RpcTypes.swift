@@ -166,6 +166,14 @@ public enum RpcErrorCode: Int, Codable, Sendable, CaseIterable {
     case downloadFailed = 1009
     case unsignedEngineRefused = 1010
     case prefixBusy = 1011
+    case titleNotInstalled = 1012
+    case downloadInProgress = 1013
+    case alreadyRunning = 1014
+    case clientRuntimeUnavailable = 1015
+    case noLaunchExe = 1016
+    case notRunning = 1017
+    case titleExitedEarly = 1018
+    case prefixUnusable = 1019
 }
 
 public struct HelloParams: Codable, Equatable, Sendable {

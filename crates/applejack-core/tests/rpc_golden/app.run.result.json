@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "id": 12,
+    "job_id": 7,
+    "log_path": "/data/logs/run-19a-1f-0/wine.log"
+  }
+}

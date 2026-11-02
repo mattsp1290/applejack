@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use applejack_engine::{EngineId, Error as EngineError, SyncMode};
 
-use crate::config::{ALLOW_UNSIGNED_ENV, DataDirError, Error as ConfigError};
+use crate::config::{ALLOW_UNSIGNED_ENV, DataDirError, Drm, Error as ConfigError};
 use crate::rpc::wire::{ErrorCode, RpcError};
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +37,30 @@ pub enum CoreError {
     /// Plan 02: every path handed to Wine is inside the data directory.
     #[error("`{}` is outside the data directory", exe.display())]
     PathOutsideData { exe: PathBuf },
+    /// `apps` has no row for the title, or the library does not hold it.
+    #[error("title {appid} is not installed: {reason}")]
+    TitleNotInstalled { appid: u32, reason: String },
+    /// `applejack/<appid>.download.json` exists: the files are mid-write.
+    #[error("title {appid} has a download record; its files are not complete until it finishes")]
+    DownloadInProgress { appid: u32 },
+    #[error("title {appid} is already running")]
+    AlreadyRunning { appid: u32 },
+    /// The title takes the client path, which does not exist yet.
+    #[error(
+        "title {appid} (drm = {drm}) launches through the Steam client, and the client runtime \
+         is not available yet; only client-free titles run, or try --probe-direct"
+    )]
+    ClientRuntimeUnavailable { appid: u32, drm: Drm },
+    #[error("title {appid} has no usable launch executable: {reason}")]
+    NoLaunchExe { appid: u32, reason: String },
+    #[error("title {appid} is not running")]
+    NotRunning { appid: u32 },
+    /// Plan 05's error path for a direct launch.
+    #[error(
+        "title {appid} exited within {seconds} seconds: title may require the Steam client; \
+         switch launch_mode to client"
+    )]
+    TitleExitedEarly { appid: u32, seconds: u64 },
     #[error("{}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -114,6 +138,13 @@ impl CoreError {
                 ErrorCode::DownloadFailed
             }
             Self::NoActiveEngine { .. } => ErrorCode::EngineNotInstalled,
+            Self::TitleNotInstalled { .. } => ErrorCode::TitleNotInstalled,
+            Self::DownloadInProgress { .. } => ErrorCode::DownloadInProgress,
+            Self::AlreadyRunning { .. } => ErrorCode::AlreadyRunning,
+            Self::ClientRuntimeUnavailable { .. } => ErrorCode::ClientRuntimeUnavailable,
+            Self::NoLaunchExe { .. } => ErrorCode::NoLaunchExe,
+            Self::NotRunning { .. } => ErrorCode::NotRunning,
+            Self::TitleExitedEarly { .. } => ErrorCode::TitleExitedEarly,
             Self::Io { source, .. } => io_code(source),
             Self::UnknownPrefix { .. }
             | Self::SyncUnavailable { .. }
@@ -146,6 +177,9 @@ fn engine_code(error: &EngineError) -> ErrorCode {
         EngineError::NotInstalled { .. } => ErrorCode::EngineNotInstalled,
         EngineError::Io { source, .. } => io_code(source),
         EngineError::PrefixBusy { .. } => ErrorCode::PrefixBusy,
+        EngineError::PrefixUnusable { .. } | EngineError::InvalidPrefix { .. } => {
+            ErrorCode::PrefixUnusable
+        }
         EngineError::ResetFailed { source, .. } => engine_code(source),
         EngineError::UnknownEngineId(_)
         | EngineError::UnknownGraphicsBackend(_)

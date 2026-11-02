@@ -481,6 +481,42 @@ Dropping a `Session` reaps the loader if it has already exited and does not
 wait otherwise; the core keeps a session until `wait` or `cancel` has
 returned.
 
+`spec.session_id` names the session when the caller has to know it before the
+spawn; the core writes it to the `sessions` row first. A launch with none gets
+a fresh id. A process that holds no `Session`, because another process launched
+the title or the launcher died, stops a prefix with
+`RosettaWine::stop_server(installed, prefix_dir, log)`, the same `-k` and `-w`.
+
+The launch header in `wine.log` names a dropped variable and never its value,
+a rejected path included.
+
+### Sessions in the core
+
+`applejack app run <appid>` (`applejack run` is the same command) launches a
+client-free title in its own prefix, named after the appid and created on
+first use with drive `S:` on the title's library. The exe is the absolute Unix
+path, reached through `Z:`, with the cwd in its directory. Before the launch
+the core waits out a server from the last run and applies any setting the
+configuration changed, since `apply_overrides` refuses while a server is up; an
+engine change takes a snapshot first.
+
+The game-running marker in direct mode is a process of the session whose
+executable name is the launch exe, case-insensitively, looked for twice a second.
+Two looks in a row without it end the title: a read can miss a process
+mid-`exec`. The `wineserver` and Wine's own services (`services.exe`,
+`explorer.exe`, ...) carry the session id too, so they are not the marker; they
+are what the end then waits for, for up to ten seconds, before the row closes
+and the lock goes. A title that outlives its launch exe (a launcher that starts
+the game and exits) ends the session at the launcher; see Known limits.
+
+The process table cannot be read for platform binaries: macOS hides their
+environment from `KERN_PROCARGS2`, so `/bin/sh` and `/bin/sleep` never show up
+under a session, which is why the tests' stub title is a test binary.
+
+`sessions` rows, states, and what each process sees of the others are in
+`docs/rpc-protocol.md` under Sessions, and in
+`crates/applejack-core/src/runtime/session.rs`.
+
 ## Process discovery
 
 Wine passes the environment to every Windows process it starts, so
@@ -683,7 +719,10 @@ call the same ones. The `meta` and `engine_versions` writes are the core's.
 | `applejack prefix list-snapshots <name>` | `snapshot::list`, oldest first. Works for a prefix that is gone |
 | `applejack prefix remove <name>` | Deletes the prefix and Wine's `server-*` directory for it; snapshots stay, and `restore` brings the prefix back from one. `remove` takes no snapshot of its own |
 | `applejack prefix exec <name> -- <exe> [args]` | `Engine::launch` with the bundle that last touched the prefix; streams the session log and exits with the child's code. Development only |
-| `applejack run <appid>` | `RosettaWine::launch`, then `Session::{wait, cancel, processes, wineserver_alive}` |
+| `applejack app run <appid> [--probe-direct]`, or `applejack run <appid>` | `Core::plan_run`, then `PlannedRun::run`, which stays until the title exits and exits with its code. Progress goes to stderr |
+| `applejack app cancel <appid> [--kill-prefix]` | `Core::plan_cancel`, then `PlannedCancel::run`, for a session started anywhere |
+| `applejack app register <appid> --drm none --exe <file> [--library <dir>]` | Writes the `apps` row from `<library>/steamapps/appmanifest_<appid>.acf` and `launch_exe_override`, until `app.install` writes both. The library defaults to `<data>/library`. `--drm` is the caller's word |
+| `applejack session list [--appid n] [--json]` | `Core::session_list`, after settling sessions nobody owns |
 
 A directory passed to `--from` is packed to
 `engines/<id>/<version>.local.tar.zst` first, so it takes the same hashing,
@@ -709,6 +748,15 @@ behind.
 
 ## Known limits
 
+- `--probe-direct` runs a title but never writes `direct_verified_at`: that
+  takes the frame probe's game-owned window, and a title can stay up behind a
+  "start Steam" dialog. The early-exit check has no window to look at either, so
+  it is by time alone.
+- The direct marker follows the launch exe only, so a launcher that exits and
+  leaves its game running ends the session, while the game keeps the server
+  alive and the session closes with `processes of the session were still there`.
+- A running title holds its prefix, not its files: nothing stops a depot update
+  of a running direct title until `app.install` checks for an open session.
 - Wine Mono and Gecko are never installed; .NET titles and embedded
   browsers that need them do not work in this engine.
 - msync is not in the payload: the payload build's gate G4b (the msync

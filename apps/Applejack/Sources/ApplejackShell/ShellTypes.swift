@@ -42,18 +42,32 @@ public struct AppRunParams: Codable, Equatable, Sendable {
     }
 }
 
-/// The shell's proposal for the result of `app.run` until work package 5
-/// defines it: the session's `id` and `log_path`, named after the fields of
-/// `Session` in `applejack-engine` (which has no serde form yet). Both
-/// members are optional so the shell decodes whatever the method returns
-/// first and lights up the log tail once `log_path` is there.
+public struct AppCancelParams: Codable, Equatable, Sendable {
+    public var appid: UInt32
+    public var killPrefix: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case appid
+        case killPrefix = "kill_prefix"
+    }
+
+    public init(appid: UInt32, killPrefix: Bool = false) {
+        self.appid = appid
+        self.killPrefix = killPrefix
+    }
+}
+
+/// `AppRunResult` in `rpc/methods.rs`: the `sessions` row, its log, and the
+/// job that reports the session's states and ends with it.
 public struct AppRunResult: Codable, Equatable, Sendable {
     public var id: JSONValue?
     public var logPath: String?
+    public var jobId: UInt64?
 
     enum CodingKeys: String, CodingKey {
         case id
         case logPath = "log_path"
+        case jobId = "job_id"
     }
 
     public init(id: JSONValue? = nil, logPath: String? = nil) {
@@ -324,7 +338,12 @@ public struct LoginSession: Codable, Equatable, Sendable {
     }
 }
 
-/// One `sessions` row.
+/// `SessionState` in `applejack-config`.
+public enum SessionState: String, Codable, Sendable {
+    case starting, running, exited, cancelled, failed, lost
+}
+
+/// One `sessions` row: `SessionRow` in `applejack-config`.
 public struct SessionEntry: Codable, Equatable, Sendable, Identifiable {
     public var id: Int64
     public var appid: UInt32
@@ -334,9 +353,18 @@ public struct SessionEntry: Codable, Equatable, Sendable, Identifiable {
     public var engineVersion: String?
     public var exitCode: Int32?
     public var logPath: String?
+    public var state: SessionState
+    public var sessionKey: String
+    public var prefix: String
+    public var launchExe: String
+    public var note: String?
+    public var cancelRequested: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, appid
+        case id, appid, state, prefix, note
+        case sessionKey = "session_key"
+        case launchExe = "launch_exe"
+        case cancelRequested = "cancel_requested"
         case startedAt = "started_at"
         case endedAt = "ended_at"
         case engineId = "engine_id"

@@ -10,6 +10,7 @@ use applejack_engine::{EngineLayout, RosettaWine};
 
 use crate::config::{self, ConfigDb, DataDirError};
 use crate::error::CoreError;
+use crate::runtime::session::RunTuning;
 
 /// Resolved directories, the engine, and the database handle.
 #[derive(Debug)]
@@ -20,6 +21,7 @@ pub struct Core {
     layout: EngineLayout,
     pub(crate) engine: RosettaWine,
     allow_unsigned: bool,
+    pub(crate) tuning: RunTuning,
     db: Option<ConfigDb>,
 }
 
@@ -35,6 +37,7 @@ impl Core {
             data_dir,
             engine: RosettaWine,
             allow_unsigned: false,
+            tuning: RunTuning::default(),
             db: None,
         }
     }
@@ -57,6 +60,13 @@ impl Core {
     #[must_use]
     pub fn with_unsigned_installs(mut self, allow: bool) -> Self {
         self.allow_unsigned = allow;
+        self
+    }
+
+    /// Replaces the session timings; tests shorten them.
+    #[must_use]
+    pub fn with_run_tuning(mut self, tuning: RunTuning) -> Self {
+        self.tuning = tuning;
         self
     }
 
@@ -95,6 +105,7 @@ impl Core {
             layout: self.layout.clone(),
             engine: self.engine,
             allow_unsigned: self.allow_unsigned,
+            tuning: self.tuning,
             db: None,
         }
     }

@@ -214,10 +214,26 @@ pub enum ErrorCode {
     UnsignedEngineRefused,
     /// Another operation is using the prefix.
     PrefixBusy,
+    /// `app.run` for a title with no `apps` row or nothing in the library.
+    TitleNotInstalled,
+    /// `app.run` for a title with a download record.
+    DownloadInProgress,
+    /// `app.run` for a title with an open session.
+    AlreadyRunning,
+    /// `app.run` for a title that launches through the Steam client.
+    ClientRuntimeUnavailable,
+    /// `app.run` for a title with no launch executable, or one outside it.
+    NoLaunchExe,
+    /// `app.cancel` for a title with no open session.
+    NotRunning,
+    /// A direct launch ended within five seconds.
+    TitleExitedEarly,
+    /// A prefix cannot be used for the operation.
+    PrefixUnusable,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 25] = [
         Self::ParseError,
         Self::InvalidRequest,
         Self::MethodNotFound,
@@ -235,6 +251,14 @@ impl ErrorCode {
         Self::DownloadFailed,
         Self::UnsignedEngineRefused,
         Self::PrefixBusy,
+        Self::TitleNotInstalled,
+        Self::DownloadInProgress,
+        Self::AlreadyRunning,
+        Self::ClientRuntimeUnavailable,
+        Self::NoLaunchExe,
+        Self::NotRunning,
+        Self::TitleExitedEarly,
+        Self::PrefixUnusable,
     ];
 
     #[must_use]
@@ -257,6 +281,14 @@ impl ErrorCode {
             Self::DownloadFailed => 1009,
             Self::UnsignedEngineRefused => 1010,
             Self::PrefixBusy => 1011,
+            Self::TitleNotInstalled => 1012,
+            Self::DownloadInProgress => 1013,
+            Self::AlreadyRunning => 1014,
+            Self::ClientRuntimeUnavailable => 1015,
+            Self::NoLaunchExe => 1016,
+            Self::NotRunning => 1017,
+            Self::TitleExitedEarly => 1018,
+            Self::PrefixUnusable => 1019,
         }
     }
 
@@ -287,6 +319,14 @@ impl ErrorCode {
             Self::DownloadFailed => "DownloadFailed",
             Self::UnsignedEngineRefused => "UnsignedEngineRefused",
             Self::PrefixBusy => "PrefixBusy",
+            Self::TitleNotInstalled => "TitleNotInstalled",
+            Self::DownloadInProgress => "DownloadInProgress",
+            Self::AlreadyRunning => "AlreadyRunning",
+            Self::ClientRuntimeUnavailable => "ClientRuntimeUnavailable",
+            Self::NoLaunchExe => "NoLaunchExe",
+            Self::NotRunning => "NotRunning",
+            Self::TitleExitedEarly => "TitleExitedEarly",
+            Self::PrefixUnusable => "PrefixUnusable",
         }
     }
 
@@ -323,6 +363,24 @@ impl ErrorCode {
                 "A local bundle was requested without `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`."
             }
             Self::PrefixBusy => "Another operation is using the prefix.",
+            Self::TitleNotInstalled => {
+                "`app.run` for a title with no `apps` row or nothing in the library."
+            }
+            Self::DownloadInProgress => "`app.run` for a title with a download record.",
+            Self::AlreadyRunning => "`app.run` for a title with an open session.",
+            Self::ClientRuntimeUnavailable => {
+                "`app.run` for a title that launches through the Steam client, which is not available yet."
+            }
+            Self::NoLaunchExe => {
+                "`app.run` for a title with no launch executable, or one outside its install directory."
+            }
+            Self::NotRunning => "`app.cancel` for a title with no open session.",
+            Self::TitleExitedEarly => {
+                "A direct launch ended within five seconds; the title may require the Steam client."
+            }
+            Self::PrefixUnusable => {
+                "A prefix cannot be used for the operation: it is stale, broken, or a `wineserver` will not leave it."
+            }
         }
     }
 }

@@ -45,10 +45,12 @@ final class GoldenTests: XCTestCase {
         XCTAssertEqual(
             results.map(\.lastPathComponent),
             [
+                "app.cancel.result.json", "app.run.result.json",
                 "config.export.result.json", "config.get.result.json", "config.import.result.json",
                 "empty.result.json", "engine.d3dmetal.import.result.json", "engine.doctor.result.json",
                 "engine.install.result.json", "engine.list.result.json", "engine.probe_cpuid.result.json",
                 "hello.result.json", "host.doctor.result.json", "prefix.snapshot.result.json",
+                "session.list.result.json",
             ]
         )
         for file in results {
@@ -126,6 +128,13 @@ final class GoldenTests: XCTestCase {
         XCTAssertEqual(config.graphicsBackend, .dxmt)
         XCTAssertEqual(config.syncMode, .disabled)
         XCTAssertEqual(config.hidrawEnabled, true)
+        let run = try typedResult("app.run.result.json", as: AppRunResult.self)
+        XCTAssertEqual(run.jobId, 7)
+        XCTAssertNotNil(run.logPath)
+        _ = try typedResult("app.cancel.result.json", as: JobStarted.self)
+        let sessions = try typedResult("session.list.result.json", as: SessionListResult.self)
+        XCTAssertEqual(sessions.sessions.first?.state, .exited)
+        XCTAssertEqual(sessions.sessions.first?.exitCode, 0)
         let plan = try typedResult("config.import.result.json", as: ConfigImportResult.self)
         XCTAssertTrue(plan.needsConfirmation)
         XCTAssertEqual(plan.rejected.first?.field, "extra_env.PATH")
@@ -160,6 +169,7 @@ final class GoldenTests: XCTestCase {
         try check("steam.library", SteamLibraryParams.self)
         try check("app.install", AppInstallParams.self)
         try check("app.run", AppRunParams.self)
+        try check("app.cancel", AppCancelParams.self)
         try check("config.get", ConfigGetParams.self)
         try check("config.set", ConfigSetParams.self)
         try check("config.import", ConfigImportParams.self)
