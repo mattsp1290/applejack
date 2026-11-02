@@ -156,9 +156,9 @@ Flows that need an answer before the core sends a request:
   preset's overrides.
 
 Run with log tail: "Run" in the game detail sends `app.run` (`AppRunResult`:
-`id`, `log_path`, and the `job_id` that reports the session). One run is in flight
-per title at a time; the button is disabled meanwhile. When the result
-names a `log_path` and the user is still on the detail, the shell switches
+`id`, `log_path`, and the `job_id` that reports the session). The button is
+disabled only until the core answers, which it does before the title is on
+screen. If the user is still on the detail then, the shell switches
 to Logs and follows it; the library's navigation path lives in
 `ShellModels`, so returning to Library lands on the same detail. The core
 refuses a second launch of a running title with `AlreadyRunning`. The shell

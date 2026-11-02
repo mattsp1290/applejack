@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::prefix::{LIBRARY_DRIVE, backend_available};
-use applejack_engine::rosetta_wine::process::{server_socket, wineserver_running};
+use applejack_engine::rosetta_wine::process::{find_session, server_socket, wineserver_running};
 use applejack_engine::rosetta_wine::snapshot::PrefixLock;
 use applejack_engine::rosetta_wine::{Snapshot, snapshot};
 use applejack_engine::{
@@ -104,6 +104,25 @@ impl Core {
         Ok(PrefixLock::acquire(&dir, &self.snapshots_root(), name)?)
     }
 
+    /// [`Core::lock_prefix`] for the operations that are not sessions. A free
+    /// lock is not enough: a session whose owner died still runs in the
+    /// prefix, and without this each operation would stall in
+    /// [`Core::settle`] and answer `PrefixUnusable`.
+    pub(crate) fn lock_idle_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
+        let lock = self.lock_prefix(name)?;
+        let open = self.detached().reading(|db| Ok(db.open_sessions()?))?;
+        let live = open
+            .iter()
+            .any(|row| row.prefix == name && !find_session(&row.session_key).is_empty());
+        if live {
+            return Err(EngineError::PrefixBusy {
+                name: name.to_owned(),
+            }
+            .into());
+        }
+        Ok(lock)
+    }
+
     /// Locks a prefix that exists. The lock travels with the work, so a
     /// caller that answers before the work runs refuses a busy or unknown
     /// prefix up front; see [`Core::prefix_reset_claimed`].
@@ -113,7 +132,7 @@ impl Core {
     /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], or a
     /// prefix that does not open.
     pub fn claim_prefix(&self, name: &str) -> Result<PrefixLock, CoreError> {
-        let lock = self.lock_prefix(name)?;
+        let lock = self.lock_idle_prefix(name)?;
         self.open_prefix(name)?;
         Ok(lock)
     }
@@ -168,7 +187,7 @@ impl Core {
         sync_mode: Option<SyncMode>,
         hidraw: HidrawMode,
     ) -> Result<PrefixEntry, CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let installed = self.require_active_engine()?;
         let library = self.library_dir()?;
         let prefix = self.build_prefix(name, &installed, backend, sync_mode, hidraw, library)?;
@@ -269,7 +288,7 @@ impl Core {
     /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], a server
     /// that does not leave, or the copy failure.
     pub fn prefix_snapshot(&self, name: &str) -> Result<SnapshotResult, CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let (dir, _) = self.open_prefix(name)?;
         Self::settle(&dir)?;
         Ok(snapshot::create(&dir, &self.snapshots_root(), name)?.into())
@@ -285,7 +304,7 @@ impl Core {
     /// with neither a prefix nor a snapshot, [`EngineError::SnapshotNotFound`],
     /// a server that does not leave, or the copy or swap failure.
     pub fn prefix_restore(&self, name: &str, timestamp: &str) -> Result<SnapshotResult, CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let dir = self.prefix_dir(name)?;
         if dir.is_dir() {
             Self::settle(&dir)?;
@@ -363,7 +382,7 @@ impl Core {
     /// [`EngineError::PrefixBusy`], [`CoreError::UnknownPrefix`], a server
     /// that does not leave, or the removal failure.
     pub fn prefix_remove(&self, name: &str) -> Result<(), CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let dir = self.prefix_dir(name)?;
         if !dir.is_dir() {
             return Err(CoreError::UnknownPrefix {
@@ -398,7 +417,7 @@ impl Core {
         args: &[OsString],
         out: &mut dyn Write,
     ) -> Result<i32, CoreError> {
-        let _lock = self.lock_prefix(name)?;
+        let _lock = self.lock_idle_prefix(name)?;
         let (dir, prefix) = self.open_prefix(name)?;
         self.check_inside_data(exe)?;
         let installed = self.prefix_engine(&prefix)?;

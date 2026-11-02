@@ -6,6 +6,7 @@
 //! ```text
 //! starting -> running -> exited | cancelled
 //! starting -> failed  | cancelled
+//! running -> failed, when the watch failed and nothing of the session is left
 //! starting | running -> lost
 //! ```
 //!
@@ -27,7 +28,18 @@
 //! carry the session id too, and are what [`SessionProbe::drained`] waits
 //! for.
 //!
-//! A core that starts and finds a live title with no owner takes it over
+//! The marker ends the title, not the session: the row stays open and the
+//! lock stays held until the session drains, so a game a launcher left
+//! behind can still be cancelled and its prefix cannot be pulled away. That
+//! wait has no bound. A session that will not drain is ended by `app.cancel`.
+//! `exit_code` stays what plan 05 says: the status of the launch exe, however
+//! long its children ran on.
+//!
+//! After the spawn nothing writes [`SessionState::Failed`] over a session
+//! with a process left: a failure that cannot end the title leaves the row
+//! open for the next core, as a dead owner does.
+//!
+//! A core that starts and finds a live session with no owner takes it over
 //! with [`Adopted`] (`serve` only; plan 05 asks for it and it costs no
 //! client support). The exit code of such a session is unknown.
 
@@ -56,8 +68,8 @@ pub const NOTE_ADOPTED: &str = "taken over after the owning core died; exit code
 /// The note on a direct launch that did not last.
 pub const NOTE_EARLY: &str = "exited early: the title may require the Steam client";
 
-/// The note on a session whose processes outlived the wait for them.
-pub const NOTE_LINGERED: &str = "processes of the session were still there when it closed";
+/// The note on a session that went on after the wait for it passed.
+pub const NOTE_LINGERED: &str = "processes of the session outlived the launch exe";
 
 /// How a session is watched. [`Default`] is the shipping set; tests shorten
 /// it with [`Core::with_run_tuning`].
@@ -68,7 +80,8 @@ pub struct RunTuning {
     /// Looks in a row without the marker before it counts as cleared: a
     /// process table read can miss a process that is mid-`exec`.
     pub marker_misses: u32,
-    /// How long the end of a title waits for the rest of the session.
+    /// How long the rest of a session may take to leave before the session
+    /// counts as lingering. A cancel stops the prefix's server at this bound.
     pub drain: Duration,
     /// A natural end sooner than this is plan 05's "may require the client".
     pub early_exit: Duration,
@@ -112,37 +125,50 @@ pub trait SessionProbe {
     fn drained(&mut self) -> Result<bool, CoreError>;
 }
 
+/// What a watch tells its owner as it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchEvent {
+    /// The marker is there. Answering `false` asks again at the next look.
+    Running,
+    /// The title has gone and the session went on past [`RunTuning::drain`].
+    /// Once.
+    Lingering,
+}
+
 /// How a watched session ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchEnd {
     /// When the marker cleared, or the loader exited for a title that never
-    /// showed one.
+    /// showed one. For a lingering session, when it drained.
     pub ended_at: String,
+    /// The launch exe's status. What it left running has none here.
     pub exit_code: Option<i32>,
     /// The marker was seen at all.
     pub seen: bool,
-    /// [`SessionProbe::drained`] said so before the bound ran out.
-    pub drained: bool,
+    /// The session outlasted [`RunTuning::drain`].
+    pub lingered: bool,
     /// From the start of the watch, which follows the spawn, to the end of
     /// the title; neither the prefix build before it nor the drain after it
     /// counts toward an early exit.
     pub lived: Duration,
 }
 
-/// Runs until the title is gone, then waits for the rest of the session.
-/// `on_running` fires once, when the marker first shows. `seen` starts true
-/// for a title already running when the watch began.
+/// Runs until the title is gone, then until the session drains, however long
+/// that takes. `seen` starts true for a title already running when the watch
+/// began. A failed look at the prefix counts as "not drained": the title is
+/// not the owner's to abandon over a `stat`.
 ///
 /// # Errors
 ///
-/// Returns a probe failure or one from `on_running`.
+/// Returns the failure to read the loader's status.
 pub fn watch(
     probe: &mut dyn SessionProbe,
     tuning: &RunTuning,
     seen: bool,
-    on_running: &mut dyn FnMut() -> Result<(), CoreError>,
+    on_event: &mut dyn FnMut(WatchEvent) -> bool,
 ) -> Result<WatchEnd, CoreError> {
     let watching = Instant::now();
+    let mut announced = seen;
     let mut seen = seen;
     let mut misses = 0;
     let mut code = None;
@@ -153,9 +179,9 @@ pub fn watch(
         let present = probe.title_present();
         if present {
             misses = 0;
-            if !seen {
-                seen = true;
-                on_running()?;
+            seen = true;
+            if !announced {
+                announced = on_event(WatchEvent::Running);
             }
         } else {
             misses += 1;
@@ -166,26 +192,31 @@ pub fn watch(
         }
         std::thread::sleep(tuning.tick);
     }
-    let ended_at = utc_now();
+    let title_ended = utc_now();
     let lived = watching.elapsed();
     let deadline = Instant::now() + tuning.drain;
-    let drained = loop {
+    let mut lingered = false;
+    loop {
         if code.is_none() {
             code = probe.loader_exit()?;
         }
-        if probe.drained()? {
-            break true;
+        if probe.drained().unwrap_or(false) {
+            break;
         }
-        if Instant::now() >= deadline {
-            break false;
+        if !lingered && Instant::now() >= deadline {
+            lingered = true;
+            on_event(WatchEvent::Lingering);
         }
         std::thread::sleep(tuning.tick);
-    };
+    }
+    if code.is_none() {
+        code = probe.loader_exit()?;
+    }
     Ok(WatchEnd {
-        ended_at,
+        ended_at: if lingered { utc_now() } else { title_ended },
         exit_code: code,
         seen,
-        drained,
+        lingered,
         lived,
     })
 }
@@ -273,13 +304,19 @@ impl Adopted {
         let row = self.session.clone();
         let dir = self.core.prefix_dir(&row.prefix)?;
         report("running", format!("took over session {}", row.id));
+        let note_lingering = format!("session {} outlived {}", row.id, row.launch_exe);
         let mut probe = ForeignProbe {
             key: &row.session_key,
             exe: &row.launch_exe,
             prefix_dir: &dir,
         };
         let tuning = self.core.tuning;
-        let end = watch(&mut probe, &tuning, true, &mut || Ok(()))?;
+        let end = watch(&mut probe, &tuning, true, &mut |event| {
+            if event == WatchEvent::Lingering {
+                report("lingering", note_lingering.clone());
+            }
+            true
+        })?;
         let cancelled = self
             .core
             .reading(|db| Ok(db.session(row.id)?))?
@@ -325,19 +362,25 @@ impl PlannedCancel {
     /// Ends the title, then the rest of the session, then waits for the
     /// owner to close the row and let go of the prefix. When there is no
     /// owner the row is closed here. On return no process with the session's
-    /// id is left and the lock is free.
+    /// id is left and the lock is free. This is the way out of a session
+    /// that will not drain: what the server stop leaves is killed by pid, and
+    /// a server stop that fails does not stop that.
+    ///
+    /// A session still `starting` with no process is the owner building the
+    /// prefix: its server is left alone, and the owner sees the request
+    /// before the spawn.
     ///
     /// # Errors
     ///
-    /// Returns a server stop failure, or a message when the owner holds on
-    /// past [`RunTuning::cancel_wait`] or a process survived.
+    /// Returns a message when the owner holds on past
+    /// [`RunTuning::cancel_wait`] or a process survived.
     pub fn run(mut self, report: &mut dyn FnMut(&str, String)) -> Result<SessionRow, CoreError> {
         let row = self.session.clone();
         let tuning = self.core.tuning;
         let dir = self.core.prefix_dir(&row.prefix)?;
         if self.kill_prefix {
             report("cancel", "stopping the prefix's server".to_owned());
-            self.stop_server(&row)?;
+            self.stop_server_logged(&row);
         } else {
             report("cancel", format!("ending {}", row.launch_exe));
             end_title(&row, &tuning)?;
@@ -347,19 +390,18 @@ impl PlannedCancel {
                 prefix_dir: &dir,
             };
             let deadline = Instant::now() + tuning.drain;
-            while !probe.drained()? {
+            while !probe.drained().unwrap_or(false) {
                 if Instant::now() >= deadline {
-                    self.stop_server(&row)?;
+                    if self.has_a_session_to_stop(&row)? {
+                        self.stop_server_logged(&row);
+                    }
                     break;
                 }
                 std::thread::sleep(tuning.tick);
             }
         }
+        end_stragglers(&row, &tuning)?;
         let lock = self.wait_for_owner(&row)?;
-        let left = find_session(&row.session_key);
-        if !left.is_empty() {
-            self.stop_server(&row)?;
-        }
         self.core.db()?.end_session(
             row.id,
             &SessionEnd {
@@ -385,6 +427,14 @@ impl PlannedCancel {
         self.core.session_row(row.id)
     }
 
+    /// False once the row has closed, since the prefix may then be another
+    /// session's, and while the owner is still building the prefix.
+    fn has_a_session_to_stop(&mut self, row: &SessionRow) -> Result<bool, CoreError> {
+        let now = self.core.session_row(row.id)?;
+        Ok(now.ended_at.is_none()
+            && (now.state != SessionState::Starting || !find_session(&row.session_key).is_empty()))
+    }
+
     fn wait_for_owner(&self, row: &SessionRow) -> Result<PrefixLock, CoreError> {
         let deadline = Instant::now() + self.core.tuning.cancel_wait;
         loop {
@@ -401,6 +451,12 @@ impl PlannedCancel {
                 }
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    fn stop_server_logged(&self, row: &SessionRow) {
+        if let Err(error) = self.stop_server(row) {
+            let _ = log_line(&row.log_path, &format!("the server stop failed: {error}"));
         }
     }
 
@@ -443,6 +499,26 @@ fn end_title(row: &SessionRow, tuning: &RunTuning) -> Result<(), CoreError> {
     }
 }
 
+/// `SIGKILL` to whatever of the session is left once a server stop has had
+/// [`RunTuning::term_wait`]: a helper that is no client of the server, or
+/// the server itself when it would not stop.
+fn end_stragglers(row: &SessionRow, tuning: &RunTuning) -> Result<(), CoreError> {
+    let deadline = Instant::now() + tuning.term_wait;
+    loop {
+        let left = find_session(&row.session_key);
+        if left.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            for process in left {
+                process::signal(process.pid, true)?;
+            }
+            return Ok(());
+        }
+        std::thread::sleep(tuning.tick);
+    }
+}
+
 impl Core {
     pub(crate) fn session_row(&mut self, id: i64) -> Result<SessionRow, CoreError> {
         self.reading(|db| Ok(db.session(id)?))?
@@ -459,7 +535,7 @@ impl Core {
     }
 
     /// Settles every open row nobody owns: a free prefix lock means the
-    /// owner is gone. A title that has left is closed as
+    /// owner is gone. A session that has left is closed as
     /// [`SessionState::Lost`]; one still running comes back as [`Adopted`],
     /// lock held, for a caller that will stay to watch it. A caller that
     /// drops it leaves the row open for the next core, and the title is
@@ -488,13 +564,11 @@ impl Core {
         Ok(adopted)
     }
 
-    /// With `row`'s owner known to be gone: true for a live title; a title
-    /// that has left gets its row closed.
+    /// With `row`'s owner known to be gone: true for a session with a process
+    /// left, whether or not that is the launch exe; a session that has left
+    /// gets its row closed.
     pub(crate) fn settle_orphan(&mut self, row: &SessionRow) -> Result<bool, CoreError> {
-        let alive = find_session(&row.session_key)
-            .iter()
-            .any(|process| is_title(process, &row.launch_exe));
-        if alive {
+        if !find_session(&row.session_key).is_empty() {
             return Ok(true);
         }
         let state = if row.cancel_requested {
@@ -592,9 +666,11 @@ mod tests {
 
     fn run(probe: &mut Scripted, seen: bool) -> (WatchEnd, u32) {
         let mut running = 0;
-        let end = watch(probe, &FAST, seen, &mut || {
-            running += 1;
-            Ok(())
+        let end = watch(probe, &FAST, seen, &mut |event| {
+            if event == WatchEvent::Running {
+                running += 1;
+            }
+            true
         })
         .unwrap();
         (end, running)
@@ -615,7 +691,7 @@ mod tests {
         let (end, running) = run(&mut probe, false);
         assert_eq!(running, 1);
         assert!(end.seen);
-        assert!(end.drained);
+        assert!(!end.lingered);
         assert_eq!(end.exit_code, Some(3));
     }
 
@@ -670,12 +746,75 @@ mod tests {
     }
 
     #[test]
-    fn the_end_waits_for_the_session_and_gives_up_at_the_bound() {
+    fn the_end_waits_for_the_session_past_the_bound_and_says_so_once() {
         let looks = [Look(true, None), Look(false, None), Look(false, Some(0))];
-        let mut settles = Scripted::new(&looks, 2);
-        assert!(run(&mut settles, false).0.drained);
-        let mut lingers = Scripted::new(&looks, u32::MAX);
-        assert!(!run(&mut lingers, false).0.drained);
+        let mut settles = Scripted::new(&looks, 0);
+        assert!(!run(&mut settles, false).0.lingered);
+
+        let mut tuning = FAST;
+        tuning.drain = Duration::ZERO;
+        let mut probe = Scripted::new(&looks, 50);
+        let mut events = Vec::new();
+        let end = watch(&mut probe, &tuning, false, &mut |event| {
+            events.push(event);
+            true
+        })
+        .unwrap();
+        assert_eq!(
+            probe.drained_after, 0,
+            "the wait ended only when it drained"
+        );
+        assert_eq!(events, [WatchEvent::Running, WatchEvent::Lingering]);
+        assert!(end.lingered);
+        assert_eq!(end.exit_code, Some(0), "the launch exe's own status");
+    }
+
+    #[test]
+    fn a_running_stamp_that_failed_is_asked_for_again_and_the_watch_goes_on() {
+        let looks = [
+            Look(true, None),
+            Look(true, None),
+            Look(true, None),
+            Look(false, None),
+            Look(false, Some(0)),
+        ];
+        let mut probe = Scripted::new(&looks, 0);
+        let mut asked = 0;
+        let end = watch(&mut probe, &FAST, false, &mut |_| {
+            asked += 1;
+            asked == 2
+        })
+        .unwrap();
+        assert_eq!(asked, 2);
+        assert_eq!(end.exit_code, Some(0));
+    }
+
+    struct BrokenPrefix(u32);
+
+    impl SessionProbe for BrokenPrefix {
+        fn loader_exit(&mut self) -> Result<Option<i32>, CoreError> {
+            Ok(Some(0))
+        }
+
+        fn title_present(&mut self) -> bool {
+            false
+        }
+
+        fn drained(&mut self) -> Result<bool, CoreError> {
+            self.0 -= 1;
+            if self.0 == 0 {
+                Ok(true)
+            } else {
+                Err(CoreError::Message("no stat".to_owned()))
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_look_at_the_prefix_is_not_drained_and_not_the_end() {
+        let mut probe = BrokenPrefix(3);
+        watch(&mut probe, &FAST, false, &mut |_| true).unwrap();
+        assert_eq!(probe.0, 0);
     }
 
     #[test]

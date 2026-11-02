@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use applejack_engine::rosetta_wine::launch::pe_machine;
+
 use crate::config::{AppRow, Drm, GameConfig, LaunchMode};
 use crate::error::CoreError;
 
@@ -38,7 +40,8 @@ pub struct DirectLaunch {
 
 /// Resolves `launch_exe_override` against the install directory. The value
 /// may come from a preset, so it stays inside that directory, symlinks
-/// followed.
+/// followed, and must be a PE image: Wine's answer to anything else looks
+/// like a title that needs the client.
 ///
 /// # Errors
 ///
@@ -79,6 +82,13 @@ pub fn resolve_launch(
             relative.display()
         )));
     }
+    let image = pe_machine(&exe).map_err(|error| refuse(format!("{}: {error}", exe.display())))?;
+    if image.is_none() {
+        return Err(refuse(format!(
+            "`{}` is not a Windows executable",
+            relative.display()
+        )));
+    }
     let name = |path: &Path| {
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -104,6 +114,15 @@ pub fn resolve_launch(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The least [`pe_machine`] reads as an image.
+    fn pe() -> Vec<u8> {
+        let mut image = vec![0; 64];
+        image[..2].copy_from_slice(b"MZ");
+        image[60] = 64;
+        image.extend_from_slice(b"PE\0\0\x64\x86");
+        image
+    }
 
     fn app(drm: Drm) -> AppRow {
         AppRow {
@@ -153,7 +172,7 @@ mod tests {
     fn the_exe_resolves_inside_the_install_dir() {
         let dir = TempDir::new().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
-        fs::write(dir.path().join("bin/game.exe"), b"MZ").unwrap();
+        fs::write(dir.path().join("bin/game.exe"), pe()).unwrap();
         let launch = resolve_launch(10, dir.path(), &with_exe("bin/game.exe")).unwrap();
         assert_eq!(launch.exe_name, "game.exe");
         assert_eq!(launch.cwd.file_name().unwrap(), "bin");
@@ -161,11 +180,20 @@ mod tests {
     }
 
     #[test]
+    fn a_file_that_is_not_a_pe_image_is_refused() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("text.exe"), b"MZ but no more").unwrap();
+        let error = resolve_launch(10, dir.path(), &with_exe("text.exe")).unwrap_err();
+        assert!(matches!(error, CoreError::NoLaunchExe { .. }), "{error}");
+        assert!(error.to_string().contains("not a Windows executable"));
+    }
+
+    #[test]
     fn an_exe_that_leaves_the_install_dir_is_refused() {
         let root = TempDir::new().unwrap();
         let install = root.path().join("title");
         fs::create_dir(&install).unwrap();
-        fs::write(root.path().join("outside.exe"), b"MZ").unwrap();
+        fs::write(root.path().join("outside.exe"), pe()).unwrap();
         std::os::unix::fs::symlink(root.path().join("outside.exe"), install.join("link.exe"))
             .unwrap();
         let absolute = root.path().join("outside.exe");

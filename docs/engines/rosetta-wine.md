@@ -487,8 +487,9 @@ a fresh id. A process that holds no `Session`, because another process launched
 the title or the launcher died, stops a prefix with
 `RosettaWine::stop_server(installed, prefix_dir, log)`, the same `-k` and `-w`.
 
-The launch header in `wine.log` names a dropped variable and never its value,
-a rejected path included.
+The launch header in `wine.log` gives a title's argument count and never the
+arguments, which come from a per-game setting and are where passwords go. It
+names a dropped variable and never its value, a rejected path included.
 
 ### Sessions in the core
 
@@ -505,9 +506,12 @@ executable name is the launch exe, case-insensitively, looked for twice a second
 Two looks in a row without it end the title: a read can miss a process
 mid-`exec`. The `wineserver` and Wine's own services (`services.exe`,
 `explorer.exe`, ...) carry the session id too, so they are not the marker; they
-are what the end then waits for, for up to ten seconds, before the row closes
-and the lock goes. A title that outlives its launch exe (a launcher that starts
-the game and exits) ends the session at the launcher; see Known limits.
+are what the end then waits for before the row closes and the lock goes. That
+wait has no bound, so a launcher that starts the game and exits leaves a session
+that is still open, locked, and cancellable. Past ten seconds it reports
+`lingering`, and it closes with a note and no early-exit verdict. `exit_code`
+stays the launch exe's status. A session whose helpers never exit stays open
+until `app cancel`, which ends with `SIGKILL` for what a server stop leaves.
 
 The process table cannot be read for platform binaries: macOS hides their
 environment from `KERN_PROCARGS2`, so `/bin/sh` and `/bin/sleep` never show up
@@ -719,9 +723,9 @@ call the same ones. The `meta` and `engine_versions` writes are the core's.
 | `applejack prefix list-snapshots <name>` | `snapshot::list`, oldest first. Works for a prefix that is gone |
 | `applejack prefix remove <name>` | Deletes the prefix and Wine's `server-*` directory for it; snapshots stay, and `restore` brings the prefix back from one. `remove` takes no snapshot of its own |
 | `applejack prefix exec <name> -- <exe> [args]` | `Engine::launch` with the bundle that last touched the prefix; streams the session log and exits with the child's code. Development only |
-| `applejack app run <appid> [--probe-direct]`, or `applejack run <appid>` | `Core::plan_run`, then `PlannedRun::run`, which stays until the title exits and exits with its code. Progress goes to stderr |
+| `applejack app run <appid> [--probe-direct]`, or `applejack run <appid>` | `Core::plan_run`, then `PlannedRun::run`, which stays until the session ends. Exits with the launch exe's status, with 1 when none is known, and with 1 for an early exit, which still prints the row on stdout. `SIGINT` and `SIGTERM` cancel it. Progress goes to stderr, and a closed pipe does not end the run |
 | `applejack app cancel <appid> [--kill-prefix]` | `Core::plan_cancel`, then `PlannedCancel::run`, for a session started anywhere |
-| `applejack app register <appid> --drm none --exe <file> [--library <dir>]` | Writes the `apps` row from `<library>/steamapps/appmanifest_<appid>.acf` and `launch_exe_override`, until `app.install` writes both. The library defaults to `<data>/library`. `--drm` is the caller's word |
+| `applejack app register <appid> [--drm d] [--exe <file>] [--library <dir>]` | Writes the `apps` row from `<library>/steamapps/appmanifest_<appid>.acf` and `launch_exe_override`, until `app.install` writes both. The library is canonicalized, may be on any volume, must be absolute and exist, and defaults to `<data>/library`. The manifest is not trusted: its `appid` must match, its `installdir` must be one plain directory name, control characters leave its `name`, and `--exe` must pass what a run checks. `--drm` is the caller's word, and a title registered again keeps its value without it |
 | `applejack session list [--appid n] [--json]` | `Core::session_list`, after settling sessions nobody owns |
 
 A directory passed to `--from` is packed to
@@ -753,8 +757,8 @@ behind.
   "start Steam" dialog. The early-exit check has no window to look at either, so
   it is by time alone.
 - The direct marker follows the launch exe only, so a launcher that exits and
-  leaves its game running ends the session, while the game keeps the server
-  alive and the session closes with `processes of the session were still there`.
+  leaves its game running gives the launcher's `exit_code`, and the row reports
+  `lingering` while the game plays.
 - A running title holds its prefix, not its files: nothing stops a depot update
   of a running direct title until `app.install` checks for an open session.
 - Wine Mono and Gecko are never installed; .NET titles and embedded

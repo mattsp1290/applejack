@@ -32,7 +32,7 @@ impl Fixture {
         write_title(
             &fixture.data().join("library"),
             1234,
-            &["title.exe", "quick.exe"],
+            &["title.exe", "quick.exe", "launcher.exe"],
         );
         fixture.ok(&[
             "engine",
@@ -281,9 +281,72 @@ fn a_run_exits_with_the_titles_code() {
 fn a_quick_exit_is_reported_and_fails_the_run() {
     let fixture = Fixture::new();
     fixture.ok(&["config", APP, "set", "launch_exe_override", "quick.exe"]);
-    let text = fixture.refused(&["app", "run", APP]);
+    let output = fixture.output(&["app", "run", APP]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a clean code, but it did not stay"
+    );
+    let text = String::from_utf8(output.stderr).unwrap();
     assert!(text.contains("may require the Steam client"), "{text}");
+    let row = String::from_utf8(output.stdout).unwrap();
+    assert!(row.contains("exited exit 0"), "the row: {row}");
     assert_eq!(fixture.sessions()[0]["state"], json!("exited"));
+}
+
+fn signal(child: &Child, name: &str) {
+    let status = Command::new("/bin/kill")
+        .args([name, &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn sigint_and_sigterm_cancel_an_attached_run() {
+    for name in ["-INT", "-TERM"] {
+        let fixture = Fixture::new();
+        let mut run = fixture.attached_run();
+        let row = fixture.sessions()[0].clone();
+        signal(&run, name);
+        assert_eq!(run.wait().unwrap().code(), Some(128 + 15), "{name}");
+        let end = &fixture.sessions()[0];
+        assert_eq!(end["state"], json!("cancelled"), "{name}");
+        assert_eq!(find_session(&key(&row)), []);
+        fixture.ok(&["prefix", "snapshot", APP]);
+    }
+}
+
+#[test]
+fn closed_pipes_do_not_kill_the_owner_of_a_session() {
+    let fixture = Fixture::new();
+    let mut run = fixture
+        .command()
+        .args(["app", "run", APP])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(run.stdout.take());
+    drop(run.stderr.take());
+    fixture.wait_for_state("running");
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(run.try_wait().unwrap(), None, "the owner stays");
+    fs::write(fixture.prefix().join("quit"), "9").unwrap();
+    assert_eq!(run.wait().unwrap().code(), Some(9));
+    assert_eq!(fixture.sessions()[0]["state"], json!("exited"));
+}
+
+#[test]
+fn register_reports_what_it_refuses_and_stores_a_canonical_library() {
+    let fixture = Fixture::new();
+    let text = fixture.refused(&["app", "register", APP, "--library", "./library"]);
+    assert!(text.contains("not an absolute path"), "{text}");
+    let text = fixture.refused(&["app", "register", APP, "--exe", "../../etc"]);
+    assert!(text.contains("launch"), "{text}");
+
+    let line = fixture.ok(&["app", "register", APP]);
+    assert!(line.contains("drm none"), "{line}");
 }
 
 #[test]

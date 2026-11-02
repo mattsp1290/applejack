@@ -177,16 +177,23 @@ fn render(program: &Path, args: &[&OsStr]) -> String {
     text
 }
 
+/// `shown` replaces the arguments in the log line: a title's arguments come
+/// from a per-game setting, and passwords and tokens go there in practice.
 fn spawn_logged(
     program: &Path,
     args: &[&OsStr],
+    shown: Option<&str>,
     env: &[EnvPair],
     cwd: &Path,
     log: &Path,
     header: &[String],
 ) -> Result<std::process::Child> {
     let mut file = open_log(log)?;
-    let mut lines = vec![format!("[applejack] run: {}", render(program, args))];
+    let line = shown.map_or_else(
+        || render(program, args),
+        |text| format!("{} {text}", program.display()),
+    );
+    let mut lines = vec![format!("[applejack] run: {line}")];
     lines.extend(header.iter().cloned());
     for line in lines {
         writeln!(file, "{line}").map_err(|error| Error::io(log, error))?;
@@ -257,7 +264,7 @@ pub(crate) fn run_loader(
 ) -> Result<()> {
     let loader = installed.root.join(&installed.bundle.wine.loader);
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    let mut child = spawn_logged(&loader, &args, env, cwd, log, &[])?;
+    let mut child = spawn_logged(&loader, &args, None, env, cwd, log, &[])?;
     let pid = child.id();
     let Some(status) = wait_bounded(&mut child, &loader, timeout)? else {
         return Err(timed_out(render(&loader, &args), timeout, log, pid));
@@ -318,7 +325,15 @@ fn server_command(
             prefix_dir.as_os_str().to_owned(),
         ),
     ];
-    spawn_logged(server, &[OsStr::new(flag)], &env, prefix_dir, log, &[])
+    spawn_logged(
+        server,
+        &[OsStr::new(flag)],
+        None,
+        &env,
+        prefix_dir,
+        log,
+        &[],
+    )
 }
 
 /// `<server> -k` then `<server> -w` bounded by [`KILL_WAIT`], so the caller
@@ -407,7 +422,16 @@ pub(crate) fn spawn(
     let loader = installed.root.join(&installed.bundle.wine.loader);
     let mut args: Vec<&OsStr> = vec![spec.exe.as_os_str()];
     args.extend(spec.args.iter().map(OsString::as_os_str));
-    let child = spawn_logged(&loader, &args, &env, &spec.cwd, &log_path, &header)?;
+    let shown = format!("{} ({} arguments)", spec.exe.display(), spec.args.len());
+    let child = spawn_logged(
+        &loader,
+        &args,
+        Some(&shown),
+        &env,
+        &spec.cwd,
+        &log_path,
+        &header,
+    )?;
     let path = env
         .iter()
         .find(|(name, _)| name == "PATH")

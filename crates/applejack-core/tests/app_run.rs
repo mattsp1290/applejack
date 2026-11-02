@@ -21,11 +21,11 @@ use applejack_core::rpc::methods::{
 use applejack_core::rpc::wire::{ErrorCode, RpcError};
 use applejack_core::rpc::{CoreHandler, Handler, PROTOCOL_VERSION};
 use applejack_core::run::{AppRegistration, NOTE_PROBE};
-use applejack_core::runtime::session::{NOTE_ADOPTED, NOTE_LOST, RunTuning};
+use applejack_core::runtime::session::{NOTE_ADOPTED, NOTE_LINGERED, NOTE_LOST, RunTuning};
 use applejack_core::{Core, CoreError};
 use applejack_engine::rosetta_wine::process::find_session;
 use applejack_engine::{Error as EngineError, GraphicsBackend, HidrawMode};
-use common::{script, spawn_stub_title, write_stub_bundle, write_title};
+use common::{script, spawn_stub_server, spawn_stub_title, write_stub_bundle, write_title};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -67,7 +67,13 @@ impl Fixture {
         write_title(
             &fixture.library(),
             APP,
-            &["title.exe", "stubborn.exe", "quick.exe"],
+            &[
+                "title.exe",
+                "stubborn.exe",
+                "quick.exe",
+                "launcher.exe",
+                "immortal.exe",
+            ],
         );
         fixture.register(Drm::None, Some("title.exe"));
         fixture
@@ -91,7 +97,7 @@ impl Fixture {
         self.core()
             .app_register(&AppRegistration {
                 appid: APP,
-                drm,
+                drm: Some(drm),
                 exe: exe.map(str::to_owned),
                 library: None,
             })
@@ -261,23 +267,236 @@ fn a_title_with_no_launch_exe_is_refused() {
 }
 
 #[test]
-fn a_library_outside_the_data_directory_is_refused() {
+fn a_registered_library_outside_the_data_directory_runs() {
+    let fixture = Fixture::new();
+    let outside = fixture.dir.path().join("elsewhere");
+    write_title(&outside, APP, &["title.exe"]);
+    let row = fixture
+        .core()
+        .app_register(&AppRegistration {
+            appid: APP,
+            drm: Some(Drm::None),
+            exe: Some("title.exe".to_owned()),
+            library: Some(outside.clone()),
+        })
+        .unwrap();
+    let outside = fs::canonicalize(outside).unwrap();
+    assert_eq!(row.library_dir.as_deref(), outside.to_str());
+    let running = fixture.start();
+    let link = fixture.prefix_dir().join("dosdevices/s:");
+    assert_eq!(fs::read_link(link).unwrap(), outside);
+    fixture.quit(0);
+    assert_eq!(running.finish().0.exit_code, Some(0));
+}
+
+#[test]
+fn the_exe_stays_inside_the_install_dir_of_a_library_outside_the_data_directory() {
+    let fixture = Fixture::new();
+    let outside = fixture.dir.path().join("elsewhere");
+    write_title(&outside, APP, &["title.exe"]);
+    fs::write(outside.join("steamapps/stray.exe"), common::pe_image()).unwrap();
+    let register = |exe: &str| {
+        fixture.core().app_register(&AppRegistration {
+            appid: APP,
+            drm: Some(Drm::None),
+            exe: Some(exe.to_owned()),
+            library: Some(outside.clone()),
+        })
+    };
+    register("title.exe").unwrap();
+    let error = register("../../stray.exe").unwrap_err();
+    assert_eq!(error.code(), ErrorCode::NoLaunchExe, "{error}");
+    fixture
+        .core()
+        .config_set(APP, "launch_exe_override", "../../stray.exe")
+        .unwrap();
+    assert_refused(&fixture, ErrorCode::NoLaunchExe);
+}
+
+#[test]
+fn a_prefix_exec_outside_the_data_directory_is_still_refused() {
     let fixture = Fixture::new();
     let outside = fixture.dir.path().join("elsewhere");
     write_title(&outside, APP, &["title.exe"]);
     fixture
         .core()
-        .app_register(&AppRegistration {
-            appid: APP,
-            drm: Drm::None,
-            exe: None,
-            library: Some(outside),
-        })
+        .prefix_create(PREFIX, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
         .unwrap();
-    let error = plan_error(&fixture);
+    let exe = outside.join("steamapps/common/Title/title.exe");
+    let mut sink = Vec::new();
+    let error = fixture
+        .core()
+        .prefix_exec(PREFIX, &exe, &[] as &[OsString], &mut sink)
+        .unwrap_err();
     assert!(
         matches!(error, CoreError::PathOutsideData { .. }),
         "{error}"
+    );
+}
+
+fn refused_registration(fixture: &Fixture, registration: &AppRegistration) -> CoreError {
+    let before = fixture.db().app(registration.appid).unwrap();
+    let error = fixture.core().app_register(registration).unwrap_err();
+    let after = fixture.db().app(registration.appid).unwrap();
+    assert_eq!(before, after, "a refusal writes nothing");
+    error
+}
+
+fn manifest_with(fixture: &Fixture, from: &str, to: &str) {
+    let acf = fixture
+        .library()
+        .join(format!("steamapps/appmanifest_{APP}.acf"));
+    let text = fs::read_to_string(&acf).unwrap();
+    assert!(text.contains(from));
+    fs::write(&acf, text.replace(from, to)).unwrap();
+}
+
+fn registration(exe: Option<&str>, library: Option<PathBuf>) -> AppRegistration {
+    AppRegistration {
+        appid: APP,
+        drm: Some(Drm::None),
+        exe: exe.map(str::to_owned),
+        library,
+    }
+}
+
+#[test]
+fn an_installdir_that_is_not_one_name_is_refused_at_register_and_at_run() {
+    let fixture = Fixture::new();
+    for bad in ["..", "../..", ".", "/etc", "a/b", "Title/", "a\\\\b"] {
+        manifest_with(
+            &fixture,
+            "\"installdir\"\t\t\"Title\"",
+            &format!("\"installdir\"\t\t\"{bad}\""),
+        );
+        let error = refused_registration(&fixture, &registration(None, None));
+        assert_eq!(error.code(), ErrorCode::TitleNotInstalled, "{bad}: {error}");
+        assert!(error.to_string().contains("install directory"), "{error}");
+        manifest_with(
+            &fixture,
+            &format!("\"installdir\"\t\t\"{bad}\""),
+            "\"installdir\"\t\t\"Title\"",
+        );
+    }
+}
+
+#[test]
+fn a_stored_installdir_that_is_not_one_name_is_refused_at_run() {
+    let fixture = Fixture::new();
+    let mut row = fixture.db().app(APP).unwrap().unwrap();
+    row.installdir = Some("../..".to_owned());
+    fixture.db().upsert_app(&row).unwrap();
+    assert_refused(&fixture, ErrorCode::TitleNotInstalled);
+    assert!(
+        plan_error(&fixture)
+            .to_string()
+            .contains("install directory")
+    );
+}
+
+#[test]
+fn a_manifest_for_another_app_is_refused() {
+    let fixture = Fixture::new();
+    manifest_with(&fixture, "\"appid\"\t\t\"1234\"", "\"appid\"\t\t\"999\"");
+    let error = refused_registration(&fixture, &registration(None, None));
+    assert_eq!(error.code(), ErrorCode::TitleNotInstalled, "{error}");
+    assert!(error.to_string().contains("names app 999"), "{error}");
+    assert_refused(&fixture, ErrorCode::TitleNotInstalled);
+}
+
+#[test]
+fn register_refuses_what_a_run_would_refuse_of_the_exe() {
+    let fixture = Fixture::new();
+    fs::write(fixture.library().join("outside.exe"), common::pe_image()).unwrap();
+    let title = fixture.library().join("steamapps/common/Title");
+    fs::write(title.join("notes.exe"), "plain text").unwrap();
+    for exe in [
+        "../../../outside.exe",
+        "/etc/hosts",
+        "missing.exe",
+        "notes.exe",
+    ] {
+        let error = refused_registration(&fixture, &registration(Some(exe), None));
+        assert_eq!(error.code(), ErrorCode::NoLaunchExe, "{exe}: {error}");
+    }
+}
+
+#[test]
+fn a_library_that_is_relative_or_missing_is_refused_at_register() {
+    let fixture = Fixture::new();
+    for library in ["library", "./library"] {
+        let error = refused_registration(&fixture, &registration(None, Some(library.into())));
+        assert_eq!(error.code(), ErrorCode::TitleNotInstalled, "{error}");
+        assert!(error.to_string().contains("absolute"), "{error}");
+    }
+    let missing = fixture.dir.path().join("nowhere");
+    let error = refused_registration(&fixture, &registration(None, Some(missing)));
+    assert_eq!(error.code(), ErrorCode::TitleNotInstalled, "{error}");
+}
+
+#[test]
+fn a_relative_library_in_the_record_is_refused_at_run() {
+    let fixture = Fixture::new();
+    let mut row = fixture.db().app(APP).unwrap().unwrap();
+    row.library_dir = Some("library".to_owned());
+    fixture.db().upsert_app(&row).unwrap();
+    assert_refused(&fixture, ErrorCode::TitleNotInstalled);
+    let error = plan_error(&fixture).to_string();
+    assert!(error.contains("not an absolute path"), "{error}");
+}
+
+#[test]
+fn control_characters_in_a_manifest_name_are_not_stored() {
+    let fixture = Fixture::new();
+    manifest_with(
+        &fixture,
+        "\"name\"\t\t\"Title\"",
+        "\"name\"\t\t\"Ti\u{1b}[31mtle\u{7}\"",
+    );
+    let row = fixture
+        .core()
+        .app_register(&registration(None, None))
+        .unwrap();
+    assert_eq!(row.name.as_deref(), Some("Ti[31mtle"));
+    let stored = fixture.db().app(APP).unwrap().unwrap();
+    assert_eq!(stored.name, row.name);
+}
+
+#[test]
+fn register_keeps_the_stored_drm_unless_it_is_given() {
+    let fixture = Fixture::new();
+    let mut again = registration(None, None);
+    again.drm = None;
+    let row = fixture.core().app_register(&again).unwrap();
+    assert_eq!(row.drm, Drm::None);
+    let mut steam = registration(None, None);
+    steam.drm = Some(Drm::Steam);
+    assert_eq!(fixture.core().app_register(&steam).unwrap().drm, Drm::Steam);
+
+    let other = AppRegistration {
+        appid: 77,
+        drm: None,
+        exe: None,
+        library: None,
+    };
+    write_title(&fixture.library(), 77, &[]);
+    assert_eq!(
+        fixture.core().app_register(&other).unwrap().drm,
+        Drm::Unknown
+    );
+}
+
+#[test]
+fn the_direct_verification_stamp_cannot_be_set_by_hand() {
+    let fixture = Fixture::new();
+    let error = fixture
+        .core()
+        .config_set(APP, "direct_verified_at", "2026-01-01T00:00:00Z")
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidParams, "{error}");
+    assert_eq!(
+        fixture.core().config_get(APP).unwrap().direct_verified_at,
+        None
     );
 }
 
@@ -332,10 +551,6 @@ fn a_session_runs_in_order_and_records_its_end() {
 #[test]
 fn the_log_lives_in_a_directory_of_the_session_under_the_data_dir() {
     let fixture = Fixture::new();
-    fixture
-        .core()
-        .config_set(APP, "launch_args_override", "--windowed")
-        .unwrap();
     let running = fixture.start();
     fixture.quit(0);
     let (end, _) = running.finish();
@@ -343,7 +558,28 @@ fn the_log_lives_in_a_directory_of_the_session_under_the_data_dir() {
     assert!(log.starts_with(fixture.data().join("logs").join(&end.session_key)));
     let text = fs::read_to_string(log).unwrap();
     assert!(text.contains("title up:"), "{text}");
-    assert!(text.contains("--windowed"), "{text}");
+}
+
+#[test]
+fn launch_arguments_reach_the_title_and_only_their_count_reaches_the_log() {
+    let fixture = Fixture::new();
+    fixture
+        .core()
+        .config_set(
+            APP,
+            "launch_args_override",
+            "+connect srv +password hunter5",
+        )
+        .unwrap();
+    let running = fixture.start();
+    fixture.quit(0);
+    let (end, _) = running.finish();
+    let given = fs::read_to_string(fixture.prefix_dir().join("args")).unwrap();
+    assert_eq!(given.trim(), "+connect srv +password hunter5");
+    let text = fs::read_to_string(end.log_path).unwrap();
+    assert!(!text.contains("hunter5"), "{text}");
+    assert!(!text.contains("+connect"), "{text}");
+    assert!(text.contains("title.exe (4 arguments)"), "{text}");
 }
 
 #[test]
@@ -351,7 +587,8 @@ fn a_new_prefix_maps_the_titles_library_and_is_reused() {
     let fixture = Fixture::new();
     let running = fixture.start();
     let link = fixture.prefix_dir().join("dosdevices/s:");
-    assert_eq!(fs::read_link(link).unwrap(), fixture.library());
+    let library = fs::canonicalize(fixture.library()).unwrap();
+    assert_eq!(fs::read_link(link).unwrap(), library);
     fixture.quit(0);
     running.finish();
     fs::remove_file(fixture.prefix_dir().join("quit")).unwrap();
@@ -434,14 +671,12 @@ fn a_double_launch_is_refused_and_the_first_is_untouched() {
 #[test]
 fn a_busy_prefix_with_no_session_is_busy_not_already_running() {
     let fixture = Fixture::new();
-    let core = fixture.core();
     let _other = applejack_engine::rosetta_wine::snapshot::PrefixLock::acquire(
         &fixture.prefix_dir(),
         &fixture.data().join("prefixes/.snapshots"),
         PREFIX,
     )
     .unwrap();
-    drop(core);
     assert_refused(&fixture, ErrorCode::PrefixBusy);
 }
 
@@ -465,6 +700,41 @@ fn a_launch_that_cannot_start_is_a_failed_session_and_lets_go() {
             .contains("failed:")
     );
     fixture.assert_lock_free_without_prefix();
+}
+
+#[test]
+fn a_failure_with_a_live_process_of_the_session_leaves_the_row_open() {
+    let fixture = Fixture::new();
+    fixture
+        .core()
+        .prefix_create(PREFIX, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
+        .unwrap();
+    fixture
+        .core()
+        .config_set(APP, "graphics_backend", "d3dmetal")
+        .unwrap();
+    let plan = fixture.core().plan_run(APP, false).unwrap();
+    let id = plan.session_id();
+    let key = fixture.db().session(id).unwrap().unwrap().session_key;
+    let _left = Orphan::start(&fixture, &key);
+    plan.run(&mut |_, _| {}).unwrap_err();
+    let row = fixture.db().session(id).unwrap().unwrap();
+    assert_eq!(row.ended_at, None, "{:?}", row.note);
+    assert_eq!(row.state, SessionState::Starting);
+    assert!(
+        fs::read_to_string(row.log_path)
+            .unwrap()
+            .contains("left running:")
+    );
+
+    let end = fixture
+        .core()
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert_eq!(end.state, SessionState::Cancelled);
+    assert_eq!(find_session(&key), []);
 }
 
 #[test]
@@ -538,6 +808,8 @@ fn no_environment_value_reaches_the_log() {
     core.config_set(APP, "extra_env", "STEAM_REFRESH_TOKEN=hunter2")
         .unwrap();
     core.config_set(APP, "extra_env", "VK_ICD_FILENAMES=/tmp/hunter3")
+        .unwrap();
+    core.config_set(APP, "launch_args_override", "-token hunter4")
         .unwrap();
     let running = fixture.start();
     fixture.quit(0);
@@ -614,11 +886,328 @@ fn a_cancel_before_the_spawn_never_starts_the_title() {
     assert!(!log.exists() || !fs::read_to_string(log).unwrap().contains("title up"));
 }
 
+/// The run on its own thread, with `on_phase` called for each step, so a test
+/// can land something in the window between two of them.
+fn start_watching(
+    fixture: &Fixture,
+    tuning: RunTuning,
+    mut on_phase: impl FnMut(&str, i64) + Send + 'static,
+) -> Running {
+    let plan = fixture
+        .core()
+        .with_run_tuning(tuning)
+        .plan_run(APP, false)
+        .unwrap();
+    let id = plan.session_id();
+    let thread = thread::spawn(move || {
+        let mut phases = Vec::new();
+        let outcome = plan.run(&mut |phase, _| {
+            on_phase(phase, id);
+            phases.push(phase.to_owned());
+        });
+        (outcome, phases)
+    });
+    Running { id, thread }
+}
+
+/// Fails the test rather than hanging it, and lets the title go if it did.
+fn finish_or_fail(fixture: &Fixture, running: Running) -> (SessionRow, Vec<String>) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !running.thread.is_finished() {
+        if Instant::now() > deadline {
+            fixture.quit(0);
+            panic!("the run did not end");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    running.finish()
+}
+
+#[test]
+fn a_cancel_inside_the_launch_window_ends_the_title_it_just_started() {
+    let fixture = Fixture::new();
+    let data = fixture.data();
+    let running = start_watching(&fixture, FAST, move |phase, id| {
+        if phase == "starting" {
+            let db = ConfigDb::open(&data.join("db.sqlite")).unwrap();
+            db.request_session_cancel(id).unwrap();
+        }
+    });
+    let (row, phases) = finish_or_fail(&fixture, running);
+    assert_eq!(row.state, SessionState::Cancelled);
+    assert_eq!(row.exit_code, Some(99), "the server stop ended it");
+    assert_eq!(phases.last().map(String::as_str), Some("cancelled"));
+    assert_eq!(find_session(&row.session_key), []);
+    fixture.assert_lock_free();
+}
+
+#[test]
+fn a_quick_cancel_is_not_an_early_exit() {
+    let fixture = Fixture::new();
+    let mut tuning = FAST;
+    tuning.early_exit = Duration::from_secs(60);
+    let running = start_watching(&fixture, tuning, |_, _| {});
+    fixture.wait_for(running.id, SessionState::Running);
+    let row = fixture
+        .core()
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert_eq!(row.state, SessionState::Cancelled);
+    let (end, _) = running.finish();
+    assert_eq!(end.note, None);
+}
+
+#[test]
+fn a_cancel_that_fails_the_launch_closes_as_cancelled_not_failed() {
+    let fixture = Fixture::new();
+    fixture
+        .core()
+        .config_set(APP, "graphics_backend", "d3dmetal")
+        .unwrap();
+    let plan = fixture.core().plan_run(APP, false).unwrap();
+    let id = plan.session_id();
+    fixture.db().request_session_cancel(id).unwrap();
+    let row = plan.run(&mut |_, _| {}).unwrap();
+    assert_eq!(row.state, SessionState::Cancelled);
+    assert_eq!(row.exit_code, None);
+    fixture.assert_lock_free_without_prefix();
+}
+
+#[test]
+fn a_cancel_leaves_the_server_of_a_prefix_still_being_built() {
+    let fixture = Fixture::new();
+    fixture
+        .core()
+        .prefix_create(PREFIX, GraphicsBackend::Dxmt, None, HidrawMode::Disabled)
+        .unwrap();
+    let plan = fixture.core().plan_run(APP, false).unwrap();
+    let id = plan.session_id();
+    // The build's server carries the build's own session id.
+    let mut server = spawn_stub_server("prefix-build", &fixture.prefix_dir());
+    let mut tuning = FAST;
+    tuning.drain = Duration::from_millis(100);
+    tuning.cancel_wait = Duration::from_millis(500);
+    let cancel = fixture
+        .core()
+        .with_run_tuning(tuning)
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap_err();
+    assert!(cancel.to_string().contains("did not let go"), "{cancel}");
+    assert!(
+        !fixture.prefix_dir().join("server-quit").exists(),
+        "a cancel stopped the server of a row that is still starting"
+    );
+    fs::write(fixture.prefix_dir().join("server-quit"), "").unwrap();
+    server.wait().unwrap();
+    let row = plan.run(&mut |_, _| {}).unwrap();
+    assert_eq!(row.id, id);
+    assert_eq!(row.state, SessionState::Cancelled);
+}
+
+#[test]
+fn a_cancel_stops_a_server_that_outstays_the_title() {
+    let fixture = Fixture::new();
+    let mut tuning = FAST;
+    tuning.drain = Duration::from_millis(100);
+    let running = start_watching(&fixture, tuning, |_, _| {});
+    fixture.wait_for(running.id, SessionState::Running);
+    let row = fixture.db().session(running.id).unwrap().unwrap();
+    let mut server = spawn_stub_server(&row.session_key, &fixture.prefix_dir());
+    let end = fixture
+        .core()
+        .with_run_tuning(tuning)
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert_eq!(end.state, SessionState::Cancelled);
+    assert_eq!(find_session(&end.session_key), []);
+    assert!(
+        server.wait().unwrap().success(),
+        "the server left on `-k`, not as a straggler"
+    );
+    fixture.assert_lock_free();
+    running.finish();
+}
+
 #[test]
 fn cancelling_a_title_that_is_not_running_is_refused() {
     let fixture = Fixture::new();
     let error = fixture.core().plan_cancel(APP, false).unwrap_err();
     assert_eq!(error.code(), ErrorCode::NotRunning, "{error}");
+}
+
+// The end of a session.
+
+const SHORT_DRAIN: RunTuning = RunTuning {
+    drain: Duration::from_millis(100),
+    ..FAST
+};
+
+#[test]
+fn a_busy_database_at_the_marker_does_not_abandon_the_title() {
+    let fixture = Fixture::new();
+    let plan = fixture.core().plan_run(APP, false).unwrap();
+    let id = plan.session_id();
+    let log = plan.log_path().to_owned();
+    let writer = rusqlite::Connection::open(fixture.data().join("db.sqlite")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let running = Running {
+        id,
+        thread: thread::spawn(move || {
+            let mut phases = Vec::new();
+            let outcome = plan.run(&mut |phase, _| phases.push(phase.to_owned()));
+            (outcome, phases)
+        }),
+    };
+    wait_until("the marker to fail", || {
+        fs::read_to_string(&log)
+            .is_ok_and(|text| text.contains("could not record running"))
+            .then_some(())
+    });
+    let row = fixture.db().session(id).unwrap().unwrap();
+    assert_eq!(row.ended_at, None, "{:?}", row.note);
+    assert_ne!(find_session(&row.session_key), []);
+    assert!(
+        !running.thread.is_finished(),
+        "the owner stays with the title"
+    );
+    assert_busy(fixture.core().prefix_snapshot(PREFIX));
+
+    writer.execute_batch("ROLLBACK").unwrap();
+    fixture.wait_for(id, SessionState::Running);
+    fixture.quit(4);
+    let (end, phases) = running.finish();
+    assert_eq!(end.state, SessionState::Exited);
+    assert_eq!(end.exit_code, Some(4));
+    assert_eq!(phases, ["prefix", "starting", "running", "exited"]);
+    fixture.assert_lock_free();
+}
+
+#[test]
+fn a_session_that_outlives_its_launcher_stays_open_and_locked_until_it_drains() {
+    let fixture = Fixture::new();
+    fixture.register(Drm::None, Some("launcher.exe"));
+    let mut tuning = SHORT_DRAIN;
+    tuning.early_exit = Duration::from_secs(60);
+    let (sender, lingering) = std::sync::mpsc::channel();
+    let running = start_watching(&fixture, tuning, move |phase, _| {
+        if phase == "lingering" {
+            sender.send(()).unwrap();
+        }
+    });
+    lingering.recv_timeout(Duration::from_secs(10)).unwrap();
+    let row = fixture.db().session(running.id).unwrap().unwrap();
+    assert_eq!(row.ended_at, None);
+    assert_eq!(row.state, SessionState::Running);
+    assert_eq!(
+        find_session(&row.session_key)[0].exe,
+        "game.exe",
+        "the launcher's game is what is left"
+    );
+    assert_busy(fixture.core().prefix_snapshot(PREFIX));
+    assert_refused(&fixture, ErrorCode::AlreadyRunning);
+
+    fixture.quit(0);
+    let (end, _) = finish_or_fail(&fixture, running);
+    assert_eq!(end.state, SessionState::Exited);
+    assert_eq!(
+        end.exit_code,
+        Some(3),
+        "the launch exe's status, not the game's"
+    );
+    assert_eq!(end.note.as_deref(), Some(NOTE_LINGERED));
+    assert_eq!(find_session(&end.session_key), []);
+    fixture.assert_lock_free();
+}
+
+#[test]
+fn cancel_reaches_the_game_a_launcher_left() {
+    let fixture = Fixture::new();
+    fixture.register(Drm::None, Some("launcher.exe"));
+    let (sender, lingering) = std::sync::mpsc::channel();
+    let running = start_watching(&fixture, SHORT_DRAIN, move |phase, _| {
+        if phase == "lingering" {
+            sender.send(()).unwrap();
+        }
+    });
+    lingering.recv_timeout(Duration::from_secs(10)).unwrap();
+    let row = fixture
+        .core()
+        .with_run_tuning(SHORT_DRAIN)
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert_eq!(row.state, SessionState::Cancelled);
+    assert_eq!(find_session(&row.session_key), []);
+    fixture.assert_lock_free();
+    assert_eq!(finish_or_fail(&fixture, running).0.exit_code, Some(3));
+}
+
+#[test]
+fn cancel_ends_a_helper_nothing_else_will() {
+    let fixture = Fixture::new();
+    fixture.register(Drm::None, Some("immortal.exe"));
+    let running = start_watching(&fixture, SHORT_DRAIN, |_, _| {});
+    fixture.wait_for(running.id, SessionState::Running);
+    let row = fixture
+        .core()
+        .with_run_tuning(SHORT_DRAIN)
+        .plan_cancel(APP, false)
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert_eq!(row.state, SessionState::Cancelled);
+    assert_eq!(find_session(&row.session_key), []);
+    fixture.assert_lock_free();
+    finish_or_fail(&fixture, running);
+}
+
+#[test]
+fn the_row_closes_only_when_the_server_has_gone() {
+    let fixture = Fixture::new();
+    let running = start_watching(&fixture, SHORT_DRAIN, |_, _| {});
+    fixture.wait_for(running.id, SessionState::Running);
+    let row = fixture.db().session(running.id).unwrap().unwrap();
+    let mut server = spawn_stub_server(&row.session_key, &fixture.prefix_dir());
+    fixture.quit(0);
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        fixture.db().session(running.id).unwrap().unwrap().ended_at,
+        None
+    );
+    assert!(!running.thread.is_finished());
+    fs::write(fixture.prefix_dir().join("server-quit"), "").unwrap();
+    server.wait().unwrap();
+    let (end, phases) = running.finish();
+    assert_eq!(end.exit_code, Some(0));
+    assert_eq!(end.note.as_deref(), Some(NOTE_LINGERED));
+    assert!(phases.contains(&"lingering".to_owned()), "{phases:?}");
+}
+
+#[test]
+fn a_run_waits_out_the_server_the_last_one_left() {
+    let fixture = Fixture::new();
+    let running = fixture.start();
+    fixture.quit(0);
+    running.finish();
+    fs::remove_file(fixture.prefix_dir().join("quit")).unwrap();
+    let mut server = spawn_stub_server("run-before", &fixture.prefix_dir());
+    let quit = fixture.prefix_dir().join("server-quit");
+    let leaves = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        fs::write(quit, "").unwrap();
+        server.wait().unwrap();
+    });
+    let running = fixture.start();
+    leaves.join().unwrap();
+    fixture.quit(0);
+    running.finish();
 }
 
 // A core that died.
@@ -650,7 +1239,11 @@ struct Orphan(Child);
 
 impl Orphan {
     fn start(fixture: &Fixture, key: &str) -> Self {
-        let child = spawn_stub_title(key, &fixture.prefix_dir());
+        Self::named(fixture, key, "title.exe")
+    }
+
+    fn named(fixture: &Fixture, key: &str, exe: &str) -> Self {
+        let child = spawn_stub_title(key, &fixture.prefix_dir(), exe);
         let key = key.to_owned();
         wait_until("the orphan to be listed", || {
             (!find_session(&key).is_empty()).then_some(())
@@ -712,6 +1305,46 @@ fn a_session_owned_by_a_live_core_is_not_touched() {
     assert_eq!(row.state, SessionState::Running);
     fixture.quit(0);
     running.finish();
+}
+
+#[test]
+fn a_dead_owners_session_answers_busy_at_once_not_after_the_settle() {
+    let fixture = Fixture::new();
+    orphan_row(&fixture, "run-gap");
+    let _title = Orphan::start(&fixture, "run-gap");
+    let mut server = spawn_stub_server("run-gap", &fixture.prefix_dir());
+    let started = Instant::now();
+    let mut core = fixture.core();
+    assert_busy(core.prefix_snapshot(PREFIX));
+    assert_busy(core.prefix_reset(PREFIX, false));
+    assert_busy(core.prefix_remove(PREFIX));
+    assert_busy(core.prefix_restore(PREFIX, "20260101T000000Z"));
+    assert_busy(core.prefix_exec(
+        PREFIX,
+        Path::new("x.exe"),
+        &[] as &[OsString],
+        &mut Vec::new(),
+    ));
+    assert!(started.elapsed() < Duration::from_secs(5), "it stalled");
+    fs::write(fixture.prefix_dir().join("server-quit"), "").unwrap();
+    server.wait().unwrap();
+}
+
+#[test]
+fn a_game_a_dead_owners_launcher_left_is_taken_over_not_lost() {
+    let fixture = Fixture::new();
+    let id = orphan_row(&fixture, "run-left");
+    let game = Orphan::named(&fixture, "run-left", "game.exe");
+    let mut adopted = fixture.core().reconcile_sessions().unwrap();
+    assert_eq!(adopted.len(), 1, "title.exe is gone and its game is not");
+    assert_eq!(fixture.db().session(id).unwrap().unwrap().ended_at, None);
+    let session = adopted.pop().unwrap();
+    let thread = thread::spawn(move || session.watch(&mut |_, _| {}));
+    assert_busy(fixture.core().prefix_snapshot(PREFIX));
+    fixture.quit(0);
+    drop(game);
+    let row = thread.join().unwrap().unwrap();
+    assert_eq!(row.state, SessionState::Exited);
 }
 
 #[test]

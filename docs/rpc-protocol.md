@@ -190,7 +190,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `prefix.restore` | The same shape, naming the safety snapshot of the replaced state, or the restored snapshot when the prefix was gone and there was nothing to replace |
 | `prefix.reset` | `JobStarted`. A `job.progress` message names the safety snapshot |
 | `config.get` | `GameConfig`; every member `null` for an appid with no row |
-| `config.set` | `{}`. `value` is a string, a boolean, a number, an object for `extra_env`, or `null` to clear |
+| `config.set` | `{}`. `value` is a string, a boolean, a number, an object for `extra_env`, or `null` to clear. `direct_verified_at` is refused: only a direct probe records it |
 | `config.export` | `{path}` |
 | `config.import` | `{applied, preset_appid, accepted, rejected, confirmations}` |
 
@@ -226,8 +226,17 @@ a prefix nor a snapshot is an unknown prefix.
 `app.run` claims a session and answers at once with the `sessions` row id, the
 log path, and a job. The job's `job.progress` phases are the session's steps:
 `prefix` (only when it builds or changes the prefix), `starting`, `running`,
-then the state it ended in. The job ends with the title, so a `job.done` means
-the session is closed: `session.list` has its `exit_code`.
+`lingering` (only when the session goes on after the launch exe), then the state
+it ended in. The job ends with the session, so a `job.done` means the session is
+closed: `session.list` has its `exit_code`. The job of `app.cancel` reports
+`cancel`, then `cancelled`; the job of a taken-over session reports `running`,
+`lingering` if it applies, and the state it ended in.
+
+A title's registered `library_dir` is an allowed root at run, so a Steam library
+on another volume works: the exe stays inside the title's install directory,
+that stays inside the library, and `S:` of the title's prefix is the library.
+Everything else Wine is handed stays inside the data directory, and `prefix.exec`
+is still confined to it.
 
 Only client-free titles run. A title takes the direct path with `drm = none`,
 with `launch_mode = direct` and a `direct_verified_at`, or with `probe_direct`.
@@ -237,20 +246,26 @@ Refused with an error response, before anything starts or any row is written:
 
 | Code | When |
 |---|---|
-| `TitleNotInstalled` | No `apps` row, no complete `appmanifest_<appid>.acf`, or an empty install directory |
+| `TitleNotInstalled` | No `apps` row, no complete `appmanifest_<appid>.acf` for this appid, an empty install directory, an `installdir` that is not one plain directory name, or a relative library |
 | `DownloadInProgress` | `<library>/applejack/<appid>.download.json` exists |
 | `ClientRuntimeUnavailable` | The title takes the client path, which is not built yet |
-| `NoLaunchExe` | `launch_exe_override` is empty, is not a file, or leaves the install directory |
+| `NoLaunchExe` | `launch_exe_override` is empty, is not a PE image, or leaves the install directory |
 | `EngineNotInstalled` | No active engine, and none pinned by the game configuration |
 | `AlreadyRunning` | The title has an open session, in this core or another process |
-| `PrefixBusy` | Another operation holds the prefix |
+| `PrefixBusy` | Another operation holds the prefix, or a session whose owner died still runs in it |
 | `PrefixUnusable` | The prefix cannot be opened, or holds DLLs an older engine left |
-| `InvalidParams` | The title is outside the data directory (Wine is handed no path outside it) |
 
 After the answer, a failure is a `job.failed`: a session that could not start
 is `failed`, with the reason in `note` and in its log, and a `wineserver` that
-will not leave the prefix is `PrefixUnusable`. A title that ends within five
-seconds on its own is `exited`, and its job fails with `TitleExitedEarly`.
+will not leave the prefix is `PrefixUnusable`. A failure a cancel asked for is
+`cancelled`, and its job is a `job.done`. A title that ends within five seconds
+on its own, leaving nothing behind, is `exited`, and its job fails with
+`TitleExitedEarly`.
+
+Once the title is spawned, nothing closes a row over a live session. A running
+stamp the database refuses is tried again at the next look, and the watch goes
+on. A failure that ends the watch stops the title. If a process still remains,
+the row stays open as a dead owner's, so `app.cancel` and the next core reach it.
 
 A session is in one state, `SessionRow.state`:
 
@@ -258,33 +273,50 @@ A session is in one state, `SessionRow.state`:
 |---|---|---|
 | `starting` | Claimed; the title has not been seen. `ended_at` is null | `app.run` |
 | `running` | The game-running marker appeared; `started_at` is restamped. `ended_at` is null | The owner |
-| `exited` | The marker cleared. `exit_code` is the title's, or null for a taken-over session | The owner |
+| `exited` | The marker cleared and the session drained. `exit_code` is the launch exe's, or null for a taken-over session | The owner |
 | `cancelled` | It ended after `app.cancel` | The owner, or the cancel when there is none |
-| `failed` | It never ran | The owner |
-| `lost` | The owner died and the title was gone when that was found. `exit_code` is null | The next core |
+| `failed` | It never ran, or its watch failed and nothing of it is left | The owner |
+| `lost` | The owner died and the session was gone when that was found. `exit_code` is null | The next core |
+
+The marker ends the title, and the session goes on until it drains: no process
+carries the session id and the prefix's server has gone. Until then the row is
+open and the lock is held, so `app.run` answers `AlreadyRunning`, however long
+that takes. A session that outlasts the ten-second bound reports `lingering`,
+and closes with a note. For such a session `ended_at` is when it drained; for
+the rest it is when the marker cleared.
+
+`exit_code` is always the launch exe's status: for a launcher that exits and
+leaves its game running, the launcher's, not the game's. `started_at` is when
+the marker first appeared.
 
 The process that claims a session owns it: it holds the prefix lock from before
 the row exists until after it closes, on the thread that watches the title. So
 `prefix.reset`, `prefix.restore`, `prefix.snapshot`, and `applejack prefix
-remove` answer `PrefixBusy` for the whole session, across processes, and only
-the owner can read the exit code. `app.run` and `app.cancel` work on the
-session wherever it was started. A `serve` and an `applejack app run` see each
-other through that lock and the row: `serve` refuses a second launch of a title
-the CLI runs, lists it, and cancels it; the CLI, which stays attached until the
-title exits, closes the row and exits with the title's code.
+remove` answer `PrefixBusy` for the whole session, across processes, also after
+an owner died and left the session running, and only the owner can read the exit
+code. `app.run` and `app.cancel` work on the session wherever it was started. A
+`serve` and an `applejack app run` see each other through that lock and the row:
+`serve` refuses a second launch of a title the CLI runs, lists it, and cancels
+it; the CLI, which stays attached until the session ends, closes the row. It
+exits with `exit_code`, with 1 when none is known, and with 1 for an early exit,
+which still prints the row on stdout. `SIGINT` and `SIGTERM` cancel an attached
+run; a second one stops the CLI waiting and leaves the row open.
 
 `app.cancel` is a job, since it waits. It answers `NotRunning` for a title with
 no open session. It sends `SIGTERM` to the title, `SIGKILL` three seconds later,
 then waits for the rest of the session and stops the prefix's server if that
-does not leave within ten seconds. `kill_prefix` skips to `<server> -k`. When
-the job ends, no process carries the session's `APPLEJACK_SESSION` and the lock
-is free.
+does not leave within ten seconds. `kill_prefix` skips to `<server> -k`. Three
+seconds after a stop, any process still carrying the session id gets `SIGKILL`,
+so a session whose helpers never exit has this way out. The server of a session
+still `starting` with no process is left alone: the owner is building the prefix
+and sees the request before the spawn. When the job ends, no process carries the
+session's `APPLEJACK_SESSION` and the lock is free.
 
 The kernel drops the lock when an owner dies, so an open row with a free lock
-is a dead owner's. `hello` and `session.list` settle those rows. A title that
-is gone closes as `lost`. One still running is taken over: the core holds the
-lock on a job of its own, with no request behind it, and closes the row when the
-title leaves, with a null `exit_code`. The shell may ignore that job's
+is a dead owner's. `hello` and `session.list` settle those rows. A session with
+no process left closes as `lost`. One still running is taken over: the core
+holds the lock on a job of its own, with no request behind it, and closes the row
+when the session drains, with a null `exit_code`. The shell may ignore that job's
 notifications. The CLI does not take over, since it would have to stay: its
 `session list` shows the title running and `app run` refuses it, until a `serve`
 starts or `app cancel` ends it. `serve` waits for its jobs at EOF, so a shell
@@ -388,8 +420,6 @@ Cancelling a Swift task stops its wait. A request not yet written is never
 sent; one already written still runs in the core, and its late response is
 dropped. `app.cancel` is the method that stops work in the
 core.
-
-Reattaching running game sessions after a core restart is work package 5.
 
 ## Goldens
 

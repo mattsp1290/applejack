@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use applejack_engine::rosetta_wine::launch::{check_dxmt_copies, new_session_id};
+use applejack_engine::rosetta_wine::process::find_session;
 use applejack_engine::rosetta_wine::snapshot::{self, PrefixLock};
 use applejack_engine::rosetta_wine::{CpuidProbe, utc_now};
 use applejack_engine::{
@@ -24,7 +25,7 @@ use crate::error::CoreError;
 use crate::prefixes::pick_sync;
 use crate::runtime::direct::{DirectLaunch, resolve_launch, takes_direct_path};
 use crate::runtime::session::{
-    NOTE_EARLY, NOTE_LINGERED, OwnedProbe, WatchEnd, busy, log_line, watch,
+    NOTE_EARLY, NOTE_LINGERED, OwnedProbe, WatchEnd, WatchEvent, busy, log_line, watch,
 };
 use crate::state::Core;
 
@@ -40,10 +41,11 @@ const DEFAULT_BACKEND: GraphicsBackend = GraphicsBackend::Dxmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppRegistration {
     pub appid: u32,
-    pub drm: Drm,
+    /// `None` keeps what the title has, or `unknown` for a new one.
+    pub drm: Option<Drm>,
     /// Written to `launch_exe_override`, relative to the install directory.
     pub exe: Option<String>,
-    /// The library root; `<data>/library` when `None`.
+    /// The library root, absolute; `<data>/library` when `None`.
     pub library: Option<PathBuf>,
 }
 
@@ -109,25 +111,57 @@ impl PlannedRun {
     /// # Errors
     ///
     /// A failure before the title started, recorded as
-    /// [`SessionState::Failed`], or [`CoreError::TitleExitedEarly`].
+    /// [`SessionState::Failed`] unless a cancel asked for it, or
+    /// [`CoreError::TitleExitedEarly`]. A failure that left a process of the
+    /// session running leaves the row open: the next core takes it over, and
+    /// `app.cancel` reaches it.
     pub fn run(mut self, report: &mut dyn FnMut(&str, String)) -> Result<SessionRow, CoreError> {
         match self.launch_and_watch(report) {
             Ok(end) => self.close(end.as_ref(), report),
-            Err(error) => {
-                let text = error.to_string();
-                let _ = log_line(&self.session.log_path, &format!("failed: {text}"));
-                self.core.db()?.end_session(
-                    self.session.id,
-                    &SessionEnd {
-                        ended_at: &utc_now(),
-                        state: SessionState::Failed,
-                        exit_code: None,
-                        note: Some(&text),
-                    },
-                )?;
-                Err(error)
-            }
+            Err(error) => self.close_failed(error, report),
         }
+    }
+
+    fn close_failed(
+        &mut self,
+        error: CoreError,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<SessionRow, CoreError> {
+        let text = error.to_string();
+        let log = self.session.log_path.clone();
+        if !find_session(&self.session.session_key).is_empty() {
+            let _ = log_line(&log, &format!("left running: {text}"));
+            return Err(error);
+        }
+        let _ = log_line(&log, &format!("failed: {text}"));
+        let cancelled = self.cancel_requested().unwrap_or(false);
+        let state = if cancelled {
+            SessionState::Cancelled
+        } else {
+            SessionState::Failed
+        };
+        let id = self.session.id;
+        let closed = self.core.db().and_then(|db| {
+            Ok(db.end_session(
+                id,
+                &SessionEnd {
+                    ended_at: &utc_now(),
+                    state,
+                    exit_code: None,
+                    note: Some(&text),
+                },
+            )?)
+        });
+        // The launch failure is the story. A row this cannot close is a dead
+        // owner's to the next core.
+        if let Err(close) = closed {
+            let _ = log_line(&log, &format!("could not close the session: {close}"));
+        }
+        if cancelled {
+            report(state.as_str(), format!("session {id} ended"));
+            return self.core.session_row(id);
+        }
+        Err(error)
     }
 
     fn cancel_requested(&mut self) -> Result<bool, CoreError> {
@@ -148,12 +182,29 @@ impl PlannedRun {
             .core
             .engine
             .launch(&self.installed, &prefix, &self.spec)?;
+        let watched = self.watch_spawned(&mut session, report);
+        if let Err(error) = &watched {
+            let log = &self.session.log_path;
+            let _ = log_line(log, &format!("ending the title: {error}"));
+            if let Err(stop) = session.cancel() {
+                let _ = log_line(log, &format!("the title may still run: {stop}"));
+            }
+        }
+        watched.map(Some)
+    }
+
+    fn watch_spawned(
+        &mut self,
+        session: &mut Session,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<WatchEnd, CoreError> {
         // A cancel that read no process before the spawn left this to us; one
-        // written after this read finds the process.
-        if self.cancel_requested()? {
+        // written after this read finds the process. A failed read is no
+        // reason to stop a game.
+        if self.cancel_requested().unwrap_or(false) {
             session.cancel()?;
         }
-        self.watch_title(&mut session, report).map(Some)
+        self.watch_title(session, report)
     }
 
     fn watch_title(
@@ -162,14 +213,41 @@ impl PlannedRun {
         report: &mut dyn FnMut(&str, String),
     ) -> Result<WatchEnd, CoreError> {
         let exe = self.session.launch_exe.clone();
+        let log = self.session.log_path.clone();
         let id = self.session.id;
         let tuning = self.core.tuning;
         let core = &mut self.core;
         let mut probe = OwnedProbe { session, exe: &exe };
-        watch(&mut probe, &tuning, false, &mut || {
-            core.db()?.mark_session_running(id, &utc_now())?;
-            report("running", format!("session {id}"));
-            Ok(())
+        let mut warned = false;
+        watch(&mut probe, &tuning, false, &mut |event| match event {
+            WatchEvent::Running => {
+                let stamped = core
+                    .db()
+                    .and_then(|db| Ok(db.mark_session_running(id, &utc_now())?));
+                match stamped {
+                    Ok(()) => {
+                        report("running", format!("session {id}"));
+                        true
+                    }
+                    // A missed stamp is not the end of a game.
+                    Err(error) => {
+                        if !warned {
+                            warned = true;
+                            let _ = log_line(&log, &format!("could not record running: {error}"));
+                        }
+                        false
+                    }
+                }
+            }
+            WatchEvent::Lingering => {
+                // A launcher can be gone before the first look.
+                if let Ok(db) = core.db() {
+                    let _ = db.mark_session_running(id, &utc_now());
+                }
+                let _ = log_line(&log, NOTE_LINGERED);
+                report("lingering", format!("session {id} outlived {exe}"));
+                true
+            }
         })
     }
 
@@ -187,9 +265,11 @@ impl PlannedRun {
         };
         let exit_code = end.and_then(|end| end.exit_code);
         let ended_at = end.map_or_else(utc_now, |end| end.ended_at.clone());
-        let lingered = end.is_some_and(|end| !end.drained);
+        let lingered = end.is_some_and(|end| end.lingered);
         let early_exit = self.core.tuning.early_exit;
-        let early = state == SessionState::Exited && end.is_some_and(|e| e.lived < early_exit);
+        // A launcher is quick and the game behind it is no sign of DRM.
+        let early =
+            state == SessionState::Exited && !lingered && end.is_some_and(|e| e.lived < early_exit);
         let notes: Vec<&str> = [
             early.then_some(NOTE_EARLY),
             lingered.then_some(NOTE_LINGERED),
@@ -272,8 +352,8 @@ impl Core {
     ///
     /// [`CoreError::TitleNotInstalled`], [`CoreError::DownloadInProgress`],
     /// [`CoreError::ClientRuntimeUnavailable`], [`CoreError::NoLaunchExe`],
-    /// [`CoreError::PathOutsideData`], [`CoreError::NoActiveEngine`],
-    /// [`CoreError::AlreadyRunning`], `PrefixBusy`, `PrefixUnusable`.
+    /// [`CoreError::NoActiveEngine`], [`CoreError::AlreadyRunning`],
+    /// `PrefixBusy`, `PrefixUnusable`.
     pub fn plan_run(&mut self, appid: u32, probe_direct: bool) -> Result<PlannedRun, CoreError> {
         let app = self.reading(|db| Ok(db.app(appid)?))?.ok_or_else(|| {
             not_installed(appid, "it has no record; run `applejack app register`")
@@ -286,8 +366,9 @@ impl Core {
                 drm: app.drm,
             });
         }
+        // The exe stays inside the install directory and that inside the
+        // title's library, which may be on another volume (plan 02).
         let launch = resolve_launch(appid, &install_dir, &config)?;
-        self.check_inside_data(&launch.exe)?;
         let installed = self.run_engine(&config)?;
         let wish = PrefixWish::of(&config)?;
         let name = appid.to_string();
@@ -393,29 +474,47 @@ impl Core {
     /// Writes the `apps` row and launch exe of a title already on disk, from
     /// its `appmanifest_<appid>.acf`. This is the stand-in for `app.install`,
     /// which writes the same row and takes the exe from the app info. `drm`
-    /// is the caller's word: nothing here can probe it.
+    /// is the caller's word: nothing here can probe it. The manifest is not
+    /// trusted, and everything a run would refuse is refused here, with
+    /// nothing written.
     ///
     /// # Errors
     ///
-    /// [`CoreError::TitleNotInstalled`] without a readable manifest, or the
-    /// database failure.
+    /// [`CoreError::TitleNotInstalled`] for a library that is relative or
+    /// missing, or a manifest that is unreadable, names another app, or has
+    /// an unusable `installdir`; [`CoreError::NoLaunchExe`] for an `exe` a
+    /// run would refuse; or the database failure.
     pub fn app_register(&mut self, request: &AppRegistration) -> Result<AppRow, CoreError> {
         let appid = request.appid;
-        let library = request
-            .library
-            .clone()
-            .unwrap_or_else(|| self.data_dir().join("library"));
-        let acf = LibraryPaths::new(&library).acf(appid);
+        let library = self.register_library(request)?;
+        let paths = LibraryPaths::new(&library);
+        let acf = paths.acf(appid);
         let text = std::fs::read_to_string(&acf)
             .map_err(|error| not_installed(appid, &format!("{}: {error}", acf.display())))?;
         let manifest = AppManifest::parse(&text)
             .map_err(|error| not_installed(appid, &format!("{}: {error}", acf.display())))?;
+        if manifest.appid != appid {
+            return Err(not_installed(
+                appid,
+                &format!("{} names app {}", acf.display(), manifest.appid),
+            ));
+        }
+        if !plain_installdir(&manifest.installdir) {
+            return Err(not_installed(appid, UNUSABLE_INSTALLDIR));
+        }
+        if let Some(exe) = &request.exe {
+            let config = GameConfig {
+                launch_exe_override: Some(exe.clone()),
+                ..GameConfig::default()
+            };
+            resolve_launch(appid, &paths.install_dir(&manifest.installdir), &config)?;
+        }
         let existing = self.reading(|db| Ok(db.app(appid)?))?.unwrap_or_default();
         let row = AppRow {
             appid,
-            name: Some(manifest.name),
+            name: Some(printable(&manifest.name)),
             installdir: Some(manifest.installdir),
-            drm: request.drm,
+            drm: request.drm.unwrap_or(existing.drm),
             library_dir: Some(library.to_string_lossy().into_owned()),
             last_installed_buildid: Some(manifest.buildid),
             ..existing
@@ -427,6 +526,41 @@ impl Core {
         }
         Ok(row)
     }
+
+    /// The canonical library of a registration, which is what a run and the
+    /// prefix's `S:` get whatever the working directory then is.
+    fn register_library(&self, request: &AppRegistration) -> Result<PathBuf, CoreError> {
+        let appid = request.appid;
+        let library = match &request.library {
+            Some(library) if library.is_absolute() => library.clone(),
+            Some(library) => {
+                return Err(not_installed(
+                    appid,
+                    &format!("the library {} is not an absolute path", library.display()),
+                ));
+            }
+            None => self.data_dir().join("library"),
+        };
+        std::fs::canonicalize(&library)
+            .map_err(|error| not_installed(appid, &format!("{}: {error}", library.display())))
+    }
+}
+
+const UNUSABLE_INSTALLDIR: &str = "its manifest names an unusable install directory";
+
+/// A Steam `installdir` is one directory name. Anything else in the manifest
+/// or the row could widen the install root the exe is confined to.
+fn plain_installdir(text: &str) -> bool {
+    !text.is_empty()
+        && text != "."
+        && text != ".."
+        && !text.contains(['/', '\\'])
+        && !text.chars().any(char::is_control)
+}
+
+/// A manifest's `name` reaches terminals and logs.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn not_installed(appid: u32, reason: &str) -> CoreError {
@@ -443,6 +577,12 @@ fn installed_dir(app: &AppRow) -> Result<PathBuf, CoreError> {
     let (Some(library), Some(installdir)) = (&app.library_dir, &app.installdir) else {
         return Err(not_installed(appid, "its record names no library location"));
     };
+    if !plain_installdir(installdir) {
+        return Err(not_installed(appid, UNUSABLE_INSTALLDIR));
+    }
+    if !Path::new(library).is_absolute() {
+        return Err(not_installed(appid, "its library is not an absolute path"));
+    }
     let paths = LibraryPaths::new(library);
     if paths.record(appid).exists() {
         return Err(CoreError::DownloadInProgress { appid });
@@ -452,6 +592,12 @@ fn installed_dir(app: &AppRow) -> Result<PathBuf, CoreError> {
         .ok()
         .and_then(|text| AppManifest::parse(&text).ok())
         .ok_or_else(|| not_installed(appid, &format!("no readable {}", acf.display())))?;
+    if manifest.appid != appid {
+        return Err(not_installed(
+            appid,
+            &format!("{} names app {}", acf.display(), manifest.appid),
+        ));
+    }
     if !manifest.is_fully_installed() {
         return Err(not_installed(appid, "its manifest says it is not complete"));
     }

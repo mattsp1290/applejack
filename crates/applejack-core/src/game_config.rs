@@ -63,6 +63,14 @@ impl Core {
     /// database is created.
     pub fn config_set(&mut self, appid: u32, key: &str, value: &str) -> Result<(), CoreError> {
         let field = Field::parse(key).ok_or_else(|| Error::UnknownField(key.to_owned()))?;
+        if key == "direct_verified_at" {
+            return Err(Error::InvalidValue {
+                field: "direct_verified_at",
+                value: value.to_owned(),
+                reason: "only a direct probe records this".to_owned(),
+            }
+            .into());
+        }
         GameConfig::default().set(field, value)?;
         self.db()?.set_field(appid, key, value)?;
         Ok(())
