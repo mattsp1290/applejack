@@ -10,6 +10,7 @@ mod game_config;
 mod migrations;
 pub mod presets;
 pub mod resolve;
+mod sessions;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -22,6 +23,7 @@ pub use error::Error;
 pub use game_config::{Field, GameConfig, GraphicsBackend, LaunchMode, SyncMode};
 pub use presets::{EnvPolicy, ImportOptions, ImportPlan, Preset, ValueCheck};
 pub use resolve::{Resolved, resolve};
+pub use sessions::{NewSession, SessionEnd, SessionRow, SessionState};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 const WAL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
