@@ -10,4 +10,11 @@ ALTER TABLE sessions ADD COLUMN state TEXT
 ALTER TABLE sessions ADD COLUMN note TEXT;
 ALTER TABLE sessions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;
 
+-- Nothing wrote this table before now, but a row that did would have no state
+-- and no way to close, and two open ones would fail the index below.
+UPDATE sessions
+SET state = 'lost',
+    ended_at = COALESCE(ended_at, started_at, ''),
+    note = 'recorded before sessions had states';
+
 CREATE UNIQUE INDEX sessions_one_open ON sessions (appid) WHERE ended_at IS NULL;

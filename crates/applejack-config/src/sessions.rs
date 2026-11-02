@@ -18,13 +18,14 @@ pub enum SessionState {
     Starting,
     /// The game-running marker appeared.
     Running,
-    /// The marker cleared with nobody asking.
+    /// The marker cleared and the session drained, with nobody asking.
     Exited,
-    /// The marker cleared after `app.cancel`.
+    /// It ended after `app.cancel`.
     Cancelled,
-    /// The title never ran; `note` says why.
+    /// The title never ran, or its watch failed with nothing of it left;
+    /// `note` says why.
     Failed,
-    /// The owning core died and the title was gone when that was noticed;
+    /// The owning core died and the session was gone when that was noticed;
     /// the exit code is unknown.
     Lost,
 }
@@ -90,8 +91,8 @@ pub struct SessionRow {
     pub ended_at: Option<String>,
     pub engine_id: String,
     pub engine_version: String,
-    /// The title's exit status (128 plus the signal). `NULL` when no process
-    /// of this core was its parent.
+    /// The launch exe's exit status (128 plus the signal), not that of what
+    /// it left running. `NULL` when no process of this core was its parent.
     pub exit_code: Option<i32>,
     pub log_path: String,
     pub state: SessionState,
