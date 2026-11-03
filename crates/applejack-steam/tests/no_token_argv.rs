@@ -101,9 +101,9 @@ const GUARD: Scope = Scope {
 /// `Password` and `RefreshToken`.
 fn holders(root: &Path, path: &Path) -> &'static [&'static str] {
     if path == root.join("src/live.rs") {
-        &["answer", "response"]
+        &["answer", "response", "request", "sealed"]
     } else if path == root.join("src/live/session.rs") {
-        &["logon"]
+        &["logon", "response", "bytes", "reply"]
     } else if path == root.join("src/depot.rs") {
         &["keys"]
     } else if path == root.join("src/auth.rs") || path == root.join("src/keychain.rs") {
@@ -388,11 +388,11 @@ fn the_print_scan_keeps_common_words_to_where_they_can_be_secrets() {
 #[test]
 fn the_print_scan_sees_the_holders_of_a_file() {
     let live = Scope {
-        holders: &["answer", "response"],
+        holders: &["answer", "response", "request", "sealed"],
         ..Scope::default()
     };
     let session = Scope {
-        holders: &["logon"],
+        holders: &["logon", "response", "bytes", "reply"],
         ..Scope::default()
     };
     let depot = Scope {
@@ -418,6 +418,14 @@ fn the_print_scan_sees_the_holders_of_a_file() {
     assert_eq!(
         secret_in(r#"format!("{:?}", self.keys)"#, depot),
         Some("keys")
+    );
+    assert_eq!(
+        secret_in(r#"format!("{:?}", reply.body)"#, session),
+        Some("reply")
+    );
+    assert_eq!(
+        secret_in(r#"tracing::debug!(?request, "begin auth")"#, live),
+        Some("request")
     );
     assert_eq!(
         secret_in(r#"println!("{}", self.0);"#, auth),
