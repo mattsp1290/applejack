@@ -826,6 +826,60 @@ fn two_windows_entries_beside_another_platforms_default_are_refused() {
     assert!(matches!(choice(entries), LaunchChoice::Several(left) if left.len() == 2));
 }
 
+/// Final-launch probe A. An untyped entry a filter took was the title's own
+/// entry, as much as a `default`: an option left beside it was offered beside
+/// it. Red if only a lost `default` counts.
+#[test]
+fn a_lone_option_left_when_a_filter_took_a_better_windows_entry_is_refused() {
+    for lost in [
+        r#""0" { "executable" "game.exe" "config" { "betakey" "beta" } }"#,
+        r#""0" { "executable" "game.exe" "config" { "ownsdlc" "99" } }"#,
+        r#""0" { "executable" "game.exe" "config" { "oslist" "windows" "osarch" "32" } }"#,
+        r#""0" { "executable" "game.exe" "type" "none" "config" { "betakey" "beta" } }"#,
+    ] {
+        for survivor in [
+            r#""1" { "executable" "bench.exe" "type" "option1" "config" { "osarch" "64" } }"#,
+            r#""1" { "executable" "bench.exe" "type" "benchmark" "config" { "osarch" "64" } }"#,
+        ] {
+            let LaunchChoice::Several(left) = choice(&format!("{lost}\n{survivor}")) else {
+                panic!("chose a lone entry for {lost} and {survivor}");
+            };
+            assert_eq!(left.len(), 1);
+            assert_eq!(left[0].executable, "bench.exe");
+        }
+    }
+}
+
+/// Final-launch probe B. Options are offered beside each other, so an option
+/// that `betakey` or `ownsdlc` took leaves the other one a side entry, even
+/// when the app's `default` is for another platform. `osarch` is not a
+/// loss: the entry for the other architecture is the same offering.
+#[test]
+fn a_lone_option_left_when_a_filter_took_another_option_is_refused() {
+    let macos_default =
+        r#""0" { "executable" "Game.app" "type" "default" "config" { "oslist" "macos" } }"#;
+    for lost in [
+        r#""1" { "executable" "game.exe" "type" "option1" "config" { "ownsdlc" "99" } }"#,
+        r#""1" { "executable" "game.exe" "type" "option1" "config" { "betakey" "beta" } }"#,
+    ] {
+        let survivor = r#""2" { "executable" "bench.exe" "type" "option2" }"#;
+        let entries = format!("{macos_default}\n{lost}\n{survivor}");
+        let LaunchChoice::Several(left) = choice(&entries) else {
+            panic!("chose a lone entry for {lost}");
+        };
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].executable, "bench.exe");
+    }
+    let by_arch = r#"
+        "0" { "executable" "x86/game.exe" "type" "option1" "config" { "osarch" "32" } }
+        "1" { "executable" "x64/game.exe" "type" "option1" "config" { "osarch" "64" } }"#;
+    assert_eq!(chosen(by_arch).0, "x64/game.exe");
+    let server_on_a_branch = r#"
+        "0" { "executable" "server.exe" "type" "server" "config" { "betakey" "beta" } }
+        "1" { "executable" "game.exe" "type" "option1" }"#;
+    assert_eq!(chosen(server_on_a_branch).0, "game.exe");
+}
+
 /// The rule does not reach an app that never had a `default`.
 #[test]
 fn a_lone_entry_stands_when_no_filter_took_a_default() {

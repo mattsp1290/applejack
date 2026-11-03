@@ -147,6 +147,20 @@ impl LaunchEntry {
         self.oslist.is_empty() || self.oslist.iter().any(|os| os == WINDOWS)
     }
 
+    fn on_branch(&self, branch: &str) -> bool {
+        self.betakeys.is_empty() || self.betakeys.iter().any(|key| key == branch)
+    }
+
+    fn dlc_owned(&self, filter: &DepotFilter) -> bool {
+        self.owns_dlc
+            .is_none_or(|dlc| filter.owned_appids.contains(&dlc))
+    }
+
+    /// A typed option, which a Steam client offers beside the main entry.
+    fn is_option(&self) -> bool {
+        self.tier() == 2 && !self.is_tool()
+    }
+
     /// A server, an editor, or a config tool is never the title itself.
     fn is_tool(&self) -> bool {
         matches!(
@@ -167,7 +181,7 @@ pub enum LaunchChoice {
     /// Nothing runs on Windows.
     None,
     /// More than one command fits, or the only one left stands behind a
-    /// Windows `default` a filter took. Picking is the user's to do.
+    /// better Windows entry a filter took. Picking is the user's to do.
     Several(Vec<LaunchEntry>),
 }
 
@@ -288,12 +302,15 @@ impl OwnedApp {
     /// 4. Entries of the best tier must agree on the command. Two commands
     ///    are [`LaunchChoice::Several`]: Steam would ask the user, and
     ///    guessing would launch a benchmark or a launcher nobody asked for.
-    /// 5. The same goes for a lone entry when the app has a `default` entry
-    ///    that allows Windows and rule 1 or 2 took it away: what is left was
-    ///    offered beside the main entry, and no rule says it stands in for
-    ///    it. A `default` for another OS was never offered on Windows, so it
-    ///    takes nothing away. A lone entry of an app with no Windows
-    ///    `default` at all is that app's entry.
+    /// 5. The same goes for a lone entry when the app has a Windows entry of
+    ///    a better tier that rule 1 or 2 took away: what is left was offered
+    ///    beside the main entry, and no rule says it stands in for it. An
+    ///    option that `betakey` or `ownsdlc` took counts the same way for a
+    ///    lone option left, since options are offered beside each other; an
+    ///    option for the other architecture is the same offering, so `osarch`
+    ///    takes nothing away there. An entry for another OS was never
+    ///    offered on Windows, so it takes nothing away either. A lone entry
+    ///    of an app with nothing better at all is that app's entry.
     #[must_use]
     pub fn launch_choice(&self, branch: &str, filter: &DepotFilter) -> LaunchChoice {
         let mut fits: Vec<&LaunchEntry> = self
@@ -301,12 +318,7 @@ impl OwnedApp {
             .iter()
             .filter(|entry| !entry.executable.is_empty() && !entry.is_tool())
             .filter(|entry| entry.allows_windows())
-            .filter(|entry| entry.betakeys.is_empty() || entry.betakeys.iter().any(|b| b == branch))
-            .filter(|entry| {
-                entry
-                    .owns_dlc
-                    .is_none_or(|dlc| filter.owned_appids.contains(&dlc))
-            })
+            .filter(|entry| entry.on_branch(branch) && entry.dlc_owned(filter))
             .collect();
         let arch = self.planned_arch(branch, filter);
         if fits.iter().any(|entry| entry.osarch == Some(arch)) {
@@ -315,11 +327,16 @@ impl OwnedApp {
         let Some(best) = fits.iter().map(|entry| entry.tier()).min() else {
             return LaunchChoice::None;
         };
-        let lost_default = best != 0
-            && self
-                .launch
-                .iter()
-                .any(|entry| entry.tier() == 0 && entry.allows_windows());
+        let lost_better = self
+            .launch
+            .iter()
+            .filter(|entry| entry.allows_windows())
+            .any(|entry| {
+                entry.tier() < best
+                    || (entry.is_option()
+                        && best == 2
+                        && !(entry.on_branch(branch) && entry.dlc_owned(filter)))
+            });
         fits.retain(|entry| entry.tier() == best);
         let mut commands: Vec<&LaunchEntry> = Vec::new();
         for entry in fits {
@@ -328,7 +345,7 @@ impl OwnedApp {
             }
         }
         match commands.as_slice() {
-            [one] if !lost_default => LaunchChoice::One((*one).clone()),
+            [one] if !lost_better => LaunchChoice::One((*one).clone()),
             several => LaunchChoice::Several(several.iter().map(|e| (*e).clone()).collect()),
         }
     }
