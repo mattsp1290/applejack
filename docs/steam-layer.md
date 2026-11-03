@@ -56,9 +56,10 @@ the only implementations that open a socket.
   looks once more, and then ends the login with `SteamLoginStalled`, code
   `SteamLoginFailed`; the CLI prints a line while it waits. A non-empty refresh
   token is an approval, with or without an access token: `logon` sends only the
-  refresh token, and Steam has answered with no access token. An answer with an
-  empty refresh token is not one: it would store nothing usable and read as
-  signed in. `LoginFlow::start` refuses a blank account name before it connects,
+  refresh token, so an answer with no access token, should Steam send one, is
+  still a login. An answer with an empty refresh token is not one: it would
+  store nothing usable and read as signed in. An answer with a blank account
+  name is refused: `logon` would be handed that name on the next command. `LoginFlow::start` refuses a blank account name before it connects,
   and the CLI before it asks for the password.
   `InvalidGuardCode` keeps the session open.
   Any other error from `submit_guard_code` or `poll` ends the login: the

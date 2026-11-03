@@ -110,9 +110,12 @@ impl AuthFlow {
             self.client_id = client_id;
         }
         if let Some(refresh) = answer.refresh_token.as_ref().filter(|t| !t.is_empty()) {
+            // A blank name would be stored and handed to `logon` on the next
+            // command, the one path a blank name still has to Steam.
             let account_name = answer
                 .account_name
                 .clone()
+                .filter(|name| !name.trim().is_empty())
                 .ok_or(AuthError::MissingField("account_name"))?;
             // The auth connection is dropped with the flow; `logon` opens the
             // session with the refresh token and the fixed logon id.

@@ -127,7 +127,8 @@ pub struct Credentials {
 
 /// What a completed auth session yields. Not comparable: the token is a
 /// secret, and nothing needs to compare it. The refresh token alone decides:
-/// `logon` sends it, and Steam has answered with no access token.
+/// `logon` sends it, so an answer with no access token, should Steam send
+/// one, is still a login.
 #[derive(Debug, Clone)]
 pub struct Tokens {
     pub account_name: String,
