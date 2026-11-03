@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior};
 
-pub use apps::{AppRow, Drm};
+pub use apps::{AppRow, Drm, LibraryRow};
 pub use engine_versions::EngineVersionRow;
 pub use error::Error;
 pub use game_config::{Field, GameConfig, GraphicsBackend, LaunchMode, SyncMode};

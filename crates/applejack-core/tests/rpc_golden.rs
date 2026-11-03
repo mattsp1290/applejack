@@ -2,14 +2,17 @@
 //! `docs/rpc-protocol.md` are generated from the Rust types and must match
 //! what is committed. `APPLEJACK_UPDATE_GOLDENS=1` rewrites both.
 
-use applejack_core::config::{GameConfig, GraphicsBackend, SessionRow, SessionState, SyncMode};
+use applejack_core::config::{
+    Drm, GameConfig, GraphicsBackend, SessionRow, SessionState, SyncMode,
+};
 use applejack_core::host::{HostFacts, ScreenRecordingState};
 use applejack_core::rpc::PROTOCOL_VERSION;
 use applejack_core::rpc::jobs::{JobDone, JobFailed, JobId, JobProgress, JobStarted};
 use applejack_core::rpc::methods::{
     AppRunResult, ConfigExportResult, ConfigImportResult, CpuidProbeResult, D3dmetalImportResult,
-    EmptyResult, EngineEntry, EngineListResult, HelloResult, Method, MethodStatus,
-    SessionListResult, SnapshotResult,
+    EmptyResult, EngineEntry, EngineListResult, GuardFactorWire, HelloResult, InstallState,
+    LibraryEntry, LoginSession, LoginStepWire, Method, MethodStatus, SessionListResult,
+    SnapshotResult, SteamLibraryResult,
 };
 use applejack_core::rpc::wire::{ErrorCode, Id, Notification, Request, Response};
 use applejack_engine::rosetta_wine::{CpuidFeatures, CpuidProbe};
@@ -206,6 +209,44 @@ fn session_results(files: &mut BTreeMap<String, String>) {
     let mut add = |name: &str, response: &Response| {
         files.insert(format!("{name}.result.json"), pretty(response));
     };
+    add(
+        "steam.login.start",
+        &result_response(&LoginSession {
+            session_id: "login-19a-1f-0".to_owned(),
+            step: LoginStepWire::GuardRequired {
+                factor: GuardFactorWire::DeviceCode,
+            },
+        }),
+    );
+    add(
+        "steam.login.complete",
+        &result_response(&LoginSession {
+            session_id: "login-19a-1f-0".to_owned(),
+            step: LoginStepWire::Done {
+                account_name: "fixture-user".to_owned(),
+            },
+        }),
+    );
+    add(
+        "steam.library",
+        &result_response(&SteamLibraryResult {
+            apps: vec![LibraryEntry {
+                appid: 220,
+                name: "Example Title".to_owned(),
+                installdir: "Example Title".to_owned(),
+                size_bytes: 4_096,
+                drm: Drm::Unknown,
+                default_branch: "public".to_owned(),
+                install_state: InstallState::UpdateAvailable,
+            }],
+            fetched_at: Some("2026-11-02T00:00:00Z".to_owned()),
+            job_id: Some(JobId(8)),
+        }),
+    );
+    add(
+        "app.install",
+        &result_response(&JobStarted { job_id: JobId(9) }),
+    );
     add(
         "app.run",
         &result_response(&AppRunResult {

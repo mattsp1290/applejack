@@ -108,6 +108,8 @@ dependencies = [
  "applejack-core",
  "applejack-engine",
  "clap",
+ "rpassword",
+ "rustix",
  "serde_json",
  "signal-hook",
  "tempfile",
@@ -132,11 +134,17 @@ dependencies = [
  "applejack-config",
  "applejack-engine",
  "applejack-steam",
+ "bytes",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
+ "steamroom",
+ "steamroom-client",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -170,10 +178,10 @@ dependencies = [
 name = "applejack-steam"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "prost",
  "reqwest",
- "rpassword",
  "rustix",
  "security-framework",
  "serde",

@@ -1,7 +1,7 @@
 //! The [`SteamConnection`] and [`SteamroomSession`] that talk to Steam through
 //! `steamroom` 0.3.0 and `steamroom-client` 0.3.0. Compiled always; only the
-//! spikes and live tests open a socket. `cargo test` drives
-//! [`SteamroomSession`] over an in-memory transport.
+//! CLI, the core, and live tests open a socket. `cargo test` drives
+//! [`SteamroomSession`] and the auth flow over an in-memory transport.
 //!
 //! Every call below is named in `docs/steam-layer.md` under "API grounding"
 //! with the registry file and line it was confirmed against.
@@ -11,24 +11,29 @@ mod session;
 
 use std::time::Duration;
 
+use base64::Engine as _;
+use prost::Message as _;
+use steamroom::auth::GuardType;
 use steamroom::client::{Ready, SteamClient};
 use steamroom::connection::{CmServer, Protocol};
+use steamroom::crypto::rsa::encrypt_with_rsa_public_key;
 use steamroom::enums::EResultError;
 use steamroom::error::ConnectionError;
-use steamroom::transport::tcp::TcpTransport;
-use steamroom_client::login::{
-    ApprovedAuth, CredentialsLoginFlow, GuardChallenge, GuardType, LoginBuilder, LoginError,
-    MobileChallenge, QrLoginFlow,
+use steamroom::generated::{
+    CAuthenticationBeginAuthSessionViaCredentialsRequest,
+    CAuthenticationBeginAuthSessionViaQrRequest, CAuthenticationPollAuthSessionStatusRequest,
+    CAuthenticationPollAuthSessionStatusResponse,
 };
+use steamroom::transport::tcp::TcpTransport;
 use tokio::time::timeout;
 
 pub use cdn::LiveChunks;
 pub use session::SteamroomSession;
 
-use crate::auth::{AccessToken, AuthError, Credentials, GuardFactor, SteamConnection, Tokens};
+use crate::auth::{AuthError, AuthPoll, Credentials, GuardFactor, SteamConnection, Tokens};
 use crate::keychain::RefreshToken;
 
-/// Pinned crate versions, reported by the spike. Mirror `[workspace.dependencies]`.
+/// Pinned crate versions. Mirror `[workspace.dependencies]`.
 pub const STEAMROOM_VERSION: &str = "0.3.0";
 pub const STEAMROOM_CLIENT_VERSION: &str = "0.3.0";
 
@@ -57,49 +62,127 @@ const CM_ATTEMPTS: usize = 3;
 /// `EResult::TryAnotherCM`, which `steamroom` has no variant for.
 const TRY_ANOTHER_CM: i32 = 48;
 
-enum Stage {
-    Idle,
-    Qr(QrLoginFlow),
-    GuardCode(GuardChallenge),
-    MobileConfirm(MobileChallenge),
-    Approved(ApprovedAuth),
+/// `EAuthTokenPlatformType::SteamClient`: other platforms get tokens a CM
+/// refuses at logon.
+const PLATFORM_STEAM_CLIENT: i32 = 1;
+
+/// Seconds between polls when Steam does not say.
+const DEFAULT_POLL_SECONDS: f32 = 5.0;
+
+/// `steamroom`'s calls wait for their reply without a bound.
+const AUTH_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `EResult::InvalidLoginAuthCode` and `ExpiredLoginAuthCode`, a wrong or
+/// stale email code, which `steamroom` has no variants for.
+const WRONG_EMAIL_CODE: [i32; 2] = [65, 71];
+
+/// One auth session on its own connection. `steamroom-client`'s
+/// `GuardChallenge` keeps its poll loop private and treats `DuplicateRequest`
+/// as fatal, so this holds what it holds and makes the same `steamroom`
+/// calls: a poll can then run while a code is awaited, and a code that loses
+/// the race with an approval is not a failure.
+struct AuthFlow {
+    client: SteamClient<Ready>,
+    client_id: u64,
+    steam_id: u64,
+    request_id: Vec<u8>,
+    interval: Duration,
+    kinds: Vec<GuardType>,
+    code_pending: bool,
+}
+
+impl AuthFlow {
+    async fn poll(&mut self) -> Result<AuthPoll, AuthError> {
+        let request = CAuthenticationPollAuthSessionStatusRequest {
+            client_id: Some(self.client_id),
+            request_id: Some(self.request_id.clone()),
+            ..Default::default()
+        };
+        let body = request.encode_to_vec();
+        let call = self
+            .client
+            .call_service_method_non_authed("Authentication.PollAuthSessionStatus#1", &body);
+        let response = bounded(call).await?;
+        let answer: CAuthenticationPollAuthSessionStatusResponse = response
+            .decode()
+            .map_err(|error| AuthError::Connection(error.to_string()))?;
+        if let Some(client_id) = answer.new_client_id.filter(|id| *id != 0) {
+            self.client_id = client_id;
+        }
+        if let Some(refresh) = answer.refresh_token.as_ref().filter(|t| !t.is_empty()) {
+            let account_name = answer
+                .account_name
+                .clone()
+                .ok_or(AuthError::MissingField("account_name"))?;
+            // The auth connection is dropped with the flow; `logon` opens the
+            // session with the refresh token and the fixed logon id.
+            return Ok(AuthPoll::Approved(Tokens {
+                account_name,
+                refresh_token: RefreshToken::new(refresh.clone()),
+            }));
+        }
+        Ok(AuthPoll::Pending {
+            challenge: answer.new_challenge_url.filter(|url| !url.is_empty()),
+        })
+    }
+}
+
+async fn bounded<T>(
+    call: impl Future<Output = Result<T, steamroom::Error>>,
+) -> Result<T, AuthError> {
+    match timeout(AUTH_CALL_TIMEOUT, call).await {
+        Ok(result) => result.map_err(map_steamroom_error),
+        Err(_elapsed) => Err(AuthError::Connection(
+            "Steam did not answer an auth call".to_owned(),
+        )),
+    }
 }
 
 /// The auth flow, one connection at a time. `logon` opens the session on its
 /// own socket, as decision 5 in the plan requires.
+#[derive(Default)]
 pub struct SteamroomConnection {
-    stage: Stage,
-}
-
-impl Default for SteamroomConnection {
-    fn default() -> Self {
-        Self::new()
-    }
+    flow: Option<AuthFlow>,
+    /// Takes the place of connecting; see [`SteamroomConnection::over`].
+    prepared: Option<SteamClient<Ready>>,
 }
 
 impl SteamroomConnection {
     #[must_use]
     pub fn new() -> Self {
-        Self { stage: Stage::Idle }
+        Self::default()
     }
 
-    fn take_stage(&mut self) -> Stage {
-        std::mem::replace(&mut self.stage, Stage::Idle)
+    /// An auth flow over a client that is already prepared, the way
+    /// [`SteamroomSession::start`] takes one, so `cargo test` can drive it
+    /// over an in-memory transport.
+    #[must_use]
+    pub fn over(client: SteamClient<Ready>) -> Self {
+        Self {
+            flow: None,
+            prepared: Some(client),
+        }
+    }
+
+    async fn auth_client(&mut self) -> Result<SteamClient<Ready>, AuthError> {
+        if let Some(client) = self.prepared.take() {
+            return Ok(client);
+        }
+        let servers = CmServer::fetch()
+            .await
+            .unwrap_or_else(|_| CmServer::defaults());
+        let tcp = servers
+            .iter()
+            .filter(|server| server.protocol == Protocol::Tcp);
+        first_cm(tcp, |server| async move { reach_cm(server).await }).await
     }
 }
 
 impl std::fmt::Debug for SteamroomConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let stage = match self.stage {
-            Stage::Idle => "Idle",
-            Stage::Qr(_) => "Qr",
-            Stage::GuardCode(_) => "GuardCode",
-            Stage::MobileConfirm(_) => "MobileConfirm",
-            Stage::Approved(_) => "Approved",
-        };
         f.debug_struct("SteamroomConnection")
-            .field("stage", &stage)
-            .finish()
+            .field("auth_session", &self.flow.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -107,14 +190,29 @@ impl SteamConnection for SteamroomConnection {
     type Session = SteamroomSession;
 
     async fn begin_qr(&mut self) -> Result<String, AuthError> {
-        let flow = LoginBuilder::new()
-            .device_name(DEVICE_NAME)
-            .with_qr()
-            .begin()
-            .await
-            .map_err(map_login_error)?;
-        let payload = flow.challenge_url().to_owned();
-        self.stage = Stage::Qr(flow);
+        let client = self.auth_client().await?;
+        let request = CAuthenticationBeginAuthSessionViaQrRequest {
+            device_friendly_name: Some(DEVICE_NAME.to_owned()),
+            platform_type: Some(PLATFORM_STEAM_CLIENT),
+            ..Default::default()
+        };
+        let session = bounded(client.begin_auth_session_via_qr(request)).await?;
+        let payload = session
+            .challenge_url
+            .ok_or(AuthError::MissingField("challenge_url"))?;
+        self.flow = Some(AuthFlow {
+            client,
+            client_id: session
+                .client_id
+                .ok_or(AuthError::MissingField("client_id"))?,
+            steam_id: 0,
+            request_id: session
+                .request_id
+                .ok_or(AuthError::MissingField("request_id"))?,
+            interval: poll_interval(session.poll_interval),
+            kinds: session.allowed_confirmations,
+            code_pending: false,
+        });
         Ok(payload)
     }
 
@@ -122,103 +220,119 @@ impl SteamConnection for SteamroomConnection {
         &mut self,
         credentials: &Credentials,
     ) -> Result<Option<GuardFactor>, AuthError> {
-        let flow = LoginBuilder::new()
-            .device_name(DEVICE_NAME)
-            .with_credentials(
-                credentials.account_name.clone(),
-                credentials.password.expose().to_owned(),
-            )
-            .begin()
-            .await
-            .map_err(map_login_error)?;
-        match flow {
-            CredentialsLoginFlow::Approved(approved) => {
-                self.stage = Stage::Approved(approved);
-                Ok(None)
-            }
-            CredentialsLoginFlow::NeedsGuardCode(challenge) => {
-                let factor = guard_factor(challenge.allowed_kinds());
-                self.stage = Stage::GuardCode(challenge);
-                Ok(Some(factor))
-            }
-            CredentialsLoginFlow::NeedsMobileConfirm(challenge) => {
-                self.stage = Stage::MobileConfirm(challenge);
-                Ok(Some(GuardFactor::DeviceConfirmation))
-            }
-            _ => Err(AuthError::Connection(
-                "steamroom-client returned an unknown login flow".to_owned(),
-            )),
-        }
+        let client = self.auth_client().await?;
+        let account_name = credentials.account_name.clone();
+        let key = bounded(client.get_password_rsa_public_key(&account_name)).await?;
+        let modulus = key
+            .publickey_mod
+            .ok_or(AuthError::MissingField("publickey_mod"))?;
+        let exponent = key
+            .publickey_exp
+            .ok_or(AuthError::MissingField("publickey_exp"))?;
+        let sealed = encrypt_with_rsa_public_key(
+            credentials.password.expose().as_bytes(),
+            &modulus,
+            &exponent,
+        )
+        .map_err(|error| AuthError::Connection(error.to_string()))?;
+        let request = CAuthenticationBeginAuthSessionViaCredentialsRequest {
+            account_name: Some(account_name),
+            encrypted_password: Some(base64::engine::general_purpose::STANDARD.encode(sealed)),
+            encryption_timestamp: Some(key.timestamp.unwrap_or(0)),
+            remember_login: Some(true),
+            persistence: Some(1),
+            platform_type: Some(PLATFORM_STEAM_CLIENT),
+            device_friendly_name: Some(DEVICE_NAME.to_owned()),
+            ..Default::default()
+        };
+        let session = bounded(client.begin_auth_session_via_credentials(request)).await?;
+        let kinds = session.allowed_confirmations;
+        let no_factor = kinds.is_empty() || kinds.contains(&GuardType::None);
+        let code_pending = !no_factor
+            && kinds
+                .iter()
+                .any(|kind| matches!(kind, GuardType::DeviceCode | GuardType::EmailCode));
+        let factor = (!no_factor).then(|| guard_factor(&kinds));
+        self.flow = Some(AuthFlow {
+            client,
+            client_id: session
+                .client_id
+                .ok_or(AuthError::MissingField("client_id"))?,
+            steam_id: session.steam_id.ok_or(AuthError::MissingField("steamid"))?,
+            request_id: session
+                .request_id
+                .ok_or(AuthError::MissingField("request_id"))?,
+            interval: poll_interval(session.poll_interval),
+            kinds,
+            code_pending,
+        });
+        Ok(factor)
     }
 
     async fn submit_guard_code(&mut self, code: &str) -> Result<(), AuthError> {
-        // Check before taking: a wrong-stage call must leave the stage
-        // untouched, as `OutOfOrder` promises.
-        if !matches!(self.stage, Stage::GuardCode(_)) {
+        let Some(flow) = self.flow.as_mut().filter(|flow| flow.code_pending) else {
             return Err(AuthError::OutOfOrder("no Steam Guard code is pending"));
-        }
-        let Stage::GuardCode(challenge) = self.take_stage() else {
-            unreachable!("stage checked above")
         };
-        let kind = if challenge.allowed_kinds().contains(&GuardType::DeviceCode) {
+        let kind = if flow.kinds.contains(&GuardType::DeviceCode) {
             GuardType::DeviceCode
         } else {
             GuardType::EmailCode
         };
-        match challenge.submit_code(code, kind).await {
-            Ok(approved) => {
-                self.stage = Stage::Approved(approved);
+        let call = flow
+            .client
+            .submit_steam_guard_code(flow.client_id, flow.steam_id, code, kind);
+        match timeout(AUTH_CALL_TIMEOUT, call).await {
+            Ok(Ok(())) => {
+                flow.code_pending = false;
                 Ok(())
             }
-            Err((challenge, LoginError::InvalidGuardCode)) => {
-                self.stage = Stage::GuardCode(challenge);
-                Err(AuthError::InvalidGuardCode)
+            Ok(Err(error)) => match service_result(&error) {
+                // SteamKit reads this as success too: the session was
+                // approved in the mobile app, and the next poll has tokens.
+                Some(EResultError::DuplicateRequest) => {
+                    flow.code_pending = false;
+                    Ok(())
+                }
+                Some(result) if is_wrong_code(result) => Err(AuthError::InvalidGuardCode),
+                _ => {
+                    self.flow = None;
+                    Err(map_steamroom_error(error))
+                }
+            },
+            Err(_elapsed) => {
+                self.flow = None;
+                Err(AuthError::Connection(
+                    "Steam did not answer an auth call".to_owned(),
+                ))
             }
-            // The challenge is gone with the flow. A code mismatch reported
-            // from the token poll rather than the submit itself would read
-            // as "try another code", which nothing can accept any more.
-            Err((_, error)) => Err(match map_login_error(error) {
-                AuthError::InvalidGuardCode => AuthError::OutOfOrder(
-                    "the Steam Guard challenge was consumed; begin the login again",
-                ),
-                other => other,
-            }),
         }
     }
 
-    async fn wait_for_tokens(&mut self) -> Result<Tokens, AuthError> {
-        match &self.stage {
-            Stage::GuardCode(challenge) => {
-                return Err(AuthError::GuardRequired {
-                    factor: guard_factor(challenge.allowed_kinds()),
-                });
-            }
-            Stage::Idle => {
-                return Err(AuthError::OutOfOrder("no auth session is pending"));
-            }
-            Stage::Qr(_) | Stage::MobileConfirm(_) | Stage::Approved(_) => {}
-        }
-        let approved = match self.take_stage() {
-            Stage::Qr(flow) => flow.wait_for_scan().await.map_err(map_login_error)?,
-            Stage::MobileConfirm(challenge) => challenge
-                .wait_for_confirmation()
-                .await
-                .map_err(map_login_error)?,
-            Stage::Approved(approved) => approved,
-            Stage::Idle | Stage::GuardCode(_) => unreachable!("stage checked above"),
+    async fn poll_tokens(&mut self) -> Result<AuthPoll, AuthError> {
+        let Some(flow) = self.flow.as_mut() else {
+            return Err(AuthError::OutOfOrder("no auth session is pending"));
         };
-        let tokens = approved.tokens();
-        let account_name = tokens
-            .account_name
-            .clone()
-            .ok_or(AuthError::MissingField("account_name"))?;
-        // The auth connection is dropped here; `logon` opens the session with
-        // the refresh token and the fixed logon id.
-        Ok(Tokens {
-            account_name,
-            refresh_token: RefreshToken::new(tokens.refresh_token.clone()),
-            access_token: AccessToken::new(tokens.access_token.clone()),
-        })
+        match flow.poll().await {
+            Ok(AuthPoll::Pending { challenge }) => Ok(AuthPoll::Pending { challenge }),
+            done => {
+                self.flow = None;
+                // The session is gone with the flow, so "try another code"
+                // would be answered by nothing.
+                done.map_err(|error| match error {
+                    AuthError::InvalidGuardCode => AuthError::OutOfOrder(
+                        "the Steam Guard challenge was consumed; begin the login again",
+                    ),
+                    other => other,
+                })
+            }
+        }
+    }
+
+    fn poll_interval(&self) -> Duration {
+        self.flow.as_ref().map_or_else(
+            || Duration::from_secs_f32(DEFAULT_POLL_SECONDS),
+            |flow| flow.interval,
+        )
     }
 
     async fn logon(
@@ -226,7 +340,7 @@ impl SteamConnection for SteamroomConnection {
         account_name: &str,
         refresh_token: &RefreshToken,
     ) -> Result<SteamroomSession, AuthError> {
-        self.stage = Stage::Idle;
+        self.flow = None;
         let servers = CmServer::fetch()
             .await
             .unwrap_or_else(|_| CmServer::defaults());
@@ -234,17 +348,28 @@ impl SteamConnection for SteamroomConnection {
             .iter()
             .filter(|server| server.protocol == Protocol::Tcp);
         first_cm(tcp, |server| async move {
-            let client = match timeout(CM_CONNECT_TIMEOUT, connect_ready(server)).await {
-                Ok(Ok(client)) => client,
-                Ok(Err(error)) => return Err(AuthError::CmUnavailable(error.to_string())),
-                Err(_elapsed) => {
-                    let detail = "connection: timed out connecting to a CM".to_owned();
-                    return Err(AuthError::CmUnavailable(detail));
-                }
-            };
+            let client = reach_cm(server).await?;
             SteamroomSession::start(client, account_name, refresh_token).await
         })
         .await
+    }
+}
+
+fn poll_interval(seconds: Option<f32>) -> Duration {
+    let seconds = seconds
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .unwrap_or(DEFAULT_POLL_SECONDS);
+    Duration::from_secs_f32(seconds)
+}
+
+/// A prepared client on this CM, or [`AuthError::CmUnavailable`].
+async fn reach_cm(server: &CmServer) -> Result<SteamClient<Ready>, AuthError> {
+    match timeout(CM_CONNECT_TIMEOUT, connect_ready(server)).await {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(error)) => Err(AuthError::CmUnavailable(error.to_string())),
+        Err(_elapsed) => Err(AuthError::CmUnavailable(
+            "connection: timed out connecting to a CM".to_owned(),
+        )),
     }
 }
 
@@ -291,18 +416,18 @@ fn guard_factor(kinds: &[GuardType]) -> GuardFactor {
     }
 }
 
-fn map_login_error(error: LoginError) -> AuthError {
+fn service_result(error: &steamroom::Error) -> Option<EResultError> {
     match error {
-        LoginError::LogonFailed(EResultError::DuplicateRequest)
-        | LoginError::Transport(steamroom::Error::Connection(
-            ConnectionError::ServiceMethodFailed(EResultError::DuplicateRequest),
-        )) => AuthError::DuplicateGuardApproval,
-        LoginError::InvalidPassword => AuthError::Refused,
-        LoginError::InvalidGuardCode => AuthError::InvalidGuardCode,
-        LoginError::LogonFailed(result) => map_eresult(result),
-        LoginError::MissingField(field) => AuthError::MissingField(field),
-        LoginError::Transport(error) => map_steamroom_error(error),
-        other => AuthError::Connection(other.to_string()),
+        steamroom::Error::Connection(ConnectionError::ServiceMethodFailed(result)) => Some(*result),
+        _ => None,
+    }
+}
+
+fn is_wrong_code(result: EResultError) -> bool {
+    match result {
+        EResultError::TwoFactorCodeMismatch => true,
+        EResultError::Unknown(code) => WRONG_EMAIL_CODE.contains(&code),
+        _ => false,
     }
 }
 
@@ -420,16 +545,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_request_tells_the_user_to_use_one_factor() {
-        let error = map_login_error(LoginError::Transport(steamroom::Error::Connection(
-            ConnectionError::ServiceMethodFailed(EResultError::DuplicateRequest),
-        )));
-        assert!(matches!(error, AuthError::DuplicateGuardApproval));
-        assert!(error.to_string().contains("not both"));
-        assert!(matches!(
-            map_eresult(EResultError::DuplicateRequest),
-            AuthError::Connection(_)
-        ));
+    fn wrong_email_and_device_codes_read_as_wrong_codes() {
+        assert!(is_wrong_code(EResultError::TwoFactorCodeMismatch));
+        assert!(is_wrong_code(EResultError::from_code(65)));
+        assert!(is_wrong_code(EResultError::from_code(71)));
+        assert!(!is_wrong_code(EResultError::DuplicateRequest));
     }
 
     #[test]

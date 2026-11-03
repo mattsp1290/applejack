@@ -75,7 +75,7 @@ pub trait RefreshTokenStore {
     fn delete(&self) -> Result<(), Error>;
 }
 
-/// Process-local store for tests and the G2 spike.
+/// Process-local store for tests.
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
     token: Mutex<Option<RefreshToken>>,

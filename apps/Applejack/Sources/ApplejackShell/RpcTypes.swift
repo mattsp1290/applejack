@@ -174,6 +174,19 @@ public enum RpcErrorCode: Int, Codable, Sendable, CaseIterable {
     case notRunning = 1017
     case titleExitedEarly = 1018
     case prefixUnusable = 1019
+    case steamLoginRequired = 1020
+    case steamLoginFailed = 1021
+    case steamGuardRejected = 1022
+    case steamRateLimited = 1023
+    case steamUnavailable = 1024
+    case appNotOwned = 1025
+    case titleNotInstallable = 1026
+    case launchExeAmbiguous = 1027
+    case installCancelled = 1028
+    case lockHeld = 1029
+    case alreadyInstalled = 1030
+    case steamClientOwnsTitle = 1031
+    case verifyFailed = 1032
 }
 
 public struct HelloParams: Codable, Equatable, Sendable {

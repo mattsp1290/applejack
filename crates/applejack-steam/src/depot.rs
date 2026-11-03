@@ -226,6 +226,14 @@ impl Default for InstallOptions {
 /// `applejack-engine` and this crate does not depend on it.
 pub type ClientRunning<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 
+/// True once the caller wants the install to stop. Read once a second during
+/// a download.
+pub type CancelRequested<'a> = &'a (dyn Fn() -> bool + Send + Sync);
+
+/// Runs once, past every refusal, before the first write. An error stops the
+/// install as [`Error::BeforeWrite`].
+pub type BeforeWrite<'a> = &'a (dyn Fn() -> Result<(), String> + Send + Sync);
+
 /// Receives [`InstallProgress`].
 pub type ProgressSink<'a> = &'a (dyn Fn(&InstallProgress) + Send + Sync);
 
@@ -569,6 +577,8 @@ pub struct DepotInstaller<'a, S> {
     client_running: ClientRunning<'a>,
     options: InstallOptions,
     progress: Option<ProgressSink<'a>>,
+    cancel: Option<CancelRequested<'a>>,
+    before_write: Option<BeforeWrite<'a>>,
 }
 
 impl<S> std::fmt::Debug for DepotInstaller<'_, S> {
@@ -597,6 +607,8 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
             client_running,
             options: InstallOptions::default(),
             progress: None,
+            cancel: None,
+            before_write: None,
         }
     }
 
@@ -609,6 +621,21 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
     #[must_use]
     pub fn with_progress(mut self, progress: ProgressSink<'a>) -> Self {
         self.progress = Some(progress);
+        self
+    }
+
+    /// `cancel` is consulted wherever the ownership predicate is. A stop
+    /// keeps the record, like any other stop, and answers
+    /// [`Error::Cancelled`].
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelRequested<'a>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    #[must_use]
+    pub fn with_before_write(mut self, before_write: BeforeWrite<'a>) -> Self {
+        self.before_write = Some(before_write);
         self
     }
 
@@ -721,11 +748,15 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
         Ok(outcome)
     }
 
-    fn refuse_while_client_runs(&self, appid: u32) -> Result<(), Error> {
-        if (self.client_running)() {
-            return Err(Error::ClientRunning { appid });
+    fn halted(&self, appid: u32) -> Option<Error> {
+        if self.cancel.is_some_and(|cancel| cancel()) {
+            return Some(Error::Cancelled { appid });
         }
-        Ok(())
+        (self.client_running)().then_some(Error::ClientRunning { appid })
+    }
+
+    fn refuse_while_client_runs(&self, appid: u32) -> Result<(), Error> {
+        self.halted(appid).map_or(Ok(()), Err)
     }
 }
 
@@ -1041,6 +1072,9 @@ impl<S: SteamSession> Run<'_, '_, S> {
         // record would hold the title back from launching.
         fs::create_dir_all(&install_dir).map_err(|source| io_error(appid, &install_dir, source))?;
         refuse_links_out(&install_dir, &queued)?;
+        if let Some(before_write) = self.installer.before_write {
+            before_write().map_err(|reason| Error::BeforeWrite { appid, reason })?;
+        }
         record.save(&record_path, appid)?;
 
         // Without every manifest, nothing can be proved stale.
@@ -1173,9 +1207,9 @@ impl<S: SteamSession> Run<'_, '_, S> {
                     }
                 }
                 _ = client_check.tick(), if halted.is_none() => {
-                    if (self.installer.client_running)() {
+                    if let Some(error) = self.installer.halted(appid) {
                         stop.stop();
-                        halted = Some(Error::ClientRunning { appid });
+                        halted = Some(error);
                     }
                 }
                 joined = &mut download => break joined,
@@ -1705,7 +1739,8 @@ impl VerifyReport {
 ///
 /// # Errors
 ///
-/// [`Error::LockHeld`], [`Error::NotInstalled`] without an `.acf`, and
+/// [`Error::LockHeld`], [`Error::NotInstalled`] without an `.acf`,
+/// [`Error::NothingToVerify`] for one that lists no depots, and
 /// [`Error::ManifestNotStored`] for a depot installed by something other
 /// than this crate.
 pub fn verify_install(
@@ -1719,6 +1754,9 @@ pub fn verify_install(
     let (acf, _) = read_acf(paths, appid)?.ok_or(Error::NotInstalled { appid })?;
     check_installdir(&acf.installdir)?;
     let install_dir = paths.install_dir(&acf.installdir);
+    if acf.installed_depots.is_empty() {
+        return Err(Error::NothingToVerify { appid });
+    }
 
     let mut manifests = Vec::new();
     for depot in &acf.installed_depots {

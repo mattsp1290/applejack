@@ -22,6 +22,14 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: include_str!("schema_v3.sql"),
     },
+    Migration {
+        version: 4,
+        sql: include_str!("schema_v4.sql"),
+    },
+    Migration {
+        version: 5,
+        sql: include_str!("schema_v5.sql"),
+    },
 ];
 
 pub(crate) const LATEST_VERSION: u32 = match MIGRATIONS.last() {
@@ -126,7 +134,7 @@ mod tests {
         )
         .unwrap();
         apply_pending(&mut conn).unwrap();
-        assert_eq!(stored_version(&conn).unwrap(), 3);
+        assert_eq!(stored_version(&conn).unwrap(), LATEST_VERSION);
         let name: String = conn
             .query_row("SELECT name FROM apps WHERE appid = 10", [], |row| {
                 row.get(0)

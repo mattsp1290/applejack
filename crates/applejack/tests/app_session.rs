@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use applejack_core::config::ConfigDb;
 use applejack_engine::rosetta_wine::process::find_session;
 use common::{write_stub_bundle, write_title};
 use serde_json::{Value, json};
@@ -65,8 +66,26 @@ impl Fixture {
         command
     }
 
+    /// A `steam` or `install` run has the network denied, so a mistake in a
+    /// test cannot reach Steam.
+    fn command_for(&self, args: &[&str]) -> Command {
+        if !matches!(args.first(), Some(&("steam" | "install"))) {
+            return self.command();
+        }
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+            .args([
+                "-p",
+                "(version 1)(allow default)(deny network*)",
+                env!("CARGO_BIN_EXE_applejack"),
+            ])
+            .env("APPLEJACK_DATA_DIR", self.data())
+            .env("APPLEJACK_ALLOW_UNSIGNED_ENGINE", "1");
+        command
+    }
+
     fn output(&self, args: &[&str]) -> Output {
-        self.command().args(args).output().unwrap()
+        self.command_for(args).args(args).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -77,6 +96,31 @@ impl Fixture {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// [`refused`](Self::refused) for a command that, with its rule broken,
+    /// would start a title and stay attached. Ends in a failure, not a hang.
+    fn refused_in_time(&self, args: &[&str]) -> String {
+        let mut child = self
+            .command_for(args)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                drop(self.output(&["app", "cancel", APP]));
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("{args:?} was not refused: it was still running");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "{args:?} was not refused");
+        String::from_utf8(output.stderr).unwrap()
     }
 
     fn refused(&self, args: &[&str]) -> String {
@@ -357,4 +401,83 @@ fn register_needs_a_manifest_and_session_list_starts_empty() {
     assert_eq!(fixture.ok(&["session", "list"]).trim(), "no sessions");
     let text = fixture.refused(&["app", "cancel", APP]);
     assert!(text.contains("not running"), "{text}");
+}
+
+/// Red if an install takes no prefix lock: nothing else stops it writing
+/// under a running title. It refuses before it looks for an account, so no
+/// Steam is needed to get this far.
+#[test]
+fn an_install_refuses_while_the_title_runs_in_another_process() {
+    let fixture = Fixture::new();
+    let mut run = fixture.attached_run();
+    let refused = fixture.refused(&["install", APP, "--update"]);
+    assert!(refused.contains("already running"), "{refused}");
+    let output = fixture.output(&["install", APP, "--verify"]);
+    assert_eq!(output.status.code(), Some(1));
+    fixture.ok(&["app", "cancel", APP]);
+    run.wait().unwrap();
+}
+
+/// Red if the run stops looking for the record. The record is the only thing
+/// left of a process that was killed, so nothing else can refuse this.
+#[test]
+fn a_run_refuses_while_a_download_record_exists() {
+    let fixture = Fixture::new();
+    let records = fixture.data().join("library/applejack");
+    fs::create_dir_all(&records).unwrap();
+    fs::write(records.join(format!("{APP}.download.json")), "{}").unwrap();
+    let refused = fixture.refused_in_time(&["run", APP]);
+    assert!(refused.contains("applejack install"), "{refused}");
+    fs::remove_file(records.join(format!("{APP}.download.json"))).unwrap();
+}
+
+/// Red if `show` lists only `game_config`: what the app info chose, and the
+/// `drm` a run reads, would be visible nowhere.
+#[test]
+fn config_show_lists_the_titles_own_fields() {
+    let fixture = Fixture::new();
+    let db = ConfigDb::open(&fixture.data().join("db.sqlite")).unwrap();
+    let mut row = db.app(1234).unwrap().unwrap();
+    row.launch_exe = Some("bin/title.exe".to_owned());
+    db.upsert_app(&row).unwrap();
+    fixture.ok(&["config", APP, "set", "drm", "steam"]);
+
+    let shown = fixture.ok(&["config", APP, "show"]);
+    let line = |name: &str| {
+        let wanted = format!("{name} ");
+        shown
+            .lines()
+            .find(|line| line.starts_with(&wanted))
+            .unwrap_or_else(|| panic!("no {name} in {shown}"))
+            .split_once(" = ")
+            .unwrap()
+            .1
+            .to_owned()
+    };
+    assert_eq!(line("drm"), "\"steam\"");
+    assert_eq!(line("launch_exe"), "\"bin/title.exe\"");
+
+    let json: Value =
+        serde_json::from_str(&fixture.ok(&["config", APP, "show", "--json"])).unwrap();
+    assert_eq!(json["drm"], "steam");
+    assert_eq!(json["launch_exe"], "bin/title.exe");
+}
+
+/// A title on disk is `--update`'s, and `drm` is how a run gets past the
+/// client: both answers work from a second process, offline.
+#[test]
+fn a_title_on_disk_is_not_installed_over_and_drm_is_a_setting() {
+    let fixture = Fixture::new();
+    let refused = fixture.refused(&["install", APP]);
+    assert!(refused.contains("already installed"), "{refused}");
+    fixture.ok(&["config", APP, "set", "drm", "unknown"]);
+    let refused = fixture.refused(&["run", APP]);
+    assert!(
+        refused.contains(&format!("config {APP} set drm none")),
+        "{refused}"
+    );
+    fixture.ok(&["config", APP, "set", "drm", "none"]);
+    let mut run = fixture.attached_run();
+    fixture.ok(&["app", "cancel", APP]);
+    run.wait().unwrap();
 }

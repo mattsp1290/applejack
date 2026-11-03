@@ -84,6 +84,10 @@ pub enum Error {
     /// There is no `.acf` for this app.
     #[error("app {appid} is not installed")]
     NotInstalled { appid: u32 },
+    /// The caller asked the install to stop. The partial state is kept, so
+    /// the next run resumes.
+    #[error("install of app {appid} was cancelled; partial state kept")]
+    Cancelled { appid: u32 },
     /// The title is already fully installed; update or verify it instead.
     #[error("app {appid} is already installed; update or verify it instead")]
     AlreadyInstalled { appid: u32 },
@@ -125,6 +129,12 @@ pub enum Error {
         depot_id: u32,
         manifest_id: u64,
     },
+    /// The `.acf` lists no depots, so no file could be checked.
+    #[error("app {appid}: its manifest lists no depots, so there is nothing to verify")]
+    NothingToVerify { appid: u32 },
+    /// The caller's step before the first write failed. Nothing was written.
+    #[error("app {appid}: {reason}")]
+    BeforeWrite { appid: u32, reason: String },
     /// A chunk or assembled file failed its hash. Nothing corrupt reached
     /// the install, and the partial state is kept.
     #[error("depot {depot_id}: corrupt download: {detail}")]

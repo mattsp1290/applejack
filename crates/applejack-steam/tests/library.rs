@@ -6,8 +6,12 @@ mod support;
 use applejack_steam::Error;
 use applejack_steam::auth::License;
 use applejack_steam::depot::InstallPlan;
-use applejack_steam::library::{DRM_UNKNOWN, DepotFilter, Library, OwnedApp};
+use applejack_steam::library::{
+    DRM_UNKNOWN, DepotFilter, LaunchChoice, Library, OwnedApp, fetch_owned_app,
+};
 use applejack_steam::session::{AppInfo, PackageGrants};
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use support::FakeSession;
 
 fn info(appid: u32, text: &str) -> AppInfo {
@@ -717,4 +721,253 @@ fn an_unlicensed_shared_depot_is_skipped_rather_than_refused() {
         .windows_depots("public", &library.filter())
         .unwrap();
     assert_eq!(selection.not_licensed, [502]);
+}
+
+const LAUNCH_HEAD: &str = r#""appinfo"
+{
+    "appid" "70"
+    "common" { "name" "Launchy" "oslist" "windows,linux" }
+    "config" { "installdir" "Launchy" "launch" {
+"#;
+
+const LAUNCH_TAIL: &str = r#"
+    } }
+    "depots" {
+        "71" {
+            "config" { "oslist" "windows" "osarch" "64" }
+            "manifests" { "public" { "gid" "9" "size" "4" } }
+        }
+        "branches" { "public" { "buildid" "3" } }
+    }
+}
+"#;
+
+fn launchy(entries: &str) -> OwnedApp {
+    let filter = DepotFilter {
+        owned_appids: BTreeSet::from([70, 77]),
+        owned_depots: BTreeSet::from([71]),
+        ..DepotFilter::default()
+    };
+    let text = format!("{LAUNCH_HEAD}{entries}{LAUNCH_TAIL}");
+    OwnedApp::parse(&info(70, &text), &filter).unwrap()
+}
+
+fn choice(entries: &str) -> LaunchChoice {
+    let app = launchy(entries);
+    let filter = DepotFilter {
+        owned_appids: BTreeSet::from([70, 77]),
+        owned_depots: BTreeSet::from([71]),
+        ..DepotFilter::default()
+    };
+    app.launch_choice("public", &filter)
+}
+
+fn chosen(entries: &str) -> (String, Option<String>) {
+    match choice(entries) {
+        LaunchChoice::One(entry) => (entry.executable, entry.arguments),
+        other => panic!("expected one entry: {other:?}"),
+    }
+}
+
+/// What a filter leaves when it takes a `default` a Windows client would have
+/// run is not what the app calls its main entry. Red if a lone survivor is
+/// chosen whatever it is.
+#[test]
+fn a_lone_entry_left_when_a_filter_took_a_windows_default_is_refused() {
+    for lost in [
+        r#""0" { "executable" "beta.exe" "type" "default" "config" { "betakey" "beta" } }"#,
+        r#""0" { "executable" "dlc.exe" "type" "default" "config" { "ownsdlc" "99" } }"#,
+        r#""0" { "executable" "old.exe" "type" "default"
+                 "config" { "oslist" "windows" "osarch" "32" } }"#,
+        r#""0" { "executable" "beta.exe" "type" "default"
+                 "config" { "oslist" "macos,windows" "betakey" "beta" } }"#,
+    ] {
+        for survivor in [
+            r#""1" { "executable" "bench.exe" "type" "option1" "config" { "osarch" "64" } }"#,
+            r#""1" { "executable" "bench.exe" "type" "benchmark" "config" { "osarch" "64" } }"#,
+            r#""1" { "executable" "bench.exe" "config" { "osarch" "64" } }"#,
+        ] {
+            let LaunchChoice::Several(left) = choice(&format!("{lost}\n{survivor}")) else {
+                panic!("chose a lone entry for {lost} and {survivor}");
+            };
+            assert_eq!(left.len(), 1);
+            assert_eq!(left[0].executable, "bench.exe");
+        }
+    }
+}
+
+/// A Windows client was never offered a macOS or Linux `default`, so nothing
+/// was lost. Red if every `default` counts. This is the shape Peglin may have.
+#[test]
+fn a_lone_windows_entry_beside_another_platforms_default_is_chosen() {
+    for elsewhere in [
+        r#""0" { "executable" "Game.app" "type" "default" "config" { "oslist" "macos" } }"#,
+        r#""0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }"#,
+        r#""0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux,macos" } }"#,
+    ] {
+        for lone in [
+            r#""1" { "executable" "game.exe" "config" { "oslist" "windows" } }"#,
+            r#""1" { "executable" "game.exe" "type" "none" "config" { "oslist" "windows" } }"#,
+            r#""1" { "executable" "game.exe" "type" "option1" "config" { "oslist" "windows" } }"#,
+            r#""1" { "executable" "game.exe" }"#,
+        ] {
+            assert_eq!(chosen(&format!("{elsewhere}\n{lone}")).0, "game.exe");
+        }
+    }
+}
+
+/// Two commands stay the user's to pick from, whatever else the app lists.
+#[test]
+fn two_windows_entries_beside_another_platforms_default_are_refused() {
+    let entries = r#"
+        "0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }
+        "1" { "executable" "a.exe" "config" { "oslist" "windows" } }
+        "2" { "executable" "b.exe" "config" { "oslist" "windows" } }"#;
+    assert!(matches!(choice(entries), LaunchChoice::Several(left) if left.len() == 2));
+}
+
+/// The rule does not reach an app that never had a `default`.
+#[test]
+fn a_lone_entry_stands_when_no_filter_took_a_default() {
+    let only_option = r#""0" { "executable" "game.exe" "type" "option1" }"#;
+    assert_eq!(chosen(only_option).0, "game.exe");
+    let beside_a_linux_option = r#"
+        "0" { "executable" "game.sh" "type" "option1" "config" { "oslist" "linux" } }
+        "1" { "executable" "game.exe" "type" "option1" "config" { "oslist" "windows" } }"#;
+    assert_eq!(chosen(beside_a_linux_option).0, "game.exe");
+    let default_kept = r#"
+        "0" { "executable" "game.exe" "type" "default" }
+        "1" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }"#;
+    assert_eq!(chosen(default_kept).0, "game.exe");
+}
+
+#[test]
+fn the_windows_entry_is_chosen_from_entries_for_other_platforms() {
+    let entries = r#"
+        "0" { "executable" "launchy.sh" "config" { "oslist" "linux" } }
+        "1" { "executable" "bin\launchy.exe" "arguments" " -a " "type" "default"
+              "config" { "oslist" "windows" } }
+    "#;
+    assert_eq!(
+        chosen(entries),
+        ("bin/launchy.exe".to_owned(), Some("-a".to_owned()))
+    );
+}
+
+#[test]
+fn an_entry_that_names_no_os_runs_on_windows() {
+    assert_eq!(
+        chosen(r#""0" { "executable" "./game.exe" }"#).0,
+        "game.exe".to_owned()
+    );
+}
+
+#[test]
+fn tools_lose_to_the_game_and_never_stand_in_for_it() {
+    let entries = r#"
+        "0" { "executable" "server.exe" "type" "server" }
+        "1" { "executable" "editor.exe" "type" "editor" }
+        "2" { "executable" "game.exe" }
+    "#;
+    assert_eq!(chosen(entries).0, "game.exe");
+    assert_eq!(
+        choice(r#""0" { "executable" "server.exe" "type" "server" }"#),
+        LaunchChoice::None
+    );
+}
+
+#[test]
+fn the_default_entry_beats_an_untyped_one_and_that_beats_an_option() {
+    let entries = r#"
+        "0" { "executable" "safe.exe" "type" "option1" }
+        "1" { "executable" "plain.exe" }
+    "#;
+    assert_eq!(chosen(entries).0, "plain.exe");
+    let entries = r#"
+        "0" { "executable" "plain.exe" }
+        "1" { "executable" "game.exe" "type" "default" }
+    "#;
+    assert_eq!(chosen(entries).0, "game.exe");
+}
+
+#[test]
+fn the_entry_for_the_installed_architecture_wins() {
+    let entries = r#"
+        "0" { "executable" "x86/game.exe" "config" { "osarch" "32" } }
+        "1" { "executable" "x64/game.exe" "config" { "osarch" "64" } }
+    "#;
+    assert_eq!(chosen(entries).0, "x64/game.exe");
+    assert_eq!(
+        chosen(r#""0" { "executable" "x86/game.exe" "config" { "osarch" "32" } }"#).0,
+        "x86/game.exe",
+        "a 32-bit exe in a 64-bit depot is still the title's exe"
+    );
+}
+
+#[test]
+fn entries_for_another_branch_or_an_unowned_dlc_do_not_count() {
+    let entries = r#"
+        "0" { "executable" "beta.exe" "config" { "betakey" "beta" } }
+        "1" { "executable" "dlc.exe" "config" { "ownsdlc" "78" } }
+        "2" { "executable" "owned.exe" "config" { "ownsdlc" "77" } }
+    "#;
+    assert_eq!(chosen(entries).0, "owned.exe");
+}
+
+#[test]
+fn two_commands_of_one_rank_are_refused_with_both_named() {
+    let entries = r#"
+        "0" { "executable" "game.exe" "arguments" "-dx11" }
+        "1" { "executable" "game.exe" "arguments" "-dx12" }
+    "#;
+    let LaunchChoice::Several(found) = choice(entries) else {
+        panic!("expected several");
+    };
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[1].arguments.as_deref(), Some("-dx12"));
+}
+
+#[test]
+fn the_same_command_twice_is_one_choice() {
+    let entries = r#"
+        "0" { "executable" "game.exe" "config" { "oslist" "windows" } }
+        "1" { "executable" "game.exe" "description" "Play" }
+    "#;
+    assert_eq!(chosen(entries).0, "game.exe");
+}
+
+#[test]
+fn entries_keep_their_numeric_order() {
+    let mut entries = String::new();
+    for index in 0..11 {
+        write!(entries, r#""{index}" {{ "executable" "e{index}.exe" }}"#).unwrap();
+    }
+    let app = launchy(&entries);
+    assert_eq!(app.launch[9].executable, "e9.exe");
+    assert_eq!(app.launch[10].executable, "e10.exe");
+}
+
+#[test]
+fn no_launch_section_is_no_choice() {
+    assert_eq!(choice(""), LaunchChoice::None);
+}
+
+#[tokio::test]
+async fn one_title_is_read_without_the_whole_library() {
+    let session = FakeSession {
+        grants: grants(&[100], &[11]),
+        ..FakeSession::default()
+    };
+    session
+        .app_info
+        .lock()
+        .unwrap()
+        .push_back(vec![info(100, GAME)]);
+    let (app, filter) = fetch_owned_app(&session, 100).await.unwrap();
+    assert_eq!(app.appid, 100);
+    assert!(filter.owned_depots.contains(&11));
+    assert!(matches!(
+        fetch_owned_app(&session, 101).await.unwrap_err(),
+        Error::AppNotOwned { appid: 101 }
+    ));
 }

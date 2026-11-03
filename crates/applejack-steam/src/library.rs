@@ -21,6 +21,7 @@ pub const DEFAULT_BRANCH: &str = "public";
 pub const DRM_UNKNOWN: &str = "unknown";
 
 const X86_64: u32 = 64;
+const X86: u32 = 32;
 
 /// One branch's entry under a depot's `manifests`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +115,62 @@ pub struct DepotSelection {
     pub not_licensed: Vec<u32>,
 }
 
+/// One numbered entry under an app's `config/launch`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchEntry {
+    /// With forward slashes, relative to the install directory.
+    pub executable: String,
+    pub arguments: Option<String>,
+    /// `type`, lower-cased: `default`, `option1`, `server`, and so on.
+    pub kind: Option<String>,
+    /// `config/oslist`, lower-cased. Empty means every platform.
+    pub oslist: Vec<String>,
+    /// `config/osarch`: `32`, `64`, or absent for either.
+    pub osarch: Option<u32>,
+    /// `config/betakey`: the branches this entry is for. Empty means any.
+    pub betakeys: Vec<String>,
+    /// `config/ownsdlc`: the DLC this entry needs.
+    pub owns_dlc: Option<u32>,
+}
+
+impl LaunchEntry {
+    fn tier(&self) -> u8 {
+        match self.kind.as_deref() {
+            Some("default") => 0,
+            None | Some("" | "none") => 1,
+            _ => 2,
+        }
+    }
+
+    /// Whether a Windows client is ever offered this entry.
+    fn allows_windows(&self) -> bool {
+        self.oslist.is_empty() || self.oslist.iter().any(|os| os == WINDOWS)
+    }
+
+    /// A server, an editor, or a config tool is never the title itself.
+    fn is_tool(&self) -> bool {
+        matches!(
+            self.kind.as_deref(),
+            Some("server" | "editor" | "config" | "vr")
+        )
+    }
+
+    fn same_command(&self, other: &Self) -> bool {
+        self.executable == other.executable && self.arguments == other.arguments
+    }
+}
+
+/// What [`OwnedApp::launch_choice`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchChoice {
+    One(LaunchEntry),
+    /// Nothing runs on Windows.
+    None,
+    /// More than one command fits, or the only one left stands behind a
+    /// Windows `default` a filter took. Picking is the user's to do.
+    Several(Vec<LaunchEntry>),
+}
+
 /// One owned app.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnedApp {
@@ -135,6 +192,9 @@ pub struct OwnedApp {
     pub change_number: u32,
     /// `common/freetodownload`: depots need no license.
     pub free_to_download: bool,
+    /// `config/launch`, in entry order.
+    #[serde(default)]
+    pub launch: Vec<LaunchEntry>,
     app_oslist: Vec<String>,
 }
 
@@ -200,10 +260,99 @@ impl OwnedApp {
             free_to_download: text(&root, &["common", "freetodownload"])
                 .and_then(|value| value.parse::<i32>().ok())
                 .is_some_and(|value| value != 0),
+            launch: parse_launch(&root),
             app_oslist,
         };
         app.measure(filter);
         Some(app)
+    }
+
+    /// The launch entry for a Windows install of `branch`. Plan 05 names the
+    /// source: the app info's launch options filtered to `oslist = windows`.
+    /// Steamworks' uploading page grounds the OS and DLC filters: an option
+    /// shows only on its OS and, with a DLC set, to its owners. It says
+    /// nothing of `type`, `osarch`, or `betakey`, so steps 2 and 3 and the
+    /// branch half of step 1 are a reading of the field names. The rule errs
+    /// towards refusing: anything it cannot rank goes to the user.
+    ///
+    /// 1. Keep an entry with an executable whose `oslist` allows Windows,
+    ///    whose `betakey` is empty or names `branch`, and whose `ownsdlc`, if
+    ///    any, the account owns. Drop servers, editors, and config tools.
+    /// 2. `osarch` must match the depots this install takes, 64-bit when any
+    ///    planned depot is. An entry with no `osarch` fits both, and when
+    ///    nothing fits the rule is dropped: a 32-bit exe in a 64-bit app is
+    ///    still its exe.
+    /// 3. Of what is left, a `default` entry beats an untyped one, and that
+    ///    beats `option1` and its like, which a Steam client offers beside
+    ///    the main entry rather than instead of it.
+    /// 4. Entries of the best tier must agree on the command. Two commands
+    ///    are [`LaunchChoice::Several`]: Steam would ask the user, and
+    ///    guessing would launch a benchmark or a launcher nobody asked for.
+    /// 5. The same goes for a lone entry when the app has a `default` entry
+    ///    that allows Windows and rule 1 or 2 took it away: what is left was
+    ///    offered beside the main entry, and no rule says it stands in for
+    ///    it. A `default` for another OS was never offered on Windows, so it
+    ///    takes nothing away. A lone entry of an app with no Windows
+    ///    `default` at all is that app's entry.
+    #[must_use]
+    pub fn launch_choice(&self, branch: &str, filter: &DepotFilter) -> LaunchChoice {
+        let mut fits: Vec<&LaunchEntry> = self
+            .launch
+            .iter()
+            .filter(|entry| !entry.executable.is_empty() && !entry.is_tool())
+            .filter(|entry| entry.allows_windows())
+            .filter(|entry| entry.betakeys.is_empty() || entry.betakeys.iter().any(|b| b == branch))
+            .filter(|entry| {
+                entry
+                    .owns_dlc
+                    .is_none_or(|dlc| filter.owned_appids.contains(&dlc))
+            })
+            .collect();
+        let arch = self.planned_arch(branch, filter);
+        if fits.iter().any(|entry| entry.osarch == Some(arch)) {
+            fits.retain(|entry| entry.osarch.is_none_or(|bits| bits == arch));
+        }
+        let Some(best) = fits.iter().map(|entry| entry.tier()).min() else {
+            return LaunchChoice::None;
+        };
+        let lost_default = best != 0
+            && self
+                .launch
+                .iter()
+                .any(|entry| entry.tier() == 0 && entry.allows_windows());
+        fits.retain(|entry| entry.tier() == best);
+        let mut commands: Vec<&LaunchEntry> = Vec::new();
+        for entry in fits {
+            if !commands.iter().any(|seen| seen.same_command(entry)) {
+                commands.push(entry);
+            }
+        }
+        match commands.as_slice() {
+            [one] if !lost_default => LaunchChoice::One((*one).clone()),
+            several => LaunchChoice::Several(several.iter().map(|e| (*e).clone()).collect()),
+        }
+    }
+
+    fn planned_arch(&self, branch: &str, filter: &DepotFilter) -> u32 {
+        let planned: BTreeSet<u32> = self
+            .windows_depots(branch, filter)
+            .map(|selection| {
+                selection
+                    .depots
+                    .iter()
+                    .map(|depot| depot.depot_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let has_x86_64 = self
+            .depots
+            .iter()
+            .any(|depot| planned.contains(&depot.depot_id) && depot.osarch == Some(X86_64));
+        let has_32 = self
+            .depots
+            .iter()
+            .any(|depot| planned.contains(&depot.depot_id) && depot.osarch == Some(X86));
+        if has_32 && !has_x86_64 { X86 } else { X86_64 }
     }
 
     fn measure(&mut self, filter: &DepotFilter) {
@@ -400,6 +549,38 @@ pub(crate) async fn fetch_app<S: SteamSession>(
     Ok(Some(app))
 }
 
+/// One owned app's fresh product info and the filter of this account, without
+/// reading the product info of the whole library.
+///
+/// # Errors
+///
+/// [`Error::AppNotOwned`], [`Error::NoWindowsDepot`], and [`Error::Auth`].
+pub async fn fetch_owned_app<S: SteamSession>(
+    session: &S,
+    appid: u32,
+) -> Result<(OwnedApp, DepotFilter), Error> {
+    let licenses = session.license_list().await?;
+    let grants = session.package_grants(&licenses).await?;
+    if !grants.appids.contains(&appid) {
+        return Err(Error::AppNotOwned { appid });
+    }
+    let filter = DepotFilter {
+        owned_appids: grants.appids,
+        owned_depots: grants.depot_ids,
+        ..DepotFilter::default()
+    };
+    let app = fetch_app(session, appid, &filter)
+        .await?
+        .ok_or(Error::AppNotOwned { appid })?;
+    if !app.has_windows_depot() {
+        return Err(Error::NoWindowsDepot {
+            appid,
+            platforms: app.platforms,
+        });
+    }
+    Ok((app, filter))
+}
+
 /// The owned apps of one account.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Library {
@@ -548,6 +729,42 @@ fn oslist(value: Option<&str>) -> Vec<String> {
         .map(|os| os.trim().to_ascii_lowercase())
         .filter(|os| !os.is_empty())
         .collect()
+}
+
+fn parse_launch(root: &KeyValue) -> Vec<LaunchEntry> {
+    let launch = child(root, "config").and_then(|config| child(config, "launch"));
+    let mut entries: Vec<(u32, LaunchEntry)> = children(launch)
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, entry)| Some((key.parse().ok()?, parse_launch_entry(entry))))
+        .collect();
+    // The map's keys are text, so "10" would sort before "9".
+    entries.sort_by_key(|(index, _)| *index);
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn parse_launch_entry(entry: &KeyValue) -> LaunchEntry {
+    LaunchEntry {
+        executable: text(entry, &["executable"])
+            .unwrap_or_default()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_owned(),
+        arguments: text(entry, &["arguments"])
+            .map(str::trim)
+            .filter(|arguments| !arguments.is_empty())
+            .map(str::to_owned),
+        kind: text(entry, &["type"]).map(str::to_ascii_lowercase),
+        oslist: oslist(text(entry, &["config", "oslist"])),
+        osarch: text(entry, &["config", "osarch"]).and_then(|arch| arch.parse().ok()),
+        betakeys: text(entry, &["config", "betakey"])
+            .unwrap_or_default()
+            .split([',', ' '])
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        owns_dlc: text(entry, &["config", "ownsdlc"]).and_then(|dlc| dlc.parse().ok()),
+    }
 }
 
 fn parse_depot(depot_id: u32, entry: &KeyValue) -> DepotInfo {

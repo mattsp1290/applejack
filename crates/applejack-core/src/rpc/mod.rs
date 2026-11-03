@@ -12,14 +12,22 @@ use crate::engines::describe_progress;
 use crate::error::CoreError;
 use crate::game_config::config_value_text;
 use crate::host::HostFacts;
+use crate::install::TitleInstall;
 use crate::state::Core;
+use crate::steam::{LiveSteam, LoginFlow, NoSteam, SteamHost};
+use applejack_engine::rosetta_wine::launch::new_session_id;
+use applejack_steam::{AuthError, AuthMode, Credentials, Error as SteamError, GuardFactor};
+use applejack_steam::{LoginStep, Password};
 use jobs::Notifier;
 use methods::{
-    AppCancelParams, AppRunParams, AppRunResult, ConfigExportResult, EmptyResult, HelloResult,
-    Method, MethodStatus, SessionListResult,
+    AppCancelParams, AppInstallParams, AppRunParams, AppRunResult, ConfigExportResult, EmptyResult,
+    GuardFactorWire, HelloResult, LoginMode, LoginSession, LoginStepWire, Method, MethodStatus,
+    PrefixResetParams, SessionListResult, SteamLibraryParams, SteamLoginCompleteParams,
+    SteamLoginStartParams,
 };
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::thread;
 use wire::{Body, ErrorCode, Id, Request, Response, RpcError};
@@ -69,26 +77,57 @@ pub trait Handler {
     }
 }
 
+/// A login between its requests.
+struct PendingLogin<H: SteamHost> {
+    id: String,
+    flow: LoginFlow<H>,
+}
+
 /// The real core. Methods whose work package has not landed answer
-/// `NotImplemented`.
-#[derive(Debug)]
-pub struct CoreHandler {
+/// `NotImplemented`. `H` is where Steam comes from; only
+/// [`CoreHandler::from_env`] gets the real one.
+pub struct CoreHandler<H: SteamHost = NoSteam> {
     /// An unusable data directory fails the methods that need one, not
     /// `hello` or `host.doctor`.
     core: Result<Core, DataDirError>,
+    steam: Arc<H>,
+    login: Option<PendingLogin<H>>,
+}
+
+impl<H: SteamHost> std::fmt::Debug for CoreHandler<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreHandler")
+            .field("core", &self.core)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CoreHandler {
     #[must_use]
     pub fn new(core: Core) -> Self {
-        Self { core: Ok(core) }
+        Self::with_steam(core, NoSteam::default())
     }
+}
 
+impl CoreHandler<LiveSteam> {
     /// The handler this process's environment describes.
     #[must_use]
     pub fn from_env() -> Self {
         Self {
             core: Core::from_env(),
+            steam: Arc::new(LiveSteam::default()),
+            login: None,
+        }
+    }
+}
+
+impl<H: SteamHost> CoreHandler<H> {
+    #[must_use]
+    pub fn with_steam(core: Core, steam: H) -> Self {
+        Self {
+            core: Ok(core),
+            steam: Arc::new(steam),
+            login: None,
         }
     }
 
@@ -118,9 +157,158 @@ impl CoreHandler {
         params: &AppCancelParams,
         notifier: &Notifier,
     ) -> Result<Value, RpcError> {
-        let plan = self.core()?.plan_cancel(params.appid, params.kill_prefix)?;
+        let appid = params.appid;
+        if self.core()?.cancel_install(appid)? {
+            return to_result(&notifier.start_job(move |job| {
+                job.progress("cancelling", None, None, format!("install of {appid}"));
+                Ok(())
+            })?);
+        }
+        let plan = self.core()?.plan_cancel(appid, params.kill_prefix)?;
         to_result(&notifier.start_job(move |job| {
             plan.run(&mut |phase, message| job.progress(phase, None, None, message))?;
+            Ok(())
+        })?)
+    }
+
+    /// Starting a login drops any other pending one: there is one account,
+    /// and a shell that lost track of a login must be able to begin again.
+    fn login_start(&mut self, params: &SteamLoginStartParams) -> Result<Value, RpcError> {
+        self.login = None;
+        let (mode, credentials) = match &params.mode {
+            LoginMode::Qr => (AuthMode::Qr, None),
+            LoginMode::Credentials {
+                account_name,
+                password,
+            } => (
+                AuthMode::Credentials,
+                Some(Credentials {
+                    account_name: account_name.clone(),
+                    password: Password::new(password.clone()),
+                }),
+            ),
+        };
+        let steam = Arc::clone(&self.steam);
+        let flow = LoginFlow::start(self.core()?, steam, mode, credentials.as_ref())?;
+        let id = new_session_id("login");
+        let step = wire_step(flow.step());
+        if !matches!(step, LoginStepWire::Done { .. }) {
+            self.login = Some(PendingLogin {
+                id: id.clone(),
+                flow,
+            });
+        }
+        to_result(&LoginSession {
+            session_id: id,
+            step,
+        })
+    }
+
+    /// One submit or one poll. A wrong code keeps the login, since Steam
+    /// does; every other failure ends it.
+    fn login_complete(&mut self, params: &SteamLoginCompleteParams) -> Result<Value, RpcError> {
+        let current = self.login.as_ref();
+        if current.is_none_or(|pending| pending.id != params.session_id) {
+            return Err(CoreError::NoSuchLogin.into());
+        }
+        let mut pending = self.login.take().ok_or(CoreError::NoSuchLogin)?;
+        let steam_guard_code = params.steam_guard_code.as_deref();
+        match pending.flow.advance(self.core()?, steam_guard_code) {
+            Ok(step) => {
+                let id = pending.id.clone();
+                if !matches!(step, LoginStep::Done { .. }) {
+                    self.login = Some(pending);
+                }
+                to_result(&LoginSession {
+                    session_id: id,
+                    step: wire_step(&step),
+                })
+            }
+            Err(error) => {
+                if matches!(
+                    error,
+                    CoreError::Steam(SteamError::Auth(AuthError::InvalidGuardCode))
+                ) {
+                    self.login = Some(pending);
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn logout(&mut self) -> Result<Value, RpcError> {
+        self.login = None;
+        let steam = Arc::clone(&self.steam);
+        self.core()?.steam_logout(steam.as_ref())?;
+        to_result(&EmptyResult {})
+    }
+
+    fn prefix_reset(
+        &mut self,
+        params: &PrefixResetParams,
+        notifier: &Notifier,
+    ) -> Result<Value, RpcError> {
+        let core = self.core()?;
+        let claim = core.claim_prefix(&params.prefix)?;
+        let mut core = core.detached();
+        let keep = params.keep_user_data;
+        to_result(&notifier.start_job(move |job| {
+            let name = claim.name();
+            job.progress("reset", None, None, format!("rebuilding prefix {name}"));
+            let safety = core.prefix_reset_claimed(&claim, keep)?;
+            job.progress(
+                "reset",
+                None,
+                None,
+                format!("safety snapshot {}", safety.timestamp),
+            );
+            Ok(())
+        })?)
+    }
+
+    fn steam_library(
+        &mut self,
+        params: &SteamLibraryParams,
+        notifier: &Notifier,
+    ) -> Result<Value, RpcError> {
+        let core = self.core()?;
+        let mut library = core.steam_library_cached()?;
+        if params.refresh {
+            let mut core = core.detached();
+            let steam = Arc::clone(&self.steam);
+            let started = notifier.start_job(move |job| {
+                job.progress("resolve", None, None, "reading the library from Steam");
+                let refreshed = core.steam_library_refresh(steam.as_ref())?;
+                job.progress(
+                    "cached",
+                    None,
+                    None,
+                    format!("{} titles", refreshed.apps.len()),
+                );
+                Ok(())
+            })?;
+            library.job_id = Some(started.job_id);
+        }
+        to_result(&library)
+    }
+
+    fn app_install(
+        &mut self,
+        params: &AppInstallParams,
+        notifier: &Notifier,
+    ) -> Result<Value, RpcError> {
+        let plan = self.core()?.plan_title_install(TitleInstall {
+            appid: params.appid,
+            branch: params.branch.clone(),
+            update: params.update,
+            verify: params.verify,
+            library: params.library.clone(),
+        })?;
+        let steam = Arc::clone(&self.steam);
+        to_result(&notifier.start_job(move |job| {
+            plan.run(steam.as_ref(), &|phase, done, total, message| {
+                job.progress(phase, done, total, message);
+            })?;
             Ok(())
         })?)
     }
@@ -141,7 +329,26 @@ impl CoreHandler {
     }
 }
 
-impl Handler for CoreHandler {
+fn wire_step(step: &LoginStep) -> LoginStepWire {
+    match step {
+        LoginStep::QrReady { payload } => LoginStepWire::QrReady {
+            payload: payload.clone(),
+        },
+        LoginStep::GuardRequired { factor } => LoginStepWire::GuardRequired {
+            factor: match factor {
+                GuardFactor::EmailCode => GuardFactorWire::EmailCode,
+                GuardFactor::DeviceCode => GuardFactorWire::DeviceCode,
+                GuardFactor::DeviceConfirmation => GuardFactorWire::DeviceConfirmation,
+            },
+        },
+        LoginStep::Waiting => LoginStepWire::Waiting,
+        LoginStep::Done { account_name } => LoginStepWire::Done {
+            account_name: account_name.clone(),
+        },
+    }
+}
+
+impl<H: SteamHost> Handler for CoreHandler<H> {
     fn handle(&mut self, method: &Method, notifier: &Notifier) -> Result<Value, RpcError> {
         match method {
             Method::Hello(_) => {
@@ -212,24 +419,12 @@ impl Handler for CoreHandler {
                     .core()?
                     .prefix_restore(&params.prefix, &params.timestamp)?,
             ),
-            Method::PrefixReset(params) => {
-                let core = self.core()?;
-                let claim = core.claim_prefix(&params.prefix)?;
-                let mut core = core.detached();
-                let keep = params.keep_user_data;
-                to_result(&notifier.start_job(move |job| {
-                    let name = claim.name();
-                    job.progress("reset", None, None, format!("rebuilding prefix {name}"));
-                    let safety = core.prefix_reset_claimed(&claim, keep)?;
-                    job.progress(
-                        "reset",
-                        None,
-                        None,
-                        format!("safety snapshot {}", safety.timestamp),
-                    );
-                    Ok(())
-                })?)
-            }
+            Method::PrefixReset(params) => self.prefix_reset(params, notifier),
+            Method::SteamLoginStart(params) => self.login_start(params),
+            Method::SteamLoginComplete(params) => self.login_complete(params),
+            Method::SteamLogout(_) => self.logout(),
+            Method::SteamLibrary(params) => self.steam_library(params, notifier),
+            Method::AppInstall(params) => self.app_install(params, notifier),
             Method::AppRun(params) => self.app_run(params, notifier),
             Method::AppCancel(params) => self.app_cancel(params, notifier),
             Method::SessionList(params) => {

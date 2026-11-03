@@ -5,7 +5,7 @@ const SUBCOMMANDS: [&str; 11] = [
     "doctor",
 ];
 
-const STUBS: [&str; 3] = ["steam", "install", "runtime"];
+const STUBS: [&str; 1] = ["runtime"];
 
 const DOCTOR_KEYS: [&str; 6] = [
     "macos_version",
@@ -55,7 +55,6 @@ fn stubs_exit_with_ex_unavailable() {
 #[test]
 fn stubs_ignore_trailing_arguments() {
     assert_not_implemented("runtime", &["install"]);
-    assert_not_implemented("steam", &["login"]);
 }
 
 fn assert_not_implemented(name: &str, args: &[&str]) {
@@ -70,8 +69,24 @@ fn assert_not_implemented(name: &str, args: &[&str]) {
     assert_eq!(stderr.trim(), format!("applejack {name}: not implemented"));
 }
 
+/// A `steam` or `install` run has the network denied, so a mistake in a test
+/// cannot reach Steam.
+fn applejack_for(args: &[&str]) -> Command {
+    if matches!(args.first(), Some(&("steam" | "install"))) {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command.args([
+            "-p",
+            "(version 1)(allow default)(deny network*)",
+            env!("CARGO_BIN_EXE_applejack"),
+        ]);
+        command
+    } else {
+        applejack()
+    }
+}
+
 fn with_data(data_dir: &std::path::Path, args: &[&str]) -> std::process::Output {
-    applejack()
+    applejack_for(args)
         .env("APPLEJACK_DATA_DIR", data_dir)
         .env_remove("APPLEJACK_ALLOW_UNSIGNED_ENGINE")
         .args(args)
@@ -269,8 +284,15 @@ fn config_show_on_empty_data_dir_prints_empty_config() {
     );
     let text = String::from_utf8(output.stdout).expect("utf-8");
     assert!(text.contains("hidraw_enabled"), "{text}");
+    let drm = text.lines().find(|line| line.starts_with("drm "));
     assert!(
-        !text.lines().any(|line| !line.ends_with(" = (unset)")),
+        drm.is_some_and(|line| line.ends_with(" = \"unknown\"")),
+        "{text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|line| !line.ends_with(" = (unset)") && !line.starts_with("drm ")),
         "{text}"
     );
 
@@ -732,4 +754,39 @@ fn serve_stdio_exits_non_zero_on_protocol_mismatch() {
     assert_eq!(code, Some(65));
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0]["error"]["code"], 1000);
+}
+
+/// With no account on record neither reaches the Keychain or the network.
+#[test]
+fn a_command_that_needs_a_login_exits_3() {
+    let data = tempfile::tempdir().unwrap();
+    for args in [
+        &["install", "480"][..],
+        &["steam", "library"],
+        &["steam", "library", "--refresh", "--json"],
+    ] {
+        let output = with_data(data.path(), args);
+        assert_eq!(output.status.code(), Some(3), "{args:?}");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.contains("applejack steam login"), "{args:?}: {text}");
+    }
+}
+
+#[test]
+fn update_and_verify_cannot_go_together() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["install", "480", "--update", "--verify"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn no_secret_is_an_argument() {
+    let data = tempfile::tempdir().unwrap();
+    for args in [
+        &["steam", "login", "--password", "x"][..],
+        &["steam", "login", "--code", "x"],
+    ] {
+        let output = with_data(data.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
 }

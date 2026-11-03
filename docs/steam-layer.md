@@ -12,15 +12,15 @@ Gate G2 status: **green** (2026-10-30, `steamroom` and `steamroom-client`
 refresh logon, and the license list all worked against live Steam, and the CM
 asked for a 9 s heartbeat. The Rust path stays primary. QR mode was not run.
 
-Approving the mobile prompt and then typing a code fails with EResult
-`DuplicateRequest`, on the first attempt of this run. SteamKit treats that
-result as success because the next poll returns tokens; `steamroom-client`
-treats it as fatal. applejack surfaces it as
-`AuthError::DuplicateGuardApproval`, which ends the login and tells the user
-to log in again with one factor. `GuardChallenge` keeps its client and poll
-loop private, so continuing would need a `[patch.crates-io]` fork of
-`steamroom-client`; a fork is a permanent rebase cost for a failure the user
-clears by retrying, so applejack does not carry one.
+Approving the mobile prompt and then typing a code answered EResult
+`DuplicateRequest` at G2. SteamKit treats that as success because the next
+poll returns tokens; `steamroom-client`'s `GuardChallenge` treats it as fatal
+and keeps its poll loop private. Every call it makes is public on `steamroom`'s
+`SteamClient`, though, so `live::SteamroomConnection` holds the auth session
+itself and needs no fork: one connection polls between code submissions, and
+`DuplicateRequest` at the submit means the tokens are on the next poll. Either
+path finishes a login, whichever comes first. This has passed a scripted CM
+(`tests/live_session.rs`); it has not yet run against live Steam.
 
 ## Flows
 
@@ -33,41 +33,58 @@ answer it in 30 s; a refusal, a rate limit, a Guard error, or
 `CLIENT_LOGGED_OFF` ends it there. Unit tests use scripted fakes; `live::SteamroomConnection` and `live::SteamroomSession` are
 the only implementations that open a socket.
 
+- **Polling.** `Authenticator::poll` is one look at the pending session and is
+  valid while a code is awaited. Each answer is a `LoginStep`: `QrReady` with a
+  rotated challenge, `GuardRequired` while a code is still wanted, `Waiting`, or
+  `Done`, by which point the refresh token is stored. `finish()` polls at
+  Steam's interval for a driver with no code to wait for. `LoginState` lets a
+  login be put down between RPC requests and picked up with
+  `Authenticator::resume`. `core::steam::LoginFlow` is the one driver the CLI
+  and `steam.login.*` share.
 - **QR login.** `begin(AuthMode::Qr)` calls `BeginAuthSessionViaQR` and returns
   `LoginStep::QrReady { payload }`; the shell renders the payload as a QR code.
-  `finish()` polls `PollAuthSessionStatus` until the Steam mobile app approves,
-  stores the refresh token, and returns `LoginStep::Done { account_name }`.
+  Polling follows `new_client_id` and `new_challenge_url`, which `steamroom`'s
+  own `poll_auth_session` drops, so a rotated challenge reaches the user. QR
+  mode has not run against live Steam.
 - **Credentials login.** `begin(AuthMode::Credentials, Some(credentials))`
   fetches the account's RSA key, sends the encrypted password to
-  `BeginAuthSessionViaCredentials`, and returns either `Done` (no second
-  factor), `GuardRequired { factor: EmailCode | DeviceCode }` (call
-  `submit_guard_code`, which may answer `InvalidGuardCode` and keep the session
-  open), or `GuardRequired { factor: DeviceConfirmation }` (call `finish()`
-  and wait for the mobile approval). Any error other than `InvalidGuardCode`
-  from `submit_guard_code` or `finish` (a rate limit, a transport failure, a
-  missing field, a store that rejects the token) ends the login: the
-  connection has consumed its auth session, the driver returns to idle, and
-  the next call must be `begin` again; `finish` or `submit_guard_code` before
-  that is `OutOfOrder`, never `GuardRequired`, so a shell that re-prompts on
-  `GuardRequired` cannot loop. The same holds for a `GuardRequired` that the
-  connection itself reports from `finish`: it ends the login, since the
-  driver's own `GuardRequired` is only ever returned before the flow is
-  consumed. A call in the wrong state is `OutOfOrder` and leaves the
-  connection's state unchanged; a live connection never answers
-  `InvalidGuardCode` once its challenge is gone (a mismatch reported by the
-  token poll rather than the submit is `OutOfOrder`), so "try another code"
-  is only ever said while another code can be accepted.
+  `BeginAuthSessionViaCredentials`, and returns either `Waiting` (no second
+  factor, so polling finishes it), `GuardRequired { factor: EmailCode | DeviceCode }` (poll, and call
+  `submit_guard_code` when a code arrives), or `GuardRequired { factor:
+  DeviceConfirmation }` (poll). `submit_guard_code` polls once, so `Waiting`
+  from it means the code was taken. `LoginFlow` allows `Waiting` two minutes,
+  looks once more, and then ends the login with `SteamLoginStalled`, code
+  `SteamLoginFailed`; the CLI prints a line while it waits. A non-empty refresh
+  token is an approval, with or without an access token: `logon` sends only the
+  refresh token, and Steam has answered with no access token. An answer with an
+  empty refresh token is not one: it would store nothing usable and read as
+  signed in. `LoginFlow::start` refuses a blank account name before it connects,
+  and the CLI before it asks for the password.
+  `InvalidGuardCode` keeps the session open.
+  Any other error from `submit_guard_code` or `poll` ends the login: the
+  connection has dropped its auth session, the driver returns to idle, and the
+  next call must be `begin`; `poll` or `submit_guard_code` before that is
+  `OutOfOrder`, never `GuardRequired`, so a shell that re-prompts on
+  `GuardRequired` cannot loop. A call in the wrong state is `OutOfOrder` and
+  leaves the connection's state unchanged.
 - **Refresh.** `refresh(account_name)` reads the stored refresh token, sends
   `CMsgClientLogon` with it on a fresh connection, and returns the session.
   The account name is not a secret; the token logon requires it alongside
   the token, so the host persists it next to its other metadata (the `meta`
-  table in work package 6). `AuthError::NoStoredToken` means the user must
-  log in; `AuthError::Refused` means the token was rejected and the CLI
-  exits 3. Only a login answers `Refused`. A call denied on a healthy session
+  table, key `steam_account_name`). `AuthError::NoStoredToken` means the user
+  must log in; `AuthError::Refused` means the token was rejected. Any failed
+  silent refresh exits the CLI with 3, and only those two answer
+  `SteamLoginRequired` on the wire; the rest keep their own code, since a login
+  would not fix a network. Only a login answers `Refused`. A call denied on a healthy session
   is `AuthError::CallDenied { call, result }`, and sending that user back to
   log in would not help.
-- **Logout.** `logout()` deletes the Keychain item. Clearing cached library
-  rows is the host's job.
+- **Logout.** `logout()` deletes the Keychain item. `Core::steam_logout` also
+  clears the library cache and the account name, in one transaction; titles on
+  disk stay, with their `drm` and launch exe. It is local only: the token is not
+  revoked at Steam, which still lists the device until the user removes it from
+  their account. A refresh that outlasts a logout, or a login to another
+  account, drops its rows and fails with `SteamLoginRequired`: the fetch writes
+  through `cache_library_for`, which checks the account in the same transaction.
 
 Rate limits and Steam Guard surface as typed errors (`AuthError::RateLimited
 { retry_after }`, `AuthError::GuardRequired { factor }`); nothing loops on
@@ -278,17 +295,100 @@ a manifest trimmed to the files that still need writing.
 An interrupted `update` leaves the `.acf` at the old manifest over files that
 are partly new. The record says so; see "Follow-ups".
 
-### What the CLI unit wires
+### The CLI and RPC
 
-- `applejack steam library [--json] [--refresh]`: `Library::fetch`,
-  `windows_apps`, and the `apps` table.
-- `applejack install <appid> [--branch public]`: `InstallPlan::new` from fresh
-  product info, `DepotInstaller::install`. `--update` is `update`, after
-  syncing the row from the `.acf`. `--verify` is `verify_install`.
-- `client_running`: `wineserver_alive` over every prefix that maps the library.
-- The `steam-session` lock for as long as a session lives.
-- `InstallProgress`, through `with_progress`.
-- Exit codes and messages for `Error`'s variants.
+`crates/applejack-core/src/{steam,install}.rs` hold this; `applejack steam
+login|logout|library`, `applejack install`, `steam.*`, and `app.install` are
+thin over them. A `SteamHost` supplies the connection and the store: `LiveSteam`
+for `applejack` and `serve`, and `NoSteam`, which reaches nothing, for a handler
+built with `CoreHandler::new`, so a test that walks the method table cannot
+touch an account or the Keychain.
+
+`applejack steam login` asks for the account name, then the password through
+`rpassword`, with echo off. `--qr` prints the payload instead. A code prompt
+keeps polling, so typing the code and approving in the mobile app both finish
+it. Codes are read with echo on: the reader thread is left blocked when the
+login ends first, and a process that exits mid-read with echo off leaves the
+terminal that way. `rpassword` clears echo, canonical mode, and `ISIG`, reads
+control-C as a character, and raises `SIGINT` before its own restore, so the
+login holds a handler from the password prompt on: `SIGINT`, `SIGTERM`,
+`SIGHUP`, and `SIGQUIT` put the terminal back and exit with `128 + signal`.
+
+`steam library` reads the cache, or Steam with `--refresh` or an empty cache.
+Rows go to the `apps` table: `fetched_at` marks the cache, and `size_bytes`,
+`default_branch`, and `latest_buildid` come with it. A refresh replaces the
+cache in one transaction, and a title on disk keeps its `installdir` and stays
+when it leaves the account. Over RPC a refresh is a job, because a large library
+can outlast a request. `latest_buildid` is the default branch's, so a title on
+another branch reads `installed` whatever it says.
+
+`applejack install <appid> [--branch public] [--update] [--verify] [--library
+<abs>]`, and `app.install`:
+
+1. **Refusals**, quick and with no Steam, so each is an error response: another
+   install of the title, an open session, a title on disk without `--update` or
+   `--verify`, a stopped update without `--update`, a Windows client running.
+2. **`login`**, then **`resolve`**: fresh product info for this one title with
+   `fetch_owned_app`, an `InstallPlan`, and the launch choice below.
+3. **`download`**, with byte counts. `update` re-reads the `.acf` into the row
+   first. `verify` needs no login and hashes instead, as phase **`verify`**, and
+   refuses with `VerifyFailed` when the `.acf` lists no depots.
+4. **`register`**: the `.acf` into the `apps` row through `Core::record_title`,
+   the one write `app register` uses too. Its `launch exe:` line names what a run
+   would launch. A chosen exe that is missing or not a PE image is a `warning:`
+   line naming `launch_exe_override`, and the install stands.
+
+With no `--branch`, an update and a resumed install stay on `installed_branch`,
+the branch recorded in the row; a new install takes the default. A title
+`applejack install` did not put there has none and an update takes the default.
+
+The job holds `locks/install-<appid>.lock` from the first step to the last and
+the title's prefix lock with it. The prefix lock is what a run holds for the life
+of a session, so an install and a run exclude each other across processes
+whichever comes first. A run also refuses while a download record exists, which
+is all that is left of a process that was killed; `app.run` checks again after
+taking the lock. The first download writes the row's `library_dir` past the
+installer's own refusals, just before the record, with no build id, so a run
+finds the record of a title that has never finished and a refused install leaves
+the row alone. `app cancel`, `app.cancel`, and `SIGINT` write
+`locks/install-<appid>.cancel`, which the installer reads once a second from
+whichever process runs it; a stop keeps the record, and the next install resumes
+a first install while `--update` resumes an update, whose `.acf` still says whole.
+The refusal names the right one. `--verify` reads no cancel file: it cannot be
+stopped short of ending the process, though `app cancel` still answers that it
+asked.
+
+**Which exe.** Plan 05 says the app info's launch options filtered to
+`oslist = windows`, overridable per game. `OwnedApp::launch_choice` applies, in
+order: an entry with an executable, not a `server`, `editor`, `config`, or `vr`
+type, whose `oslist` allows Windows, whose `betakey` is empty or names the
+branch, and whose `ownsdlc` is owned; `osarch` matching the planned depots, unless
+that leaves nothing; then `default` over untyped over `option1` and its like.
+The entries that remain must agree on executable and arguments. If they do not,
+or if the app has a `default` entry that allows Windows and these filters took
+it, so that what is left was only ever offered beside it, the install refuses
+with `LaunchExeAmbiguous` before a byte arrives and lists them;
+`applejack config <appid> set launch_exe_override <file>` is the way out, with
+any arguments of the entry in `launch_args_override`. A `default` for another
+OS takes nothing away: a Windows client was never offered it, so a lone Windows
+entry beside it stands. The rule errs towards refusing.
+A title with an override, an exe already recorded, or a client launch
+(`drm = steam` or `launch_mode = client`) needs no choice. Steamworks' uploading
+documentation grounds only the OS and DLC filters. `type`, `osarch`, and
+`betakey` are a reading of the field names, not a documented rule, and no
+captured app info has been checked against this; `install` prints the exe it
+chose so a wrong pick shows at once.
+
+**`drm` stays `unknown`.** It cannot be inferred from Steam, and nothing here
+marks a title `none`. The route to a client-free run is the user's word, after
+trying it: `applejack run <appid> --probe-direct`, which launches once
+whatever `drm` says, then `applejack config <appid> set drm none`, or
+`config.set` with key `drm`. It lives on the title and not in `game_config`, so
+a preset cannot carry it, and the refusal from `applejack run` names the route.
+
+**`app register` stays**, for a title `applejack install` did not put there: a
+library copied in, or one the Windows client installed, which `install` refuses
+because a `.acf` is present. It writes through `Core::record_title`.
 
 ## Token handling rules
 
@@ -296,17 +396,26 @@ are partly new. The record says so; see "Follow-ups".
   service `applejack` and account `steam-refresh-token`, written through the
   Security framework (`SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete`).
   The `security` command line tool is never invoked.
-- The access token stays in memory (`auth::AccessToken`).
-- `RefreshToken`, `AccessToken`, and `Password` redact themselves in `Debug`
+- `RefreshToken` and `Password` redact themselves in `Debug`
   and `Display`; a value is readable only through `expose()`.
 - No token is ever passed on a process command line. The crate constructs no
   `std::process::Command`: `crates/applejack-steam/clippy.toml` lists it and
   `tokio::process::Command` under `disallowed-types`, which the gate's Clippy
   run (`-D warnings`) enforces by resolved type, so an import alias cannot
-  hide one; `tests/no_token_argv.rs` greps `src/` and `examples/` as a
-  textual backstop, and also fails on a print of a line that names a token or
-  depot key.
-- `RefreshToken`, `AccessToken`, `Password`, and `Credentials` are not
+  hide one; `tests/no_token_argv.rs` greps `src/` as a textual backstop, and
+  also fails on a print of a line that names a token or depot key, in this
+  crate, the core's RPC, Steam, and install modules, and the CLI's commands.
+- `LoginMode` and `SteamLoginCompleteParams`, which carry a password and a code
+  on the wire, write `Debug` by hand. So does every type above.
+- The password buffer is not wiped. `Password` is a plain `String`, and the CLI
+  drops it unwiped; over RPC the line buffer and the parsed copies keep it until
+  they are reused. This is accepted: it stays in this process's memory, and the
+  shell sends no password today.
+- The Keychain item belongs to the macOS user, not the data directory, while the
+  account name lives in each directory's `meta` table. `steam logout` with one
+  `APPLEJACK_DATA_DIR` signs every other out, and a login in one leaves another
+  naming the old account until its next login.
+- `RefreshToken`, `Password`, and `Credentials` are not
   comparable (no `PartialEq`: a derived comparison is not constant time and
   nothing needs one), `License::Debug` omits the PICS `access_token`, and the
   `CMsgClientLogon` built in `SteamroomSession::start` carries the refresh
@@ -360,11 +469,12 @@ kills it.
 
 Lock order is per-appid first, then the library. Decision (U8e): the library
 lock taken under an app lock is **shared**. "Shared library lock" in the plan
-means `LOCK_SH`, so two `applejack install` processes for different appids
-download at the same time and serialize only against library-wide
-operations (rewriting `libraryfolders.vdf`, moving the library), which take
-the library lock exclusively through `LockDir::library_exclusive` and are
-never run while the same process holds an app lock. What the types
+means `LOCK_SH`, so two `DepotInstaller` runs for different appids download at
+the same time and serialize only against library-wide operations (rewriting
+`libraryfolders.vdf`, moving the library), which take the library lock
+exclusively through `LockDir::library_exclusive` and are never run while the
+same process holds an app lock. The CLI and RPC never get that far: each opens
+a Steam session, and the second is refused on `steam-session`. What the types
 guarantee, within one process:
 
 - `LockDir::app(&mut self, appid, mode)` yields an `AppLock` that borrows the
@@ -402,9 +512,13 @@ needs more than one title; the installer holds one.
 
 Every applejack process sends the same `LOGIN_ID` in `CMsgClientLogon`, so two
 concurrent logged-in applejack connections on one account displace each
-other. The CLI/RPC unit that owns the connection lifetime must hold a
-`steam-session` lock (a `LockDir` name) for as long as a `SteamroomSession`
-exists; this crate only documents that rule.
+other. `core::steam::silent_logon` holds `LockDir::steam_session` for as long
+as a session exists, non-blocking, so a second one fails at once naming the
+first. Two installs of different titles therefore do not overlap, whatever the
+library lock would allow: the second waits for the user, not for the first.
+
+`LockDir::install_job` comes before the prefix lock, the prefix lock before
+`steam-session`, and `steam-session` before the app lock.
 
 These locks serialize applejack processes only. They say nothing about the
 Windows Steam client.
@@ -474,9 +588,6 @@ writer with whatever keys the client needs.
 
 ## Follow-ups
 
-- **Interrupted update.** The `.acf` stays at the old manifest while files
-  change. Launch code should check `LibraryPaths::record` and refuse a title
-  with a record present until the install is resumed.
 - **Verify a client-installed depot.** `verify_install` needs a stored manifest;
   a session-aware variant could fetch it.
 - **Power loss.** Resume trusts a recorded file's size. `DepotJob` does not
@@ -484,7 +595,7 @@ writer with whatever keys the client needs.
 - **Repair.** `VerifyReport` only reports; `install` refuses an installed title.
 - **PICS over HTTP.** A reply can carry `http_host` and omit a large buffer.
   Such an app lands in `Library::skipped`. Whether Steam still does this for
-  this request is unknown until a large account runs the spike.
+  this request is unknown until a large account refreshes its library.
 - **Family sharing** is out of scope, and `Library` does not yet filter
   licenses by `owner_id`, since the value on an account's own licenses has not
   been observed. Expired licenses are not filtered either; the `ELicenseFlags`
@@ -503,8 +614,10 @@ to file; the local copies in `live.rs` stay until they land:
    discards the sibling messages of the `MULTI` that carries the logon
    response; applejack avoids `login` entirely (see "Session").
 4. `GuardChallenge::submit_code` (`steamroom-client-0.3.0/src/login/credentials.rs:167-187`)
-   treats `DuplicateRequest` as fatal, and `GuardChallenge` exposes no poll,
-   so a caller cannot continue after the user approved in the app.
+   treats `DuplicateRequest` as fatal, and `GuardChallenge` exposes no poll.
+   `live.rs` makes the same `SteamClient<Ready>` calls itself instead, and
+   `poll_auth_session` drops `new_client_id` and `new_challenge_url`, so it
+   calls `PollAuthSessionStatus` itself too.
 5. Each `SteamClient<LoggedIn>` call runs its own receive loop, so they cannot
    share a connection with anything else that reads. A receive buffer in
    `ClientInner`, or a dispatcher, would let applejack drop the wire copies in
@@ -538,93 +651,15 @@ purchases only and does not bypass DRM.
 
 ## Live result
 
-On 2026-10-31 `depot_spike` passed against a real account at e615214: device-code
-login, CM logon, license and product info, then Spacewar (480) from two depots,
-one of them shared from app 228980. It wrote 12 files and 85,850,313 bytes and
-verified them with no mismatches.
+On 2026-10-31 the depot spike, since deleted, passed against a real account at
+e615214: device-code login, CM logon, license and product info, then Spacewar
+(480) from two depots, one of them shared from app 228980. It wrote 12 files and
+85,850,313 bytes and verified them with no mismatches.
 
-## Running the depot spike
+Both spikes are gone: `steam login`, `steam library`, and `install` are the same
+flows. The CLI itself has not run against live Steam yet.
 
-`examples/depot_spike.rs` is the live check of this code. Without
-`APPLEJACK_LIVE_STEAM=1` it prints usage, exits 0, and contacts nothing.
-
-```sh
-cargo run -p applejack-steam --example depot_spike                 # prints usage, exits 0
-APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike
-APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \
-    --install 480 --dir /tmp/applejack-spike
-APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example depot_spike -- \
-    --library-out ~/applejack-library.tsv
-```
-
-Repeat `--install` to install several apps on one login. A later run over the
-same `--dir` needs `--force`, because the other apps' files are there.
-
-`--library-out` writes the owned Windows apps to a new file with mode 0600. It
-combines with `--install`. Keep that file out of the repository.
-
-Spacewar (480) is a small free title; add it to the account first, or use any
-small Windows title the account owns. `--dir` is the library root, and it also
-holds `locks/`. A directory that holds anything else and no applejack record
-for that app is refused before login, so a mistyped path cannot land on
-someone's files; `--force` installs over it. The spike reads the account name
-from stdin and the password
-from the terminal without echo. When Steam asks for a code, enter the code and
-do not also approve in the mobile app; doing both fails with
-`DuplicateRequest`. It holds the refresh token in memory only and never prints
-it. It passes a `client_running` that is always false, so quit any client that
-maps the directory first.
-
-Green is `logon ok`, a plausible `owned apps with a Windows depot` count, and
-with `--install`, `verify: N files, 0 mismatched, 0 missing` and `depot spike:
-green`. Interrupt an install and run it again to see `resumed: true`. Every
-Steam call prints a `call:` line first, so on a failure the last one names the
-call. The skipped apps and the depots not licensed print by id.
-
-## Running the G2 spike
-
-```sh
-cargo run -p applejack-steam --example auth_spike                 # prints usage, exits 0
-APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example auth_spike
-APPLEJACK_LIVE_STEAM=1 cargo run -p applejack-steam --example auth_spike -- --credentials
-```
-
-Use `--credentials` as the primary G2 mode. QR mode prints the challenge URL
-to render with any QR tool and scan with the Steam mobile app, but
-`steamroom` 0.3.0 ignores the `new_client_id` and `new_challenge_url` fields
-of `CAuthentication_PollAuthSessionStatus_Response`
-(`steamroom-0.3.0/src/client/mod.rs:470-496`), so when the QR challenge
-rotates the printed URL goes stale and the poll keeps running with the old
-id; scan within about 30 s or fall back to `--credentials`. Credentials mode
-reads the account name from stdin and the password from the terminal without
-echo (`rpassword`). The spike stores the refresh token in an `InMemoryStore`,
-logs on again with it, prints the heartbeat interval from the logon response,
-decodes the license list, prints the license count and crate versions, and
-never prints the token.
-
-### Reading the result
-
-- `login ok`, `refresh logon ok`, `licenses on account: N` with `N >= 1`, and
-  `gate G2: green`: green. A logged-on account always holds package 0, so the
-  spike prints a warning instead of the green line when the list is empty;
-  that is a decode problem to fix, not a red result.
-- A failure before `refresh logon ok` (auth, Steam Guard, rate limit,
-  `CMsgClientLogonResponse` eresult): the real red case. Rate limits and
-  Steam Guard surface as typed errors; retry after the floor or complete the
-  factor rather than counting them as red.
-- `refresh logon ok` followed by `Steam EResult ...`, `rate limited by
-  Steam`, or `Steam denied the license list` from the license list: the CM
-  accepted the logon but answered `CMsgClientLicenseList` with a non-OK
-  `eresult`. Red for the decode path; record the EResult in the table.
-- `refresh logon ok` followed by `timed out waiting for CLIENT_LICENSE_LIST`:
-  red. It meant something else when this spike used `SteamClient<Ready>::login`,
-  which discards the other messages in the logon `MULTI`. `live/session.rs` now
-  owns the receive side and routes them, so the list was either never sent or
-  not decoded.
-
-Record the outcome here:
-
-| Date | Outcome | steamroom | steamroom-client | Notes |
+| Date | Gate G2 | steamroom | steamroom-client | Notes |
 |------|---------|-----------|------------------|-------|
 | 2026-10-30 | green | 0.3.0 | 0.3.0 | macOS 26.6.2, `--credentials` with a Steam Guard device code |
 
@@ -640,14 +675,10 @@ real ones are listed in the unit report's DEVIATIONS.
 | Plan name | Real name | File:line |
 |-----------|-----------|-----------|
 | credential auth begin | `SteamClient<Ready>::begin_auth_session_via_credentials` | `steamroom-0.3.0/src/client/mod.rs:422` |
-| (wrapper used) | `LoginBuilder::with_credentials` / `CredentialsLogin::begin` | `steamroom-client-0.3.0/src/login/mod.rs:292`, `src/login/credentials.rs:58` |
 | QR auth begin | `SteamClient<Ready>::begin_auth_session_via_qr` | `steamroom-0.3.0/src/client/mod.rs:446` |
-| (wrapper used) | `LoginBuilder::with_qr` / `QrLogin::begin` / `QrLoginFlow::challenge_url` / `wait_for_scan` | `steamroom-client-0.3.0/src/login/mod.rs:305`, `src/login/qr.rs:37,73,85` |
-| poll | `SteamClient<Ready>::poll_auth_session` | `steamroom-0.3.0/src/client/mod.rs:470` |
-| (wrapper used) | `poll_until_tokens` (via `wait_for_scan`, `wait_for_confirmation`, `submit_code`) | `steamroom-client-0.3.0/src/login/credentials.rs:226` |
+| poll | `SteamClient<Ready>::call_service_method_non_authed` with `Authentication.PollAuthSessionStatus#1`, as `poll_auth_session` does | `steamroom-0.3.0/src/client/mod.rs:370,470` |
 | Steam Guard submit | `SteamClient<Ready>::submit_steam_guard_code` | `steamroom-0.3.0/src/client/mod.rs:499` |
-| (wrapper used) | `GuardChallenge::submit_code`, `MobileChallenge::wait_for_confirmation` | `steamroom-client-0.3.0/src/login/credentials.rs:167,207` |
-| tokens after approval | `ApprovedAuth::tokens` → `steamroom::auth::AuthTokens { access_token, refresh_token, account_name }` | `steamroom-client-0.3.0/src/login/terminal.rs:83`, `steamroom-0.3.0/src/auth/mod.rs:23` (line 22 is its `#[non_exhaustive]`) |
+| tokens after approval | `CAuthenticationPollAuthSessionStatusResponse { access_token, refresh_token, account_name, new_client_id, new_challenge_url }` | generated from `steamroom-0.3.0/proto` |
 | refresh-token logon | `SteamClient<Ready>::send_msg` with `CMsgClientLogon { account_name, access_token, obfuscated_private_ip, .. }`, the reply routed by the session's receive loop (`login` drops `MULTI` siblings) | `steamroom-0.3.0/src/client/mod.rs:362`; proto `steammessages_clientserver_login.proto` (`account_name`=50, `access_token`=108, `obfuscated_private_ip`=11) |
 | (reference) | `TokenLogin::login` builds the same message without a logon id and without `supports_rate_limit_response`, both of which applejack adds | `steamroom-client-0.3.0/src/login/terminal.rs:55` |
 | logon response | `CMsgClientLogonResponse { eresult, heartbeat_seconds, .. }` from the `IncomingMsg` that `login` returns; `SteamClient<LoggedIn>::send_heartbeat` | proto `steammessages_clientserver_login.proto:97`; `steamroom-0.3.0/src/client/mod.rs:289,537` |

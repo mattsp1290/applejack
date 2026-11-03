@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 bytes = { workspace = true }
 prost = { workspace = true }
 rustix = { workspace = true }
@@ -19,14 +20,8 @@ tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 reqwest = { workspace = true }
-rpassword = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-
-# `cargo test` otherwise skips an example's own tests.
-[[example]]
-name = "depot_spike"
-test = true
 
 [lints]
 workspace = true

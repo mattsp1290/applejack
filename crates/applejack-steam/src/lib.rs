@@ -17,9 +17,9 @@
 //! ever passed on a process command line: this crate spawns no process at
 //! all, so it constructs no `Command` from `std::process` or `tokio::process`
 //! (`clippy.toml` lists both under `disallowed-types`, and
-//! `tests/no_token_argv.rs` greps for them). [`keychain::RefreshToken`],
-//! [`auth::AccessToken`], and [`auth::Password`] redact themselves in `Debug`
-//! and are readable only through `expose()`. `docs/steam-layer.md` under
+//! `tests/no_token_argv.rs` greps for them). [`keychain::RefreshToken`] and
+//! [`auth::Password`] redact themselves in `Debug` and are readable only
+//! through `expose()`. `docs/steam-layer.md` under
 //! "Token handling rules" is the full list.
 
 pub mod acf;
@@ -35,17 +35,18 @@ pub mod vdf;
 
 pub use acf::{AcfWriter, AppManifest, InstalledDepot};
 pub use auth::{
-    AccessToken, AuthError, AuthMode, Authenticator, Credentials, GuardFactor, License, LoginStep,
-    Password, SteamConnection, Tokens,
+    AuthError, AuthMode, AuthPoll, Authenticator, Credentials, GuardFactor, License, LoginState,
+    LoginStep, Password, SteamConnection, Tokens,
 };
 pub use depot::{
-    ClientRunning, DepotInstaller, DownloadRecord, InstallOptions, InstallOutcome, InstallPlan,
-    InstallProgress, LibraryPaths, VerifyReport, verify_install,
+    BeforeWrite, CancelRequested, ClientRunning, DepotInstaller, DownloadRecord, InstallOptions,
+    InstallOutcome, InstallPlan, InstallProgress, LibraryPaths, VerifyReport, verify_install,
 };
 pub use error::Error;
 pub use keychain::{InMemoryStore, RefreshToken, RefreshTokenStore, SecurityFrameworkStore};
 pub use library::{
-    DepotFilter, DepotInfo, DepotSelection, Library, ManifestRef, OwnedApp, PlannedDepot,
+    DepotFilter, DepotInfo, DepotSelection, LaunchChoice, LaunchEntry, Library, ManifestRef,
+    OwnedApp, PlannedDepot, fetch_owned_app,
 };
 pub use lock::{AppLock, Holder, LibraryLock, Lock, LockDir, Mode};
 pub use session::{AppInfo, PackageGrants, SteamSession};

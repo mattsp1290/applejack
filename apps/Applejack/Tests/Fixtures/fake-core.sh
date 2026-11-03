@@ -19,8 +19,13 @@
 #   FAKE_CORE_IMPLEMENTED=1    answer the view-model methods (engine.*,
 #                              steam.*, config.*, session.list, app.install)
 #                              with canned results shaped like the Rust types;
-#                              engine.install and app.install run as jobs that
-#                              emit two job.progress then job.done
+#                              engine.install, app.install, and steam.library
+#                              with refresh run as jobs that emit two
+#                              job.progress then job.done
+#   FAKE_CORE_LOGIN_POLLS=<n>  steam.login.complete answers `waiting` n times
+#                              before `done`
+#   FAKE_CORE_LOGIN_ROTATE=1   each steam.login.start answers a new session id,
+#                              and steam.login.complete answers the latest
 #   FAKE_CORE_JOB_OUTCOME=failed  the jobs end with job.failed (code 1004)
 #   FAKE_CORE_JOB_OUTCOME=never   the jobs emit their progress and no terminal
 #                                 notification
@@ -132,13 +137,32 @@ implemented() {
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"advertise_avx":true,"avx":true,"avx2":false,"osxsave":true}}'
       ;;
     steam.login.start)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"login-session-fake","step":{"kind":"qr_ready","payload":"https://s.team/q/1/fake-challenge"}}}'
+      if [ -n "${FAKE_CORE_LOGIN_ROTATE:-}" ]; then
+        login_serial=$((${login_serial:-0} + 1))
+        login_session="login-session-fake-$login_serial"
+      fi
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"qr_ready","payload":"https://s.team/q/1/fake-challenge"}}}'
       ;;
     steam.login.complete)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"login-session-fake","step":{"kind":"done","account_name":"fake-account"}}}'
+      case "${FAKE_CORE_LOGIN_POLLS:-0}" in
+        0) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"done","account_name":"fake-account"}}}' ;;
+        *)
+          FAKE_CORE_LOGIN_POLLS=$((FAKE_CORE_LOGIN_POLLS - 1))
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"waiting"}}}'
+          ;;
+      esac
       ;;
     steam.library)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"apps":[{"appid":220,"name":"Half-Life 2","drm":"steam","install_state":"installed"},{"appid":440,"name":"Team Fortress 2","drm":"unknown","install_state":"not_installed"}]}}'
+      apps='[{"appid":220,"name":"Half-Life 2","installdir":"Half-Life 2","size_bytes":4096,"drm":"steam","default_branch":"public","install_state":"installed"},{"appid":440,"name":"Team Fortress 2","installdir":"Team Fortress 2","size_bytes":8192,"drm":"unknown","default_branch":"public","install_state":"not_installed"}]'
+      case "$3" in
+        *'"refresh":true'*)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"apps":'"$apps"',"fetched_at":"2026-11-02T00:00:00Z","job_id":9}}'
+          job 9
+          ;;
+        *)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"apps":'"$apps"',"fetched_at":"2026-11-02T00:00:00Z","job_id":null}}'
+          ;;
+      esac
       ;;
     config.get)
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"engine_id":"rosetta-wine","engine_version":"10.0.1","graphics_backend":"dxmt","sync_mode":"esync","hidraw_enabled":false,"steam_input":null,"steam_overlay":true,"rosetta_advertise_avx":null,"extra_env":{"DXMT_LOG":"1"},"launch_mode":"client","launch_exe_override":null,"launch_args_override":null,"direct_verified_at":null,"isolated_prefix":false,"dx12_expectation":null,"notes":"fake"}}'

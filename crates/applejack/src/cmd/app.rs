@@ -1,4 +1,5 @@
 //! `applejack app run|cancel|register`, and `applejack run`, its plan name.
+//! `app cancel` also stops a running `applejack install`, in any process.
 //! A run stays attached until the session ends and exits with the launch
 //! exe's status, or 1 when no status is known or the title exited early.
 //! `SIGINT` and `SIGTERM` cancel it.
@@ -14,8 +15,6 @@ use applejack_core::config::{Drm, SessionRow, SessionState};
 use applejack_core::run::AppRegistration;
 use applejack_core::{Core, CoreError};
 use clap::{Args, Subcommand};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 #[derive(Args)]
 pub struct AppArgs {
@@ -44,8 +43,8 @@ enum Action {
         #[arg(long)]
         kill_prefix: bool,
     },
-    /// Record a title already on disk from its `appmanifest_<appid>.acf`,
-    /// until `applejack install` writes this itself
+    /// Record a title `applejack install` did not put there, from its
+    /// `appmanifest_<appid>.acf`
     Register {
         /// Steam app id
         appid: u32,
@@ -56,8 +55,8 @@ enum Action {
         /// The launch executable, relative to the install directory
         #[arg(long)]
         exe: Option<String>,
-        /// The library root holding `steamapps/`, an absolute path;
-        /// `<data>/library` by default
+        /// The library root holding `steamapps/`, an absolute path; the
+        /// title's own or `<data>/library` by default
         #[arg(long)]
         library: Option<PathBuf>,
     },
@@ -147,22 +146,7 @@ fn attached(args: &RunArgs) -> Result<SessionRow, CoreError> {
 /// A second one stops waiting for that: the row stays open and `app cancel`
 /// or the next core settles it.
 fn cancel_on_signal(appid: u32) {
-    let mut signals = match Signals::new([SIGINT, SIGTERM]) {
-        Ok(signals) => signals,
-        Err(error) => {
-            say(&format!("applejack app: no signal handling: {error}"));
-            return;
-        }
-    };
-    std::thread::spawn(move || {
-        let mut received = signals.forever();
-        if received.next().is_some() {
-            std::thread::spawn(move || cancel_for_signal(appid));
-        }
-        if let Some(signal) = received.next() {
-            std::process::exit(128 + signal);
-        }
-    });
+    super::on_signal(move || cancel_for_signal(appid));
 }
 
 fn cancel_for_signal(appid: u32) {
@@ -180,6 +164,9 @@ fn end_session(appid: u32) -> Result<SessionRow, CoreError> {
 
 fn cancel(appid: u32, kill_prefix: bool) -> Result<String, CoreError> {
     let mut core = Core::from_env()?;
+    if core.cancel_install(appid)? {
+        return Ok(format!("asked the install of {appid} to stop"));
+    }
     drop(core.reconcile_sessions()?);
     let row = core
         .plan_cancel(appid, kill_prefix)?

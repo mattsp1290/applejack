@@ -2,6 +2,11 @@
 //! applejack processes. They say nothing about the Windows Steam client: the
 //! ownership rule in `docs/steam-layer.md` uses `wineserver_alive` for that.
 //!
+//! An install job holds [`LockDir::install_job`] for its whole life, login
+//! included, so another process can tell one is running and ask it to stop.
+//! It comes before everything else. [`LockDir::steam_session`] is held for as
+//! long as a logged-in session exists, and comes before the per-appid lock.
+//!
 //! Lock order is per-appid first, then the library. Within one process the
 //! types enforce it: [`LockDir::app`] borrows the [`LockDir`] mutably for as
 //! long as the [`AppLock`] lives, so one `LockDir` holds at most one app lock,
@@ -71,6 +76,8 @@ const WAIT_POLL: Duration = Duration::from_millis(25);
 const REPLACED_RETRIES: u32 = 8;
 
 const LIBRARY_LOCK_NAME: &str = "library";
+
+const STEAM_SESSION_LOCK_NAME: &str = "steam-session";
 
 /// `LOCK_SH` or `LOCK_EX`.
 #[derive(Debug, Clone, Copy)]
@@ -323,6 +330,40 @@ impl LockDir {
         })
     }
 
+    /// Takes the lock an install job holds from its first step to its last.
+    /// It has no place in the type-enforced order: nothing is taken under it
+    /// in this `LockDir`, and the job's installer opens its own.
+    ///
+    /// # Errors
+    ///
+    /// See [`LockDir::app`].
+    pub fn install_job(&self, appid: u32, mode: Mode) -> Result<Lock, Error> {
+        Lock::acquire(
+            &self.root,
+            &install_job_lock_name(appid),
+            Kind::Exclusive,
+            mode,
+            &self.command,
+        )
+    }
+
+    /// Takes the lock held for as long as a logged-in session exists. Every
+    /// applejack process logs on with one logon id, so two sessions of one
+    /// account would displace each other.
+    ///
+    /// # Errors
+    ///
+    /// See [`LockDir::app`].
+    pub fn steam_session(&self, mode: Mode) -> Result<Lock, Error> {
+        Lock::acquire(
+            &self.root,
+            STEAM_SESSION_LOCK_NAME,
+            Kind::Exclusive,
+            mode,
+            &self.command,
+        )
+    }
+
     /// Takes the library lock exclusively, for operations on the library as a
     /// whole (rewriting `libraryfolders.vdf`, moving the library). It waits
     /// for every shared holder from [`AppLock::library`] and keeps new ones
@@ -362,6 +403,11 @@ impl LockDir {
 #[must_use]
 pub fn app_lock_name(appid: u32) -> String {
     format!("app-{appid}")
+}
+
+#[must_use]
+pub fn install_job_lock_name(appid: u32) -> String {
+    format!("install-{appid}")
 }
 
 /// The per-appid lock. Holding one is the only way to take the library lock.

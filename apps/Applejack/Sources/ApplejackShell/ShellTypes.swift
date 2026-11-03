@@ -237,11 +237,16 @@ public enum InstallState: String, Codable, Sendable {
 public struct LibraryEntry: Codable, Equatable, Sendable, Identifiable {
     public var appid: UInt32
     public var name: String?
+    public var installdir: String
+    public var sizeBytes: UInt64
     public var drm: Drm
+    public var defaultBranch: String
     public var installState: InstallState
 
     enum CodingKeys: String, CodingKey {
-        case appid, name, drm
+        case appid, name, installdir, drm
+        case sizeBytes = "size_bytes"
+        case defaultBranch = "default_branch"
         case installState = "install_state"
     }
 
@@ -251,6 +256,15 @@ public struct LibraryEntry: Codable, Equatable, Sendable, Identifiable {
 
 public struct SteamLibraryResult: Codable, Equatable, Sendable {
     public var apps: [LibraryEntry]
+    public var fetchedAt: String?
+    /// The job a `refresh` started; the cache has the new rows after it.
+    public var jobId: UInt64?
+
+    enum CodingKeys: String, CodingKey {
+        case apps
+        case fetchedAt = "fetched_at"
+        case jobId = "job_id"
+    }
 }
 
 public struct EngineEntry: Codable, Equatable, Sendable, Identifiable {
@@ -292,7 +306,14 @@ public struct DoctorReport: Codable, Equatable, Sendable {
 public enum LoginStep: Codable, Equatable, Sendable {
     case qrReady(payload: String)
     case guardRequired(factor: String)
+    /// Steam has the answer and has not issued tokens yet.
+    case waiting
     case done(accountName: String)
+
+    public var isDone: Bool {
+        if case .done = self { return true }
+        return false
+    }
 
     enum CodingKeys: String, CodingKey {
         case kind, payload, factor
@@ -306,6 +327,8 @@ public enum LoginStep: Codable, Equatable, Sendable {
             self = .qrReady(payload: try container.decode(String.self, forKey: .payload))
         case "guard_required":
             self = .guardRequired(factor: try container.decode(String.self, forKey: .factor))
+        case "waiting":
+            self = .waiting
         case "done":
             self = .done(accountName: try container.decode(String.self, forKey: .accountName))
         case let other:
@@ -322,6 +345,8 @@ public enum LoginStep: Codable, Equatable, Sendable {
         case .guardRequired(let factor):
             try container.encode("guard_required", forKey: .kind)
             try container.encode(factor, forKey: .factor)
+        case .waiting:
+            try container.encode("waiting", forKey: .kind)
         case .done(let accountName):
             try container.encode("done", forKey: .kind)
             try container.encode(accountName, forKey: .accountName)

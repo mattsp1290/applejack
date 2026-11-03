@@ -12,9 +12,24 @@ public final class LibraryViewModel {
         self.app = app
     }
 
+    /// A refresh is a job, since reading a library can outlast a request; the
+    /// rows come from the cache once it ends.
     public func load(refresh: Bool = false) async {
         library = .loading
-        if let next = await app.run({ try await $0.call("steam.library", params: SteamLibraryParams(refresh: refresh)) as SteamLibraryResult }) {
+        if refresh {
+            var failure: FlowState<SteamLibraryResult>?
+            await app.runJob("steam.library", params: SteamLibraryParams(refresh: true)) { state in
+                switch state {
+                case .failed, .unavailable: failure = state.map { _ in SteamLibraryResult(apps: [], fetchedAt: nil, jobId: nil) }
+                default: break
+                }
+            }
+            if let failure {
+                library = failure
+                return
+            }
+        }
+        if let next = await app.run({ try await $0.call("steam.library", params: SteamLibraryParams(refresh: false)) as SteamLibraryResult }) {
             library = next
         }
     }
