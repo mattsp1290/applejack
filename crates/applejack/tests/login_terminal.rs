@@ -91,9 +91,16 @@ impl Drop for Leader {
             return;
         }
         if let Ok(pid) = fs::read_to_string(&self.pid_file) {
-            let _ = Command::new("/bin/kill")
-                .args(["-TERM", pid.trim()])
-                .status();
+            let pid = pid.trim();
+            // Only while the login is still the leader's child is the pid
+            // its own; signalled after, it could be anyone's.
+            let parent = Command::new("/bin/ps")
+                .args(["-o", "ppid=", "-p", pid])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            if parent.is_ok_and(|parent| parent == self.child.id().to_string()) {
+                let _ = Command::new("/bin/kill").args(["-TERM", pid]).status();
+            }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
