@@ -396,7 +396,6 @@ because a `.acf` is present. It writes through `Core::record_title`.
   service `applejack` and account `steam-refresh-token`, written through the
   Security framework (`SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete`).
   The `security` command line tool is never invoked.
-- The access token stays in memory (`auth::AccessToken`).
 - `RefreshToken` and `Password` redact themselves in `Debug`
   and `Display`; a value is readable only through `expose()`.
 - No token is ever passed on a process command line. The crate constructs no
