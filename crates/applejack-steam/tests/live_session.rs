@@ -895,6 +895,19 @@ impl Cm {
         self.answer(&begin, 1, &body);
     }
 
+    async fn answer_poll_with_an_empty_refresh_token(&mut self) {
+        let poll = self
+            .expect_call("Authentication.PollAuthSessionStatus#1")
+            .await;
+        let body = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some(String::new()),
+            access_token: Some("access-fixture".to_owned()),
+            account_name: Some("fixture-user".to_owned()),
+            ..Default::default()
+        };
+        self.answer(&poll, 1, &body.encode_to_vec());
+    }
+
     async fn answer_poll(&mut self, tokens: bool) {
         let poll = self
             .expect_call("Authentication.PollAuthSessionStatus#1")
@@ -976,6 +989,30 @@ async fn an_approval_while_the_prompt_is_up_needs_no_code() {
         .await
         .unwrap();
     assert!(matches!(auth.poll().await.unwrap(), LoginStep::Done { .. }));
+    script.await.unwrap();
+}
+
+/// An answer that would store an empty token and read as signed in; the next
+/// silent logon would then fail with nothing to say why.
+#[tokio::test]
+async fn an_answer_with_an_empty_refresh_token_is_not_an_approval() {
+    let (client, mut cm) = prepared().await;
+    let script = tokio::spawn(async move {
+        cm.open_credentials_session().await;
+        cm.answer_poll_with_an_empty_refresh_token().await;
+    });
+    let store = InMemoryStore::default();
+    let mut connection = SteamroomConnection::over(client);
+    let mut auth = Authenticator::new(&mut connection, &store);
+    let credentials = fixture_credentials();
+    auth.begin(AuthMode::Credentials, Some(&credentials))
+        .await
+        .unwrap();
+    assert!(matches!(
+        auth.poll().await.unwrap(),
+        LoginStep::GuardRequired { .. }
+    ));
+    assert!(store.get().unwrap().is_none());
     script.await.unwrap();
 }
 

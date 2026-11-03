@@ -113,6 +113,7 @@ impl AuthFlow {
         }
         if let (Some(access), Some(refresh)) = (&answer.access_token, &answer.refresh_token)
             && !access.is_empty()
+            && !refresh.is_empty()
         {
             let account_name = answer
                 .account_name

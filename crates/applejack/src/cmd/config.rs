@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use applejack_core::config::{DataDirError, Field, GameConfig};
+use applejack_core::config::{AppRow, DataDirError, Field, GameConfig};
 use applejack_core::game_config::ConfigImportResult;
 use applejack_core::{Core, CoreError};
 use clap::{Args, Subcommand};
@@ -34,7 +34,8 @@ enum Action {
     /// Set one field; an empty value clears it. `extra_env` takes NAME=VALUE,
     /// a bare NAME to remove, or a JSON object to replace
     Set {
-        /// Column name, as listed by `show`
+        /// Column name, as listed by `show`; `launch_exe` is the app info's
+        /// choice, and `launch_exe_override` wins over it
         key: String,
         /// New value
         #[arg(allow_hyphen_values = true)]
@@ -90,11 +91,12 @@ fn execute(args: ConfigArgs) -> Result<String, Failure> {
     match args.action {
         Action::Show { json } => {
             let config = core.config_get(appid)?;
+            let title = core.title(appid)?.unwrap_or_default();
             if json {
-                return serde_json::to_string_pretty(&config)
+                return as_json(&config, &title)
                     .map_err(|error| Failure::Message(format!("cannot encode config: {error}")));
             }
-            Ok(render(&config))
+            Ok(render(&config, &title))
         }
         Action::Set { key, value } => {
             core.config_set(appid, &key, &value)?;
@@ -116,22 +118,35 @@ fn execute(args: ConfigArgs) -> Result<String, Failure> {
 /// Debug-quoted: control and bidirectional formatting characters come out
 /// escaped, so a stored value cannot move the cursor, reverse a line, or
 /// forge a `show` line. `--json` gives the exact form.
-fn render(config: &GameConfig) -> String {
+fn render(config: &GameConfig, title: &AppRow) -> String {
     let width = Field::names()
         .iter()
         .map(|name| name.len())
         .max()
         .unwrap_or(0);
-    Field::ALL
+    let quoted = |value: Option<String>| {
+        value.map_or_else(|| "(unset)".to_owned(), |value| format!("{value:?}"))
+    };
+    let fields = Field::ALL
         .iter()
-        .map(|field| {
-            let value = config
-                .get(*field)
-                .map_or_else(|| "(unset)".to_owned(), |value| format!("{value:?}"));
-            format!("{:<width$} = {value}", field.name())
-        })
+        .map(|field| (field.name(), config.get(*field)));
+    let drm = Some(title.drm.as_str().to_owned());
+    fields
+        .chain([("drm", drm), ("launch_exe", title.launch_exe.clone())])
+        .map(|(name, value)| format!("{name:<width$} = {}", quoted(value)))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The stored configuration and the two fields of the title that `show`
+/// lists with it.
+fn as_json(config: &GameConfig, title: &AppRow) -> Result<String, serde_json::Error> {
+    let mut shown = serde_json::to_value(config)?;
+    if let Some(fields) = shown.as_object_mut() {
+        fields.insert("drm".to_owned(), title.drm.as_str().into());
+        fields.insert("launch_exe".to_owned(), title.launch_exe.clone().into());
+    }
+    serde_json::to_string_pretty(&shown)
 }
 
 fn import(
@@ -209,7 +224,7 @@ mod tests {
             extra_env: std::collections::BTreeMap::from([("A".to_owned(), "1".to_owned())]),
             ..GameConfig::default()
         };
-        let text = render(&config);
+        let text = render(&config, &AppRow::default());
         let line = |name: &str| {
             text.lines()
                 .find(|line| line.starts_with(name))

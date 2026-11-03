@@ -2,7 +2,9 @@
 //! crate constructs no `std::process::Command` at all. `clippy.toml`
 //! (`disallowed-types`) is the type-resolved guard that an import alias cannot
 //! bypass; this grep is the textual backstop. The grep walks `src/`, so the
-//! session, library, and depot modules are covered as they are added.
+//! session, library, and depot modules are covered as they are added. The
+//! print scan also reads the code that handles a password or a code on its
+//! way here: the core's RPC and Steam modules and the CLI's commands.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,6 +50,7 @@ const SECRET_NAMES: &[&str] = &[
     "cdn_token",
     "depot_key",
     "refresh_token",
+    "steam_guard_code",
 ];
 
 /// Every print call in `text`, parentheses balanced, so a call split across
@@ -136,11 +139,20 @@ fn the_print_scan_refuses_a_raw_string_with_a_quote() {
 #[test]
 fn no_print_or_debug_format_touches_a_token() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
+    let mut files = vec![
+        root.join("../applejack-core/src/install.rs"),
+        root.join("../applejack-core/src/steam.rs"),
+    ];
     rust_files(&root.join("src"), &mut files);
+    rust_files(&root.join("../applejack-core/src/rpc"), &mut files);
+    rust_files(&root.join("../applejack/src/cmd"), &mut files);
     for path in files {
         let text = fs::read_to_string(&path).unwrap();
-        for call in print_calls(&text) {
+        let code: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        for call in print_calls(&code.join("\n")) {
             if let Some(name) = secret_in(call) {
                 panic!("{}: `{call}` mentions `{name}`", path.display());
             }

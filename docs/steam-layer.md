@@ -48,11 +48,15 @@ the only implementations that open a socket.
   mode has not run against live Steam.
 - **Credentials login.** `begin(AuthMode::Credentials, Some(credentials))`
   fetches the account's RSA key, sends the encrypted password to
-  `BeginAuthSessionViaCredentials`, and returns either `Done` (no second
-  factor), `GuardRequired { factor: EmailCode | DeviceCode }` (poll, and call
+  `BeginAuthSessionViaCredentials`, and returns either `Waiting` (no second
+  factor, so polling finishes it), `GuardRequired { factor: EmailCode | DeviceCode }` (poll, and call
   `submit_guard_code` when a code arrives), or `GuardRequired { factor:
   DeviceConfirmation }` (poll). `submit_guard_code` polls once, so `Waiting`
-  from it means the code was taken. `InvalidGuardCode` keeps the session open.
+  from it means the code was taken. `LoginFlow` allows `Waiting` two minutes and
+  then ends the login with `SteamLoginStalled`, code `SteamLoginFailed`; the CLI
+  prints a line while it waits. An answer with an empty refresh token is not an
+  approval: it would store nothing usable and read as signed in.
+  `InvalidGuardCode` keeps the session open.
   Any other error from `submit_guard_code` or `poll` ends the login: the
   connection has dropped its auth session, the driver returns to idle, and the
   next call must be `begin`; `poll` or `submit_guard_code` before that is
@@ -71,8 +75,12 @@ the only implementations that open a socket.
   is `AuthError::CallDenied { call, result }`, and sending that user back to
   log in would not help.
 - **Logout.** `logout()` deletes the Keychain item. `Core::steam_logout` also
-  clears the library cache and the account name; titles on disk stay, with
-  their `drm` and launch exe.
+  clears the library cache and the account name, in one transaction; titles on
+  disk stay, with their `drm` and launch exe. It is local only: the token is not
+  revoked at Steam, which still lists the device until the user removes it from
+  their account. A refresh that outlasts a logout, or a login to another
+  account, drops its rows and fails with `SteamLoginRequired`: the fetch writes
+  through `cache_library_for`, which checks the account in the same transaction.
 
 Rate limits and Steam Guard surface as typed errors (`AuthError::RateLimited
 { retry_after }`, `AuthError::GuardRequired { factor }`); nothing loops on
@@ -297,38 +305,54 @@ touch an account or the Keychain.
 keeps polling, so typing the code and approving in the mobile app both finish
 it. Codes are read with echo on: the reader thread is left blocked when the
 login ends first, and a process that exits mid-read with echo off leaves the
-terminal that way.
+terminal that way. `rpassword` clears echo, canonical mode, and `ISIG`, reads
+control-C as a character, and raises `SIGINT` before its own restore, so the
+login holds a handler from the password prompt on: `SIGINT`, `SIGTERM`, and
+`SIGHUP` put the terminal back and exit with `128 + signal`.
 
 `steam library` reads the cache, or Steam with `--refresh` or an empty cache.
 Rows go to the `apps` table: `fetched_at` marks the cache, and `size_bytes`,
 `default_branch`, and `latest_buildid` come with it. A refresh replaces the
 cache in one transaction, and a title on disk keeps its `installdir` and stays
 when it leaves the account. Over RPC a refresh is a job, because a large library
-can outlast a request.
+can outlast a request. `latest_buildid` is the default branch's, so a title on
+another branch reads `installed` whatever it says.
 
 `applejack install <appid> [--branch public] [--update] [--verify] [--library
 <abs>]`, and `app.install`:
 
 1. **Refusals**, quick and with no Steam, so each is an error response: another
    install of the title, an open session, a title on disk without `--update` or
-   `--verify`, a Windows client running.
+   `--verify`, a stopped update without `--update`, a Windows client running.
 2. **`login`**, then **`resolve`**: fresh product info for this one title with
    `fetch_owned_app`, an `InstallPlan`, and the launch choice below.
 3. **`download`**, with byte counts. `update` re-reads the `.acf` into the row
-   first. `verify` needs no login and hashes instead, as phase **`verify`**.
+   first. `verify` needs no login and hashes instead, as phase **`verify`**, and
+   refuses with `VerifyFailed` when the `.acf` lists no depots.
 4. **`register`**: the `.acf` into the `apps` row through `Core::record_title`,
-   the one write `app register` uses too.
+   the one write `app register` uses too. Its `launch exe:` line names what a run
+   would launch. A chosen exe that is missing or not a PE image is a `warning:`
+   line naming `launch_exe_override`, and the install stands.
+
+With no `--branch`, an update and a resumed install stay on `installed_branch`,
+the branch recorded in the row; a new install takes the default. A title
+`applejack install` did not put there has none and an update takes the default.
 
 The job holds `locks/install-<appid>.lock` from the first step to the last and
 the title's prefix lock with it. The prefix lock is what a run holds for the life
 of a session, so an install and a run exclude each other across processes
 whichever comes first. A run also refuses while a download record exists, which
 is all that is left of a process that was killed; `app.run` checks again after
-taking the lock. The first download writes the row's `library_dir` before any
-file, with no build id, so a run finds the record of a title that has never
-finished. `app cancel`, `app.cancel`, and `SIGINT` write
+taking the lock. The first download writes the row's `library_dir` past the
+installer's own refusals, just before the record, with no build id, so a run
+finds the record of a title that has never finished and a refused install leaves
+the row alone. `app cancel`, `app.cancel`, and `SIGINT` write
 `locks/install-<appid>.cancel`, which the installer reads once a second from
-whichever process runs it; a stop keeps the record and the next install resumes.
+whichever process runs it; a stop keeps the record, and the next install resumes
+a first install while `--update` resumes an update, whose `.acf` still says whole.
+The refusal names the right one. `--verify` reads no cancel file: it cannot be
+stopped short of ending the process, though `app cancel` still answers that it
+asked.
 
 **Which exe.** Plan 05 says the app info's launch options filtered to
 `oslist = windows`, overridable per game. `OwnedApp::launch_choice` applies, in
@@ -337,8 +361,11 @@ type, whose `oslist` allows Windows, whose `betakey` is empty or names the
 branch, and whose `ownsdlc` is owned; `osarch` matching the planned depots, unless
 that leaves nothing; then `default` over untyped over `option1` and its like.
 The entries that remain must agree on executable and arguments. If they do not,
-the install refuses with `LaunchExeAmbiguous` before a byte arrives and lists
-them; `applejack config <appid> set launch_exe_override <file>` is the way out.
+or if the app has a `default` entry and these filters took it, so that what is
+left was only ever offered beside it, the install refuses with
+`LaunchExeAmbiguous` before a byte arrives and lists them;
+`applejack config <appid> set launch_exe_override <file>` is the way out. A lone
+entry stands only when no filter took a `default`. The rule errs towards refusing.
 A title with an override, an exe already recorded, or a client launch
 (`drm = steam` or `launch_mode = client`) needs no choice. Steamworks' uploading
 documentation grounds only the OS and DLC filters. `type`, `osarch`, and
@@ -370,9 +397,19 @@ because a `.acf` is present. It writes through `Core::record_title`.
   `std::process::Command`: `crates/applejack-steam/clippy.toml` lists it and
   `tokio::process::Command` under `disallowed-types`, which the gate's Clippy
   run (`-D warnings`) enforces by resolved type, so an import alias cannot
-  hide one; `tests/no_token_argv.rs` greps `src/` and `examples/` as a
-  textual backstop, and also fails on a print of a line that names a token or
-  depot key.
+  hide one; `tests/no_token_argv.rs` greps `src/` as a textual backstop, and
+  also fails on a print of a line that names a token or depot key, in this
+  crate, the core's RPC, Steam, and install modules, and the CLI's commands.
+- `LoginMode` and `SteamLoginCompleteParams`, which carry a password and a code
+  on the wire, write `Debug` by hand. So does every type above.
+- The password buffer is not wiped. `Password` is a plain `String`, and the CLI
+  drops it unwiped; over RPC the line buffer and the parsed copies keep it until
+  they are reused. This is accepted: it stays in this process's memory, and the
+  shell sends no password today.
+- The Keychain item belongs to the macOS user, not the data directory, while the
+  account name lives in each directory's `meta` table. `steam logout` with one
+  `APPLEJACK_DATA_DIR` signs every other out, and a login in one leaves another
+  naming the old account until its next login.
 - `RefreshToken`, `AccessToken`, `Password`, and `Credentials` are not
   comparable (no `PartialEq`: a derived comparison is not constant time and
   nothing needs one), `License::Debug` omits the PICS `access_token`, and the
@@ -427,11 +464,12 @@ kills it.
 
 Lock order is per-appid first, then the library. Decision (U8e): the library
 lock taken under an app lock is **shared**. "Shared library lock" in the plan
-means `LOCK_SH`, so two `applejack install` processes for different appids
-download at the same time and serialize only against library-wide
-operations (rewriting `libraryfolders.vdf`, moving the library), which take
-the library lock exclusively through `LockDir::library_exclusive` and are
-never run while the same process holds an app lock. What the types
+means `LOCK_SH`, so two `DepotInstaller` runs for different appids download at
+the same time and serialize only against library-wide operations (rewriting
+`libraryfolders.vdf`, moving the library), which take the library lock
+exclusively through `LockDir::library_exclusive` and are never run while the
+same process holds an app lock. The CLI and RPC never get that far: each opens
+a Steam session, and the second is refused on `steam-session`. What the types
 guarantee, within one process:
 
 - `LockDir::app(&mut self, appid, mode)` yields an `AppLock` that borrows the

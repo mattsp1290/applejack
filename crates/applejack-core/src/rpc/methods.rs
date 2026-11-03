@@ -12,6 +12,7 @@ pub use crate::prefixes::SnapshotResult;
 pub use crate::steam::{InstallState, LibraryEntry, SteamLibraryResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::fmt;
 use std::path::PathBuf;
 
 /// Whether a method answers for real or with [`ErrorCode::NotImplemented`].
@@ -283,7 +284,7 @@ pub struct EngineD3dmetalImportParams {
 #[serde(deny_unknown_fields)]
 pub struct EngineD3dmetalRemoveParams {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LoginMode {
     Qr,
@@ -293,17 +294,38 @@ pub enum LoginMode {
     },
 }
 
+/// By hand, like every other type that holds a secret: [`Method`] derives
+/// `Debug` over this.
+impl fmt::Debug for LoginMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Qr => f.write_str("Qr"),
+            Self::Credentials { .. } => f.write_str("Credentials(<redacted>)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SteamLoginStartParams {
     pub mode: LoginMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SteamLoginCompleteParams {
     pub session_id: String,
     pub steam_guard_code: Option<String>,
+}
+
+impl fmt::Debug for SteamLoginCompleteParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self.steam_guard_code.as_ref().map(|_| "<redacted>");
+        f.debug_struct("SteamLoginCompleteParams")
+            .field("session_id", &self.session_id)
+            .field("steam_guard_code", &code)
+            .finish()
+    }
 }
 
 /// Where a login stands, on the wire. `waiting` means Steam has the answer

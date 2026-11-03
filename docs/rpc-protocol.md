@@ -106,7 +106,7 @@ Swift case; do not edit the table by hand.
 | 1010 | `UnsignedEngineRefused` | A local bundle was requested without `APPLEJACK_ALLOW_UNSIGNED_ENGINE=1`. |
 | 1011 | `PrefixBusy` | Another operation is using the prefix. |
 | 1012 | `TitleNotInstalled` | `app.run` for a title with no `apps` row or nothing in the library. |
-| 1013 | `DownloadInProgress` | `app.run` for a title with a download record. |
+| 1013 | `DownloadInProgress` | `app.run` for a title with a download record, or `app.install` without `update` for a stopped update. |
 | 1014 | `AlreadyRunning` | `app.run` for a title with an open session. |
 | 1015 | `ClientRuntimeUnavailable` | `app.run` for a title that launches through the Steam client, which is not available yet. |
 | 1016 | `NoLaunchExe` | `app.run` for a title with no launch executable, or one outside its install directory. |
@@ -122,7 +122,7 @@ Swift case; do not edit the table by hand.
 | 1026 | `TitleNotInstallable` | The title has no Windows depot, none on the branch, or none this account licenses. |
 | 1027 | `LaunchExeAmbiguous` | Several launch entries fit and none outranks the rest. `launch_exe_override` is the way out. |
 | 1028 | `InstallCancelled` | The install stopped on request. Its download record stays, and the next install resumes. |
-| 1029 | `LockHeld` | Another process holds this title's install lock. |
+| 1029 | `LockHeld` | Another process holds this title's install lock or the Steam session. |
 | 1030 | `AlreadyInstalled` | `app.install` for a title that is whole on disk. Use `update` or `verify`. |
 | 1031 | `SteamClientOwnsTitle` | A Windows Steam client is running against the library, or owns this title's update. |
 | 1032 | `VerifyFailed` | `app.install` with `verify` found files that differ from the manifest. |
@@ -353,13 +353,16 @@ A login is a series of short requests. `steam.login.start` takes `{"mode":
 {"kind": "qr"}}` or `{"mode": {"kind": "credentials", "account_name", "password"}}`,
 connects, and answers `{session_id, step}`. `steam.login.complete` takes
 `session_id` and an optional `steam_guard_code`, and answers the same shape after
-one submit, or one poll when there is no code. `step.kind` is:
+one submit, or one poll when there is no code. `step.kind` is below, with what a
+client does. The app today offers QR only, so it never sees `guard_required`, and
+it starts polling when the user presses Done, not when the QR appears; the CLI
+drives every row.
 
-| `kind` | Members | The shell |
+| `kind` | Members | A client |
 |---|---|---|
 | `qr_ready` | `payload` | Renders it, and renders it again when it changes |
 | `guard_required` | `factor`: `email_code`, `device_code`, `device_confirmation` | Shows a code field unless the factor is `device_confirmation`, and goes on polling |
-| `waiting` | | Goes on polling |
+| `waiting` | | Goes on polling; a login with no second factor starts here |
 | `done` | `account_name` | Stops; the refresh token is stored |
 
 Call `steam.login.complete` with no code every couple of seconds while a step is
@@ -367,24 +370,33 @@ pending, so an approval in the Steam mobile app ends the login as a typed code
 does. A poll sooner than Steam's interval answers the current step without
 reaching Steam. A code that arrives once none is wanted is dropped. A wrong code
 answers `SteamGuardRejected` and the login stays open; any other error ends it,
-and a later `complete` answers `SteamLoginFailed`. One login is pending at a time:
-`steam.login.start` drops the last. These requests block the loop for one Steam
+and a later `complete` answers `SteamLoginFailed`. So does two minutes at
+`waiting`, which ends the login too. A `session_id` that is not the pending one
+answers `SteamLoginFailed` and leaves that login alone. One login is pending at a
+time: `steam.login.start` drops the last. These requests block the loop for one Steam
 call, bounded at 30 s, or longer while `start` tries up to three CMs. Their params
 and results never reach a log.
 
 `steam.library` answers from the cache and touches nothing else. With
 `refresh: true` it answers the cache as it stood plus `job_id`, and fetches on that
-job; read again after `job.done`. `LibraryEntry` is `{appid, name, installdir,
+job; read again after `job.done`. A `steam.logout` during the fetch stands: the
+rows are dropped, and the job ends in `job.failed` with `SteamLoginRequired`.
+`LibraryEntry` is `{appid, name, installdir,
 size_bytes, drm, default_branch, install_state}`, and `install_state` is `installed`,
-`not_installed`, or `update_available`.
+`not_installed`, or `update_available`. `update_available` compares against the
+default branch, so a title on another branch stays `installed`.
 
-`app.install` takes `{appid, branch?, update, verify, library?}`. Every refusal is
+`app.install` takes `{appid, branch?, update, verify, library?}`. With no `branch`,
+an update stays on the branch the title was installed from. Every refusal is
 an error response and starts no job: `LockHeld`, `AlreadyRunning`,
-`AlreadyInstalled`, `SteamClientOwnsTitle`, `InvalidParams`. The job's
-`job.progress` phases are `login`, `resolve`, `download` with byte counts, `verify`,
-and `register`, whose message names the launch exe. `app.cancel` stops an install,
-in this core or another process: the install's job ends in `job.failed` with
-`InstallCancelled`, the download record stays, and the next `app.install` resumes.
+`AlreadyInstalled`, `DownloadInProgress`, `SteamClientOwnsTitle`, `InvalidParams`.
+The job's `job.progress` phases are `login`, `resolve`, `download` with byte counts,
+`verify`, and `register`, whose message names the launch exe, with a second
+`warning:` message when that exe could not run. `app.cancel` stops an install, in
+this core or another process: the install's job ends in `job.failed` with
+`InstallCancelled`, the download record stays, and the next `app.install` resumes,
+with `update` when an update stopped. A `verify` cannot be stopped; `app.cancel`
+answers `cancelling` for one all the same.
 
 A Steam failure that needs the user keeps its code through `job.failed`:
 `SteamLoginRequired`, `AppNotOwned`, `TitleNotInstallable`, `LaunchExeAmbiguous`,

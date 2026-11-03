@@ -21,7 +21,9 @@ use applejack_engine::{
 use applejack_steam::{AppManifest, InstallPlan, LaunchEntry, LibraryPaths};
 
 use crate::config::presets::is_unsafe_char;
-use crate::config::{AppRow, Drm, GameConfig, NewSession, SessionEnd, SessionRow, SessionState};
+use crate::config::{
+    AppRow, Drm, GameConfig, LaunchMode, NewSession, SessionEnd, SessionRow, SessionState,
+};
 use crate::engines::META_CPUID_PROBE;
 use crate::error::CoreError;
 use crate::prefixes::pick_sync;
@@ -366,6 +368,7 @@ impl Core {
             return Err(CoreError::ClientRuntimeUnavailable {
                 appid,
                 drm: app.drm,
+                route: client_free_route(&app, &config),
             });
         }
         // The exe stays inside the install directory and that inside the
@@ -545,25 +548,63 @@ impl Core {
     }
 
     /// What a run needs to find the download record of a first install. The
-    /// missing build id is what says the title is not whole.
+    /// missing build id is what says the title is not whole. An update stays
+    /// whole on paper, and keeps its branch for the run that finishes it.
     pub(crate) fn note_install_started(
         &mut self,
         plan: &InstallPlan,
         library: &Path,
+        update: bool,
     ) -> Result<(), CoreError> {
         let existing = self
             .reading(|db| Ok(db.app(plan.appid)?))?
             .unwrap_or_default();
-        self.db()?.upsert_app(&AppRow {
-            appid: plan.appid,
-            name: Some(printable(&plan.name)),
-            installdir: Some(plan.installdir.clone()),
-            library_dir: Some(library.to_string_lossy().into_owned()),
-            last_installed_buildid: None,
-            last_manifest_ids: BTreeMap::new(),
-            ..existing
-        })?;
+        let branch = Some(plan.branch.clone());
+        let row = if update {
+            AppRow {
+                installed_branch: branch,
+                ..existing
+            }
+        } else {
+            AppRow {
+                appid: plan.appid,
+                name: Some(printable(&plan.name)),
+                installdir: Some(plan.installdir.clone()),
+                library_dir: Some(library.to_string_lossy().into_owned()),
+                last_installed_buildid: None,
+                last_manifest_ids: BTreeMap::new(),
+                installed_branch: branch,
+                ..existing
+            }
+        };
+        self.db()?.upsert_app(&row)?;
         Ok(())
+    }
+
+    /// The branch on disk, and what the install just learned about the
+    /// default one: a title that took its build from there is current, even
+    /// when the cached library has not seen that build.
+    pub(crate) fn note_install_finished(
+        &mut self,
+        appid: u32,
+        branch: &str,
+        default_branch: &str,
+    ) -> Result<AppRow, CoreError> {
+        let existing = self.reading(|db| Ok(db.app(appid)?))?.unwrap_or_default();
+        let latest = if branch == default_branch {
+            existing.last_installed_buildid
+        } else {
+            existing.latest_buildid
+        };
+        let row = AppRow {
+            appid,
+            installed_branch: Some(branch.to_owned()),
+            default_branch: Some(default_branch.to_owned()),
+            latest_buildid: latest,
+            ..existing
+        };
+        self.db()?.upsert_app(&row)?;
+        Ok(row)
     }
 
     /// The canonical library of a registration, which is what a run and the
@@ -603,9 +644,32 @@ fn plain_installdir(text: &str) -> bool {
         && !text.chars().any(char::is_control)
 }
 
+/// How to get past the client path, which `launch_mode = client` holds a
+/// title to whatever `drm` says.
+fn client_free_route(app: &AppRow, config: &GameConfig) -> String {
+    let appid = app.appid;
+    let probe = format!("try it with `applejack run {appid} --probe-direct`");
+    let drm = format!("`applejack config {appid} set drm none`");
+    if config.launch_mode != Some(LaunchMode::Client) {
+        return format!(
+            "Nothing marks a title client-free for you: {probe}, and if it runs, record that \
+             with {drm}"
+        );
+    }
+    let mode = format!("`applejack config {appid} set launch_mode \"\"`");
+    if app.drm == Drm::None {
+        return format!(
+            "`launch_mode` is `client`: {probe}, and if it runs, clear that with {mode}"
+        );
+    }
+    format!(
+        "`launch_mode` is `client`: {probe}, and if it runs, clear that with {mode} and record it with {drm}"
+    )
+}
+
 /// What a run launches: the override when the configuration has one, else
 /// what the app info chose at install.
-fn launch_config(app: &AppRow, config: &GameConfig) -> GameConfig {
+pub(crate) fn launch_config(app: &AppRow, config: &GameConfig) -> GameConfig {
     let mut merged = config.clone();
     let has_override = config
         .launch_exe_override
@@ -647,7 +711,10 @@ fn installed_dir(app: &AppRow) -> Result<PathBuf, CoreError> {
     }
     let paths = LibraryPaths::new(library);
     if paths.record(appid).exists() {
-        return Err(CoreError::DownloadInProgress { appid });
+        return Err(CoreError::download_in_progress(
+            appid,
+            app.last_installed_buildid.is_some(),
+        ));
     }
     let acf = paths.acf(appid);
     let manifest = std::fs::read_to_string(&acf)

@@ -122,17 +122,12 @@ leaves a flow where it was. A job's progress is `FlowState<JobSnapshot>`:
 `ready` while it runs (`finished` after `job.done`), `failed(.rpc)` with
 the typed code from `job.failed`.
 
-The core implements only `hello` and `host.doctor` today, so in the running
-app every flow but Host shows the unavailable state. The view models are
-tested against `Tests/Fixtures/fake-core.sh`, which answers every flow
+A flow whose method is still pending in the core shows the unavailable state.
+The view models are tested against `Tests/Fixtures/fake-core.sh`, which answers every flow
 method with results shaped like the Rust types when `FAKE_CORE_IMPLEMENTED=1`
 is set and runs `engine.install`, `app.install`, and a `steam.library` refresh as
-jobs. The result
-mirrors for pending methods (`ShellTypes.swift`: `SteamLibraryResult`,
-`EngineListResult`, `DoctorReport`, `LoginSession`, `SessionListResult`,
-`GameConfig`, `ConfigImportResult`) are provisional until the methods land
-and gain result goldens; the params mirrors are pinned to the request
-goldens by `GoldenTests`.
+jobs. The result mirrors in `ShellTypes.swift` are pinned to the result goldens
+and the params mirrors to the request goldens by `GoldenTests`.
 
 Flows that need an answer before the core sends a request:
 

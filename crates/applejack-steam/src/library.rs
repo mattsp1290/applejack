@@ -161,7 +161,8 @@ pub enum LaunchChoice {
     One(LaunchEntry),
     /// Nothing runs on Windows.
     None,
-    /// More than one command fits, and picking one is the user's to do.
+    /// More than one command fits, or the only one left is not the entry the
+    /// app calls its default. Picking is the user's to do.
     Several(Vec<LaunchEntry>),
 }
 
@@ -282,6 +283,10 @@ impl OwnedApp {
     /// 4. Entries of the best tier must agree on the command. Two commands
     ///    are [`LaunchChoice::Several`]: Steam would ask the user, and
     ///    guessing would launch a benchmark or a launcher nobody asked for.
+    /// 5. The same goes for a lone entry when the app has a `default` entry
+    ///    and rule 1 or 2 took it away: what is left was offered beside the
+    ///    main entry, and no rule says it stands in for it. A lone entry of
+    ///    an app with no `default` at all is that app's entry.
     #[must_use]
     pub fn launch_choice(&self, branch: &str, filter: &DepotFilter) -> LaunchChoice {
         let mut fits: Vec<&LaunchEntry> = self
@@ -303,6 +308,7 @@ impl OwnedApp {
         let Some(best) = fits.iter().map(|entry| entry.tier()).min() else {
             return LaunchChoice::None;
         };
+        let lost_default = best != 0 && self.launch.iter().any(|entry| entry.tier() == 0);
         fits.retain(|entry| entry.tier() == best);
         let mut commands: Vec<&LaunchEntry> = Vec::new();
         for entry in fits {
@@ -311,7 +317,7 @@ impl OwnedApp {
             }
         }
         match commands.as_slice() {
-            [one] => LaunchChoice::One((*one).clone()),
+            [one] if !lost_default => LaunchChoice::One((*one).clone()),
             several => LaunchChoice::Several(several.iter().map(|e| (*e).clone()).collect()),
         }
     }

@@ -39,7 +39,8 @@ pub enum LoginStep {
     /// Collect a code and call [`Authenticator::submit_guard_code`], or for
     /// [`GuardFactor::DeviceConfirmation`] call [`Authenticator::finish`].
     GuardRequired { factor: GuardFactor },
-    /// Steam has the answer and has not issued tokens yet; poll again.
+    /// Steam has what it needs and has not issued tokens yet; poll again.
+    /// A login that needs no second factor starts here.
     Waiting,
     /// The refresh token is stored.
     Done { account_name: String },
@@ -291,7 +292,7 @@ impl<'a, C: SteamConnection, S: RefreshTokenStore + ?Sized> Authenticator<'a, C,
                     }
                     None => {
                         self.state = LoginState::AwaitingTokens;
-                        self.finish().await
+                        Ok(LoginStep::Waiting)
                     }
                 }
             }

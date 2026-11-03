@@ -339,6 +339,28 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
+    /// Red if the loop tests only for `.ready`: the tick after the sleep
+    /// would send the old id for a login that has been replaced.
+    func testANewLoginEndsThePollOfTheOldOne() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_ROTATE": "1", "FAKE_CORE_LOGIN_POLLS": "100"])
+        let steam = SteamAccountViewModel(app: app)
+        await steam.startQrLogin()
+        let polling = Task { await steam.complete() }
+        while try requests(for: "steam.login.complete").isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await steam.startQrLogin()
+        await polling.value
+
+        let sent = try requests()
+        let restart = try XCTUnwrap(sent.lastIndex { $0.contains("\"method\":\"steam.login.start\"") })
+        XCTAssertFalse(sent[restart...].contains { $0.contains("login-session-fake-1") }, "\(sent)")
+        guard case .ready(let session) = steam.login else { return XCTFail("\(steam.login)") }
+        XCTAssertEqual(session.sessionId, "login-session-fake-2")
+        XCTAssertNotNil(steam.qrPayload, "the new challenge stays up")
+        await app.shutdown()
+    }
+
     func testLoginPollsUntilSteamIssuesTheTokens() async throws {
         setenv("FAKE_CORE_LOGIN_POLLS", "1", 1)
         defer { unsetenv("FAKE_CORE_LOGIN_POLLS") }

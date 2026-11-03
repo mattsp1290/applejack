@@ -81,6 +81,9 @@ pub struct AppRow {
     /// `game_config.launch_exe_override` wins over it.
     pub launch_exe: Option<String>,
     pub launch_args: Option<String>,
+    /// The branch on disk. `None` for a title installed elsewhere, which an
+    /// update treats as the default branch.
+    pub installed_branch: Option<String>,
 }
 
 /// One owned title as the library cache stores it.
@@ -94,7 +97,7 @@ pub struct LibraryRow {
     pub latest_buildid: Option<u64>,
 }
 
-const APP_COLUMNS: &str = "appid, name, installdir, drm, library_dir, last_installed_buildid, last_manifest_ids, fetched_at, size_bytes, default_branch, latest_buildid, launch_exe, launch_args";
+const APP_COLUMNS: &str = "appid, name, installdir, drm, library_dir, last_installed_buildid, last_manifest_ids, fetched_at, size_bytes, default_branch, latest_buildid, launch_exe, launch_args, installed_branch";
 
 impl ConfigDb {
     /// Inserts or replaces the row for `row.appid`.
@@ -113,7 +116,7 @@ impl ConfigDb {
             db.conn.execute(
                 &format!(
                     "INSERT INTO apps ({APP_COLUMNS}) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                      ON CONFLICT(appid) DO UPDATE SET name = excluded.name, \
                      installdir = excluded.installdir, drm = excluded.drm, \
                      library_dir = excluded.library_dir, \
@@ -124,7 +127,8 @@ impl ConfigDb {
                      default_branch = excluded.default_branch, \
                      latest_buildid = excluded.latest_buildid, \
                      launch_exe = excluded.launch_exe, \
-                     launch_args = excluded.launch_args"
+                     launch_args = excluded.launch_args, \
+                     installed_branch = excluded.installed_branch"
                 ),
                 params![
                     row.appid,
@@ -140,6 +144,7 @@ impl ConfigDb {
                     latest,
                     row.launch_exe,
                     row.launch_args,
+                    row.installed_branch,
                 ],
             )?;
             Ok(())
@@ -186,6 +191,44 @@ impl ConfigDb {
                 [],
             )?;
             Ok(())
+        })
+    }
+
+    /// [`cache_library`](Self::cache_library), only while `meta` still names
+    /// `account` under `key`: a fetch can outlast a logout, and the check and
+    /// the write must be one transaction for that to stay undone. `false`
+    /// when the rows were dropped.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`cache_library`](Self::cache_library).
+    pub fn cache_library_for(
+        &self,
+        key: &str,
+        account: &str,
+        rows: &[LibraryRow],
+        fetched_at: &str,
+    ) -> Result<bool, Error> {
+        self.write_locked(|db| {
+            if db.meta_get(key)?.as_deref() != Some(account) {
+                return Ok(false);
+            }
+            db.cache_library(rows, fetched_at)?;
+            Ok(true)
+        })
+    }
+
+    /// Clears the library cache and the `meta` value under `key`, in one
+    /// transaction, so [`cache_library_for`](Self::cache_library_for) sees
+    /// both or neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlite`] when a write fails.
+    pub fn forget_account(&self, key: &str) -> Result<(), Error> {
+        self.write_locked(|db| {
+            db.clear_library_cache()?;
+            db.meta_delete(key)
         })
     }
 
@@ -349,6 +392,7 @@ struct RawApp {
     latest_buildid: Option<i64>,
     launch_exe: Option<String>,
     launch_args: Option<String>,
+    installed_branch: Option<String>,
 }
 
 fn read_app(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawApp> {
@@ -366,6 +410,7 @@ fn read_app(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawApp> {
         latest_buildid: row.get(10)?,
         launch_exe: row.get(11)?,
         launch_args: row.get(12)?,
+        installed_branch: row.get(13)?,
     })
 }
 
@@ -400,6 +445,7 @@ impl RawApp {
             latest_buildid: unsigned("latest_buildid", self.latest_buildid)?,
             launch_exe: self.launch_exe,
             launch_args: self.launch_args,
+            installed_branch: self.installed_branch,
         })
     }
 }
@@ -426,6 +472,7 @@ mod tests {
             latest_buildid: Some(123_457),
             launch_exe: Some("bin/game.exe".to_owned()),
             launch_args: Some("-windowed".to_owned()),
+            installed_branch: Some("beta".to_owned()),
         };
         db.upsert_app(&row).unwrap();
         db.upsert_app(&AppRow {

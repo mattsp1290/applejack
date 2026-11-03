@@ -109,6 +109,7 @@ dependencies = [
  "applejack-engine",
  "clap",
  "rpassword",
+ "rustix",
  "serde_json",
  "signal-hook",
  "tempfile",

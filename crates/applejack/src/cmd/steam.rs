@@ -3,6 +3,7 @@
 //! keeps polling: approving in the Steam mobile app finishes the login just
 //! as typing the code does, and whichever comes second is dropped.
 
+use std::fs::File;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -16,6 +17,12 @@ use applejack_core::steam::{
 };
 use applejack_core::{Core, CoreError};
 use clap::{Args, Subcommand};
+use rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+
+/// What a shell reads as a command ended by control-C.
+const EXIT_INTERRUPTED: i32 = 130;
 
 #[derive(Args)]
 pub struct SteamArgs {
@@ -73,10 +80,46 @@ fn ask_line(prompt: &str) -> Result<String, CoreError> {
     Ok(line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
+/// From here to the end of the process, a signal puts the terminal back and
+/// exits as that signal would have. `rpassword` clears echo, canonical mode,
+/// and `ISIG`, reads control-C as a character, and raises `SIGINT` before its
+/// own restore, so with the default action the terminal stays that way. The
+/// handler stays for good because a signal-hook handler is not undone: the
+/// polling that follows must still answer control-C. With no terminal there
+/// is nothing to restore, and the prompt reports that itself.
+fn restore_terminal_on_signal() -> Result<(), CoreError> {
+    let Ok(terminal) = File::options().read(true).write(true).open("/dev/tty") else {
+        return Ok(());
+    };
+    let Ok(modes) = tcgetattr(&terminal) else {
+        return Ok(());
+    };
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])
+        .map_err(|error| CoreError::Message(format!("cannot handle signals: {error}")))?;
+    thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            let _ = tcsetattr(&terminal, OptionalActions::Now, &modes);
+            std::process::exit(128 + signal);
+        }
+    });
+    Ok(())
+}
+
 fn ask_credentials() -> Result<Credentials, CoreError> {
     let account_name = ask_line("Steam account name: ")?;
-    let password = rpassword::prompt_password("Steam password: ")
-        .map_err(|error| CoreError::Message(format!("cannot read the password: {error}")))?;
+    restore_terminal_on_signal()?;
+    let password = match rpassword::prompt_password("Steam password: ") {
+        Ok(password) => password,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+            say("");
+            std::process::exit(EXIT_INTERRUPTED);
+        }
+        Err(error) => {
+            return Err(CoreError::Message(format!(
+                "cannot read the password: {error}"
+            )));
+        }
+    };
     Ok(Credentials {
         account_name,
         password: Password::new(password),
@@ -116,7 +159,8 @@ fn show(step: &LoginStep) {
         LoginStep::GuardRequired {
             factor: GuardFactor::EmailCode,
         } => say("Type the Steam Guard code from your email and press return."),
-        LoginStep::Waiting | LoginStep::Done { .. } => {}
+        LoginStep::Waiting => say("Waiting for Steam to finish the sign-in."),
+        LoginStep::Done { .. } => {}
     }
 }
 

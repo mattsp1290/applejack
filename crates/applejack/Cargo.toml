@@ -9,10 +9,12 @@ applejack-core = { workspace = true }
 applejack-engine = { workspace = true }
 clap = { workspace = true }
 rpassword = { workspace = true }
+rustix = { workspace = true }
 serde_json = { workspace = true }
 signal-hook = { workspace = true }
 
 [dev-dependencies]
+rustix = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

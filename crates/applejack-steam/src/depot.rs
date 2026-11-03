@@ -230,6 +230,10 @@ pub type ClientRunning<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 /// a download.
 pub type CancelRequested<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 
+/// Runs once, past every refusal, before the first write. An error stops the
+/// install as [`Error::BeforeWrite`].
+pub type BeforeWrite<'a> = &'a (dyn Fn() -> Result<(), String> + Send + Sync);
+
 /// Receives [`InstallProgress`].
 pub type ProgressSink<'a> = &'a (dyn Fn(&InstallProgress) + Send + Sync);
 
@@ -574,6 +578,7 @@ pub struct DepotInstaller<'a, S> {
     options: InstallOptions,
     progress: Option<ProgressSink<'a>>,
     cancel: Option<CancelRequested<'a>>,
+    before_write: Option<BeforeWrite<'a>>,
 }
 
 impl<S> std::fmt::Debug for DepotInstaller<'_, S> {
@@ -603,6 +608,7 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
             options: InstallOptions::default(),
             progress: None,
             cancel: None,
+            before_write: None,
         }
     }
 
@@ -624,6 +630,12 @@ impl<'a, S: SteamSession> DepotInstaller<'a, S> {
     #[must_use]
     pub fn with_cancel(mut self, cancel: CancelRequested<'a>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    #[must_use]
+    pub fn with_before_write(mut self, before_write: BeforeWrite<'a>) -> Self {
+        self.before_write = Some(before_write);
         self
     }
 
@@ -1060,6 +1072,9 @@ impl<S: SteamSession> Run<'_, '_, S> {
         // record would hold the title back from launching.
         fs::create_dir_all(&install_dir).map_err(|source| io_error(appid, &install_dir, source))?;
         refuse_links_out(&install_dir, &queued)?;
+        if let Some(before_write) = self.installer.before_write {
+            before_write().map_err(|reason| Error::BeforeWrite { appid, reason })?;
+        }
         record.save(&record_path, appid)?;
 
         // Without every manifest, nothing can be proved stale.
@@ -1724,7 +1739,8 @@ impl VerifyReport {
 ///
 /// # Errors
 ///
-/// [`Error::LockHeld`], [`Error::NotInstalled`] without an `.acf`, and
+/// [`Error::LockHeld`], [`Error::NotInstalled`] without an `.acf`,
+/// [`Error::NothingToVerify`] for one that lists no depots, and
 /// [`Error::ManifestNotStored`] for a depot installed by something other
 /// than this crate.
 pub fn verify_install(
@@ -1738,6 +1754,9 @@ pub fn verify_install(
     let (acf, _) = read_acf(paths, appid)?.ok_or(Error::NotInstalled { appid })?;
     check_installdir(&acf.installdir)?;
     let install_dir = paths.install_dir(&acf.installdir);
+    if acf.installed_depots.is_empty() {
+        return Err(Error::NothingToVerify { appid });
+    }
 
     let mut manifests = Vec::new();
     for depot in &acf.installed_depots {

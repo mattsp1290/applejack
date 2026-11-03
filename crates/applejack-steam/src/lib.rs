@@ -39,8 +39,8 @@ pub use auth::{
     LoginState, LoginStep, Password, SteamConnection, Tokens,
 };
 pub use depot::{
-    CancelRequested, ClientRunning, DepotInstaller, DownloadRecord, InstallOptions, InstallOutcome,
-    InstallPlan, InstallProgress, LibraryPaths, VerifyReport, verify_install,
+    BeforeWrite, CancelRequested, ClientRunning, DepotInstaller, DownloadRecord, InstallOptions,
+    InstallOutcome, InstallPlan, InstallProgress, LibraryPaths, VerifyReport, verify_install,
 };
 pub use error::Error;
 pub use keychain::{InMemoryStore, RefreshToken, RefreshTokenStore, SecurityFrameworkStore};

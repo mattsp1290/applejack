@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{
-    self, Accepted, Confirmation, DefaultEnvPolicy, Drm, Error, Field, GameConfig, ImportOptions,
-    Preset, Rejected,
+    self, Accepted, AppRow, Confirmation, DefaultEnvPolicy, Drm, Error, Field, GameConfig,
+    ImportOptions, Preset, Rejected,
 };
 use crate::error::CoreError;
 use crate::state::Core;
@@ -56,6 +56,15 @@ impl Core {
     /// Returns the database failure.
     pub fn config_get(&mut self, appid: u32) -> Result<GameConfig, CoreError> {
         self.reading(|db| Ok(db.game_config(appid)?.unwrap_or_default()))
+    }
+
+    /// The title's `apps` row, for the fields that live there.
+    ///
+    /// # Errors
+    ///
+    /// The database failure.
+    pub fn title(&mut self, appid: u32) -> Result<Option<AppRow>, CoreError> {
+        self.reading(|db| Ok(db.app(appid)?))
     }
 
     /// Sets one field from its text form; an empty value clears it.

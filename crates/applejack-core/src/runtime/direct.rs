@@ -51,17 +51,17 @@ pub fn resolve_launch(
     install_dir: &Path,
     config: &GameConfig,
 ) -> Result<DirectLaunch, CoreError> {
-    let refuse = |reason: String| CoreError::NoLaunchExe { appid, reason };
+    let refuse = |reason: String| CoreError::NoLaunchExe {
+        appid,
+        reason: format!(
+            "{reason}; set one with `applejack config {appid} set launch_exe_override <file>`"
+        ),
+    };
     let relative = config
         .launch_exe_override
         .as_deref()
         .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| {
-            refuse(format!(
-                "none is recorded; set one with \
-                 `applejack config {appid} set launch_exe_override <file>`"
-            ))
-        })?;
+        .ok_or_else(|| refuse("none is recorded".to_owned()))?;
     let relative = Path::new(relative);
     let plain = relative
         .components()
@@ -187,6 +187,7 @@ mod tests {
         let error = resolve_launch(10, dir.path(), &with_exe("text.exe")).unwrap_err();
         assert!(matches!(error, CoreError::NoLaunchExe { .. }), "{error}");
         assert!(error.to_string().contains("not a Windows executable"));
+        assert!(error.to_string().contains("set launch_exe_override"));
     }
 
     #[test]
@@ -206,6 +207,10 @@ mod tests {
         ] {
             let error = resolve_launch(10, &install, &with_exe(value)).unwrap_err();
             assert!(matches!(error, CoreError::NoLaunchExe { .. }), "{value}");
+            assert!(
+                error.to_string().contains("launch_exe_override <file>"),
+                "{error}"
+            );
         }
         let error = resolve_launch(10, &install, &GameConfig::default()).unwrap_err();
         assert!(

@@ -431,7 +431,9 @@ impl ErrorCode {
             Self::TitleNotInstalled => {
                 "`app.run` for a title with no `apps` row or nothing in the library."
             }
-            Self::DownloadInProgress => "`app.run` for a title with a download record.",
+            Self::DownloadInProgress => {
+                "`app.run` for a title with a download record, or `app.install` without `update` for a stopped update."
+            }
             Self::AlreadyRunning => "`app.run` for a title with an open session.",
             Self::ClientRuntimeUnavailable => {
                 "`app.run` for a title that launches through the Steam client, which is not available yet."
@@ -469,7 +471,9 @@ impl ErrorCode {
             Self::InstallCancelled => {
                 "The install stopped on request. Its download record stays, and the next install resumes."
             }
-            Self::LockHeld => "Another process holds this title's install lock.",
+            Self::LockHeld => {
+                "Another process holds this title's install lock or the Steam session."
+            }
             Self::AlreadyInstalled => {
                 "`app.install` for a title that is whole on disk. Use `update` or `verify`."
             }

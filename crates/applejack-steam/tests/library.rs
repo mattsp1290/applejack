@@ -769,6 +769,49 @@ fn chosen(entries: &str) -> (String, Option<String>) {
     }
 }
 
+/// What a filter leaves when it takes the `default` entry is not what the app
+/// calls its main entry. Red if a lone survivor is chosen whatever it is.
+#[test]
+fn a_lone_entry_left_when_a_filter_took_the_default_is_refused() {
+    let default_elsewhere = r#"
+        "0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }"#;
+    for survivor in [
+        r#""1" { "executable" "bench.exe" "type" "option1" "config" { "oslist" "windows" } }"#,
+        r#""1" { "executable" "bench.exe" "type" "benchmark" "config" { "oslist" "windows" } }"#,
+        r#""1" { "executable" "bench.exe" "config" { "oslist" "windows" } }"#,
+    ] {
+        let LaunchChoice::Several(left) = choice(&format!("{default_elsewhere}\n{survivor}"))
+        else {
+            panic!("chose a lone entry for {survivor}");
+        };
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].executable, "bench.exe");
+    }
+    let other_branch = r#"
+        "0" { "executable" "beta.exe" "type" "default" "config" { "betakey" "beta" } }
+        "1" { "executable" "manual.exe" "type" "manual" }"#;
+    assert!(matches!(choice(other_branch), LaunchChoice::Several(_)));
+    let other_dlc = r#"
+        "0" { "executable" "dlc.exe" "type" "default" "config" { "ownsdlc" "99" } }
+        "1" { "executable" "tool.exe" "type" "option2" }"#;
+    assert!(matches!(choice(other_dlc), LaunchChoice::Several(_)));
+}
+
+/// The rule does not reach an app that never had a `default`.
+#[test]
+fn a_lone_entry_stands_when_no_filter_took_a_default() {
+    let only_option = r#""0" { "executable" "game.exe" "type" "option1" }"#;
+    assert_eq!(chosen(only_option).0, "game.exe");
+    let beside_a_linux_option = r#"
+        "0" { "executable" "game.sh" "type" "option1" "config" { "oslist" "linux" } }
+        "1" { "executable" "game.exe" "type" "option1" "config" { "oslist" "windows" } }"#;
+    assert_eq!(chosen(beside_a_linux_option).0, "game.exe");
+    let default_kept = r#"
+        "0" { "executable" "game.exe" "type" "default" }
+        "1" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }"#;
+    assert_eq!(chosen(default_kept).0, "game.exe");
+}
+
 #[test]
 fn the_windows_entry_is_chosen_from_entries_for_other_platforms() {
     let entries = r#"

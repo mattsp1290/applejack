@@ -28,6 +28,10 @@ pub enum CoreError {
     /// a new login may not help. The CLI exits 3 here too.
     #[error("could not sign in to Steam with the stored token: {0}")]
     SteamRefreshFailed(SteamError),
+    /// Steam took the answer and issued no token. Ends the login, so a
+    /// caller does not poll for good.
+    #[error("Steam issued no token within {seconds} seconds of the sign-in; begin again")]
+    SteamLoginStalled { seconds: u64 },
     /// `steam.login.complete` for a login that is not the pending one.
     #[error("no such Steam login in progress; begin again")]
     NoSuchLogin,
@@ -35,7 +39,7 @@ pub enum CoreError {
     #[error("{0}")]
     InvalidRequest(String),
     #[error(
-        "title {appid} has several launch entries and none outranks the rest ({}); pick one \
+        "title {appid} has no launch entry that can be chosen for you ({}); pick one \
          with `applejack config {appid} set launch_exe_override <file>`",
         candidates.join(", ")
     )]
@@ -75,19 +79,17 @@ pub enum CoreError {
     /// `applejack/<appid>.download.json` exists: the files are mid-write.
     #[error(
         "title {appid} has a download in progress or a stopped one; its files are not complete \
-         until `applejack install {appid}` finishes it"
+         until `{finish}` finishes it"
     )]
-    DownloadInProgress { appid: u32 },
+    DownloadInProgress { appid: u32, finish: String },
     #[error("title {appid} is already running")]
     AlreadyRunning { appid: u32 },
     /// The title takes the client path, which does not exist yet.
     #[error(
         "title {appid} (drm = {drm}) launches through the Steam client, and the client runtime \
-         is not available yet. Nothing marks a title client-free for you: try it with \
-         `applejack run {appid} --probe-direct`, and if it runs, record that with \
-         `applejack config {appid} set drm none`"
+         is not available yet. {route}"
     )]
-    ClientRuntimeUnavailable { appid: u32, drm: Drm },
+    ClientRuntimeUnavailable { appid: u32, drm: Drm, route: String },
     #[error("title {appid} has no usable launch executable: {reason}")]
     NoLaunchExe { appid: u32, reason: String },
     #[error("title {appid} is not running")]
@@ -162,6 +164,16 @@ impl CoreError {
         }
     }
 
+    /// `update` says the title was whole before the download that stopped,
+    /// which only `--update` finishes: a plain install finds its `.acf`.
+    pub(crate) fn download_in_progress(appid: u32, update: bool) -> Self {
+        let flag = if update { " --update" } else { "" };
+        Self::DownloadInProgress {
+            appid,
+            finish: format!("applejack install {appid}{flag}"),
+        }
+    }
+
     /// The code a response or a `job.failed` carries.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
@@ -172,7 +184,7 @@ impl CoreError {
             }
             Self::Steam(error) | Self::SteamRefreshFailed(error) => steam_code(error),
             Self::SteamLoginRequired { .. } => ErrorCode::SteamLoginRequired,
-            Self::NoSuchLogin => ErrorCode::SteamLoginFailed,
+            Self::NoSuchLogin | Self::SteamLoginStalled { .. } => ErrorCode::SteamLoginFailed,
             Self::LaunchExeAmbiguous { .. } => ErrorCode::LaunchExeAmbiguous,
             Self::VerifyFailed { .. } => ErrorCode::VerifyFailed,
             Self::UnsignedRefused => ErrorCode::UnsignedEngineRefused,
@@ -234,6 +246,7 @@ fn steam_code(error: &SteamError) -> ErrorCode {
         }
         SteamError::AlreadyInstalled { .. } => ErrorCode::AlreadyInstalled,
         SteamError::NotInstalled { .. } => ErrorCode::TitleNotInstalled,
+        SteamError::NothingToVerify { .. } => ErrorCode::VerifyFailed,
         SteamError::Cancelled { .. } => ErrorCode::InstallCancelled,
         SteamError::DiskFull { .. } => ErrorCode::DiskFull,
         SteamError::CorruptChunk { .. } => ErrorCode::ChecksumMismatch,

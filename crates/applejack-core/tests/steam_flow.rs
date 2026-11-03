@@ -13,7 +13,7 @@ mod support;
 use std::future::{Future, ready};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs};
@@ -83,6 +83,48 @@ fn product_info(launch: &str) -> AppInfo {
     }
 }
 
+/// Beside `product_info`'s `public`: another manifest and build on `beta`.
+const BETA_MANIFEST: u64 = 901;
+
+fn with_beta(mut info: AppInfo) -> AppInfo {
+    let text = info.text.take().unwrap();
+    let text = text
+        .replace(
+            r#""manifests" { "public" { "gid" "900" "size" "4096" } }"#,
+            r#""manifests" { "public" { "gid" "900" "size" "4096" }
+                             "beta" { "gid" "901" "size" "4096" } }"#,
+        )
+        .replace(
+            r#""branches" { "public" { "buildid" "55" } }"#,
+            r#""branches" { "public" { "buildid" "55" } "beta" { "buildid" "66" } }"#,
+        );
+    info.text = Some(text);
+    info
+}
+
+/// [`session`] with a `beta` branch, and every file present on both.
+fn branched_session() -> Arc<FakeSession> {
+    let session = FakeSession {
+        grants: PackageGrants {
+            appids: [APP].into(),
+            depot_ids: [DEPOT].into(),
+        },
+        ..FakeSession::default()
+    };
+    session
+        .app_info
+        .lock()
+        .unwrap()
+        .push_back(vec![with_beta(product_info(ONE_ENTRY))]);
+    let chunks = &session.chunks;
+    let exe = file(chunks, "bin\\title.exe", &[&pe()]);
+    let public = file(chunks, "data.bin", &[b"public data"]);
+    let beta = file(chunks, "data.bin", &[b"beta data"]);
+    session.add_manifest(DEPOT, manifest(MANIFEST, vec![exe.clone(), public]));
+    session.add_manifest(DEPOT, manifest(BETA_MANIFEST, vec![exe, beta]));
+    Arc::new(session)
+}
+
 const ONE_ENTRY: &str = r#""0" { "executable" "bin\\title.exe" "arguments" "-windowed"
                                   "type" "default" "config" { "oslist" "windows" } }"#;
 const TWO_ENTRIES: &str = r#""0" { "executable" "a.exe" } "1" { "executable" "b.exe" }"#;
@@ -121,6 +163,7 @@ struct Script {
     logon_error: Option<AuthError>,
     submitted: Vec<String>,
     polls: usize,
+    gate: Option<Arc<Gate>>,
     logons: Vec<(String, String)>,
 }
 
@@ -151,8 +194,14 @@ struct FakeConnection {
     session: Arc<FakeSession>,
 }
 
+/// Stops `license_list` where the fetch is under way, for a test to act.
+struct Gate {
+    reached: Mutex<Sender<()>>,
+    release: Mutex<Receiver<()>>,
+}
+
 /// `FakeSession` behind an `Arc`, so a test can look at it afterwards.
-struct Shared(Arc<FakeSession>);
+struct Shared(Arc<FakeSession>, Option<Arc<Gate>>);
 
 impl SteamSession for Shared {
     type Chunks = FakeChunks;
@@ -162,6 +211,10 @@ impl SteamSession for Shared {
     }
 
     fn license_list(&self) -> impl Future<Output = Result<Vec<License>, AuthError>> + Send {
+        if let Some(gate) = &self.1 {
+            gate.reached.lock().unwrap().send(()).unwrap();
+            gate.release.lock().unwrap().recv().unwrap();
+        }
         self.0.license_list()
     }
 
@@ -261,11 +314,12 @@ impl SteamConnection for FakeConnection {
         script
             .logons
             .push((account_name.to_owned(), refresh_token.expose().to_owned()));
+        let gate = script.gate.clone();
         ready(
             script
                 .logon_error
                 .take()
-                .map_or_else(|| Ok(Shared(Arc::clone(&self.session))), Err),
+                .map_or_else(|| Ok(Shared(Arc::clone(&self.session), gate)), Err),
         )
     }
 }
@@ -590,8 +644,14 @@ fn an_install_into_a_new_library_is_unfinished_until_it_finishes() {
         ..request()
     };
     let plan = fixture.core().plan_title_install(cancel).unwrap();
-    fixture.core().cancel_install(APP).unwrap();
-    let error = plan.run(&host, &|_, _, _, _| {}).unwrap_err();
+    let host = FakeHost::signed_in(session(ONE_ENTRY, true));
+    let record = elsewhere.join(format!("applejack/{APP}.download.json"));
+    let error = std::thread::scope(|scope| {
+        let job = scope.spawn(|| plan.run(&host, &|_, _, _, _| {}).unwrap_err());
+        wait_for("the download record", || record.exists());
+        fixture.core().cancel_install(APP).unwrap();
+        job.join().unwrap()
+    });
     assert_eq!(error.code(), ErrorCode::InstallCancelled, "{error}");
     let row = fixture.db().app(APP).unwrap().unwrap();
     assert_eq!(row.last_installed_buildid, None);
@@ -733,6 +793,289 @@ fn a_title_on_disk_is_refused_before_any_login_and_update_and_verify_take_it() {
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::VerifyFailed);
     assert!(error.to_string().contains("data.bin"), "{error}");
+}
+
+fn run_install(
+    fixture: &Fixture,
+    host: &FakeHost,
+    request: TitleInstall,
+) -> Result<applejack_core::config::AppRow, CoreError> {
+    fixture
+        .core()
+        .plan_title_install(request)?
+        .run(host, &|_, _, _, _| {})
+}
+
+fn update() -> TitleInstall {
+    TitleInstall {
+        update: true,
+        ..request()
+    }
+}
+
+/// The lines of an install, as `phase: message`.
+fn reported(
+    fixture: &Fixture,
+    host: &FakeHost,
+    request: TitleInstall,
+) -> (
+    Vec<String>,
+    Result<applejack_core::config::AppRow, CoreError>,
+) {
+    let lines = Mutex::new(Vec::new());
+    let outcome = fixture.core().plan_title_install(request).and_then(|plan| {
+        plan.run(host, &|phase, _, _, message| {
+            lines.lock().unwrap().push(format!("{phase}: {message}"));
+        })
+    });
+    (lines.into_inner().unwrap(), outcome)
+}
+
+/// Red without the line: a wrong pick shows only when a run launches it, and
+/// the app info rule has never met real data.
+#[test]
+fn an_install_says_which_exe_it_chose() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let host = FakeHost::signed_in(session(ONE_ENTRY, false));
+    let (lines, outcome) = reported(&fixture, &host, request());
+    outcome.unwrap();
+    assert!(
+        lines.contains(&"register: launch exe: bin/title.exe -windowed".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("warning")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn an_install_names_an_override_and_a_title_the_client_launches() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    fixture
+        .core()
+        .config_set(APP, "launch_exe_override", "bin/title.exe")
+        .unwrap();
+    let host = FakeHost::signed_in(session(TWO_ENTRIES, false));
+    let (lines, outcome) = reported(&fixture, &host, request());
+    outcome.unwrap();
+    assert!(
+        lines.contains(&"register: launch exe: bin/title.exe (launch_exe_override)".to_owned()),
+        "{lines:?}"
+    );
+}
+
+/// The title is whole, so this is a warning and the way out, not a failure.
+#[test]
+fn a_chosen_exe_that_cannot_run_is_reported_at_register() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let missing = r#""0" { "executable" "gone.exe" "type" "default" }"#;
+    let host = FakeHost::signed_in(session(missing, false));
+    let (lines, outcome) = reported(&fixture, &host, request());
+    let row = outcome.unwrap();
+    assert_eq!(row.launch_exe.as_deref(), Some("gone.exe"));
+    let warning = lines.iter().find(|line| line.contains("warning")).unwrap();
+    assert!(warning.contains("set launch_exe_override"), "{warning}");
+}
+
+/// App info text reaches terminals; a name must not drive one.
+#[test]
+fn app_info_text_is_made_printable_on_the_install_path() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let hostile = session(ONE_ENTRY, false);
+    {
+        let mut answers = hostile.app_info.lock().unwrap();
+        let info = &mut answers[0][0];
+        let text = info.text.take().unwrap();
+        info.text = Some(text.replace("Fixture Title", "Fixture\u{1b}[2J Title"));
+    }
+    let host = FakeHost::signed_in(hostile);
+    let (lines, outcome) = reported(&fixture, &host, request());
+    outcome.unwrap();
+    assert!(lines.iter().any(|line| line.contains("Fixture[2J Title")));
+    assert!(
+        !lines.iter().any(|line| line.contains('\u{1b}')),
+        "{lines:?}"
+    );
+
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let entries = "\"0\" { \"executable\" \"a\u{1b}[2J.exe\" } \"1\" { \"executable\" \"b.exe\" }";
+    let host = FakeHost::signed_in(session(entries, false));
+    let error = fixture.install(&host).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::LaunchExeAmbiguous);
+    assert!(!error.to_string().contains('\u{1b}'), "{error}");
+}
+
+/// A lone entry the filter left is refused through the install, naming the
+/// way out, before a byte arrives.
+#[test]
+fn a_lone_entry_behind_a_lost_default_refuses_the_install() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let entries = r#""0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }
+                     "1" { "executable" "bench.exe" "type" "option1" }"#;
+    let host = FakeHost::signed_in(session(entries, false));
+    let error = fixture.install(&host).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::LaunchExeAmbiguous);
+    assert!(error.to_string().contains("launch_exe_override"), "{error}");
+    assert!(error.to_string().contains("bench.exe"), "{error}");
+    assert!(!fixture.acf().exists());
+}
+
+/// Red if a plain install reads the `.acf` alone: `already installed` is a
+/// dead end when only `--update` finishes this.
+#[test]
+fn a_stopped_update_is_sent_to_update() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let host = FakeHost::signed_in(session(ONE_ENTRY, false));
+    fixture.install(&host).unwrap();
+    fs::create_dir_all(fixture.record().parent().unwrap()).unwrap();
+    fs::write(fixture.record(), "{}").unwrap();
+
+    let refused = fixture.install(&host).unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::DownloadInProgress, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("applejack install {APP} --update")),
+        "{refused}"
+    );
+
+    let run = fixture.core().plan_run(APP, true).map(|_| ()).unwrap_err();
+    assert_eq!(run.code(), ErrorCode::DownloadInProgress, "{run}");
+    assert!(run.to_string().contains("--update"), "{run}");
+}
+
+#[test]
+fn verifying_a_manifest_with_no_depots_is_refused() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let host = FakeHost::signed_in(session(ONE_ENTRY, false));
+    fixture.install(&host).unwrap();
+    let text = fs::read_to_string(fixture.acf()).unwrap();
+    let start = text.find("\"InstalledDepots\"").unwrap();
+    let end = start + text[start..].find('}').unwrap();
+    let end = end + 1 + text[end + 1..].find('}').unwrap();
+    fs::write(
+        fixture.acf(),
+        format!(
+            "{}\"InstalledDepots\" {{ }}{}",
+            &text[..start],
+            &text[end + 1..]
+        ),
+    )
+    .unwrap();
+    let verify = TitleInstall {
+        verify: true,
+        ..request()
+    };
+    let error = run_install(&fixture, &host, verify).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::VerifyFailed, "{error}");
+    assert!(error.to_string().contains("no depots"), "{error}");
+}
+
+/// Red if the row moves before the installer's refusals: a working copy in
+/// the old library would be unrunnable after an install that wrote nothing.
+#[test]
+fn a_refusal_inside_the_installer_leaves_the_row_alone() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let host = FakeHost::signed_in(session(ONE_ENTRY, false));
+    let row = fixture.install(&host).unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let library = fs::canonicalize(elsewhere.path()).unwrap();
+    let plan = fixture
+        .core()
+        .plan_title_install(TitleInstall {
+            library: Some(library.clone()),
+            ..request()
+        })
+        .unwrap();
+    // Lands between the plan's look and the installer's, as a second copy
+    // of the library or a client would.
+    fs::create_dir_all(library.join("steamapps")).unwrap();
+    fs::copy(
+        fixture.acf(),
+        library.join(format!("steamapps/appmanifest_{APP}.acf")),
+    )
+    .unwrap();
+    let error = plan.run(&host, &|_, _, _, _| {}).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::AlreadyInstalled, "{error}");
+    assert_eq!(fixture.db().app(APP).unwrap().unwrap(), row);
+}
+
+/// Red if `--update` falls back on the default branch: the title would move
+/// without a word.
+#[test]
+fn an_update_keeps_the_branch_the_title_came_from() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let host = FakeHost::signed_in(branched_session());
+    let beta = TitleInstall {
+        branch: Some("beta".to_owned()),
+        ..request()
+    };
+    let row = run_install(&fixture, &host, beta).unwrap();
+    assert_eq!(row.installed_branch.as_deref(), Some("beta"));
+    assert_eq!(row.last_installed_buildid, Some(66));
+
+    let row = run_install(&fixture, &host, update()).unwrap();
+    assert_eq!(row.installed_branch.as_deref(), Some("beta"));
+    assert_eq!(row.last_installed_buildid, Some(66));
+    let data = fixture
+        .library()
+        .join("steamapps/common/FixtureTitle/data.bin");
+    assert_eq!(fs::read(&data).unwrap(), b"beta data");
+
+    let public = TitleInstall {
+        branch: Some("public".to_owned()),
+        ..update()
+    };
+    let row = run_install(&fixture, &host, public).unwrap();
+    assert_eq!(row.installed_branch.as_deref(), Some("public"));
+    assert_eq!(row.last_installed_buildid, Some(55));
+    assert_eq!(fs::read(&data).unwrap(), b"public data");
+}
+
+/// `latest_buildid` is the default branch's: another branch's build differs
+/// from it for good.
+#[test]
+fn a_title_on_another_branch_does_not_read_as_out_of_date() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let host = FakeHost::signed_in(branched_session());
+    fixture.core().steam_library_refresh(&host).unwrap();
+    let beta = TitleInstall {
+        branch: Some("beta".to_owned()),
+        ..request()
+    };
+    run_install(&fixture, &host, beta).unwrap();
+    let listed = fixture.core().steam_library_cached().unwrap();
+    assert_eq!(listed.apps[0].install_state, InstallState::Installed);
+}
+
+/// Red if the row keeps the cached build: a title just installed from a
+/// build newer than the cache read as `update_available`.
+#[test]
+fn a_fresh_install_does_not_read_as_out_of_date() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let host = FakeHost::signed_in(session(ONE_ENTRY, false));
+    fixture.core().steam_library_refresh(&host).unwrap();
+    let db = fixture.db();
+    let mut row = db.app(APP).unwrap().unwrap();
+    row.latest_buildid = Some(54);
+    db.upsert_app(&row).unwrap();
+    fixture.install(&host).unwrap();
+    assert_eq!(db.app(APP).unwrap().unwrap().latest_buildid, Some(55));
+    let listed = fixture.core().steam_library_cached().unwrap();
+    assert_eq!(listed.apps[0].install_state, InstallState::Installed);
 }
 
 #[test]
@@ -1116,6 +1459,137 @@ fn the_library_over_rpc_answers_the_cache_and_refreshes_as_a_job() {
 
     let cached: SteamLibraryResult = result_of(handler.handle(&library(false), &notifier));
     assert_eq!(cached.apps.len(), 1);
+}
+
+/// Red if the fetch writes its rows without looking at the account: logout
+/// cleared the cache and the job then put it back.
+#[test]
+fn a_logout_during_a_refresh_is_not_undone() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let (notifier, lines) = Notifier::channel();
+    let (reached, arrived) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let host = FakeHost::signed_in(session(ONE_ENTRY, false));
+    host.script.lock().unwrap().gate = Some(Arc::new(Gate {
+        reached: Mutex::new(reached),
+        release: Mutex::new(released),
+    }));
+    let mut handler = handler(&fixture, host);
+    let refresh = Method::SteamLibrary(SteamLibraryParams { refresh: true });
+    handler.handle(&refresh, &notifier).unwrap();
+    arrived.recv_timeout(Duration::from_secs(20)).unwrap();
+
+    handler
+        .handle(&Method::SteamLogout(SteamLogoutParams {}), &notifier)
+        .unwrap();
+    release.send(()).unwrap();
+
+    let seen = notified(&lines, "job.failed");
+    let failed = seen.last().unwrap();
+    assert_eq!(
+        failed["params"]["code"],
+        json!(ErrorCode::SteamLoginRequired.code()),
+        "{failed}"
+    );
+    let db = fixture.db();
+    assert_eq!(db.cached_library().unwrap(), Vec::new());
+    assert_eq!(db.meta_get(META_ACCOUNT).unwrap(), None);
+}
+
+/// The other account's rows would otherwise land in the new account's cache.
+#[test]
+fn a_refresh_that_outlasts_a_change_of_account_drops_its_rows() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let db = fixture.db();
+    let rows = [applejack_core::config::LibraryRow {
+        appid: APP,
+        name: "Fixture Title".to_owned(),
+        installdir: "FixtureTitle".to_owned(),
+        size_bytes: 1,
+        default_branch: "public".to_owned(),
+        latest_buildid: Some(1),
+    }];
+    db.meta_set(META_ACCOUNT, "fixture-other-user").unwrap();
+    assert!(
+        !db.cache_library_for(META_ACCOUNT, ACCOUNT, &rows, "t")
+            .unwrap()
+    );
+    assert_eq!(db.cached_library().unwrap(), Vec::new());
+    assert!(
+        db.cache_library_for(META_ACCOUNT, "fixture-other-user", &rows, "t")
+            .unwrap()
+    );
+    assert_eq!(db.cached_library().unwrap().len(), 1);
+}
+
+/// Red if `steam.login.complete` takes the login before reading the id: the
+/// stale request would end the one the user is looking at.
+#[test]
+fn a_stale_session_id_leaves_the_pending_login_alone() {
+    let fixture = Fixture::new();
+    let (notifier, _lines) = Notifier::channel();
+    let mut handler = handler(&fixture, guarded(5));
+    let old: LoginSession = result_of(start(&mut handler, &notifier, PASSWORD));
+    let new: LoginSession = result_of(start(&mut handler, &notifier, PASSWORD));
+    assert_ne!(old.session_id, new.session_id);
+
+    let stale = complete(&mut handler, &notifier, &old.session_id, None).unwrap_err();
+    assert_eq!(stale.code, ErrorCode::SteamLoginFailed);
+
+    let done: LoginSession = result_of(complete(
+        &mut handler,
+        &notifier,
+        &new.session_id,
+        Some(CODE),
+    ));
+    assert!(matches!(done.step, LoginStepWire::Waiting), "{done:?}");
+}
+
+/// A code taken and no token: without the bound nothing ends this but Steam.
+#[test]
+fn a_login_stuck_after_its_code_ends_with_a_typed_failure() {
+    let fixture = Fixture::new();
+    let (mut core, _host, flow) = start_login(&fixture, guarded(usize::MAX));
+    let mut flow = flow.with_wait_limit(Duration::from_millis(40));
+    assert_eq!(
+        flow.advance(&mut core, Some(CODE)).unwrap(),
+        LoginStep::Waiting
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let error = loop {
+        match flow.advance(&mut core, None) {
+            Ok(step) => assert_eq!(step, LoginStep::Waiting),
+            Err(error) => break error,
+        }
+        assert!(Instant::now() < deadline, "the wait was not bounded");
+    };
+    assert!(
+        matches!(error, CoreError::SteamLoginStalled { .. }),
+        "{error}"
+    );
+    assert_eq!(error.code(), ErrorCode::SteamLoginFailed);
+}
+
+/// The method table derives `Debug`, and the log is not the only reader.
+#[test]
+fn debug_of_a_login_request_holds_no_secret() {
+    let start = Method::SteamLoginStart(SteamLoginStartParams {
+        mode: LoginMode::Credentials {
+            account_name: ACCOUNT.to_owned(),
+            password: PASSWORD.to_owned(),
+        },
+    });
+    let complete = Method::SteamLoginComplete(SteamLoginCompleteParams {
+        session_id: "login-1".to_owned(),
+        steam_guard_code: Some(CODE.to_owned()),
+    });
+    let text = format!("{start:?} {complete:?}");
+    for secret in [PASSWORD, CODE, ACCOUNT] {
+        assert!(!text.contains(secret), "{text}");
+    }
+    assert!(text.contains("login-1"), "{text}");
 }
 
 #[test]

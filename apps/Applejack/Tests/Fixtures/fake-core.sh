@@ -24,6 +24,8 @@
 #                              job.progress then job.done
 #   FAKE_CORE_LOGIN_POLLS=<n>  steam.login.complete answers `waiting` n times
 #                              before `done`
+#   FAKE_CORE_LOGIN_ROTATE=1   each steam.login.start answers a new session id,
+#                              and steam.login.complete answers the latest
 #   FAKE_CORE_JOB_OUTCOME=failed  the jobs end with job.failed (code 1004)
 #   FAKE_CORE_JOB_OUTCOME=never   the jobs emit their progress and no terminal
 #                                 notification
@@ -135,14 +137,18 @@ implemented() {
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"advertise_avx":true,"avx":true,"avx2":false,"osxsave":true}}'
       ;;
     steam.login.start)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"login-session-fake","step":{"kind":"qr_ready","payload":"https://s.team/q/1/fake-challenge"}}}'
+      if [ -n "${FAKE_CORE_LOGIN_ROTATE:-}" ]; then
+        login_serial=$((${login_serial:-0} + 1))
+        login_session="login-session-fake-$login_serial"
+      fi
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"qr_ready","payload":"https://s.team/q/1/fake-challenge"}}}'
       ;;
     steam.login.complete)
       case "${FAKE_CORE_LOGIN_POLLS:-0}" in
-        0) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"login-session-fake","step":{"kind":"done","account_name":"fake-account"}}}' ;;
+        0) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"done","account_name":"fake-account"}}}' ;;
         *)
           FAKE_CORE_LOGIN_POLLS=$((FAKE_CORE_LOGIN_POLLS - 1))
-          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"login-session-fake","step":{"kind":"waiting"}}}'
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"waiting"}}}'
           ;;
       esac
       ;;

@@ -149,7 +149,7 @@ async fn qr_login_stores_the_refresh_token() {
 }
 
 #[tokio::test]
-async fn credentials_login_without_guard_completes_immediately() {
+async fn credentials_login_without_guard_needs_only_a_poll() {
     let store = InMemoryStore::default();
     let mut fake = Fake::default();
     let mut auth = Authenticator::new(&mut fake, &store);
@@ -157,7 +157,8 @@ async fn credentials_login_without_guard_completes_immediately() {
         .begin(AuthMode::Credentials, Some(&credentials()))
         .await
         .unwrap();
-    assert!(matches!(step, LoginStep::Done { .. }));
+    assert_eq!(step, LoginStep::Waiting);
+    assert!(matches!(auth.poll().await.unwrap(), LoginStep::Done { .. }));
     assert!(store.get().unwrap().is_some());
 }
 
@@ -204,6 +205,25 @@ async fn credentials_login_with_guard_code() {
             "poll_tokens"
         ]
     );
+}
+
+/// `steam.login.start` runs this on the serve thread, so `begin` may not sit
+/// in a poll loop. Red if it goes back to `finish`.
+#[tokio::test]
+async fn a_login_with_no_factor_returns_and_polls_like_any_other() {
+    let store = InMemoryStore::default();
+    let mut fake = Fake {
+        pending_polls: 1,
+        ..Fake::default()
+    };
+    let mut auth = Authenticator::new(&mut fake, &store);
+    let step = auth
+        .begin(AuthMode::Credentials, Some(&credentials()))
+        .await
+        .unwrap();
+    assert_eq!(step, LoginStep::Waiting);
+    assert_eq!(auth.poll().await.unwrap(), LoginStep::Waiting);
+    assert!(matches!(auth.poll().await.unwrap(), LoginStep::Done { .. }));
 }
 
 #[tokio::test]

@@ -207,11 +207,11 @@ impl<H: SteamHost> CoreHandler<H> {
     /// One submit or one poll. A wrong code keeps the login, since Steam
     /// does; every other failure ends it.
     fn login_complete(&mut self, params: &SteamLoginCompleteParams) -> Result<Value, RpcError> {
-        let mut pending = self
-            .login
-            .take()
-            .filter(|pending| pending.id == params.session_id)
-            .ok_or(CoreError::NoSuchLogin)?;
+        let current = self.login.as_ref();
+        if current.is_none_or(|pending| pending.id != params.session_id) {
+            return Err(CoreError::NoSuchLogin.into());
+        }
+        let mut pending = self.login.take().ok_or(CoreError::NoSuchLogin)?;
         let code = params.steam_guard_code.as_deref();
         match pending.flow.advance(self.core()?, code) {
             Ok(step) => {

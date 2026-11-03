@@ -255,6 +255,69 @@ fn a_title_that_needs_the_client_is_refused_until_the_client_runtime_exists() {
     assert!(!fixture.prefix_dir().exists());
 }
 
+/// Red if `launch_mode = client` gets the `drm` route: following it repeats
+/// this refusal.
+#[test]
+fn a_title_held_to_the_client_is_told_about_launch_mode() {
+    let fixture = Fixture::new();
+    fixture.register(Drm::None, None);
+    fixture
+        .core()
+        .config_set(APP, "launch_mode", "client")
+        .unwrap();
+    let text = fixture.core().plan_run(APP, false).unwrap_err().to_string();
+    assert!(text.contains("set launch_mode"), "{text}");
+    assert!(!text.contains("set drm none"), "{text}");
+
+    fixture.register(Drm::Unknown, None);
+    let text = fixture.core().plan_run(APP, false).unwrap_err().to_string();
+    assert!(text.contains("set launch_mode"), "{text}");
+    assert!(text.contains("set drm none"), "{text}");
+}
+
+/// The look in `plan_run` before the claim and the one after it. A FIFO in
+/// place of the `.acf` holds the first look inside its read, past its record
+/// check, so the record lands in exactly the gap the second look closes. A
+/// real install that stopped between them leaves the same state. Red if the
+/// second `installed_dir` goes.
+#[test]
+fn a_record_that_lands_after_the_first_look_refuses_the_run() {
+    use std::io::Write;
+    let fixture = Fixture::new();
+    let acf = fixture
+        .library()
+        .join(format!("steamapps/appmanifest_{APP}.acf"));
+    let text = fs::read(&acf).unwrap();
+    fs::remove_file(&acf).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&acf)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let data = fixture.data();
+    let planner = thread::spawn(move || {
+        Core::new(data)
+            .with_unsigned_installs(true)
+            .with_run_tuning(FAST)
+            .plan_run(APP, false)
+            .map(|_plan| ())
+    });
+    // This open returns once the first look has opened the FIFO to read.
+    let mut writer = fs::OpenOptions::new().write(true).open(&acf).unwrap();
+    let record = fixture
+        .library()
+        .join(format!("applejack/{APP}.download.json"));
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(&record, b"{}").unwrap();
+    writer.write_all(&text).unwrap();
+    drop(writer);
+    let error = planner.join().unwrap().unwrap_err();
+    assert_eq!(error.code(), ErrorCode::DownloadInProgress, "{error}");
+    assert!(fixture.rows().is_empty(), "no session row");
+}
+
 #[test]
 fn a_title_with_no_launch_exe_is_refused() {
     let fixture = Fixture::new();

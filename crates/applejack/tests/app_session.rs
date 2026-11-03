@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use applejack_core::config::ConfigDb;
 use applejack_engine::rosetta_wine::process::find_session;
 use common::{write_stub_bundle, write_title};
 use serde_json::{Value, json};
@@ -77,6 +78,31 @@ impl Fixture {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// [`refused`](Self::refused) for a command that, with its rule broken,
+    /// would start a title and stay attached. Ends in a failure, not a hang.
+    fn refused_in_time(&self, args: &[&str]) -> String {
+        let mut child = self
+            .command()
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                drop(self.output(&["app", "cancel", APP]));
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("{args:?} was not refused: it was still running");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "{args:?} was not refused");
+        String::from_utf8(output.stderr).unwrap()
     }
 
     fn refused(&self, args: &[&str]) -> String {
@@ -382,9 +408,41 @@ fn a_run_refuses_while_a_download_record_exists() {
     let records = fixture.data().join("library/applejack");
     fs::create_dir_all(&records).unwrap();
     fs::write(records.join(format!("{APP}.download.json")), "{}").unwrap();
-    let refused = fixture.refused(&["run", APP]);
+    let refused = fixture.refused_in_time(&["run", APP]);
     assert!(refused.contains("applejack install"), "{refused}");
     fs::remove_file(records.join(format!("{APP}.download.json"))).unwrap();
+}
+
+/// Red if `show` lists only `game_config`: what the app info chose, and the
+/// `drm` a run reads, would be visible nowhere.
+#[test]
+fn config_show_lists_the_titles_own_fields() {
+    let fixture = Fixture::new();
+    let db = ConfigDb::open(&fixture.data().join("db.sqlite")).unwrap();
+    let mut row = db.app(1234).unwrap().unwrap();
+    row.launch_exe = Some("bin/title.exe".to_owned());
+    db.upsert_app(&row).unwrap();
+    fixture.ok(&["config", APP, "set", "drm", "steam"]);
+
+    let shown = fixture.ok(&["config", APP, "show"]);
+    let line = |name: &str| {
+        let wanted = format!("{name} ");
+        shown
+            .lines()
+            .find(|line| line.starts_with(&wanted))
+            .unwrap_or_else(|| panic!("no {name} in {shown}"))
+            .split_once(" = ")
+            .unwrap()
+            .1
+            .to_owned()
+    };
+    assert_eq!(line("drm"), "\"steam\"");
+    assert_eq!(line("launch_exe"), "\"bin/title.exe\"");
+
+    let json: Value =
+        serde_json::from_str(&fixture.ok(&["config", APP, "show", "--json"])).unwrap();
+    assert_eq!(json["drm"], "steam");
+    assert_eq!(json["launch_exe"], "bin/title.exe");
 }
 
 /// A title on disk is `--update`'s, and `drm` is how a run gets past the

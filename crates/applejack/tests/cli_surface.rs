@@ -268,8 +268,15 @@ fn config_show_on_empty_data_dir_prints_empty_config() {
     );
     let text = String::from_utf8(output.stdout).expect("utf-8");
     assert!(text.contains("hidraw_enabled"), "{text}");
+    let drm = text.lines().find(|line| line.starts_with("drm "));
     assert!(
-        !text.lines().any(|line| !line.ends_with(" = (unset)")),
+        drm.is_some_and(|line| line.ends_with(" = \"unknown\"")),
+        "{text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|line| !line.ends_with(" = (unset)") && !line.starts_with("drm ")),
         "{text}"
     );
 

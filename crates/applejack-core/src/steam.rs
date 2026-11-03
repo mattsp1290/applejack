@@ -33,6 +33,11 @@ pub use applejack_steam::{AuthMode, Credentials, GuardFactor, LoginStep, Passwor
 /// the token.
 pub const META_ACCOUNT: &str = "steam_account_name";
 
+/// How long a login stays at [`LoginStep::Waiting`]. Steam issues tokens
+/// within a poll or two of a code; no response seen says how long, and
+/// nothing else would end the wait.
+const LOGIN_WAIT_LIMIT: Duration = Duration::from_secs(120);
+
 /// Where the core gets its Steam connections and its token store.
 pub trait SteamHost: Send + Sync + 'static {
     type Connection: SteamConnection + Send + 'static;
@@ -225,6 +230,8 @@ pub struct LoginFlow<H: SteamHost> {
     state: LoginState,
     step: LoginStep,
     polled_at: Instant,
+    waiting_since: Option<Instant>,
+    wait_limit: Duration,
 }
 
 impl<H: SteamHost> std::fmt::Debug for LoginFlow<H> {
@@ -254,6 +261,7 @@ impl<H: SteamHost> LoginFlow<H> {
             let step = runtime.block_on(auth.begin(mode, credentials))?;
             (step, auth.state())
         };
+        let waiting_since = (step == LoginStep::Waiting).then(Instant::now);
         let flow = Self {
             host,
             runtime,
@@ -261,9 +269,18 @@ impl<H: SteamHost> LoginFlow<H> {
             state,
             step,
             polled_at: Instant::now(),
+            waiting_since,
+            wait_limit: LOGIN_WAIT_LIMIT,
         };
         flow.remember_account(core)?;
         Ok(flow)
+    }
+
+    /// Replaces how long the login may stay at [`LoginStep::Waiting`].
+    #[must_use]
+    pub const fn with_wait_limit(mut self, limit: Duration) -> Self {
+        self.wait_limit = limit;
+        self
     }
 
     #[must_use]
@@ -286,7 +303,9 @@ impl<H: SteamHost> LoginFlow<H> {
     /// # Errors
     ///
     /// [`AuthError::InvalidGuardCode`] leaves the login open for another
-    /// code. Any other error ends it.
+    /// code. Any other error ends it, as does
+    /// [`CoreError::SteamLoginStalled`] once [`LoginStep::Waiting`] has
+    /// lasted its limit.
     pub fn advance(
         &mut self,
         owner: &mut Core,
@@ -294,6 +313,15 @@ impl<H: SteamHost> LoginFlow<H> {
     ) -> Result<LoginStep, CoreError> {
         if matches!(self.step, LoginStep::Done { .. }) {
             return Ok(self.step.clone());
+        }
+        if self
+            .waiting_since
+            .is_some_and(|since| since.elapsed() >= self.wait_limit)
+        {
+            self.state = LoginState::Idle;
+            return Err(CoreError::SteamLoginStalled {
+                seconds: self.wait_limit.as_secs(),
+            });
         }
         let wanted = typed
             .map(str::trim)
@@ -322,6 +350,11 @@ impl<H: SteamHost> LoginFlow<H> {
         if step != LoginStep::Waiting || !keeps_prompt {
             self.step = step;
         }
+        self.waiting_since = if self.step == LoginStep::Waiting {
+            self.waiting_since.or_else(|| Some(Instant::now()))
+        } else {
+            None
+        };
         self.remember_account(owner)?;
         Ok(self.step.clone())
     }
@@ -341,9 +374,11 @@ impl<H: SteamHost> LoginFlow<H> {
 }
 
 fn entry(row: AppRow) -> LibraryEntry {
+    // `latest_buildid` is the default branch's, which says nothing of another.
+    let comparable = row.installed_branch.is_none() || row.installed_branch == row.default_branch;
     let install_state = match (row.last_installed_buildid, row.latest_buildid) {
         (None, _) => InstallState::NotInstalled,
-        (Some(have), Some(latest)) if have != latest => InstallState::UpdateAvailable,
+        (Some(have), Some(latest)) if comparable && have != latest => InstallState::UpdateAvailable,
         (Some(_), _) => InstallState::Installed,
     };
     LibraryEntry {
@@ -396,8 +431,9 @@ impl Core {
     ///
     /// # Errors
     ///
-    /// [`CoreError::SteamLoginRequired`] when nothing can sign in, and the
-    /// Steam or database failure.
+    /// [`CoreError::SteamLoginRequired`] when nothing can sign in, or when
+    /// the account signed out while the fetch ran, which drops the rows; and
+    /// the Steam or database failure.
     pub fn steam_library_refresh<H: SteamHost>(
         &mut self,
         host: &H,
@@ -410,7 +446,14 @@ impl Core {
             Ok::<_, CoreError>(Library::fetch(&signed_in.session).await?)
         })?;
         let rows: Vec<LibraryRow> = library.windows_apps().map(library_row).collect();
-        self.db()?.cache_library(&rows, &utc_now())?;
+        let kept = self
+            .db()?
+            .cache_library_for(META_ACCOUNT, &account, &rows, &utc_now())?;
+        if !kept {
+            return Err(CoreError::SteamLoginRequired {
+                reason: "the account signed out during the refresh".to_owned(),
+            });
+        }
         self.steam_library_cached()
     }
 
@@ -423,11 +466,7 @@ impl Core {
     /// cache, so the failure can be retried from the same state.
     pub fn steam_logout<H: SteamHost>(&mut self, host: &H) -> Result<(), CoreError> {
         host.store().delete()?;
-        self.reading(|db| {
-            db.clear_library_cache()?;
-            db.meta_delete(META_ACCOUNT)?;
-            Ok(())
-        })
+        self.reading(|db| Ok(db.forget_account(META_ACCOUNT)?))
     }
 }
 

@@ -25,6 +25,8 @@ use applejack_steam::{
 
 use crate::config::{AppRow, Drm, GameConfig, LaunchMode};
 use crate::error::CoreError;
+use crate::run::{launch_config, printable};
+use crate::runtime::direct::resolve_launch;
 use crate::runtime::session::busy;
 use crate::state::Core;
 use crate::steam::{SteamHost, silent_logon, steam_runtime};
@@ -110,7 +112,7 @@ impl Core {
                 return Err(if open.is_some() {
                     CoreError::AlreadyRunning { appid }
                 } else if !installing && self.install_running(appid).unwrap_or(false) {
-                    CoreError::DownloadInProgress { appid }
+                    CoreError::download_in_progress(appid, false)
                 } else {
                     error
                 });
@@ -199,8 +201,9 @@ impl Core {
     }
 }
 
-/// Before any login: a title on disk is `--update`'s or `--verify`'s. A
-/// manifest that does not parse is left for the installer to report.
+/// Before any login: a title on disk is `--update`'s or `--verify`'s, and a
+/// stopped update is `--update`'s alone. A manifest that does not parse is
+/// left for the installer to report.
 fn refuse_title_on_disk(paths: &LibraryPaths, appid: u32) -> Result<(), CoreError> {
     let Some(manifest) = fs::read_to_string(paths.acf(appid))
         .ok()
@@ -208,14 +211,16 @@ fn refuse_title_on_disk(paths: &LibraryPaths, appid: u32) -> Result<(), CoreErro
     else {
         return Ok(());
     };
-    Err(if manifest.is_fully_installed() {
-        SteamError::AlreadyInstalled { appid }.into()
-    } else {
+    Err(if !manifest.is_fully_installed() {
         SteamError::ClientOwned {
             appid,
             state_flags: manifest.state_flags,
         }
         .into()
+    } else if paths.record(appid).exists() {
+        CoreError::download_in_progress(appid, true)
+    } else {
+        SteamError::AlreadyInstalled { appid }.into()
     })
 }
 
@@ -228,11 +233,14 @@ fn client_running(prefix: &Path) -> bool {
     prefix.is_dir() && wineserver_running(prefix).unwrap_or(true)
 }
 
+fn client_launches(row: Option<&AppRow>, config: &GameConfig) -> bool {
+    config.launch_mode == Some(LaunchMode::Client) || row.is_some_and(|row| row.drm == Drm::Steam)
+}
+
 /// Whether a run of this title needs the exe at all. A title the client
 /// launches does not, and one with an override has its answer.
 fn needs_launch_entry(row: Option<&AppRow>, config: &GameConfig) -> bool {
-    let client = config.launch_mode == Some(LaunchMode::Client)
-        || row.is_some_and(|row| row.drm == Drm::Steam);
+    let client = client_launches(row, config);
     let answered = row.is_some_and(|row| row.launch_exe.is_some())
         || config
             .launch_exe_override
@@ -242,10 +250,11 @@ fn needs_launch_entry(row: Option<&AppRow>, config: &GameConfig) -> bool {
 }
 
 fn describe(entry: &LaunchEntry) -> String {
-    match &entry.arguments {
+    let command = match &entry.arguments {
         Some(arguments) => format!("{} {arguments}", entry.executable),
         None => entry.executable.clone(),
-    }
+    };
+    printable(&command)
 }
 
 /// The app info's launch entry, or the refusal when a run would need one and
@@ -380,44 +389,59 @@ impl PlannedInstall {
         let update = self.request.update;
         let core = &mut self.core;
         let request = &self.request;
-        let (launch, resumed) = runtime.block_on(async {
+        let (launch, resumed, branch, default_branch) = runtime.block_on(async {
             report("login", None, None, "signing in to Steam".to_owned());
             let signed_in = silent_logon(host, &data_dir, &account).await?;
             let session = &signed_in.session;
             report("resolve", None, None, format!("reading app {appid}"));
             let (app, filter) = fetch_owned_app(session, appid).await?;
+            let row = core.reading(|db| Ok(db.app(appid)?))?;
+            let stopped = paths.record(appid).exists();
             let branch = request
                 .branch
                 .clone()
+                .or_else(|| {
+                    row.as_ref()
+                        .and_then(|row| row.installed_branch.clone())
+                        .filter(|_| update || stopped)
+                })
                 .unwrap_or_else(|| app.default_branch.clone());
             let plan = InstallPlan::new(&app, &branch, &filter)?;
-            let row = core.reading(|db| Ok(db.app(appid)?))?;
             let config = core.config_get(appid)?;
             let launch = pick_launch(&app, &plan, row.as_ref(), &config)?;
-            if !update {
-                core.note_install_started(&plan, &library)?;
-            }
             report(
                 "download",
                 Some(0),
                 Some(plan.size),
-                format!("{} on {branch}", plan.name),
+                printable(&format!("{} on {branch}", plan.name)),
             );
+            let owner = Mutex::new(&mut *core);
+            let before_write = || {
+                owner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .note_install_started(&plan, &library, update)
+                    .map_err(|error| error.to_string())
+            };
             let installer = DepotInstaller::new(session, paths.clone(), &data_dir, &running)
                 .with_progress(&progress)
-                .with_cancel(&cancel);
+                .with_cancel(&cancel)
+                .with_before_write(&before_write);
             let outcome = if update {
                 installer.update(&plan).await?
             } else {
                 installer.install(&plan).await?
             };
-            Ok::<_, CoreError>((launch, outcome.resumed))
+            Ok::<_, CoreError>((launch, outcome.resumed, branch, app.default_branch))
         })?;
         report("register", None, None, format!("recording app {appid}"));
         let manifest = read_manifest(&paths, appid)?;
+        self.core
+            .record_title(appid, &manifest, &self.library, None, launch.as_ref())?;
         let row = self
             .core
-            .record_title(appid, &manifest, &self.library, None, launch.as_ref())?;
+            .note_install_finished(appid, &branch, &default_branch)?;
+        self.report_launch(&row, report)?;
         if resumed {
             report(
                 "register",
@@ -427,6 +451,63 @@ impl PlannedInstall {
             );
         }
         Ok(row)
+    }
+
+    /// What a run would launch, while it is cheap to set another, and the
+    /// reason it could not. The install stands either way: the files are
+    /// whole, and the way out is a setting.
+    fn report_launch(
+        &mut self,
+        row: &AppRow,
+        report: InstallReporter<'_>,
+    ) -> Result<(), CoreError> {
+        let appid = row.appid;
+        let config = self.core.config_get(appid)?;
+        let client = client_launches(Some(row), &config);
+        let merged = launch_config(row, &config);
+        let Some(exe) = merged
+            .launch_exe_override
+            .as_deref()
+            .filter(|exe| !exe.trim().is_empty())
+        else {
+            let line = if client {
+                "launch exe: none needed, the Steam client launches it"
+            } else {
+                "launch exe: none recorded"
+            };
+            report("register", None, None, line.to_owned());
+            return Ok(());
+        };
+        let chosen = match merged.launch_args_override.as_deref() {
+            Some(arguments) if !arguments.is_empty() => format!("{exe} {arguments}"),
+            _ => exe.to_owned(),
+        };
+        let source = if row.launch_exe.as_deref() == Some(exe) {
+            ""
+        } else {
+            " (launch_exe_override)"
+        };
+        report(
+            "register",
+            None,
+            None,
+            format!("launch exe: {}{source}", printable(&chosen)),
+        );
+        let install_dir = row
+            .installdir
+            .as_deref()
+            .map(|dir| LibraryPaths::new(&self.library).install_dir(dir));
+        if let (false, Some(install_dir)) = (client, install_dir)
+            && let Err(error) = resolve_launch(appid, &install_dir, &merged)
+        {
+            report(
+                "register",
+                None,
+                None,
+                format!("warning: {}", printable(&error.to_string())),
+            );
+        }
+        Ok(())
     }
 }
 
