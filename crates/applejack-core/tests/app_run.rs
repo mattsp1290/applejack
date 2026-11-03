@@ -394,7 +394,7 @@ fn a_prefix_exec_outside_the_data_directory_is_still_refused() {
     let mut sink = Vec::new();
     let error = fixture
         .core()
-        .prefix_exec(PREFIX, &exe, &[] as &[OsString], &mut sink)
+        .prefix_exec(PREFIX, &exe, &[] as &[OsString], &[], &mut sink)
         .unwrap_err();
     assert!(
         matches!(error, CoreError::PathOutsideData { .. }),
@@ -738,7 +738,13 @@ fn a_running_title_holds_the_prefix_against_every_operation() {
     assert_busy(other.prefix_remove(PREFIX));
     assert_busy(other.prefix_snapshot(PREFIX));
     let mut sink = Vec::new();
-    assert_busy(other.prefix_exec(PREFIX, Path::new("x.exe"), &[] as &[OsString], &mut sink));
+    assert_busy(other.prefix_exec(
+        PREFIX,
+        Path::new("x.exe"),
+        &[] as &[OsString],
+        &[],
+        &mut sink,
+    ));
     fixture.quit(0);
     running.finish();
     fixture.assert_lock_free();
@@ -1511,6 +1517,7 @@ fn a_dead_owners_session_answers_busy_at_once_not_after_the_settle() {
         PREFIX,
         Path::new("x.exe"),
         &[] as &[OsString],
+        &[],
         &mut Vec::new(),
     ));
     assert!(started.elapsed() < Duration::from_secs(5), "it stalled");

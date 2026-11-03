@@ -35,6 +35,7 @@ use applejack_engine::{Engine, GraphicsBackend, HidrawMode, InstalledEngine, Lau
 use applejack_steam::acf::app_state;
 use applejack_steam::{AppManifest, Document, LibraryPaths, Node, Value};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::CoreError;
 use crate::prefixes::SnapshotResult;
@@ -76,6 +77,37 @@ pub const OSSLSIGNCODE: &str = "probes/osslsigncode";
 /// The trust store the signature chain is checked against: macOS's own.
 pub const CA_FILE: &str = "/etc/ssl/cert.pem";
 
+/// The web helper shim inside the engine payload. Written over the
+/// client's `steamwebhelper.exe`, it runs the real helper with
+/// `--in-process-gpu`: CEF then draws the login page in the process that
+/// owns the window, the only process DXMT will give a swap chain on it to
+/// (DXMT issue 141; unit U15b).
+pub const WEBHELPER_SHIM: &str = "probes/steamwebhelper-shim.exe";
+
+/// The helper the client starts to draw its windows, under each
+/// `bin/cef/cef.win*/` directory of the client.
+pub const WEBHELPER_EXE: &str = "steamwebhelper.exe";
+
+/// Where the client's own helper is stashed, beside the shim.
+pub const WEBHELPER_REAL: &str = "steamwebhelper_real.exe";
+
+/// Bytes every build of the shim carries (`MARKER` in its source): a helper
+/// that is not this payload's shim by hash but carries them is an older
+/// shim, to be replaced, never stashed as the client's helper.
+pub const SHIM_MARKER: &[u8] = b"applejack steamwebhelper shim";
+
+/// The helper's log name for the login window; with `Created window` or
+/// `WasHidden 0` on the line, the window exists.
+pub const LOGIN_WINDOW_MARK: &str = "DesktopLoginWindow_uid0";
+
+/// The client's assertion when something (the macOS microphone prompt)
+/// holds its main loop; unanswered, the client dies about 3 minutes in.
+pub const STALL_ASSERTION: &str = "BMainLoop appears to have stalled";
+
+/// Every client start: the client's own check of its files would write
+/// its helper back over the shim.
+pub const NOVERIFYFILES: &str = "-noverifyfiles";
+
 /// How long the bootstrapper and the first run may each take.
 pub const FIRST_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -91,6 +123,16 @@ const STEAM_EXE: &str = "steam.exe";
 const LOGINUSERS: &str = "config/loginusers.vdf";
 
 const LIBRARYFOLDERS: &str = "config/libraryfolders.vdf";
+
+const CEF_DIR: &str = "bin/cef";
+
+const WEBHELPER_LOG: &str = "logs/webhelper.txt";
+
+/// Where the stall assertion lands besides the session's own `wine.log`
+/// (the client's stderr), in the order it is looked for.
+const STALL_LOGS: [&str; 2] = ["logs/console_log.txt", "logs/bootstrap_log.txt"];
+
+const DUMPS_DIR: &str = "dumps";
 
 /// The `StateFlags` bits that mean the client is fetching the title.
 const UPDATE_BITS: u32 = app_state::UPDATE_REQUIRED
@@ -110,6 +152,15 @@ const CLIENT_POLL: Duration = Duration::from_secs(1);
 
 /// Looks in a row without `package/tmp` before the self-update counts as done.
 const SETTLED_LOOKS: u32 = 5;
+
+/// How long a `steamwebhelper.exe` process is given to log the login
+/// window before the process alone counts as the window. On the one host
+/// tried the line comes about 7 s after the start.
+const WINDOW_FALLBACK_GRACE: Duration = Duration::from_secs(90);
+
+/// The client's own dump for an assertion, under `Steam/dumps/`; one written
+/// since the start is the stall when no log carries its text yet.
+const ASSERT_DUMP_PREFIX: &str = "assert_steam.exe_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,6 +226,15 @@ pub(crate) enum BrokenReason {
     BootstrapperLeftNoExe(PathBuf),
     /// The client exited before its window came up; its bootstrap log.
     ClientExitedEarly(PathBuf),
+    /// The client asserted a stalled main loop and died: a macOS prompt
+    /// was left unanswered. The log the assertion is in, or the assert
+    /// dump the client wrote when no log carries the text.
+    ClientStalledOnPrompt(PathBuf),
+    /// The engine payload has no web helper shim at the path.
+    NoShim(PathBuf),
+    /// A `cef.win*` directory holds the shim as `steamwebhelper.exe` and no
+    /// real helper beside it.
+    ShimWithoutReal(PathBuf),
     /// `repair` found no snapshot at all.
     NoSnapshot,
     /// `repair` found snapshots, none with an opening record and `steam.exe`.
@@ -215,6 +275,24 @@ impl BrokenReason {
                 "the client exited before its window came up; see {} and the session log; \
                  `applejack runtime steam install` starts it again",
                 log.display()
+            ),
+            Self::ClientStalledOnPrompt(evidence) => format!(
+                "the client's main loop stalled and the client died (`{STALL_ASSERTION}`, see \
+                 {}): a macOS permission prompt for \"applejack\" (the microphone) was left \
+                 unanswered; answer it (Don't Allow is fine) and run `applejack runtime steam \
+                 install` again",
+                evidence.display()
+            ),
+            Self::NoShim(path) => format!(
+                "the engine payload ships no web helper shim at {}, and without it the \
+                 client's login window does not draw on this engine; install a payload that \
+                 ships it",
+                path.display()
+            ),
+            Self::ShimWithoutReal(dir) => format!(
+                "{}/{WEBHELPER_EXE} is the shim and {WEBHELPER_REAL} is missing beside it; \
+                 {REINSTALL_RERUNS}, which lays the client's own helper down again",
+                dir.display()
             ),
             Self::NoSnapshot => {
                 format!("no snapshot of {STEAM_CLIENT_PREFIX} exists; {REINSTALL_RERUNS}")
@@ -311,6 +389,271 @@ impl ClientPaths {
     pub fn bootstrapper(&self) -> PathBuf {
         self.prefix_dir.join(BOOTSTRAPPER_FILE)
     }
+
+    /// `bin/cef/`, which holds one `cef.win*` directory per CEF build.
+    #[must_use]
+    pub fn cef_dir(&self) -> PathBuf {
+        self.steam_dir().join(CEF_DIR)
+    }
+
+    /// The helper's log, where the login window announces itself.
+    #[must_use]
+    pub fn webhelper_log(&self) -> PathBuf {
+        self.steam_dir().join(WEBHELPER_LOG)
+    }
+}
+
+/// What `ensure_webhelper_shim` did to one `cef.win*` directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShimEdit {
+    /// The shim was the helper already, with the real one beside it.
+    InPlace,
+    /// The client's helper was stashed and the shim written for the first time.
+    Applied,
+    /// A client update had written its helper over the shim; the new helper
+    /// is stashed and the shim is back.
+    Reapplied,
+    /// An older build of the shim was the helper; this payload's is now.
+    Upgraded,
+}
+
+impl ShimEdit {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::InPlace => "the shim is in front of the web helper",
+            Self::Applied => {
+                "stashed the web helper as steamwebhelper_real.exe and put the shim in front of it"
+            }
+            Self::Reapplied => {
+                "a client update replaced the web helper; stashed the new one and put the shim back"
+            }
+            Self::Upgraded => "replaced an older build of the shim with this payload's",
+        }
+    }
+}
+
+/// The `cef.win*` directories under the client's `bin/cef/`, sorted; none
+/// when the directory is not there.
+fn cef_dirs(paths: &ClientPaths) -> Result<Vec<PathBuf>, CoreError> {
+    let cef = paths.cef_dir();
+    if !cef.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(&cef).map_err(|error| CoreError::io(&cef, error))? {
+        let entry = entry.map_err(|error| CoreError::io(&cef, error))?;
+        let path = entry.path();
+        if path.is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("cef.win"))
+        {
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// The file's SHA-256 and whether it carries [`SHIM_MARKER`].
+fn hash_and_marker(path: &Path) -> Result<([u8; 32], bool), CoreError> {
+    let bytes = fs::read(path).map_err(|error| CoreError::io(path, error))?;
+    let marked = bytes
+        .windows(SHIM_MARKER.len())
+        .any(|window| window == SHIM_MARKER);
+    Ok((Sha256::digest(&bytes).into(), marked))
+}
+
+fn read_shim(engine_root: &Path) -> Result<(Vec<u8>, [u8; 32]), CoreError> {
+    let path = engine_root.join(WEBHELPER_SHIM);
+    let bytes = fs::read(&path).map_err(|_| CoreError::ClientRuntimeBroken {
+        state: ClientRuntimeState::Broken,
+        detail: BrokenReason::NoShim(path.clone()).detail(),
+    })?;
+    let hash = Sha256::digest(&bytes).into();
+    Ok((bytes, hash))
+}
+
+/// Puts the payload's shim in front of the client's web helper under every
+/// `bin/cef/cef.win*/` directory that holds one. A helper that is not the
+/// shim (by SHA-256 against the payload's, never by size) is copied to
+/// `steamwebhelper_real.exe`, over any older stash, and the shim written in
+/// its place, so after a client self-update, which writes the new helper
+/// over the shim, the next start stashes the new helper: the real one is
+/// never older than the client. Every start of the client goes through
+/// here. One edit per directory, in order, each reported under `shim`.
+///
+/// # Errors
+///
+/// [`CoreError::ClientRuntimeBroken`] when the payload has no shim or a
+/// directory holds the shim without the real helper beside it; the copy or
+/// write failure.
+pub(crate) fn ensure_webhelper_shim(
+    engine_root: &Path,
+    paths: &ClientPaths,
+    report: &mut dyn FnMut(&str, String),
+) -> Result<Vec<(PathBuf, ShimEdit)>, CoreError> {
+    let (shim, shim_hash) = read_shim(engine_root)?;
+    let mut edits = Vec::new();
+    for dir in cef_dirs(paths)? {
+        let helper = dir.join(WEBHELPER_EXE);
+        if !helper.is_file() {
+            continue;
+        }
+        let real = dir.join(WEBHELPER_REAL);
+        let (helper_hash, is_a_shim) = hash_and_marker(&helper)?;
+        let is_this_shim = helper_hash == shim_hash;
+        if (is_this_shim || is_a_shim) && !real.is_file() {
+            return Err(CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Broken,
+                detail: BrokenReason::ShimWithoutReal(dir).detail(),
+            });
+        }
+        let edit = if is_this_shim {
+            ShimEdit::InPlace
+        } else {
+            let had_real = real.is_file();
+            if !is_a_shim {
+                fs::copy(&helper, &real).map_err(|error| CoreError::io(&real, error))?;
+            }
+            let staged = dir.join("steamwebhelper.exe.applejack");
+            fs::write(&staged, &shim).map_err(|error| CoreError::io(&staged, error))?;
+            let mode = fs::metadata(&helper)
+                .map_err(|error| CoreError::io(&helper, error))?
+                .permissions();
+            fs::set_permissions(&staged, mode).map_err(|error| CoreError::io(&staged, error))?;
+            fs::rename(&staged, &helper).map_err(|error| CoreError::io(&helper, error))?;
+            if is_a_shim {
+                ShimEdit::Upgraded
+            } else if had_real {
+                ShimEdit::Reapplied
+            } else {
+                ShimEdit::Applied
+            }
+        };
+        report("shim", format!("{}: {}", dir.display(), edit.describe()));
+        edits.push((dir, edit));
+    }
+    Ok(edits)
+}
+
+/// Whether any `cef.win*` helper is not the payload's shim: a client
+/// self-update wrote its helper over it since the last check.
+fn helper_replaced(engine_root: &Path, paths: &ClientPaths) -> Result<bool, CoreError> {
+    let (_, shim_hash) = read_shim(engine_root)?;
+    for dir in cef_dirs(paths)? {
+        let helper = dir.join(WEBHELPER_EXE);
+        if helper.is_file() && hash_and_marker(&helper)?.0 != shim_hash {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The file's length, as the offset later reads start from; 0 when absent.
+fn log_offset(path: &Path) -> u64 {
+    fs::metadata(path).map_or(0, |meta| meta.len())
+}
+
+/// Whether a line written to `path` past `offset` satisfies `wanted`. The
+/// client appends to its logs across runs, so only this run's lines count.
+fn log_has_since(path: &Path, offset: u64, wanted: impl Fn(&str) -> bool) -> bool {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() {
+        return false;
+    }
+    text.lines().any(wanted)
+}
+
+/// What says the login window is there, strongest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowSignal {
+    /// The helper logged the window (`logs/webhelper.txt`).
+    Logged,
+    /// `loginusers.vdf` was written: someone signed in.
+    LoginChanged,
+    /// A `steamwebhelper.exe` is up, after the grace without a line.
+    Helper,
+}
+
+impl WindowSignal {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Logged => ": the login window exists (logs/webhelper.txt)",
+            Self::LoginChanged => ": loginusers.vdf changed",
+            Self::Helper => ": a steamwebhelper.exe is up; no window line in logs/webhelper.txt",
+        }
+    }
+}
+
+/// What one look at a starting client found.
+struct WindowSignals {
+    /// The manifest exists and nothing is under `package/tmp`.
+    updated: bool,
+    signal: Option<WindowSignal>,
+}
+
+impl WindowSignals {
+    fn phase(&self) -> (&'static str, &'static str) {
+        match (self.updated, self.signal) {
+            (false, _) => ("updating", ""),
+            (true, Some(signal)) => ("window", signal.detail()),
+            (true, None) => ("starting", ""),
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.updated && self.signal.is_some()
+    }
+}
+
+/// The stall, if any: the assertion written to one of `logs` past its
+/// offset, or an assert dump since `since`.
+fn stall_evidence(
+    logs: &[(PathBuf, u64)],
+    paths: &ClientPaths,
+    since: std::time::SystemTime,
+) -> Option<PathBuf> {
+    logs.iter()
+        .find(|(path, offset)| log_has_since(path, *offset, |line| line.contains(STALL_ASSERTION)))
+        .map(|(path, _)| path.clone())
+        .or_else(|| assert_dump_since(paths, since))
+}
+
+/// An `assert_steam.exe_*.dmp` the client wrote since `since`, if any.
+fn assert_dump_since(paths: &ClientPaths, since: std::time::SystemTime) -> Option<PathBuf> {
+    let dumps = paths.steam_dir().join(DUMPS_DIR);
+    let entries = fs::read_dir(dumps).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(ASSERT_DUMP_PREFIX))
+        })
+        .filter(|entry| {
+            entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| modified >= since)
+        })
+        .map(|entry| entry.path())
+        .next()
+}
+
+/// The helper's line that says the login window exists.
+fn is_login_window_line(line: &str) -> bool {
+    line.contains(LOGIN_WINDOW_MARK)
+        && (line.contains("Created window") || line.contains("WasHidden 0"))
 }
 
 /// Whether `loginusers.vdf` names a remembered account; `None` when the file
@@ -1122,7 +1465,8 @@ impl PlannedClientOp {
         if self.client_running() && !reinstall {
             // The window the user signs in to is up; a second steam.exe
             // would only hand off to it.
-            return self.wait_ready(None, report);
+            self.wait_window(None, None, report)?;
+            return self.finish(report);
         }
         if reinstall {
             self.stop(report)?;
@@ -1220,14 +1564,18 @@ impl PlannedClientOp {
     }
 
     /// Starts `steam.exe` and waits for its self-update and the login
-    /// window. The client stays up for the user.
+    /// window. The client stays up for the user. A self-update that wrote
+    /// the client's helper over the shim is caught after the wait: the
+    /// client is stopped, the new helper stashed, and the client started
+    /// once more, so an `install` ends with a window that draws.
     fn first_run(
         &mut self,
         prefix: &Prefix,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
         if self.client_running() {
-            return self.wait_ready(None, report);
+            self.wait_window(None, None, report)?;
+            return self.finish(report);
         }
         // The client reads `libraryfolders.vdf` at startup, so the shared
         // library is listed before the client has ever started.
@@ -1239,12 +1587,46 @@ impl PlannedClientOp {
                 format!("listing {windows_path} in libraryfolders.vdf before the client starts"),
             );
         }
+        let mut restarted = false;
+        loop {
+            self.start_client(prefix, report)?;
+            if restarted || !helper_replaced(&self.installed.root, &self.paths)? {
+                break;
+            }
+            report(
+                "client",
+                "the self-update replaced the web helper; restarting the client with the shim in \
+                 front of it"
+                    .to_owned(),
+            );
+            self.stop(report)?;
+            Core::settle(&self.paths.prefix_dir)?;
+            restarted = true;
+        }
+        self.finish(report)
+    }
+
+    /// One start of the client to its login window: the shim check, the
+    /// prompt warning, the launch under a key of its own, the wait.
+    fn start_client(
+        &mut self,
+        prefix: &Prefix,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<(), CoreError> {
+        ensure_webhelper_shim(&self.installed.root, &self.paths, report)?;
+        report(
+            "start",
+            "macOS may ask whether \"applejack\" may use the microphone within about 15 s of \
+             the client's start: answer it (Don't Allow is fine); left unanswered, the client \
+             stalls and dies about 3 minutes in"
+                .to_owned(),
+        );
         report("start", "starting steam.exe for its self-update".to_owned());
         let key = new_session_id("steam-client");
         let spec = LaunchSpec {
             session_id: Some(key.clone()),
             exe: self.paths.steam_exe(),
-            args: Vec::new(),
+            args: vec![NOVERIFYFILES.into()],
             env_extras: Vec::new(),
             cwd: self.paths.steam_dir(),
             log_dir: self.core.log_dir().to_path_buf(),
@@ -1262,16 +1644,75 @@ impl PlannedClientOp {
         );
         // The loader is the client and outlives this call; `Session`'s drop
         // is one non-blocking `try_wait`, so nothing here waits on it.
+        let session_log = session.log_path.clone();
         drop(session);
-        self.wait_ready(Some(&key), report)
+        self.wait_window(Some(&key), Some(&session_log), report)
     }
 
-    /// Waits for the self-update to finish: the manifest exists, nothing is
-    /// left under `package/tmp`, and the web helper that draws the window is
-    /// up. A `loginusers.vdf` write counts too.
-    fn wait_ready(
+    /// The client exited during the wait: the stall when one was seen,
+    /// else a bare exit pointing at the client's bootstrap log.
+    fn client_gone(stalled: Option<PathBuf>, steam: &Path) -> CoreError {
+        let reason = match stalled {
+            Some(evidence) => BrokenReason::ClientStalledOnPrompt(evidence),
+            None => BrokenReason::ClientExitedEarly(steam.join(STALL_LOGS[1])),
+        };
+        CoreError::ClientRuntimeBroken {
+            state: ClientRuntimeState::Broken,
+            detail: reason.detail(),
+        }
+    }
+
+    /// [`FIRST_RUN_TIMEOUT`] passed without the window: the client is
+    /// stopped and its files kept.
+    fn window_timed_out(&mut self, report: &mut dyn FnMut(&str, String)) -> CoreError {
+        let _ = self.stop(report);
+        CoreError::ClientRuntimeBroken {
+            state: ClientRuntimeState::Updating,
+            detail: format!(
+                "the client did not reach the login window within {} seconds; it was stopped \
+                 and its files kept",
+                FIRST_RUN_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    /// Whether a `steamwebhelper.exe` is up: by the key when this core
+    /// started the client, else by the prefix (a client `prefix exec` or an
+    /// earlier core started).
+    fn helper_up(&self, key: Option<&str>) -> bool {
+        let is_helper = |process: &applejack_engine::rosetta_wine::Process| {
+            process.exe.eq_ignore_ascii_case(WEBHELPER_EXE)
+        };
+        key.is_some_and(|key| find_session(key).iter().any(is_helper))
+            || find_in_prefix(&self.paths.prefix_dir).iter().any(is_helper)
+    }
+
+    /// After the window: the build id into `meta`, the state as the last line.
+    fn finish(&mut self, report: &mut dyn FnMut(&str, String)) -> Result<(), CoreError> {
+        if let Some(build) = record_client_build(&mut self.core, &self.paths)? {
+            report("build", format!("client build {build}"));
+        }
+        let (state, detail) = self.core.runtime_state(true)?;
+        report(state.as_str(), detail);
+        Ok(())
+    }
+
+    /// Waits for the self-update to finish and the login window to exist:
+    /// the manifest exists, nothing is left under `package/tmp`, and the
+    /// helper has logged the login window (`DesktopLoginWindow_uid0 ...
+    /// Created window` or `WasHidden 0` in `logs/webhelper.txt`, written
+    /// since this wait began). A `loginusers.vdf` write counts too, and a
+    /// `steamwebhelper.exe` process counts after [`WINDOW_FALLBACK_GRACE`]
+    /// without the line, at once for a client this call did not start
+    /// (`session_log` is `None`), whose line predates the wait. A stall
+    /// (the assertion in `session_log`, the client's logs, or an assert
+    /// dump written since the start) is reported, and the process then no
+    /// longer counts: the client dies about 3 minutes in unless the prompt
+    /// is answered, and that death is reported as the prompt.
+    fn wait_window(
         &mut self,
         key: Option<&str>,
+        session_log: Option<&Path>,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
         let key = match key {
@@ -1281,62 +1722,82 @@ impl PlannedClientOp {
         let login_before = fs::metadata(self.paths.loginusers())
             .and_then(|meta| meta.modified())
             .ok();
-        let deadline = Instant::now() + FIRST_RUN_TIMEOUT;
+        let steam = self.paths.steam_dir();
+        let helper_log = self.paths.webhelper_log();
+        let helper_log_before = log_offset(&helper_log);
+        let stall_logs: Vec<(PathBuf, u64)> = session_log
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(STALL_LOGS.iter().map(|name| steam.join(name)))
+            .map(|path| {
+                let offset = log_offset(&path);
+                (path, offset)
+            })
+            .collect();
+        let grace = if session_log.is_some() {
+            WINDOW_FALLBACK_GRACE
+        } else {
+            Duration::ZERO
+        };
+        let started_at = std::time::SystemTime::now();
+        let started = Instant::now();
+        let deadline = started + FIRST_RUN_TIMEOUT;
         let mut settled = 0;
         let mut gone = 0;
+        let mut stalled: Option<PathBuf> = None;
         let mut last_phase = String::new();
         loop {
-            let manifest = self.paths.manifest().is_file();
-            let tmp = self.paths.package_tmp().is_dir();
-            // By the key when this core started the client, else by the
-            // prefix: a client `prefix exec` or an earlier core started.
-            let is_helper = |process: &applejack_engine::rosetta_wine::Process| {
-                process.exe.eq_ignore_ascii_case("steamwebhelper.exe")
-            };
-            let helper = key
-                .as_deref()
-                .is_some_and(|key| find_session(key).iter().any(is_helper))
-                || find_in_prefix(&self.paths.prefix_dir).iter().any(is_helper);
+            if stalled.is_none() {
+                stalled = stall_evidence(&stall_logs, &self.paths, started_at);
+                if let Some(evidence) = &stalled {
+                    report(
+                        "client",
+                        format!(
+                            "stalled: the client's main loop is stalled ({}); a macOS prompt is \
+                             waiting, usually the microphone: answer it (Don't Allow is fine) \
+                             within about 3 minutes of the start or the client dies",
+                            evidence.display()
+                        ),
+                    );
+                }
+            }
             let login_changed = fs::metadata(self.paths.loginusers())
                 .and_then(|meta| meta.modified())
                 .ok()
                 != login_before;
-            let phase = if !manifest || tmp {
-                "updating"
-            } else if helper || login_changed {
-                "window"
+            let signal = if log_has_since(&helper_log, helper_log_before, is_login_window_line) {
+                Some(WindowSignal::Logged)
+            } else if login_changed {
+                Some(WindowSignal::LoginChanged)
+            } else if stalled.is_none()
+                && started.elapsed() >= grace
+                && self.helper_up(key.as_deref())
+            {
+                Some(WindowSignal::Helper)
             } else {
-                "starting"
+                None
             };
+            let signals = WindowSignals {
+                updated: self.paths.manifest().is_file() && !self.paths.package_tmp().is_dir(),
+                signal,
+            };
+            let (phase, detail) = signals.phase();
             if phase != last_phase {
                 phase.clone_into(&mut last_phase);
-                report("client", phase.to_owned());
+                report("client", format!("{phase}{detail}"));
             }
-            settled = if manifest && !tmp { settled + 1 } else { 0 };
-            if manifest && !tmp && (helper || login_changed) && settled >= SETTLED_LOOKS {
+            settled = if signals.updated { settled + 1 } else { 0 };
+            if signals.ready() && settled >= SETTLED_LOOKS {
                 break;
             }
-            // A client that is gone will not come up; its own
-            // `logs/bootstrap_log.txt` and the session log say why.
+            // A client that is gone will not come up; its own logs and the
+            // session log say why, and a stall assertion names the prompt.
             gone = if self.client_running() { 0 } else { gone + 1 };
             if gone >= SETTLED_LOOKS {
-                return Err(CoreError::ClientRuntimeBroken {
-                    state: ClientRuntimeState::Broken,
-                    detail: BrokenReason::ClientExitedEarly(
-                        self.paths.steam_dir().join("logs/bootstrap_log.txt"),
-                    )
-                    .detail(),
-                });
+                return Err(Self::client_gone(stalled, &steam));
             }
             if Instant::now() >= deadline {
-                let _ = self.stop(report);
-                return Err(CoreError::ClientRuntimeBroken {
-                    state: ClientRuntimeState::Updating,
-                    detail: format!(
-                        "the client did not reach the login window within {} seconds; it was stopped and its files kept",
-                        FIRST_RUN_TIMEOUT.as_secs()
-                    ),
-                });
+                return Err(self.window_timed_out(report));
             }
             std::thread::sleep(
                 self.core
@@ -1345,11 +1806,6 @@ impl PlannedClientOp {
                     .max(CLIENT_POLL.min(self.core.tuning.tick * 4)),
             );
         }
-        if let Some(build) = record_client_build(&mut self.core, &self.paths)? {
-            report("build", format!("client build {build}"));
-        }
-        let (state, detail) = self.core.runtime_state(true)?;
-        report(state.as_str(), detail);
         Ok(())
     }
 

@@ -13,8 +13,8 @@ use applejack_engine::rosetta_wine::process::{find_session, server_socket, wines
 use applejack_engine::rosetta_wine::snapshot::PrefixLock;
 use applejack_engine::rosetta_wine::{Snapshot, snapshot};
 use applejack_engine::{
-    Engine, Error as EngineError, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec, Prefix,
-    PrefixSpec, SyncMode, Version,
+    Engine, EnvPair, Error as EngineError, GraphicsBackend, HidrawMode, InstalledEngine,
+    LaunchSpec, Prefix, PrefixSpec, SyncMode, Version,
 };
 use serde::{Deserialize, Serialize};
 
@@ -415,6 +415,7 @@ impl Core {
         name: &str,
         exe: &Path,
         args: &[OsString],
+        env: &[EnvPair],
         out: &mut dyn Write,
     ) -> Result<i32, CoreError> {
         let _lock = self.lock_idle_prefix(name)?;
@@ -425,7 +426,7 @@ impl Core {
             session_id: None,
             exe: exe.to_path_buf(),
             args: args.to_vec(),
-            env_extras: Vec::new(),
+            env_extras: env.to_vec(),
             cwd: dir,
             log_dir: self.log_dir().to_path_buf(),
             advertise_avx: false,

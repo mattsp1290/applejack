@@ -22,6 +22,7 @@ const BUNDLE_FILES: &[&str] = &[
     "vkd3d/d3d12core.dll",
     "probes/dx11-sample.exe",
     "probes/xinput-check.exe",
+    "probes/steamwebhelper-shim.exe",
 ];
 
 /// `wineboot` makes the directories a real boot would; `exit7.exe` prints a
@@ -79,9 +80,10 @@ if [ "$name" = quick.exe ]; then
 fi
 if [ "$name" = SteamSetup.exe ]; then
   steam="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
-  mkdir -p "$steam/package" "$steam/config"
+  mkdir -p "$steam/package" "$steam/config" "$steam/bin/cef/cef.win7x64"
   echo "$*" > "$steam/bootstrapped"
   : > "$steam/steam.exe"
+  printf 'REAL-HELPER-1' > "$steam/bin/cef/cef.win7x64/steamwebhelper.exe"
   printf '"steam_client_win32"\n{\n\t"version"\t\t"1761720601"\n}\n' > "$steam/package/steam_client_win32.manifest"
   exit 0
 fi
@@ -101,6 +103,7 @@ if [ "$name" = reg ] && [ "$2" = add ]; then
   exit 0
 fi
 if [ "$name" = steam.exe ]; then
+  echo "$*" > "$WINEPREFIX/client-args"
   if [ "$2" = -applaunch ]; then
     appid=$3
     shift 3
@@ -129,11 +132,28 @@ if [ "$name" = steam.exe ]; then
       exit 0
     fi
   fi
+  steam="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
+  mkdir -p "$steam/logs"
+  if [ -e "$WINEPREFIX/stall-dump" ]; then
+    mkdir -p "$steam/dumps"
+    : > "$steam/dumps/assert_steam.exe_20260101000000_1.dmp"
+    exit 0
+  fi
+  if [ -e "$WINEPREFIX/stall" ]; then
+    printf '%s\n' 'src\clientdll\steamengine.cpp (2716) : Assertion Failed: CSteamEngine::BMainLoop appears to have stalled > 15 seconds without event signalled' >> "$steam/logs/console_log.txt"
+    exit 0
+  fi
+  if [ -e "$WINEPREFIX/self-update" ]; then
+    printf 'REAL-HELPER-2' > "$steam/bin/cef/cef.win7x64/steamwebhelper.exe"
+    rm -f "$WINEPREFIX/self-update"
+  fi
   # A client a stop just ended polls every 10 ms for its quit file; a fresh
-  # start must not clear it from under them.
+  # start must not clear it from under them. The window line follows the
+  # sleep so the launcher's wait, which counts lines past the start, sees it.
   sleep 0.1
   rm -f "$WINEPREFIX/client-quit"
   : > "$WINEPREFIX/client-up"
+  echo 'SP DesktopLoginWindow_uid0: Created window: size: 700,440 pos: 0,0 mode: System window: 0000000000030106' >> "$steam/logs/webhelper.txt"
   "@HELPER@" common::stub_title --exact --ignored --nocapture steamwebhelper.exe &
   exec "@HELPER@" common::stub_title --exact --ignored --nocapture steam.exe
 fi
@@ -143,6 +163,10 @@ fi
 if [ "$name" = exit7.exe ]; then
   echo "hello from the stub: $2"
   exit 7
+fi
+if [ "$name" = env.exe ]; then
+  echo "WINEDEBUG=${WINEDEBUG:-unset} DXMT_LOG_LEVEL=${DXMT_LOG_LEVEL:-unset} NOT_ALLOWED=${NOT_ALLOWED:-unset}"
+  exit 0
 fi
 exit 0
 "#;

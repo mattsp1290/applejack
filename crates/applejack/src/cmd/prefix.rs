@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use applejack_core::prefixes::PrefixEntry;
 use applejack_core::{Core, CoreError};
-use applejack_engine::{GraphicsBackend, HidrawMode, SyncMode};
+use applejack_engine::{EnvPair, GraphicsBackend, HidrawMode, SyncMode};
 use clap::{Args, Subcommand};
 
 #[derive(Args)]
@@ -74,6 +74,11 @@ enum Action {
     Exec {
         /// Prefix name
         name: String,
+        /// A variable for the child, as the game tier of the launch
+        /// allowlist (`WINEDEBUG=+seh`, `DXMT_LOG_LEVEL=debug`); one not in
+        /// the allowlist is dropped and logged. Repeatable
+        #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
+        env: Vec<EnvPair>,
         /// After `--`: the executable (a Windows path, a bare name, or an
         /// absolute path inside the data directory) and its arguments
         #[arg(last = true, required = true, value_name = "EXE [ARGS]")]
@@ -156,11 +161,11 @@ fn execute(args: PrefixArgs) -> Result<Outcome, CoreError> {
             core.prefix_remove(&name)?;
             format!("removed {name}")
         }
-        Action::Exec { name, child } => {
+        Action::Exec { name, env, child } => {
             let (exe, args) = child
                 .split_first()
                 .ok_or_else(|| CoreError::Message("exec needs an executable".to_owned()))?;
-            let status = core.prefix_exec(&name, Path::new(exe), args, &mut io::stdout())?;
+            let status = core.prefix_exec(&name, Path::new(exe), args, &env, &mut io::stdout())?;
             return Ok(Outcome::Exit(status));
         }
     };
@@ -179,4 +184,29 @@ fn render(entry: &PrefixEntry) -> String {
         entry.sync_mode.map_or("?", SyncMode::as_str),
         entry.hidraw.map_or("?", HidrawMode::as_str),
     )
+}
+
+/// `KEY=VALUE` into a pair; the key must be non-empty and the `=` present.
+fn parse_env(text: &str) -> Result<EnvPair, String> {
+    match text.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.into(), value.into())),
+        _ => Err(format!("expected KEY=VALUE, got `{text}`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_env;
+
+    #[test]
+    fn an_env_argument_splits_at_the_first_equals_and_needs_a_key() {
+        assert_eq!(
+            parse_env("WINEDEBUG=+seh,+loaddll").unwrap(),
+            ("WINEDEBUG".into(), "+seh,+loaddll".into())
+        );
+        assert_eq!(parse_env("A=b=c").unwrap(), ("A".into(), "b=c".into()));
+        assert_eq!(parse_env("EMPTY=").unwrap(), ("EMPTY".into(), "".into()));
+        assert!(parse_env("=value").is_err());
+        assert!(parse_env("NOEQUALS").is_err());
+    }
 }

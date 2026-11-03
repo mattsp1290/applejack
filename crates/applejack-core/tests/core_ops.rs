@@ -250,12 +250,42 @@ fn prefix_exec_returns_the_exit_code_and_the_output() {
             "p",
             Path::new("exit7.exe"),
             &[OsString::from("argument")],
+            &[],
             &mut out,
         )
         .unwrap();
     assert_eq!(exit, 7);
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("hello from the stub: argument"), "{text}");
+}
+
+/// `--env` pairs are the launch's game tier: an allowlisted tunable reaches
+/// the child, a variable outside the allowlist does not.
+#[test]
+fn prefix_exec_carries_allowlisted_env_pairs_as_the_game_tier() {
+    let dir = TempDir::new().unwrap();
+    let mut core = installed(&dir, "10.0.0");
+    create(&mut core, "p");
+    let mut out = Vec::new();
+    let exit = core
+        .prefix_exec(
+            "p",
+            Path::new("env.exe"),
+            &[],
+            &[
+                ("WINEDEBUG".into(), "+seh,+loaddll".into()),
+                ("DXMT_LOG_LEVEL".into(), "debug".into()),
+                ("NOT_ALLOWED".into(), "yes".into()),
+            ],
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(exit, 0);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("WINEDEBUG=+seh,+loaddll DXMT_LOG_LEVEL=debug NOT_ALLOWED=unset"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -266,7 +296,7 @@ fn prefix_exec_refuses_a_unix_path_outside_the_data_directory() {
     let outside = dir.path().join("elsewhere.exe");
     fs::write(&outside, "x").unwrap();
     let error = core
-        .prefix_exec("p", &outside, &[], &mut Vec::new())
+        .prefix_exec("p", &outside, &[], &[], &mut Vec::new())
         .unwrap_err();
     assert!(
         matches!(error, CoreError::PathOutsideData { .. }),

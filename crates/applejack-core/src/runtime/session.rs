@@ -338,6 +338,7 @@ impl SessionProbe for ForeignProbe<'_> {
 const CLIENT_PROCESSES: &[&str] = &[
     "steam.exe",
     "steamwebhelper.exe",
+    "steamwebhelper_real.exe",
     "steamservice.exe",
     "steamerrorreporter.exe",
     "steamerrorreporter64.exe",

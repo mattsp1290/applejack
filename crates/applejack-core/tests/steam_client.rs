@@ -18,7 +18,7 @@ use applejack_core::run::{AppRegistration, PlannedRun};
 use applejack_core::runtime::session::{NOTE_CLIENT, NOTE_LOST, RunTuning};
 use applejack_core::runtime::steam_client::{
     ClientOp, ClientRuntimeState, ClientRuntimeStatus, META_CLIENT_BUILD, META_CLIENT_SESSION,
-    META_REDOWNLOAD, STEAM_CLIENT_PREFIX, acf_backup_path,
+    META_REDOWNLOAD, STEAM_CLIENT_PREFIX, WEBHELPER_EXE, WEBHELPER_REAL, acf_backup_path,
 };
 use applejack_core::{Core, CoreError};
 use applejack_engine::rosetta_wine::process::find_session;
@@ -114,16 +114,51 @@ impl Fixture {
 
     /// `runtime steam install` with the bootstrapper arriving as `content`.
     fn install_with(&self, content: &str) -> Result<ClientRuntimeState, CoreError> {
+        self.install_reporting(content).0
+    }
+
+    /// [`Fixture::install_with`] with every `phase: message` line reported.
+    fn install_reporting(
+        &self,
+        content: &str,
+    ) -> (Result<ClientRuntimeState, CoreError>, Vec<String>) {
         let fetch = |_url: &str, dest: &Path, progress: &mut dyn FnMut(u64, Option<u64>)| {
             fs::write(dest, content).map_err(|error| CoreError::Message(error.to_string()))?;
             progress(content.len() as u64, Some(content.len() as u64));
             Ok(())
         };
-        let status = self
+        let mut lines = Vec::new();
+        let outcome = self
             .core()
-            .plan_client_op(ClientOp::Install)?
-            .run_with(&fetch, &mut |_, _| {})?;
-        Ok(status.state)
+            .plan_client_op(ClientOp::Install)
+            .and_then(|plan| {
+                plan.run_with(&fetch, &mut |phase, message| {
+                    lines.push(format!("{phase}: {message}"));
+                })
+            });
+        (outcome.map(|status| status.state), lines)
+    }
+
+    /// The stub client's one CEF directory.
+    fn cef_dir(&self) -> PathBuf {
+        self.steam_dir().join("bin/cef/cef.win7x64")
+    }
+
+    fn helper(&self) -> Vec<u8> {
+        fs::read(self.cef_dir().join(WEBHELPER_EXE)).unwrap()
+    }
+
+    fn real_helper(&self) -> Option<Vec<u8>> {
+        fs::read(self.cef_dir().join(WEBHELPER_REAL)).ok()
+    }
+
+    /// The stub bundle's shim, as the payload's would be.
+    fn shim(&self) -> Vec<u8> {
+        fs::read(
+            self.data()
+                .join("engines/rosetta-wine/10.0.0/probes/steamwebhelper-shim.exe"),
+        )
+        .unwrap()
     }
 
     fn install(&self) {
@@ -306,11 +341,26 @@ fn install_refuses_a_bootstrapper_that_is_not_valves_and_keeps_it() {
 #[test]
 fn install_lays_the_client_down_records_its_build_and_leaves_it_at_the_window() {
     let fixture = Fixture::new();
-    fixture.install();
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin);
     let bootstrapped = fs::read_to_string(fixture.steam_dir().join("bootstrapped")).unwrap();
     assert!(
         bootstrapped.trim().ends_with("SteamSetup.exe /S"),
         "{bootstrapped}"
+    );
+    assert!(
+        lines.contains(&"client: window: the login window exists (logs/webhelper.txt)".to_owned()),
+        "readiness is keyed on the helper's log line: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line
+            .starts_with("start: macOS may ask whether \"applejack\" may use the microphone")),
+        "the prompt is announced before the start: {lines:?}"
+    );
+    let client_args = fs::read_to_string(fixture.prefix_dir().join("client-args")).unwrap();
+    assert!(
+        client_args.trim().ends_with("steam.exe -noverifyfiles"),
+        "the first run skips the client's file check, which would undo the shim: {client_args}"
     );
     let status = fixture.core().client_runtime_status().unwrap();
     assert_eq!(status.state, ClientRuntimeState::NeedsLogin);
@@ -1139,4 +1189,225 @@ fn the_client_prefix_keeps_its_settings_while_the_client_runs() {
     );
     assert_eq!(prefix.hidraw, Some(HidrawMode::Disabled));
     drop(server);
+}
+
+/// The payload's shim goes in front of the client's web helper at install
+/// (stashing the client's own as `steamwebhelper_real.exe`), and a start
+/// that finds it there leaves both alone.
+#[test]
+fn install_puts_the_shim_in_front_of_the_web_helper_and_a_restart_leaves_it() {
+    let fixture = Fixture::new();
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin);
+    assert_eq!(fixture.helper(), fixture.shim());
+    assert_eq!(
+        fixture.real_helper().as_deref(),
+        Some(&b"REAL-HELPER-1"[..])
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("shim: ") && line.contains("stashed the web helper")),
+        "{lines:?}"
+    );
+
+    fixture.stop_client();
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin);
+    assert_eq!(fixture.helper(), fixture.shim());
+    assert_eq!(
+        fixture.real_helper().as_deref(),
+        Some(&b"REAL-HELPER-1"[..])
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("shim: ")
+            && line.ends_with("the shim is in front of the web helper")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("stashed")),
+        "nothing restashed: {lines:?}"
+    );
+}
+
+/// A client update writes its helper over the shim while the client is
+/// stopped; the next start (here `update`, which snapshots and starts)
+/// stashes the new helper and puts the shim back, so the stashed helper is
+/// never older than the client.
+#[test]
+fn a_client_update_that_replaced_the_helper_is_stashed_before_the_next_start() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::write(fixture.cef_dir().join(WEBHELPER_EXE), b"REAL-HELPER-2").unwrap();
+    let mut lines = Vec::new();
+    let status = fixture
+        .core()
+        .plan_client_op(ClientOp::Update)
+        .unwrap()
+        .run(&mut |phase, message| lines.push(format!("{phase}: {message}")))
+        .unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin);
+    assert_eq!(fixture.helper(), fixture.shim());
+    assert_eq!(
+        fixture.real_helper().as_deref(),
+        Some(&b"REAL-HELPER-2"[..])
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("shim: ")
+            && line.contains("a client update replaced the web helper")),
+        "{lines:?}"
+    );
+    assert!(fixture.client_up());
+}
+
+/// A payload upgrade brings a new shim build; the old shim on disk is
+/// replaced, and never stashed over the client's helper.
+#[test]
+fn an_older_shim_is_replaced_and_never_stashed_as_the_real_helper() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let old_shim = b"OLD BUILD applejack steamwebhelper shim OLD BUILD";
+    fs::write(fixture.cef_dir().join(WEBHELPER_EXE), old_shim).unwrap();
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin);
+    assert_eq!(fixture.helper(), fixture.shim());
+    assert_eq!(
+        fixture.real_helper().as_deref(),
+        Some(&b"REAL-HELPER-1"[..]),
+        "the client's helper, not the old shim"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("shim: ") && line.contains("older build of the shim")),
+        "{lines:?}"
+    );
+    fixture.stop_client();
+    fs::remove_file(fixture.cef_dir().join(WEBHELPER_REAL)).unwrap();
+    fs::write(fixture.cef_dir().join(WEBHELPER_EXE), old_shim).unwrap();
+    let error = fixture.install_with("VALVE-SIGNED").unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("steamwebhelper_real.exe is missing"),
+        "an old shim without the real helper: {error}"
+    );
+}
+
+/// The shim with nothing to run beside it is a broken runtime, and the
+/// message says how the helper comes back.
+#[test]
+fn a_shim_without_the_real_helper_is_broken_with_a_repair_hint() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::remove_file(fixture.cef_dir().join(WEBHELPER_REAL)).unwrap();
+    let error = fixture.install_with("VALVE-SIGNED").unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    let message = error.to_string();
+    assert!(
+        message.contains("steamwebhelper_real.exe is missing"),
+        "{message}"
+    );
+    assert!(
+        message.contains("applejack runtime steam repair --reinstall"),
+        "{message}"
+    );
+    assert!(!fixture.client_up(), "nothing started");
+    fixture.assert_lock_free();
+}
+
+/// A self-update during the first run writes the client's helper over the
+/// shim; after the window the client is stopped, the helper stashed, and
+/// the client started again with the shim, so the install ends with a
+/// window that draws. The stub has no server, so the stop ends nothing and
+/// the first stub client lingers under its key until the final stop; the
+/// product's second start and its new key are what is checked.
+#[test]
+fn a_self_update_during_the_first_run_restarts_the_client_with_the_shim() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::write(fixture.prefix_dir().join("self-update"), "").unwrap();
+    let first_key = fixture.client_key();
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert!(
+        lines.contains(
+            &"client: the self-update replaced the web helper; restarting the client with the \
+              shim in front of it"
+                .to_owned()
+        ),
+        "{lines:?}"
+    );
+    assert_eq!(fixture.helper(), fixture.shim());
+    assert_eq!(
+        fixture.real_helper().as_deref(),
+        Some(&b"REAL-HELPER-2"[..])
+    );
+    assert_ne!(
+        fixture.client_key(),
+        first_key,
+        "the restart is a new client session"
+    );
+    assert!(
+        fixture.client_up(),
+        "the restarted client stays up: {lines:?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("needs_login: "))
+            .count(),
+        1,
+        "the state is reported once: {lines:?}"
+    );
+    assert!(
+        !fixture.prefix_dir().join("self-update").exists(),
+        "the stub applied its update at the first start"
+    );
+    fixture.stop_client();
+}
+
+/// A client whose main loop stalled on the macOS prompt and died is
+/// `broken`, and the detail names the prompt rather than a bare exit.
+#[test]
+fn a_client_that_stalls_on_the_prompt_and_dies_names_the_prompt() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::write(fixture.prefix_dir().join("stall"), "").unwrap();
+    let error = fixture.install_with("VALVE-SIGNED").unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    let message = error.to_string();
+    assert!(
+        message.contains("BMainLoop appears to have stalled"),
+        "{message}"
+    );
+    assert!(message.contains("the microphone"), "{message}");
+    assert!(message.contains("Don't Allow is fine"), "{message}");
+    assert!(message.contains("logs/console_log.txt"), "{message}");
+    let _ = fs::remove_file(fixture.prefix_dir().join("stall"));
+    fixture.assert_lock_free();
+
+    // The text may be nowhere yet (the client writes it to its console log
+    // late); an assert dump written since the start is the same finding.
+    fs::write(fixture.prefix_dir().join("stall-dump"), "").unwrap();
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    let error = state.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    let message = error.to_string();
+    assert!(message.contains("dumps/assert_steam.exe_"), "{message}");
+    assert!(message.contains("Don't Allow is fine"), "{message}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("client: stalled: ") && line.contains("Don't Allow")),
+        "the stall is reported while the client is still up: {lines:?}"
+    );
+    let _ = fs::remove_file(fixture.prefix_dir().join("stall-dump"));
+    fixture.assert_lock_free();
 }

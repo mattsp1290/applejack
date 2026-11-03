@@ -37,7 +37,7 @@ use crate::runtime::session::{
 use crate::runtime::steam_client::RedownloadWatch;
 use crate::runtime::steam_client::{
     ClientPaths, ClientRuntimeState, LibraryEdit, META_CLIENT_SESSION, STEAM_CLIENT_PREFIX,
-    prepare_client_launch, record_client_build,
+    ensure_webhelper_shim, prepare_client_launch, record_client_build,
 };
 use crate::state::Core;
 
@@ -231,6 +231,7 @@ impl PlannedRun {
                 if !up {
                     // This run starts the client, so its key is the one the
                     // client's processes, and the games it starts, carry.
+                    ensure_webhelper_shim(&self.installed.root, &paths, report)?;
                     self.core
                         .db()?
                         .meta_set(META_CLIENT_SESSION, &self.session.session_key)?;

@@ -206,7 +206,9 @@ Environment knobs:
    `/opt/homebrew` (the script asserts with `otool -L` that nothing outside
    `/usr/lib` and `/System` remains, the rule step 9 enforces); then
    `sh crates/applejack-engine/probes/<probe>/build.sh` for `hello32`,
-   `dx11-sample`, `xinput-check`, `cpuid` — outputs under `build/work/probes/`.
+   `dx11-sample`, `xinput-check`, `steamwebhelper-shim` (the Steam client's
+   web helper shim, `docs/steam-runtime.md`), `cpuid` — outputs under
+   `build/work/probes/`.
 7. `sh build/assemble.sh` — builds the plan 02 layout under
    `<payload>.tmp` and moves it into place, so nothing from an earlier run
    survives and a failed run leaves the previous payload untouched: `wine/`
@@ -216,7 +218,7 @@ Environment knobs:
    `wine/lib/wine/{x86_64,i386}-windows/winemetal.dll`,
    `wine/lib/GStreamer.framework`,
    `dxmt/{x86_64-windows,i386-windows}`, `vkd3d/{x64,x86}`, `vulkan/`,
-   `probes/` (the three PE probes, `cpuid`, and `osslsigncode` as a host-arch
+   `probes/` (the four PE probes, `cpuid`, and `osslsigncode` as a host-arch
    tool; GPL-3.0, listed in the notices), then `BUNDLE.toml` and
    `THIRD_PARTY_NOTICES.md` rendered from `build/bundle-spec.toml` (step 8).
    `cargo xtask engine-payload --place-dxmt <payload>` (`xtask/src/dxmt.rs`)

@@ -28,8 +28,10 @@ enum Runtime {
 #[derive(Subcommand, Clone, Copy)]
 enum Action {
     /// Download Valve's bootstrapper, verify its signature, install the
-    /// client, and start it to its login window. With the client installed,
-    /// starts it to the window
+    /// client, put the web helper shim in front of steamwebhelper.exe, and
+    /// start it to its login window; macOS may ask for the microphone under
+    /// the name "applejack" (Don't Allow is fine). With the client
+    /// installed, starts it to the window
     Install,
     /// The runtime's state, build, and snapshots
     Status {
