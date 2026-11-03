@@ -699,6 +699,72 @@ pub fn reg_query(
     Ok(reg_value_data(&String::from_utf8_lossy(&text), value))
 }
 
+/// Writes one `REG_DWORD` through `<loader> reg add <key> /v <value> /t
+/// REG_DWORD /d <data> /f` in `prefix`, carrying `session_id` as
+/// [`reg_query`] does.
+///
+/// # Errors
+///
+/// Returns the spawn failure, or [`Error::WineCommandFailed`] when `reg`
+/// failed or ran past [`REG_QUERY_TIMEOUT`].
+pub fn reg_set_dword(
+    installed: &InstalledEngine,
+    prefix: &Prefix,
+    session_id: &str,
+    key: &str,
+    value: &str,
+    data: u32,
+) -> Result<()> {
+    let rows = engine_rows(
+        installed,
+        &prefix.dir,
+        session_id,
+        prefix.backend,
+        prefix.sync_mode,
+        false,
+    );
+    let (env, _) = assemble_env(installed, &prefix.dir, &[], &rows)?;
+    let loader = installed.root.join(&installed.bundle.wine.loader);
+    let data = data.to_string();
+    let mut child = Command::new(&loader)
+        .args([
+            "reg",
+            "add",
+            key,
+            "/v",
+            value,
+            "/t",
+            "REG_DWORD",
+            "/d",
+            &data,
+            "/f",
+        ])
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(&prefix.dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| Error::Spawn {
+            program: loader.clone(),
+            source: error,
+        })?;
+    let pid = child.id();
+    let command = format!("{} reg add {key} /v {value} /d {data}", loader.display());
+    let Some(status) = wait_bounded(&mut child, &loader, REG_QUERY_TIMEOUT)? else {
+        return Err(timed_out(command, REG_QUERY_TIMEOUT, &prefix.dir, pid));
+    };
+    if !status.success() {
+        return Err(Error::WineCommandFailed {
+            command,
+            status: status.to_string(),
+            log: prefix.dir.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// The data column of `value`'s row in `reg query` output
 /// (`    RunningAppID    REG_DWORD    0x3b508`).
 #[must_use]
