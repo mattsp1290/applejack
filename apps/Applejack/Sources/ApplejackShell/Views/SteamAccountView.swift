@@ -38,16 +38,17 @@ public struct SteamAccountView: View {
                 Text("Scan with the Steam mobile app; the sign-in completes on its own.")
                 QRCodeView(payload: payload).frame(width: 240, height: 240)
             case .guardRequired(let factor):
+                Text(SteamAccountViewModel.guardPrompt(factor: factor))
                 if model.guardCodeWanted {
-                    Text("Steam Guard (\(factor)): type the code, or approve in the Steam mobile app.")
                     HStack {
                         TextField("Code", text: $model.guardCode).frame(maxWidth: 160)
                             .onSubmit { model.submitGuardCode() }
                         Button("Submit") { model.submitGuardCode() }
                             .disabled(model.guardCode.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
-                } else {
-                    Text("Steam Guard: approve the sign-in in the Steam mobile app.")
+                }
+                if let rejection = model.guardRejection {
+                    Text("Steam rejected the code: \(rejection)").foregroundStyle(.red)
                 }
             case .waiting:
                 Text("Waiting for Steam.")

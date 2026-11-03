@@ -48,7 +48,7 @@ public struct GameDetailView: View {
         .toolbar {
             Button("Run") { Task { await runAndFollowLog() } }
                 .disabled(model.runState == .loading || model.isRunning)
-            Button("Cancel") { requestCancel() }
+            Button("Stop") { requestCancel() }
                 .disabled(!model.canCancel)
                 .accessibilityIdentifier("detail.cancel")
             Button("Import preset…") { choosingPreset = true }
@@ -57,7 +57,7 @@ public struct GameDetailView: View {
         .confirmationDialog(
             "Stop the session another process started?", isPresented: $confirmingCancel, titleVisibility: .visible
         ) {
-            Button("Cancel session", role: .destructive) { Task { await model.cancel() } }
+            Button("Stop session", role: .destructive) { Task { await model.cancel() } }
         } message: {
             if let open = model.openSession {
                 Text("Session \(open.id) (\(open.state.rawValue), started \(open.startedAt)) is still open. It will be ended.")
@@ -107,7 +107,7 @@ public struct GameDetailView: View {
         models.section = .logs
     }
 
-    /// A session this shell started is cancelled at once; one `session.list`
+    /// A session this shell started is stopped at once; one `session.list`
     /// showed is confirmed first, since it is some other process's.
     private func requestCancel() {
         if model.isRunning {
@@ -137,9 +137,9 @@ public struct GameDetailView: View {
             }
         }
         if let open = model.openSession {
-            Text("Session \(open.id) is open (\(open.state.rawValue)); Cancel ends it.").foregroundStyle(.orange)
+            Text("Session \(open.id) is open (\(open.state.rawValue)); Stop ends it.").foregroundStyle(.orange)
         }
-        JobProgressView(model.cancelState, title: "Cancel")
+        JobProgressView(model.cancelState, title: "Stop")
     }
 
     @ViewBuilder

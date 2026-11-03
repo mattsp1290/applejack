@@ -50,13 +50,29 @@
 #                                 (absent|ready|broken; default needs_login)
 #   FAKE_CORE_RUNTIME_OUTCOME=broken  the runtime.steam jobs end with
 #                                 job.failed 1034 after their `start:` line
-#   FAKE_CORE_RESET_OUTCOME=failed  prefix.reset ends with job.failed 1003
+#   FAKE_CORE_RESET_OUTCOME=failed  prefix.reset ends with job.failed 1019
 #                                 naming the safety snapshot to restore
+#   FAKE_CORE_RESET_SNAPSHOT=<name>  the safety snapshot prefix.reset names
+#                                 (default 20261103T140000Z; the core names
+#                                 a second snapshot in one second <ts>-001)
+#   FAKE_CORE_JOB_DELAY_MS=<n>    answer runtime.steam.* and prefix.reset
+#                                 after n milliseconds, in the background
 #   FAKE_CORE_LOGIN_GUARD=<factor>  steam.login.start answers guard_required
 #                                 with that factor instead of qr_ready
 #   FAKE_CORE_LOGIN_FAIL=1        steam.login.complete answers
 #                                 SteamLoginFailed (1021)
+#   FAKE_CORE_LOGIN_REJECT_ONCE=1  the first steam.login.complete carrying a
+#                                 steam_guard_code answers SteamGuardRejected
+#                                 (1022); the next one with a code answers done
+#
+# session.list reflects what happened: the canned open row 1 until app.run,
+# then the run's row 41, closed by app.cancel or by the title's exit
+# (FAKE_CORE_RUN_OUTCOME=exits); a cancel without a run closes row 1.
 set -u
+# A writer whose reader is gone must release the lock, not die holding it:
+# with SIGPIPE ignored the write fails with EPIPE and `write` ends the
+# subshell after `rmdir`.
+trap '' PIPE
 
 count=0
 lockdir=$(mktemp -d "${TMPDIR:-/tmp}/fake-core.XXXXXX")
@@ -73,22 +89,29 @@ fi
 # One writer at a time: a split response and a background echo must not
 # interleave on stdout.
 write() {
+  spins=0
   while ! mkdir "$lock" 2>/dev/null; do
     # In a `( ... ) &` subshell `$$` is still the parent; a parent that was
-    # killed without running its EXIT trap must not leave this loop spinning.
+    # killed without running its EXIT trap must not leave this loop spinning,
+    # and neither must a lock a dead writer left behind.
     { [ -d "$lockdir" ] && kill -0 $$ 2>/dev/null; } || exit 0
+    spins=$((spins + 1))
+    [ "$spins" -lt 500 ] || exit 0
     sleep 0.01
   done
+  written=0
   if [ "${FAKE_CORE_SPLIT:-0}" = "1" ]; then
     head=$(printf '%s' "$1" | cut -c1-12)
     tail=$(printf '%s' "$1" | cut -c13-)
-    printf '%s' "$head"
+    printf '%s' "$head" 2>/dev/null || written=1
     sleep 0.2
-    printf '%s\n' "$tail"
+    printf '%s\n' "$tail" 2>/dev/null || written=1
   else
-    printf '%s\n' "$1"
+    printf '%s\n' "$1" 2>/dev/null || written=1
   fi
   rmdir "$lock"
+  # The reader is gone: nothing this subshell could still say would arrive.
+  [ "$written" = "0" ] || exit 0
 }
 
 emit() {
@@ -143,8 +166,57 @@ run_job() {
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"running","done_bytes":null,"total_bytes":null,"message":""}}'
     if [ "${FAKE_CORE_RUN_OUTCOME:-open}" = "exits" ]; then
       sleep 0.05
+      printf 'exited\n' > "$lockdir/run"
       write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"exited","done_bytes":null,"total_bytes":null,"message":"exit code 0"}}'
       write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":12}}'
+    fi
+  ) &
+}
+
+# session_row: the one row session.list answers, as the run and cancel
+# requests left it (see the header).
+session_row() {
+  id=1; state=running; ended=null; exit_code=null
+  if [ -f "$lockdir/run" ]; then
+    id=41
+    read -r state < "$lockdir/run"
+  elif [ -f "$lockdir/cancelled" ]; then
+    state=cancelled
+  fi
+  case "$state" in
+    cancelled) ended='"2026-10-30T00:01:00Z"' ;;
+    exited) ended='"2026-10-30T00:01:00Z"'; exit_code=0 ;;
+  esac
+  printf '%s' '{"id":'"$id"',"appid":220,"started_at":"2026-10-30T00:00:00Z","ended_at":'"$ended"',"engine_id":"rosetta-wine","engine_version":"10.0.1","exit_code":'"$exit_code"',"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'","state":"'"$state"'","session_key":"fake-session","prefix":"220","launch_exe":"hl2.exe","note":null,"cancel_requested":false}'
+}
+
+# delayed <response> <job function> <job id>: the answer after
+# FAKE_CORE_JOB_DELAY_MS in the background, or at once without it; the
+# job's notifications follow either way.
+delayed() {
+  if [ -n "${FAKE_CORE_JOB_DELAY_MS:-}" ]; then
+    seconds=$(awk -v ms="$FAKE_CORE_JOB_DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
+    ( sleep "$seconds"; write "$1" ) &
+  else
+    emit "$1"
+  fi
+  "$2" "$3"
+}
+
+# reset_job <prefix>: prefix.reset's job 14. A failure carries the code of
+# its cause, as the core's does (here PrefixUnusable, 1019, for a wineboot
+# that did not come up), and names the safety snapshot to restore.
+reset_job() {
+  (
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":14,"phase":"reset","done_bytes":null,"total_bytes":null,"message":"rebuilding prefix '"$1"'"}}'
+    sleep 0.05
+    if [ "${FAKE_CORE_RESET_OUTCOME:-done}" = "failed" ]; then
+      write '{"jsonrpc":"2.0","method":"job.failed","params":{"job_id":14,"code":1019,"message":"resetting prefix '"$1"' failed; `applejack prefix restore '"$1"' '"${FAKE_CORE_RESET_SNAPSHOT:-20261103T140000Z}"'` brings it back: wineboot exited 1"}}'
+    else
+      write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":14,"phase":"reset","done_bytes":null,"total_bytes":null,"message":"safety snapshot '"${FAKE_CORE_RESET_SNAPSHOT:-20261103T140000Z}"'"}}'
+      sleep 0.05
+      write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":14}}'
     fi
   ) &
 }
@@ -184,6 +256,8 @@ implemented() {
     app.run)
       response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":41,"job_id":12,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
       run_open=1
+      # The core inserts the row before it answers.
+      printf 'running\n' > "$lockdir/run"
       if [ -n "${FAKE_CORE_RUN_DELAY_MS:-}" ]; then
         seconds=$(awk -v ms="$FAKE_CORE_RUN_DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
         ( sleep "$seconds"; write "$response" ) &
@@ -198,6 +272,11 @@ implemented() {
       else
         emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":13}}'
         cancel_job "${run_open:-0}"
+        if [ "${run_open:-0}" = "1" ]; then
+          printf 'cancelled\n' > "$lockdir/run"
+        elif [ ! -f "$lockdir/run" ]; then
+          : > "$lockdir/cancelled"
+        fi
         run_open=0
       fi
       ;;
@@ -212,23 +291,20 @@ implemented() {
       ;;
     prefix.restore)
       prefix=$(printf '%s' "$3" | sed -nE 's/.*"prefix":"([^"]*)".*/\1/p')
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"prefix":"'"$prefix"'","timestamp":"20261103T130000Z","dir":"/data/prefixes/.snapshots/'"$prefix"'/20261103T130000Z"}}'
+      timestamp=$(printf '%s' "$3" | sed -nE 's/.*"timestamp":"([^"]*)".*/\1/p')
+      # The real core answers InvalidParams (SnapshotNotFound) for a name it never made.
+      case "$timestamp" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-[0-9][0-9][0-9])
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"prefix":"'"$prefix"'","timestamp":"20261103T130000Z","dir":"/data/prefixes/.snapshots/'"$prefix"'/20261103T130000Z"}}'
+          ;;
+        *)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":-32602,"message":"snapshot '"$prefix"'/'"$timestamp"' does not exist"}}'
+          ;;
+      esac
       ;;
     prefix.reset)
       prefix=$(printf '%s' "$3" | sed -nE 's/.*"prefix":"([^"]*)".*/\1/p')
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":14}}'
-      (
-        sleep 0.05
-        write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":14,"phase":"reset","done_bytes":null,"total_bytes":null,"message":"rebuilding prefix '"$prefix"'"}}'
-        sleep 0.05
-        if [ "${FAKE_CORE_RESET_OUTCOME:-done}" = "failed" ]; then
-          write '{"jsonrpc":"2.0","method":"job.failed","params":{"job_id":14,"code":1003,"message":"resetting prefix '"$prefix"' failed; `applejack prefix restore '"$prefix"' 20261103T140000Z` brings it back: wineboot exited 1"}}'
-        else
-          write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":14,"phase":"reset","done_bytes":null,"total_bytes":null,"message":"safety snapshot 20261103T140000Z"}}'
-          sleep 0.05
-          write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":14}}'
-        fi
-      ) &
+      delayed '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":14}}' reset_job "$prefix"
       ;;
     app.install)
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":8}}'
@@ -258,6 +334,19 @@ implemented() {
       if [ "${FAKE_CORE_LOGIN_FAIL:-0}" = "1" ]; then
         emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1021,"message":"the login is over; begin again"}}'
         return 0
+      fi
+      if [ "${FAKE_CORE_LOGIN_REJECT_ONCE:-0}" = "1" ]; then
+        case "$3" in
+          *'"steam_guard_code":'*)
+            if [ "${guard_rejected:-0}" = "0" ]; then
+              guard_rejected=1
+              emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1022,"message":"the Steam Guard code was wrong; the login is still open"}}'
+            else
+              emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"done","account_name":"fake-account"}}}'
+            fi
+            return 0
+            ;;
+        esac
       fi
       case "${FAKE_CORE_LOGIN_POLLS:-0}" in
         0) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"done","account_name":"fake-account"}}}' ;;
@@ -303,7 +392,7 @@ implemented() {
       esac
       ;;
     session.list)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"sessions":[{"id":1,"appid":220,"started_at":"2026-10-30T00:00:00Z","ended_at":null,"engine_id":"rosetta-wine","engine_version":"10.0.1","exit_code":null,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'","state":"running","session_key":"fake-session","prefix":"220","launch_exe":"hl2.exe","note":null,"cancel_requested":false}]}}'
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"sessions":['"$(session_row)"']}}'
       ;;
     runtime.steam.status)
       case "${FAKE_CORE_RUNTIME_STATE:-needs_login}" in
@@ -322,8 +411,7 @@ implemented() {
       esac
       ;;
     runtime.steam.install|runtime.steam.update|runtime.steam.repair|runtime.steam.stop)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":10}}'
-      runtime_job 10
+      delayed '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":10}}' runtime_job 10
       ;;
     *)
       return 1

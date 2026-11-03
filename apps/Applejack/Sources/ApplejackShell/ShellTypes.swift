@@ -444,10 +444,10 @@ public struct SessionEntry: Codable, Equatable, Sendable, Identifiable {
     public var appid: UInt32
     public var startedAt: String
     public var endedAt: String?
-    public var engineId: String?
-    public var engineVersion: String?
+    public var engineId: String
+    public var engineVersion: String
     public var exitCode: Int32?
-    public var logPath: String?
+    public var logPath: String
     public var state: SessionState
     public var sessionKey: String
     public var prefix: String

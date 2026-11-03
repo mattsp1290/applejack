@@ -66,6 +66,7 @@ public final class PrefixSnapshotsViewModel {
                 remember(timestamp)
             }
         }
+        if case .loading = reset { reset = .idle }
         if let timestamp = resetFailureSnapshot {
             remember(timestamp)
         }
@@ -78,9 +79,10 @@ public final class PrefixSnapshotsViewModel {
         return Self.timestamp(in: error.message)
     }
 
-    /// The first snapshot timestamp (`20261031T120000Z`) in `text`.
+    /// The first snapshot name in `text`: `20261031T120000Z`, or
+    /// `20261031T120000Z-001` when the core took two in one second.
     static func timestamp(in text: String) -> String? {
-        guard let range = text.firstRange(of: /[0-9]{8}T[0-9]{6}Z/) else { return nil }
+        guard let range = text.firstRange(of: /[0-9]{8}T[0-9]{6}Z(?:-[0-9]{3})?/) else { return nil }
         return String(text[range])
     }
 

@@ -26,11 +26,12 @@ public struct SteamClientRuntimeView: View {
             HStack {
                 ForEach([SteamClientRuntimeViewModel.Action.install, .update, .repair, .reinstall, .stop], id: \.rawValue) { action in
                     Button(action.rawValue) { Task { await model.perform(action) } }
+                        .disabled(!model.canPerform(action))
                         .accessibilityIdentifier("runtime.\(action.rawValue.lowercased())")
                 }
                 Button("Refresh") { Task { await model.load() } }
+                    .disabled(model.isBusy)
             }
-            .disabled(model.isBusy)
             if let action = model.action {
                 JobProgressView(model.job, title: action.rawValue)
                 ForEach(model.progress) { line in
@@ -58,6 +59,7 @@ public struct PrefixSnapshotsView: View {
             HStack {
                 Button("Snapshot") { Task { await model.takeSnapshot() } }
                 Toggle("Keep user data", isOn: $keepUserData)
+                    .help("Reset takes a safety snapshot and rebuilds the prefix from scratch; on, drive_c/users is copied back from that snapshot. Everything else is new either way.")
                 Button("Reset") { Task { await model.resetPrefix(keepUserData: keepUserData) } }
             }
             .disabled(model.isBusy)

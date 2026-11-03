@@ -57,6 +57,20 @@ public final class SteamClientRuntimeViewModel {
         job.isLoading || (job.value.map { !$0.finished } ?? false)
     }
 
+    /// Whether `action` can do anything against the status read last:
+    /// Install always (it is the resume of an interrupted one), Stop only
+    /// while the client runs, the rest only once a prefix exists.
+    public func canPerform(_ action: Action) -> Bool {
+        guard !isBusy else { return false }
+        switch action {
+        case .install: return true
+        case .stop: return status.value?.running == true
+        case .update, .repair, .reinstall:
+            guard let state = status.value?.state else { return false }
+            return state != .absent
+        }
+    }
+
     public func load() async {
         status = .loading
         if let next = await app.run({ try await $0.call("runtime.steam.status", params: EmptyParams()) as ClientRuntimeStatus }) {
@@ -80,6 +94,7 @@ public final class SteamClientRuntimeViewModel {
         case .reinstall:
             await app.runJob(action.method, params: RuntimeSteamRepairParams(reinstall: true)) { track($0) }
         }
+        if case .loading = job { job = .idle }
         await load()
     }
 
