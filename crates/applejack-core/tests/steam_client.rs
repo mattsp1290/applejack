@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
@@ -56,13 +57,30 @@ const LOGINUSERS: &str = "\"users\"\n{\n\t\"76561190000000000\"\n\t{\n\t\t\"Acco
 struct Fixture {
     dir: TempDir,
     tuning: RunTuning,
+    /// The stub servers [`Fixture::server_at`] started, reaped at the end.
+    servers: RefCell<Vec<std::process::Child>>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Each server left with the stop it served; a test that failed
+        // first may leave one up, and the kill keeps the wait bounded.
+        for mut server in self.servers.take() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+    }
 }
 
 impl Fixture {
     /// An installed engine and a registered Steam-DRM title, no client.
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let fixture = Self { dir, tuning: FAST };
+        let fixture = Self {
+            dir,
+            tuning: FAST,
+            servers: RefCell::new(Vec::new()),
+        };
         fs::create_dir_all(fixture.data()).unwrap();
         write_title(&fixture.library(), APP, &["game.exe"]);
         let tree = fixture.dir.path().join("tree");
@@ -220,13 +238,15 @@ impl Fixture {
     /// reported line starts with `at`: a server up before `install` or
     /// `first_run` look would read as a running client. Each `stop` ends
     /// one server, so each stop a test wants exercised needs its own.
-    fn server_at(&self, at: &'static str) -> impl FnMut(&str) {
+    fn server_at(&self, at: &'static str) -> impl FnMut(&str) + '_ {
         let prefix = self.prefix_dir();
         let mut spawned = false;
         move |line: &str| {
             if !spawned && line.starts_with(at) {
                 spawned = true;
-                drop(spawn_stub_server("server", &prefix));
+                self.servers
+                    .borrow_mut()
+                    .push(spawn_stub_server("server", &prefix));
             }
         }
     }
@@ -1599,8 +1619,9 @@ fn a_file_check_that_lays_no_helper_times_out_naming_reinstall_and_reinstall_rec
     let message = error.to_string();
     assert!(
         message.contains(&format!(
-            "{cef} still has no steamwebhelper.exe: the orphan shim was removed and the \
-             client's file check did not lay the helper down within 3 seconds"
+            "{cef} still has no steamwebhelper.exe: the directory held no web helper (an \
+             orphan shim was removed, or none was there) and the client's file check did not \
+             lay one down within 3 seconds"
         )),
         "{message}"
     );
@@ -1690,6 +1711,172 @@ fn a_file_check_that_lays_no_helper_times_out_naming_reinstall_and_reinstall_rec
         fixture.real_helper().as_deref(),
         Some(&b"REAL-HELPER-1"[..])
     );
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::NeedsLogin
+    );
+    assert!(fixture.client_up());
+    fixture.stop_client();
+}
+
+/// `repair --reinstall`, the way out `NoWebHelper` names, starts the
+/// client's self-update with no manifest; when that does not reach the
+/// window within the timeout (the stub's `no-self-update` knob: the
+/// self-update lays nothing), the error is the plain `updating` timeout,
+/// not the file-check one (nothing was removed, nothing checked, and
+/// `repair --reinstall` again would restart the whole download), `status`
+/// reads `updating`, and `install` resumes the self-update to the window.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the reinstall and the install that resumes it, in the order the user sees them"
+)]
+fn a_reinstall_whose_self_update_times_out_stays_updating_and_install_resumes_it() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_through_product();
+    fs::remove_file(fixture.cef_dir().join(WEBHELPER_EXE)).unwrap();
+    fs::remove_file(fixture.cef_dir().join(WEBHELPER_REAL)).unwrap();
+    fs::write(fixture.prefix_dir().join("no-file-check"), "").unwrap();
+    fs::write(fixture.prefix_dir().join("no-self-update"), "").unwrap();
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::Broken
+    );
+    fixture.tuning = SHORT_WINDOW;
+    fixture.clear_client_starts();
+    let cef = fixture.cef_dir().display().to_string();
+    let (outcome, lines) = fixture.reinstall_hooked(
+        &mut fixture.server_at("start: starting steam.exe for its self-update, without"),
+    );
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Updating,
+                ..
+            }
+        ),
+        "the self-update's timeout is not the file check's: {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("the client did not reach the login window within 3 seconds"),
+        "{message}"
+    );
+    assert!(
+        message.contains("wait for the client's self-update"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("still has no steamwebhelper.exe") && !message.contains("removed"),
+        "{message}"
+    );
+    assert!(!message.contains("repair --reinstall"), "{message}");
+    assert_in_order(
+        &lines,
+        &[
+            "repair: removing ",
+            "bootstrap: running SteamSetup.exe /S",
+            &format!("shim: {cef}: no steamwebhelper.exe; the client's self-update lays it down"),
+            "start: starting steam.exe for its self-update, without -noverifyfiles: a web \
+             helper is missing and the client's self-update lays it down",
+            "stop: stopping the Steam client",
+        ],
+    );
+    assert_eq!(fixture.client_starts().len(), 1);
+    assert!(!fixture.steam_dir().join("package").exists());
+    wait_gone("the client", || fixture.client_up());
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Updating, "{detail}");
+    assert_eq!(detail, "the client has not finished its first self-update");
+
+    fs::remove_file(fixture.prefix_dir().join("no-self-update")).unwrap();
+    fixture.clear_client_starts();
+    let (state, lines) = fixture.install_hooked(
+        "VALVE-SIGNED",
+        &mut fixture.server_at("client: the self-update replaced"),
+    );
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert_in_order(
+        &lines,
+        &[
+            &format!("shim: {cef}: no steamwebhelper.exe; the client's self-update lays it down"),
+            "start: starting steam.exe for its self-update, without -noverifyfiles: a web \
+             helper is missing and the client's self-update lays it down",
+            "client: window: ",
+            "client: the self-update replaced the web helper; restarting the client with the \
+             shim in front of it",
+            "stop: stopping the Steam client",
+            &format!(
+                "shim: {cef}: stashed the web helper as steamwebhelper_real.exe and put the shim \
+                 in front of it"
+            ),
+            "start: starting steam.exe for its self-update",
+            "client: window: ",
+            "needs_login: ",
+        ],
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("bootstrap:")),
+        "{lines:?}"
+    );
+    assert_eq!(fixture.helper(), fixture.shim());
+    assert_eq!(
+        fixture.real_helper().as_deref(),
+        Some(&b"REAL-HELPER-1"[..])
+    );
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::NeedsLogin
+    );
+    assert!(fixture.client_up());
+    fixture.stop_client();
+}
+
+/// A `cef.win*` directory with no entries beside the one that holds the
+/// helper is a leftover, not a client without its helper: `status` does not
+/// read it as `broken`, and `install` skips it (saying so), starts the
+/// client with `-noverifyfiles`, and reaches the window.
+#[test]
+fn an_empty_cef_directory_beside_the_helper_is_skipped_by_status_and_install() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_through_product();
+    let empty = fixture.steam_dir().join("bin/cef/cef.win10x64");
+    fs::create_dir(&empty).unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::NeedsLogin, "{detail}");
+    fixture.clear_client_starts();
+    let (state, lines) = fixture.install_hooked("VALVE-SIGNED", &mut |_| {});
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert_in_order(
+        &lines,
+        &[
+            &format!(
+                "shim: {}: an empty directory beside one that holds the web helper; skipped",
+                empty.display()
+            ),
+            &format!(
+                "shim: {}: the shim is in front of the web helper",
+                fixture.cef_dir().display()
+            ),
+            "start: starting steam.exe for its self-update",
+            "needs_login: ",
+        ],
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("without -noverifyfiles")),
+        "{lines:?}"
+    );
+    let starts = fixture.client_starts();
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert!(starts[0].ends_with("-noverifyfiles"), "{starts:?}");
+    assert!(empty.is_dir());
     assert_eq!(
         fixture.core().client_runtime_state().unwrap().0,
         ClientRuntimeState::NeedsLogin

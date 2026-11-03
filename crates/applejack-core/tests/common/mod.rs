@@ -38,9 +38,10 @@ const BUNDLE_FILES: &[&str] = &[
 /// only `steam.exe` under `drive_c/Program Files (x86)/Steam`; the first
 /// `steam.exe` start is the self-update, which writes the client manifest
 /// and the CEF tree (`bin/cef/cef.win7x64/steamwebhelper.exe` =
-/// `REAL-HELPER-1`); a later start lays a missing helper down only when its
-/// file check runs (no `-noverifyfiles`) and `$WINEPREFIX/no-file-check`
-/// is absent (under it the check lays nothing down, the live shape the
+/// `REAL-HELPER-1`) unless `$WINEPREFIX/no-self-update` is there (a
+/// self-update that never gets that far); a later start lays a missing
+/// helper down only when its file check runs (no `-noverifyfiles`) and
+/// `$WINEPREFIX/no-file-check` is absent (under it the check lays nothing down, the live shape the
 /// recovery has not been seen to rule out), and `$WINEPREFIX/self-update`
 /// makes it write `REAL-HELPER-2` over the helper once, as a client update
 /// does. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`
@@ -152,9 +153,11 @@ if [ "$name" = steam.exe ]; then
   fi
   cef="$steam/bin/cef/cef.win7x64"
   if [ ! -f "$steam/package/steam_client_win32.manifest" ]; then
-    mkdir -p "$steam/package" "$cef"
-    printf '"steam_client_win32"\n{\n\t"version"\t\t"1761720601"\n}\n' > "$steam/package/steam_client_win32.manifest"
-    [ -f "$cef/steamwebhelper.exe" ] || printf 'REAL-HELPER-1' > "$cef/steamwebhelper.exe"
+    if [ ! -e "$WINEPREFIX/no-self-update" ]; then
+      mkdir -p "$steam/package" "$cef"
+      printf '"steam_client_win32"\n{\n\t"version"\t\t"1761720601"\n}\n' > "$steam/package/steam_client_win32.manifest"
+      [ -f "$cef/steamwebhelper.exe" ] || printf 'REAL-HELPER-1' > "$cef/steamwebhelper.exe"
+    fi
   elif [ ! -f "$cef/steamwebhelper.exe" ] && [ ! -e "$WINEPREFIX/no-file-check" ]; then
     case " $* " in
       *" -noverifyfiles "*) ;;
