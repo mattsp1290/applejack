@@ -366,11 +366,15 @@ type, whose `oslist` allows Windows, whose `betakey` is empty or names the
 branch, and whose `ownsdlc` is owned; `osarch` matching the planned depots, unless
 that leaves nothing; then `default` over untyped over `option1` and its like.
 The entries that remain must agree on executable and arguments. If they do not,
-or if the app has a `default` entry that allows Windows and these filters took
-it, so that what is left was only ever offered beside it, the install refuses
-with `LaunchExeAmbiguous` before a byte arrives and lists them;
+or if a Windows entry of a better kind (`default` over untyped over `option1`
+and its like) was taken by the branch, DLC, or architecture filter, so that
+what is left was only ever offered beside it, the install refuses with
+`LaunchExeAmbiguous` before a byte arrives and lists them. An `option1` or
+other typed option that the branch or DLC filter took counts the same way
+for a lone option left, since options are offered beside each other; the
+option for the other architecture does not, being the same offering.
 `applejack config <appid> set launch_exe_override <file>` is the way out, with
-any arguments of the entry in `launch_args_override`. A `default` for another
+any arguments of the entry in `launch_args_override`. An entry for another
 OS takes nothing away: a Windows client was never offered it, so a lone Windows
 entry beside it stands. The rule errs towards refusing.
 A title with an override, an exe already recorded, or a client launch
