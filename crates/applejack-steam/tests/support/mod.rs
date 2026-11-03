@@ -26,6 +26,9 @@ pub enum Fault {
     Fail(io::ErrorKind),
     RateLimited,
     Slow(Duration),
+    /// Held until the gate opens or its sender goes; only a stop ends it
+    /// sooner.
+    Until(tokio::sync::watch::Receiver<bool>),
 }
 
 #[derive(Default)]
@@ -62,6 +65,7 @@ impl ChunkFetcher for FakeChunks {
         self.fetched.lock().unwrap().push(chunk_id.clone());
         let data = self.stored.lock().unwrap().get(chunk_id).cloned().unwrap();
         let mut delay = None;
+        let mut hold = None;
         let result = match self.faults.lock().unwrap().get(chunk_id) {
             None => Ok(data),
             Some(Fault::Corrupt) => {
@@ -79,10 +83,17 @@ impl ChunkFetcher for FakeChunks {
                 delay = Some(*duration);
                 Ok(data)
             }
+            Some(Fault::Until(gate)) => {
+                hold = Some(gate.clone());
+                Ok(data)
+            }
         };
         async move {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
+            }
+            if let Some(mut gate) = hold {
+                let _ = gate.wait_for(|open| *open).await;
             }
             result
         }

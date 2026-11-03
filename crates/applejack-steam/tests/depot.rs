@@ -2184,7 +2184,12 @@ async fn a_stopped_run_cannot_reach_the_file_of_a_later_run() {
     let chunks = &bench.session.chunks;
     let old = file(chunks, "big.bin", &[b"V1 V1 V1 V1 "]);
     let slow = chunk_of(&old, 0);
-    chunks.fault(&slow, Fault::Slow(Duration::from_secs(60)));
+    // Held, not slowed: only the stop can end the fetch, and the gate opens
+    // once the later run is done, when a task that outlived the stop would
+    // write V1 into that run's file. A timer would wake it outside the
+    // check.
+    let (open, gate) = tokio::sync::watch::channel(false);
+    chunks.fault(&slow, Fault::Until(gate));
     bench.session.add_manifest(DEPOT, manifest(V1, vec![old]));
     let predicate = || chunks.fetched.lock().unwrap().contains(&slow);
     let result = bench.installer(&predicate).install(&plan(V1, 11)).await;
@@ -2194,7 +2199,8 @@ async fn a_stopped_run_cannot_reach_the_file_of_a_later_run() {
     let new = file(chunks, "big.bin", &[b"V2 V2 V2 V2 "]);
     bench.session.add_manifest(DEPOT, manifest(V2, vec![new]));
     bench.install(&plan(V2, 12)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    open.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
         fs::read(bench.game().join("big.bin")).unwrap(),
