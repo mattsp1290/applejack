@@ -39,8 +39,9 @@ enum Action {
     },
     /// Snapshot the prefix, then start the client so it updates itself
     Update,
-    /// Repair a broken client: restore the newest snapshot of the prefix, or
-    /// only clear a dead install's marker when the client's files are intact
+    /// Repair a broken client: clear a dead install's marker, and unless the
+    /// client is intact after that, restore the newest usable snapshot of the
+    /// prefix (one whose record opens and that holds steam.exe)
     Repair {
         /// Remove the client's package directory and rerun the bootstrapper
         #[arg(long)]

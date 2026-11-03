@@ -138,10 +138,11 @@ impl ClientRuntimeState {
 
 impl ClientRuntimeState {
     /// The tail of the `ClientRuntimeBroken` message: what gets the runtime
-    /// out of this state. `repair` is right for `broken` only; it refuses
-    /// any other state, since a restore would roll back a client worth
-    /// keeping, and on a `broken` client whose files are intact it only
-    /// clears the marker of a dead install.
+    /// out of this state. A `broken` detail carries its own remedy (see
+    /// `BrokenReason`), since no one command fits every sub-state: `repair`
+    /// restores a snapshot only when a usable one exists, and refuses any
+    /// state but `broken`, where a restore would roll back a client worth
+    /// keeping.
     #[must_use]
     pub const fn advice(self) -> &'static str {
         match self {
@@ -150,11 +151,83 @@ impl ClientRuntimeState {
                 "; wait for the client's self-update to finish, or run `applejack runtime steam \
                  install` if the client was stopped"
             }
-            Self::Broken => {
-                ", and `applejack runtime steam repair` restores the newest snapshot, or only \
-                 clears the marker of a dead install when the client's files are intact"
+            Self::Absent | Self::NeedsLogin | Self::Ready | Self::Broken => "",
+        }
+    }
+}
+
+/// Why the runtime is `broken`, with the way out of that sub-state. Every
+/// `broken` detail the code produces is one of these, so the composed
+/// message never promises a restore that `repair` cannot make.
+#[derive(Debug)]
+pub(crate) enum BrokenReason {
+    /// The marker of an install that died, without a lock holder.
+    DeadInstall,
+    /// `applejack/prefix.toml` does not read or parse; the engine's error.
+    RecordDoesNotOpen(String),
+    /// A `Steam/` directory without `steam.exe`.
+    NoSteamExe(PathBuf),
+    /// `SteamSetup.exe` ran past [`FIRST_RUN_TIMEOUT`]; its log.
+    BootstrapperTimedOut(PathBuf),
+    /// `SteamSetup.exe` failed; its exit status and log.
+    BootstrapperExited(String, PathBuf),
+    /// `SteamSetup.exe` succeeded and left no `steam.exe` at the path.
+    BootstrapperLeftNoExe(PathBuf),
+    /// The client exited before its window came up; its bootstrap log.
+    ClientExitedEarly(PathBuf),
+    /// `repair` found no snapshot at all.
+    NoSnapshot,
+    /// `repair` found snapshots, none with an opening record and `steam.exe`.
+    NoUsableSnapshot(usize),
+    /// `repair` restored the snapshot and the runtime still reads `broken`.
+    StillBroken { timestamp: String, detail: String },
+}
+
+impl BrokenReason {
+    pub(crate) fn detail(&self) -> String {
+        const REPAIR_RESTORES: &str =
+            "`applejack runtime steam repair` restores the newest usable snapshot";
+        const REINSTALL_RERUNS: &str =
+            "`applejack runtime steam repair --reinstall` reruns the bootstrapper";
+        match self {
+            Self::DeadInstall => {
+                "an install stopped before it finished; run `applejack runtime steam install` again"
+                    .to_owned()
             }
-            Self::Absent | Self::NeedsLogin | Self::Ready => "",
+            Self::RecordDoesNotOpen(error) => format!("{error}; {REPAIR_RESTORES}"),
+            Self::NoSteamExe(dir) => {
+                format!("{} has no steam.exe; {REPAIR_RESTORES}", dir.display())
+            }
+            Self::BootstrapperTimedOut(log) => format!(
+                "SteamSetup.exe ran past {} seconds; log {}; {REINSTALL_RERUNS}",
+                FIRST_RUN_TIMEOUT.as_secs(),
+                log.display()
+            ),
+            Self::BootstrapperExited(status, log) => format!(
+                "SteamSetup.exe exited {status}; log {}; {REINSTALL_RERUNS}",
+                log.display()
+            ),
+            Self::BootstrapperLeftNoExe(exe) => format!(
+                "the bootstrapper left no {}; {REINSTALL_RERUNS}",
+                exe.display()
+            ),
+            Self::ClientExitedEarly(log) => format!(
+                "the client exited before its window came up; see {} and the session log; \
+                 `applejack runtime steam install` starts it again",
+                log.display()
+            ),
+            Self::NoSnapshot => {
+                format!("no snapshot of {STEAM_CLIENT_PREFIX} exists; {REINSTALL_RERUNS}")
+            }
+            Self::NoUsableSnapshot(listed) => format!(
+                "no usable snapshot of {STEAM_CLIENT_PREFIX} exists ({listed} listed, none with a \
+                 prefix record that opens and a steam.exe); {REINSTALL_RERUNS}"
+            ),
+            Self::StillBroken { timestamp, detail } => format!(
+                "restoring {timestamp} left the runtime broken ({detail}); `applejack prefix \
+                 restore {STEAM_CLIENT_PREFIX} <timestamp>` picks another snapshot, and \
+                 {REINSTALL_RERUNS}"
+            ),
         }
     }
 }
@@ -819,19 +892,21 @@ impl Core {
             } else {
                 (
                     ClientRuntimeState::Broken,
-                    "an install stopped before it finished; run `applejack runtime steam install` again"
-                        .to_owned(),
+                    BrokenReason::DeadInstall.detail(),
                 )
             });
         }
         if let Err(error) = self.engine.open_prefix(dir) {
-            return Ok((ClientRuntimeState::Broken, error.to_string()));
+            return Ok((
+                ClientRuntimeState::Broken,
+                BrokenReason::RecordDoesNotOpen(error.to_string()).detail(),
+            ));
         }
         if !paths.steam_exe().is_file() {
             return Ok(if paths.steam_dir().is_dir() {
                 (
                     ClientRuntimeState::Broken,
-                    format!("{} has no steam.exe", paths.steam_dir().display()),
+                    BrokenReason::NoSteamExe(paths.steam_dir()).detail(),
                 )
             } else {
                 (
@@ -1119,11 +1194,7 @@ impl PlannedClientOp {
                 let _ = session.cancel();
                 return Err(CoreError::ClientRuntimeBroken {
                     state: ClientRuntimeState::Broken,
-                    detail: format!(
-                        "SteamSetup.exe ran past {} seconds; log {}",
-                        FIRST_RUN_TIMEOUT.as_secs(),
-                        session.log_path.display()
-                    ),
+                    detail: BrokenReason::BootstrapperTimedOut(session.log_path.clone()).detail(),
                 });
             }
             std::thread::sleep(CLIENT_POLL);
@@ -1131,20 +1202,18 @@ impl PlannedClientOp {
         if !status.success() {
             return Err(CoreError::ClientRuntimeBroken {
                 state: ClientRuntimeState::Broken,
-                detail: format!(
-                    "SteamSetup.exe exited {status}; log {}",
-                    session.log_path.display()
-                ),
+                detail: BrokenReason::BootstrapperExited(
+                    status.to_string(),
+                    session.log_path.clone(),
+                )
+                .detail(),
             });
         }
         Core::settle(&prefix.dir)?;
         if !self.paths.steam_exe().is_file() {
             return Err(CoreError::ClientRuntimeBroken {
                 state: ClientRuntimeState::Broken,
-                detail: format!(
-                    "the bootstrapper left no {}",
-                    self.paths.steam_exe().display()
-                ),
+                detail: BrokenReason::BootstrapperLeftNoExe(self.paths.steam_exe()).detail(),
             });
         }
         Ok(())
@@ -1253,13 +1322,10 @@ impl PlannedClientOp {
             if gone >= SETTLED_LOOKS {
                 return Err(CoreError::ClientRuntimeBroken {
                     state: ClientRuntimeState::Broken,
-                    detail: format!(
-                        "the client exited before its window came up; see {} and the session log",
-                        self.paths
-                            .steam_dir()
-                            .join("logs/bootstrap_log.txt")
-                            .display()
-                    ),
+                    detail: BrokenReason::ClientExitedEarly(
+                        self.paths.steam_dir().join("logs/bootstrap_log.txt"),
+                    )
+                    .detail(),
                 });
             }
             if Instant::now() >= deadline {
@@ -1305,42 +1371,47 @@ impl PlannedClientOp {
         self.first_run(&prefix, report)
     }
 
-    /// Repairs a `broken` runtime and refuses any other state: the restore
-    /// below discards what it replaces, so a client worth keeping (its
-    /// sign-in, its `userdata/`) must go through `prefix restore`, which
-    /// keeps a safety copy. A dead install's marker over an intact client
-    /// is cleared without restoring anything.
+    /// Repairs a `broken` runtime and refuses any other state, since a
+    /// client worth keeping (its sign-in, its `userdata/`) must go through
+    /// `prefix restore`, which keeps a safety copy. A dead install's marker
+    /// is cleared first; with the client intact after that, nothing is
+    /// restored. Otherwise the newest usable snapshot is restored: one whose
+    /// prefix record opens and which holds `steam.exe`. Each newer snapshot
+    /// is reported as skipped with its reason, and with no usable one the
+    /// op refuses with `ClientRuntimeBroken`. The safety copy the restore
+    /// takes of the state repaired away is discarded when that state had no
+    /// `steam.exe` (nothing of a client to keep), and kept as a regular
+    /// snapshot when it had one (a prefix record that does not open may sit
+    /// over a sign-in): the report names it for `prefix restore`, and
+    /// `repair` never picks it, since its record does not open. The op
+    /// succeeds only when the runtime no longer reads `broken`.
     fn repair(&mut self, report: &mut dyn FnMut(&str, String)) -> Result<(), CoreError> {
         let (state, detail) = self.core.runtime_state(true)?;
         if state != ClientRuntimeState::Broken {
-            return Err(CoreError::ClientRuntimeBroken {
-                state,
-                detail: format!(
-                    "nothing to repair ({detail}); `applejack prefix restore {STEAM_CLIENT_PREFIX} \
-                     <timestamp>` restores a chosen snapshot and keeps a safety copy of the \
-                     current state"
-                ),
-            });
+            return Err(nothing_to_repair(state, &detail));
         }
         let had_steam_exe = self.paths.steam_exe().is_file();
         let marker = self.paths.install_marker();
         if had_steam_exe && marker.exists() {
-            fs::remove_file(&marker).map_err(|error| CoreError::io(marker, error))?;
+            fs::remove_file(&marker).map_err(|error| CoreError::io(&marker, error))?;
+            let (state, detail) = self.core.runtime_state(true)?;
+            if state != ClientRuntimeState::Broken {
+                report(
+                    "repair",
+                    "cleared the marker of an install that died; the client's files are intact"
+                        .to_owned(),
+                );
+                return Ok(());
+            }
             report(
                 "repair",
-                "cleared the marker of an install that died; the client's files are intact"
-                    .to_owned(),
-            );
-            return Ok(());
-        }
-        let Some(newest) = self.core.prefix_snapshots(STEAM_CLIENT_PREFIX)?.pop() else {
-            return Err(CoreError::ClientRuntimeBroken {
-                state: ClientRuntimeState::Broken,
-                detail: format!(
-                    "no snapshot of {STEAM_CLIENT_PREFIX} exists; `applejack runtime steam repair --reinstall` reruns the bootstrapper"
+                format!(
+                    "cleared the marker of an install that died; the runtime is still broken: \
+                     {detail}"
                 ),
-            });
-        };
+            );
+        }
+        let newest = self.usable_snapshot(report)?;
         self.stop(report)?;
         let had_prefix = self.paths.prefix_dir.is_dir();
         if had_prefix {
@@ -1359,24 +1430,99 @@ impl PlannedClientOp {
             STEAM_CLIENT_PREFIX,
             &newest.timestamp,
         )?;
-        // The safety copy is the state just repaired away; kept, it would be
-        // the newest snapshot and the next `repair` would put it back. With
-        // no prefix to copy, `restore` returns the source, which stays. A
-        // state that still had `steam.exe` (a prefix record that does not
-        // open) may hold a sign-in, so its copy stays too.
-        if had_prefix && !had_steam_exe && safety.timestamp != newest.timestamp {
-            report(
-                "repair",
-                format!(
-                    "discarding the safety snapshot {} of the state repaired away",
-                    safety.timestamp
-                ),
-            );
-            fs::remove_dir_all(&safety.dir).map_err(|error| CoreError::io(&safety.dir, error))?;
+        // With no prefix to copy, `restore` returns the source, which stays.
+        if had_prefix && safety.timestamp != newest.timestamp {
+            if had_steam_exe {
+                report(
+                    "repair",
+                    format!(
+                        "keeping the safety snapshot {0} of the state repaired away; `applejack \
+                         prefix restore {STEAM_CLIENT_PREFIX} {0}` brings it back",
+                        safety.timestamp
+                    ),
+                );
+            } else {
+                report(
+                    "repair",
+                    format!(
+                        "discarding the safety snapshot {} of the state repaired away",
+                        safety.timestamp
+                    ),
+                );
+                fs::remove_dir_all(&safety.dir)
+                    .map_err(|error| CoreError::io(&safety.dir, error))?;
+            }
         }
         let _ = fs::remove_file(self.paths.install_marker());
+        let (state, detail) = self.core.runtime_state(true)?;
+        if state == ClientRuntimeState::Broken {
+            return Err(CoreError::ClientRuntimeBroken {
+                state,
+                detail: BrokenReason::StillBroken {
+                    timestamp: newest.timestamp,
+                    detail,
+                }
+                .detail(),
+            });
+        }
         Ok(())
     }
+
+    /// The newest snapshot `repair` can restore, after reporting each newer
+    /// one it skips; `ClientRuntimeBroken` when none qualifies.
+    fn usable_snapshot(
+        &self,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<SnapshotResult, CoreError> {
+        let snapshots = self.core.prefix_snapshots(STEAM_CLIENT_PREFIX)?;
+        for snapshot in snapshots.iter().rev() {
+            match self.unusable_snapshot_reason(&snapshot.dir) {
+                None => return Ok(snapshot.clone()),
+                Some(why) => report(
+                    "repair",
+                    format!("skipping snapshot {}: {why}", snapshot.timestamp),
+                ),
+            }
+        }
+        let reason = if snapshots.is_empty() {
+            BrokenReason::NoSnapshot
+        } else {
+            BrokenReason::NoUsableSnapshot(snapshots.len())
+        };
+        Err(CoreError::ClientRuntimeBroken {
+            state: ClientRuntimeState::Broken,
+            detail: reason.detail(),
+        })
+    }
+
+    /// Why `repair` cannot restore the snapshot at `dir`, or `None` when it
+    /// can: its prefix record opens and it holds `steam.exe`.
+    fn unusable_snapshot_reason(&self, dir: &Path) -> Option<String> {
+        if let Err(error) = self.core.engine.open_prefix(dir) {
+            return Some(format!("its prefix record does not open: {error}"));
+        }
+        if !ClientPaths::new(dir).steam_exe().is_file() {
+            return Some("it has no steam.exe".to_owned());
+        }
+        None
+    }
+}
+
+/// `repair`'s refusal of a runtime that is not `broken`: the way out
+/// depends on the state, and `prefix restore` fits only a client that is
+/// there to copy.
+fn nothing_to_repair(state: ClientRuntimeState, detail: &str) -> CoreError {
+    let detail = match state {
+        ClientRuntimeState::Absent => format!(
+            "nothing to repair ({detail}); `applejack runtime steam install` installs the client"
+        ),
+        ClientRuntimeState::Updating => format!("nothing to repair ({detail})"),
+        _ => format!(
+            "nothing to repair ({detail}); `applejack prefix restore {STEAM_CLIENT_PREFIX} \
+             <timestamp>` restores a chosen snapshot and keeps a safety copy of the current state"
+        ),
+    };
+    CoreError::ClientRuntimeBroken { state, detail }
 }
 
 /// Records the client build id from its manifest in `meta`, after a
@@ -1473,7 +1619,51 @@ mod tests {
     }
 
     #[test]
-    fn the_broken_advice_names_repair_for_a_broken_runtime_only() {
+    fn every_broken_message_names_its_own_way_out_and_no_restore_without_a_snapshot() {
+        let log = PathBuf::from("/x/log.txt");
+        let reasons = [
+            BrokenReason::DeadInstall,
+            BrokenReason::RecordDoesNotOpen("`/x` is not a usable prefix: no record".to_owned()),
+            BrokenReason::NoSteamExe(PathBuf::from("/x/Steam")),
+            BrokenReason::BootstrapperTimedOut(log.clone()),
+            BrokenReason::BootstrapperExited("exit status: 1".to_owned(), log.clone()),
+            BrokenReason::BootstrapperLeftNoExe(PathBuf::from("/x/Steam/steam.exe")),
+            BrokenReason::ClientExitedEarly(log),
+            BrokenReason::NoSnapshot,
+            BrokenReason::NoUsableSnapshot(2),
+            BrokenReason::StillBroken {
+                timestamp: "20260101T000000Z".to_owned(),
+                detail: "d".to_owned(),
+            },
+        ];
+        for reason in reasons {
+            let text = CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Broken,
+                detail: reason.detail(),
+            }
+            .to_string();
+            assert!(
+                text.contains("`applejack runtime steam status` shows it"),
+                "{text}"
+            );
+            assert!(text.contains("`applejack "), "no command in {text}");
+            let snapshot_may_be_missing = !matches!(
+                reason,
+                BrokenReason::RecordDoesNotOpen(_)
+                    | BrokenReason::NoSteamExe(_)
+                    | BrokenReason::StillBroken { .. }
+            );
+            if snapshot_may_be_missing {
+                assert!(!text.contains("restore"), "{text}");
+            } else {
+                assert!(text.contains("restore"), "{text}");
+            }
+            let reinstall = text.contains("repair --reinstall");
+            assert!(
+                reinstall || text.contains("runtime steam install") || text.contains("restores"),
+                "{text}"
+            );
+        }
         let text = |state| {
             CoreError::ClientRuntimeBroken {
                 state,
@@ -1481,7 +1671,6 @@ mod tests {
             }
             .to_string()
         };
-        assert!(text(ClientRuntimeState::Broken).contains("runtime steam repair"));
         for state in [ClientRuntimeState::Updating, ClientRuntimeState::Installing] {
             let text = text(state);
             assert!(!text.contains("repair"), "{text}");

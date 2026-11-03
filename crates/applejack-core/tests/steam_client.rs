@@ -17,8 +17,8 @@ use applejack_core::rpc::wire::ErrorCode;
 use applejack_core::run::{AppRegistration, PlannedRun};
 use applejack_core::runtime::session::{NOTE_CLIENT, NOTE_LOST, RunTuning};
 use applejack_core::runtime::steam_client::{
-    ClientOp, ClientRuntimeState, META_CLIENT_BUILD, META_CLIENT_SESSION, META_REDOWNLOAD,
-    STEAM_CLIENT_PREFIX, acf_backup_path,
+    ClientOp, ClientRuntimeState, ClientRuntimeStatus, META_CLIENT_BUILD, META_CLIENT_SESSION,
+    META_REDOWNLOAD, STEAM_CLIENT_PREFIX, acf_backup_path,
 };
 use applejack_core::{Core, CoreError};
 use applejack_engine::rosetta_wine::process::find_session;
@@ -919,6 +919,160 @@ fn repair_over_a_dead_installs_marker_clears_it_and_restores_nothing() {
         "the one snapshot is untouched"
     );
     fixture.assert_lock_free();
+}
+
+fn repair_with_lines(fixture: &Fixture) -> (Result<ClientRuntimeStatus, CoreError>, Vec<String>) {
+    let mut lines = Vec::new();
+    let outcome = fixture
+        .core()
+        .plan_client_op(ClientOp::Repair { reinstall: false })
+        .and_then(|op| op.run(&mut |phase, line| lines.push(format!("{phase}: {line}"))));
+    (outcome, lines)
+}
+
+fn snapshot_stamps(fixture: &Fixture) -> Vec<String> {
+    fixture
+        .core()
+        .prefix_snapshots(STEAM_CLIENT_PREFIX)
+        .unwrap()
+        .into_iter()
+        .map(|snapshot| snapshot.timestamp)
+        .collect()
+}
+
+#[test]
+fn repair_skips_a_snapshot_whose_record_does_not_open_and_keeps_its_safety_copy() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let good = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.sign_in();
+    fixture.stop_client();
+    let record = fixture.prefix_dir().join("applejack/prefix.toml");
+    fs::write(&record, "this is not toml = = =").unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+
+    // The state repaired away had `steam.exe`, so its copy stays, named.
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(
+        status.state,
+        ClientRuntimeState::NeedsLogin,
+        "{}",
+        status.detail
+    );
+    let stamps = snapshot_stamps(&fixture);
+    assert_eq!(stamps.len(), 2, "{stamps:?}");
+    assert_eq!(stamps[0], good.timestamp);
+    let kept = stamps[1].clone();
+    assert!(
+        lines.contains(&format!(
+            "repair: keeping the safety snapshot {kept} of the state repaired away; \
+             `applejack prefix restore steam-client {kept}` brings it back"
+        )),
+        "{lines:?}"
+    );
+    let kept_dir = fixture
+        .data()
+        .join("prefixes/.snapshots")
+        .join(STEAM_CLIENT_PREFIX)
+        .join(&kept);
+    assert!(
+        kept_dir
+            .join("drive_c/Program Files (x86)/Steam/config/loginusers.vdf")
+            .is_file(),
+        "the copy holds the sign-in"
+    );
+
+    // A later break: the kept copy is the newest snapshot, and is not a
+    // client; `repair` must say so and restore the good one.
+    for _ in 0..3 {
+        fs::remove_file(fixture.steam_dir().join("steam.exe")).unwrap();
+        let (outcome, lines) = repair_with_lines(&fixture);
+        let status = outcome.unwrap();
+        assert_ne!(
+            status.state,
+            ClientRuntimeState::Broken,
+            "{}",
+            status.detail
+        );
+        assert_eq!(status.state, ClientRuntimeState::NeedsLogin);
+        assert!(
+            lines.iter().any(|line| line
+                .starts_with(&format!("repair: skipping snapshot {kept}: "))
+                && line.contains("prefix record does not open")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&format!(
+                "repair: restoring steam-client from {}",
+                good.timestamp
+            )),
+            "{lines:?}"
+        );
+        assert!(fixture.steam_dir().join("steam.exe").is_file());
+        assert_eq!(
+            snapshot_stamps(&fixture),
+            [good.timestamp.clone(), kept.clone()],
+            "the no-steam.exe state's copy is discarded, the kept one stays"
+        );
+    }
+    fixture.assert_lock_free();
+}
+
+#[test]
+fn repair_over_a_marker_and_a_record_that_does_not_open_restores_after_the_marker() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let good = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.stop_client();
+    fs::write(
+        fixture.prefix_dir().join("applejack/prefix.toml"),
+        "nope = = =",
+    )
+    .unwrap();
+    let marker = fixture.prefix_dir().join("applejack/client-install.json");
+    fs::write(&marker, "{}").unwrap();
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(
+        status.state,
+        ClientRuntimeState::NeedsLogin,
+        "{}",
+        status.detail
+    );
+    assert!(!marker.exists());
+    assert!(
+        lines.iter().any(|line| line.starts_with(
+            "repair: cleared the marker of an install that died; the runtime is still broken: "
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&format!(
+            "repair: restoring steam-client from {}",
+            good.timestamp
+        )),
+        "{lines:?}"
+    );
+    assert_eq!(
+        status.snapshots, 2,
+        "the copy of the state with steam.exe is kept"
+    );
+    fixture.assert_lock_free();
+}
+
+#[test]
+fn repair_on_an_absent_runtime_points_at_install() {
+    let fixture = Fixture::new();
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    let text = error.to_string();
+    assert!(text.contains("is absent: nothing to repair"), "{text}");
+    assert!(text.contains("`applejack runtime steam install`"), "{text}");
+    assert!(!text.contains("prefix restore"), "{text}");
+    assert!(lines.is_empty(), "{lines:?}");
 }
 
 #[test]

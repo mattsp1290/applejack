@@ -524,7 +524,7 @@ impl ErrorCode {
                 "`runtime.steam.install`: `SteamSetup.exe` failed its Authenticode check or its signer is not Valve Corp. The file is kept and the message names the signer found."
             }
             Self::ClientRuntimeBroken => {
-                "The Steam client runtime is updating, broken, or never reached the login window, or `runtime.steam.repair` found nothing broken. `runtime.steam.status` says which; `runtime.steam.repair` restores the newest snapshot of a broken one, or only clears the marker of a dead install when the client's files are intact, and an updating one is waited for."
+                "The Steam client runtime is updating, broken, or never reached the login window, or `runtime.steam.repair` found nothing broken or no usable snapshot. `runtime.steam.status` says which; `runtime.steam.repair` clears a dead install's marker and, unless the client is intact after that, restores the newest usable snapshot of a broken one (a prefix record that opens and a `steam.exe`); an updating one is waited for."
             }
             Self::ClientRedownloadRefused => {
                 "Assumption A2 failed: the client began re-downloading the title. The client was stopped and the `.acf` restored from its backup; the finding is in `meta`."
