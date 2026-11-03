@@ -82,13 +82,36 @@ struct Scope {
     cdn: bool,
     /// The depot module, where `key` is a secret.
     depot: bool,
+    /// Bindings in this file that hold a secret under a name of their own:
+    /// a decoded Steam message, or the field of a secret newtype.
+    holders: &'static [&'static str],
 }
 
 const GUARD: Scope = Scope {
     guard_code: true,
     cdn: false,
     depot: false,
+    holders: &[],
 };
+
+/// Where a secret sits under a name the lists do not know: the decoded poll
+/// answer and its raw response in live.rs (prost derives `Debug` over the
+/// token fields), the logon message in live/session.rs, the depot key cache
+/// (steamroom's `DepotKey` derives `Debug` over its bytes), and `self.0` of
+/// `Password` and `RefreshToken`.
+fn holders(root: &Path, path: &Path) -> &'static [&'static str] {
+    if path == root.join("src/live.rs") {
+        &["answer", "response"]
+    } else if path == root.join("src/live/session.rs") {
+        &["logon"]
+    } else if path == root.join("src/depot.rs") {
+        &["keys"]
+    } else if path == root.join("src/auth.rs") || path == root.join("src/keychain.rs") {
+        &["self.0"]
+    } else {
+        &[]
+    }
+}
 
 /// Every print call in `text`, parentheses balanced, so a call split across
 /// lines is seen whole. Panics on a call it cannot read, such as a brace form
@@ -179,14 +202,27 @@ fn secret_in(call: &str, scope: Scope) -> Option<&str> {
         let generic = built && GENERIC_NAMES.contains(&word) && !(scope.depot && word == "key");
         (SECRET_NAMES.contains(&word) && !generic)
             || (scope.guard_code && !literal && GUARD_NAMES.contains(&word))
+            || (!literal && scope.holders.contains(&word))
     };
     let separator = |character: char| !character.is_alphanumeric() && character != '_';
+    // A holder such as `self.0` splits into `self` and `0`, so it is sought
+    // whole in the code.
+    let dotted_holder = |piece: &str| {
+        scope
+            .holders
+            .iter()
+            .copied()
+            .find(|holder| holder.contains('.') && piece.contains(holder))
+    };
     pieces(call)
         .into_iter()
         .enumerate()
         .find_map(|(index, piece)| {
             if index % 2 == 0 {
-                piece.split(separator).find(|word| is_secret(word, false))
+                piece
+                    .split(separator)
+                    .find(|word| is_secret(word, false))
+                    .or_else(|| dotted_holder(piece))
             } else {
                 let holes = piece
                     .split('{')
@@ -345,6 +381,62 @@ fn the_print_scan_keeps_common_words_to_where_they_can_be_secrets() {
     assert_eq!(secret_in(r#"format!("{value}")"#, depot), None);
 }
 
+/// A secret under a name of the file's own: the decoded poll answer, the
+/// logon message, the depot key cache, and the field of a secret newtype.
+/// Each counts only in its file, and only in code or a hole, never in a
+/// message.
+#[test]
+fn the_print_scan_sees_the_holders_of_a_file() {
+    let live = Scope {
+        holders: &["answer", "response"],
+        ..Scope::default()
+    };
+    let session = Scope {
+        holders: &["logon"],
+        ..Scope::default()
+    };
+    let depot = Scope {
+        depot: true,
+        holders: &["keys"],
+        ..Scope::default()
+    };
+    let auth = Scope {
+        guard_code: true,
+        holders: &["self.0"],
+        ..Scope::default()
+    };
+    assert_eq!(secret_in(r#"format!("{answer:?}")"#, live), Some("answer"));
+    assert_eq!(secret_in("dbg!(&answer);", live), Some("answer"));
+    assert_eq!(
+        secret_in("tracing::debug!(response = ?response);", live),
+        Some("response")
+    );
+    assert_eq!(
+        secret_in(r#"tracing::debug!(?logon, "sending logon");"#, session),
+        Some("logon")
+    );
+    assert_eq!(
+        secret_in(r#"format!("{:?}", self.keys)"#, depot),
+        Some("keys")
+    );
+    assert_eq!(
+        secret_in(r#"println!("{}", self.0);"#, auth),
+        Some("self.0")
+    );
+    assert_eq!(
+        secret_in(r#"write!(f, "{}", self.0)"#, auth),
+        Some("self.0")
+    );
+    assert_eq!(
+        secret_in(r#"format!("{answer:?}")"#, Scope::default()),
+        None
+    );
+    assert_eq!(secret_in(r#"format!("{logon:?}")"#, live), None);
+    assert_eq!(secret_in(r#"format!("no answer yet")"#, live), None);
+    assert_eq!(secret_in(r#"println!("the answer")"#, live), None);
+    assert_eq!(secret_in(r#"println!("{}", self.1);"#, auth), None);
+}
+
 #[test]
 #[should_panic(expected = "unreadable call")]
 fn the_print_scan_refuses_a_call_it_cannot_read() {
@@ -367,6 +459,9 @@ fn no_print_or_debug_format_touches_a_token() {
     rust_files(&root.join("src"), &mut files);
     rust_files(&root.join("../applejack-core/src/rpc"), &mut files);
     rust_files(&root.join("../applejack/src/cmd"), &mut files);
+    // rpc/mod.rs is scanned but not a guard file: its guard code goes by
+    // `steam_guard_code` alone, and it prints JSON-RPC `error.code.name()`
+    // and `.code()`, which `code` as a guard name would flag.
     let guard_files = [
         root.join("src/auth.rs"),
         root.join("src/live.rs"),
@@ -378,6 +473,7 @@ fn no_print_or_debug_format_touches_a_token() {
             guard_code: guard_files.contains(&path),
             cdn: path == root.join("src/live/cdn.rs"),
             depot: path == root.join("src/depot.rs"),
+            holders: holders(&root, &path),
         };
         let text = fs::read_to_string(&path).unwrap();
         let code: Vec<&str> = text
