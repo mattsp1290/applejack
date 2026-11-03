@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use applejack_engine::rosetta_wine::launch::{check_dxmt_copies, new_session_id};
+use applejack_engine::rosetta_wine::launch::{
+    check_dxmt_copies, new_session_id, parse_reg_dword, reg_query, reg_set_dword,
+};
 use applejack_engine::rosetta_wine::process::{find_session, wineserver_running};
 use applejack_engine::rosetta_wine::snapshot::{self, PrefixLock};
 use applejack_engine::rosetta_wine::{CpuidProbe, utc_now};
@@ -29,13 +31,13 @@ use crate::error::CoreError;
 use crate::prefixes::pick_sync;
 use crate::runtime::direct::{DirectLaunch, resolve_launch, takes_direct_path};
 use crate::runtime::session::{
-    NOTE_CLIENT, NOTE_EARLY, NOTE_LINGERED, OwnedProbe, WatchEnd, WatchEvent, WatchStyle, log_line,
-    watch,
+    NOTE_CLIENT, NOTE_EARLY, NOTE_LINGERED, OwnedProbe, RUNNING_APPID_KEY, RUNNING_APPID_VALUE,
+    WatchEnd, WatchEvent, WatchStyle, log_line, watch,
 };
 use crate::runtime::steam_client::RedownloadWatch;
 use crate::runtime::steam_client::{
-    ClientPaths, ClientRuntimeState, META_CLIENT_SESSION, STEAM_CLIENT_PREFIX,
-    prepare_client_launch,
+    ClientPaths, ClientRuntimeState, LibraryEdit, META_CLIENT_SESSION, STEAM_CLIENT_PREFIX,
+    prepare_client_launch, record_client_build,
 };
 use crate::state::Core;
 
@@ -196,7 +198,7 @@ impl PlannedRun {
         if self.cancel_requested()? {
             return Ok(None);
         }
-        let redownload = match &self.client {
+        let (redownload, starts_client) = match &self.client {
             Some(client) => {
                 let paths = ClientPaths::new(prefix.dir.clone());
                 let appid = self.session.appid;
@@ -206,18 +208,36 @@ impl PlannedRun {
                         "backing up appmanifest_{appid}.acf and listing its library for the client"
                     ),
                 );
-                let watch =
+                let (watch, edit) =
                     prepare_client_launch(&paths, &self.library, appid, &client.installdir)?;
-                if !self.core.client_is_up()? {
+                let mut up = self.core.client_is_up()?;
+                if up && edit == LibraryEdit::FolderAdded {
+                    // The client reads libraryfolders.vdf at startup; a
+                    // folder added behind its back is not a library it
+                    // knows, and -applaunch would find the title missing.
+                    report(
+                        "prepare",
+                        "restarting the Steam client so it reads the new library folder".to_owned(),
+                    );
+                    self.core.engine.stop_server(
+                        &self.installed,
+                        &prefix.dir,
+                        Path::new(&self.session.log_path),
+                    )?;
+                    Core::settle(&prefix.dir)?;
+                    up = false;
+                }
+                self.reset_stale_marker(&prefix)?;
+                if !up {
                     // This run starts the client, so its key is the one the
                     // client's processes, and the games it starts, carry.
                     self.core
                         .db()?
                         .meta_set(META_CLIENT_SESSION, &self.session.session_key)?;
                 }
-                Some(watch)
+                (Some(watch), !up)
             }
-            None => None,
+            None => (None, false),
         };
         report("starting", self.session.launch_exe.clone());
         let mut session = self
@@ -235,7 +255,58 @@ impl PlannedRun {
                 let _ = log_line(log, &format!("the title may still run: {stop}"));
             }
         }
+        if starts_client {
+            // Plan 05: the build id is recorded after every client start,
+            // and this run was one; the client may have updated itself.
+            let paths = ClientPaths::new(prefix.dir.clone());
+            match record_client_build(&mut self.core, &paths) {
+                Ok(Some(build)) => {
+                    let _ = log_line(&self.session.log_path, &format!("client build {build}"));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = log_line(
+                        &self.session.log_path,
+                        &format!("could not record the client build: {error}"),
+                    );
+                }
+            }
+        }
         watched.map(Some)
+    }
+
+    /// A client stopped while this title ran leaves `RunningAppID` at the
+    /// appid, and the watch would take that for this run's title before
+    /// `-applaunch` has done anything: the marker has to be seen to appear.
+    fn reset_stale_marker(&self, prefix: &Prefix) -> Result<(), CoreError> {
+        let key = &self.session.session_key;
+        let stale = reg_query(
+            &self.installed,
+            prefix,
+            key,
+            RUNNING_APPID_KEY,
+            RUNNING_APPID_VALUE,
+        )
+        .ok()
+        .flatten()
+        .and_then(|data| parse_reg_dword(&data))
+            == Some(self.session.appid);
+        if !stale {
+            return Ok(());
+        }
+        let _ = log_line(
+            &self.session.log_path,
+            "RunningAppID already names this title; resetting it before -applaunch",
+        );
+        reg_set_dword(
+            &self.installed,
+            prefix,
+            key,
+            RUNNING_APPID_KEY,
+            RUNNING_APPID_VALUE,
+            0,
+        )?;
+        Ok(())
     }
 
     fn watch_spawned(
@@ -571,8 +642,8 @@ impl Core {
     /// `steam.exe -applaunch <appid> -silent -noverifyfiles [args]` in the
     /// client prefix. `-silent` keeps the client's window down, which a
     /// signed-in client does not need; `-noverifyfiles` skips the client's
-    /// own check of its files, not the title's. The overlay and Steam Input
-    /// toggles are read and logged, not applied yet (docs/steam-runtime.md).
+    /// own check of its files, not the title's. `game_config.steam_overlay`
+    /// and `steam_input` are not applied, nor read (docs/steam-runtime.md).
     fn client_launch_spec(
         &mut self,
         config: &GameConfig,

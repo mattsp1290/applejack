@@ -1,7 +1,9 @@
 //! The Steam client runtime and the client launch path over the stub bundle:
 //! install with its Authenticode gate, the login state, a session that
 //! starts at the client's marker and ends when it clears while the client
-//! stays up, the A2 refusal, cancel, stop, repair, and a dead owner's row.
+//! stays up, the A2 refusal and the routine patch it is not, cancel, stop,
+//! repair, a dead owner's row, a stale install marker, a stale running
+//! marker, and a library folder added under a running client.
 
 mod common;
 
@@ -12,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use applejack_core::config::{ConfigDb, Drm, NewSession, SessionRow, SessionState};
 use applejack_core::rpc::wire::ErrorCode;
-use applejack_core::run::AppRegistration;
+use applejack_core::run::{AppRegistration, PlannedRun};
 use applejack_core::runtime::session::{NOTE_CLIENT, NOTE_LOST, RunTuning};
 use applejack_core::runtime::steam_client::{
     ClientOp, ClientRuntimeState, META_CLIENT_BUILD, META_CLIENT_SESSION, META_REDOWNLOAD,
@@ -36,6 +38,10 @@ const FAST: RunTuning = RunTuning {
     cancel_wait: Duration::from_secs(10),
     client_start_wait: Duration::from_secs(2),
 };
+
+/// How long a run against the stub may take to end: the longest legitimate
+/// one is a cancel (`cancel_wait`) followed by the drain.
+const RUN_WAIT: Duration = Duration::from_secs(30);
 
 /// A remembered account, as the client writes one after a sign-in.
 const LOGINUSERS: &str = "\"users\"\n{\n\t\"76561190000000000\"\n\t{\n\t\t\"AccountName\"\t\t\"fixture\"\n\t\t\"RememberPassword\"\t\t\"1\"\n\t\t\"MostRecent\"\t\t\"1\"\n\t\t\"AllowAutoLogin\"\t\t\"1\"\n\t}\n}\n";
@@ -145,6 +151,22 @@ impl Fixture {
         fs::write(self.prefix_dir().join("quit"), code.to_string()).unwrap();
     }
 
+    /// Ends the stub client as a stop would, and clears what that leaves so
+    /// the next start is a fresh client.
+    fn stop_client(&self) {
+        fs::write(self.prefix_dir().join("client-quit"), "").unwrap();
+        wait_gone("the client", || self.client_up());
+        let _ = fs::remove_file(self.prefix_dir().join("client-quit"));
+        let _ = fs::remove_file(self.prefix_dir().join("client-up"));
+    }
+
+    fn running_appid(&self) -> String {
+        fs::read_to_string(self.prefix_dir().join("running-appid"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
     fn start(&self) -> Running {
         let plan = self.core().plan_run(APP, false).unwrap();
         let id = plan.session_id();
@@ -179,8 +201,29 @@ struct Running {
 
 impl Running {
     fn finish(self) -> (Result<SessionRow, CoreError>, Vec<String>) {
-        self.thread.join().unwrap()
+        join_bounded(&format!("the run of session {}", self.id), self.thread)
     }
+}
+
+/// Joins a run's thread under [`RUN_WAIT`]. A watch that never ends (a
+/// marker that never clears, a stub that never starts) fails the test
+/// naming the run instead of hanging the harness.
+fn join_bounded<T: Send + 'static>(what: &str, thread: JoinHandle<T>) -> T {
+    let deadline = Instant::now() + RUN_WAIT;
+    while !thread.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {RUN_WAIT:?} waiting for {what} to end"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread.join().unwrap()
+}
+
+/// Runs a plan to its end on a thread of its own, under [`RUN_WAIT`].
+fn run_plan(plan: PlannedRun) -> Result<SessionRow, CoreError> {
+    let what = format!("the run of session {}", plan.session_id());
+    join_bounded(&what, thread::spawn(move || plan.run(&mut |_, _| {})))
 }
 
 fn wait_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
@@ -237,7 +280,7 @@ fn install_refuses_a_bootstrapper_that_is_not_valves_and_keeps_it() {
     let error = fixture.install_with("OTHER-SIGNED").unwrap_err();
     assert_eq!(error.code(), ErrorCode::BootstrapperUnverified, "{error}");
     let text = error.to_string();
-    assert!(text.contains("not Valve Corp"), "{text}");
+    assert!(text.contains("not Valve Corp."), "{text}");
     assert!(text.contains("O=Not Valve"), "names the signer: {text}");
     assert!(
         fixture
@@ -289,6 +332,16 @@ fn install_lays_the_client_down_records_its_build_and_leaves_it_at_the_window() 
             .iter()
             .any(|process| process.exe == "steamwebhelper.exe")
     );
+    let folders =
+        fs::read_to_string(fixture.steam_dir().join("config/libraryfolders.vdf")).unwrap();
+    assert!(
+        folders.contains("\"path\"\t\t\"S:\\\\\""),
+        "the shared library is listed before the client first starts: {folders}"
+    );
+    assert!(
+        folders.contains("C:\\\\Program Files (x86)\\\\Steam"),
+        "after the client's own folder: {folders}"
+    );
     fixture.sign_in();
     assert_eq!(
         fixture.core().client_runtime_state().unwrap().0,
@@ -300,6 +353,73 @@ fn install_lays_the_client_down_records_its_build_and_leaves_it_at_the_window() 
         fixture.install_with("TAMPERED").unwrap(),
         ClientRuntimeState::Ready
     );
+}
+
+/// An install that died after `steam.exe` landed leaves its marker. The
+/// next `install` holds the lock, so the marker is a dead install's: it is
+/// cleared, and the state read under the operation's own lock is never
+/// `installing`.
+#[test]
+fn a_stale_install_marker_is_cleared_by_the_next_install() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let marker = fixture.prefix_dir().join("applejack/client-install.json");
+    fs::write(&marker, "{}").unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken);
+    assert!(detail.contains("runtime steam install"), "{detail}");
+    let error = fixture.core().plan_run(APP, false).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+
+    let mut phases = Vec::new();
+    let status = fixture
+        .core()
+        .plan_client_op(ClientOp::Install)
+        .unwrap()
+        .run_with(
+            &|_: &str, _: &Path, _: &mut dyn FnMut(u64, Option<u64>)| {
+                Err(CoreError::Message(
+                    "the bootstrapper is not fetched again".to_owned(),
+                ))
+            },
+            &mut |phase, message| phases.push(format!("{phase}: {message}")),
+        )
+        .unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin, "{phases:?}");
+    assert!(!marker.exists(), "{phases:?}");
+    assert!(
+        phases
+            .iter()
+            .any(|line| line.contains("clearing the marker")),
+        "{phases:?}"
+    );
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::NeedsLogin
+    );
+    assert!(fixture.client_up());
+}
+
+/// The marker with the lock held elsewhere reads `installing`, and the read
+/// neither takes the lock nor makes anything under `.snapshots`.
+#[test]
+fn a_marker_under_a_live_lock_reads_installing_without_taking_the_lock() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let marker = fixture.prefix_dir().join("applejack/client-install.json");
+    fs::write(&marker, "{}").unwrap();
+    let held = fixture.core().claim_prefix(STEAM_CLIENT_PREFIX).unwrap();
+    let (state, _) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Installing);
+    let status = fixture.core().client_runtime_status().unwrap();
+    assert_eq!(status.state, ClientRuntimeState::Installing);
+    drop(held);
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::Broken
+    );
+    fs::remove_file(&marker).unwrap();
 }
 
 #[test]
@@ -346,12 +466,159 @@ fn a_client_session_runs_from_the_marker_to_its_clearing_and_the_client_stays() 
         "the .acf is as it was"
     );
     fixture.assert_lock_free();
+    assert!(
+        !fixture.prefix_dir().join("reg-add").exists(),
+        "a clear marker is not reset"
+    );
 
     // A second run hands off to the running client under its own key.
     let running = fixture.start();
     fixture.quit_game(0);
     assert_eq!(running.finish().0.unwrap().state, SessionState::Exited);
     assert!(fixture.client_up());
+}
+
+/// A client stopped while the title ran leaves `RunningAppID` at the appid.
+/// The run resets it before `-applaunch`, so a client that then launches
+/// nothing times out instead of a session that runs with no process.
+#[test]
+fn a_stale_running_appid_is_reset_before_the_launch() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.sign_in();
+    fs::write(fixture.prefix_dir().join("running-appid"), APP.to_string()).unwrap();
+    fs::write(fixture.prefix_dir().join("never-start"), "").unwrap();
+    let plan = fixture.core().plan_run(APP, false).unwrap();
+    let id = plan.session_id();
+    let log = plan.log_path().to_owned();
+    let started = Instant::now();
+    let error = run_plan(plan).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientLaunchTimedOut, "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "ended by the start wait, not a cancel"
+    );
+    assert_eq!(fixture.running_appid(), "0", "reset through the loader");
+    assert_eq!(
+        fs::read_to_string(fixture.prefix_dir().join("reg-add"))
+            .unwrap()
+            .trim(),
+        "0"
+    );
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .contains("RunningAppID already names this title"),
+        "the reset is logged"
+    );
+    let row = fixture.db().session(id).unwrap().unwrap();
+    assert_eq!(row.state, SessionState::Failed);
+    fixture.assert_lock_free();
+}
+
+/// A value naming another title says nothing about this one: the launch
+/// exe under the keys is what counts then.
+#[test]
+fn another_titles_marker_falls_through_to_the_exe() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.sign_in();
+    fs::write(fixture.prefix_dir().join("running-appid"), "999").unwrap();
+    fs::write(fixture.prefix_dir().join("no-marker"), "").unwrap();
+    let running = fixture.start();
+    assert_eq!(
+        fixture.running_appid(),
+        "999",
+        "another title's value is left alone"
+    );
+    assert!(!fixture.prefix_dir().join("reg-add").exists());
+    fixture.quit_game(0);
+    let (outcome, phases) = running.finish();
+    assert_eq!(outcome.unwrap().state, SessionState::Exited);
+    assert_eq!(phases, ["prepare", "starting", "running", "exited"]);
+}
+
+/// A title in a library the running client has never seen: the folder is
+/// written through a rename and the client is bounced before `-applaunch`,
+/// so the run's `steam.exe` becomes the client and carries the run's key.
+#[test]
+fn a_library_folder_added_under_a_running_client_restarts_it_first() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.sign_in();
+    let other = fixture.dir.path().join("other-library");
+    write_title(&other, APP, &["game.exe"]);
+    fixture
+        .core()
+        .app_register(&AppRegistration {
+            appid: APP,
+            drm: Some(Drm::Steam),
+            exe: Some("game.exe".to_owned()),
+            library: Some(other.clone()),
+        })
+        .unwrap();
+    let old_key = fixture.client_key();
+    let server = spawn_stub_server("server", &fixture.prefix_dir());
+    let plan = fixture.core().plan_run(APP, false).unwrap();
+    let id = plan.session_id();
+    let thread = thread::spawn(move || {
+        let mut phases = Vec::new();
+        let outcome = plan.run(&mut |phase, message| phases.push(format!("{phase}: {message}")));
+        (outcome, phases)
+    });
+    fixture.wait_for(id, SessionState::Running);
+    let row = fixture.db().session(id).unwrap().unwrap();
+    assert_eq!(
+        fixture.client_key(),
+        row.session_key,
+        "this run started the client"
+    );
+    assert_ne!(old_key, row.session_key);
+    // The stub writes the marker before it becomes the client.
+    wait_until("the client under the new key", || {
+        fixture.client_up().then_some(())
+    });
+    assert!(
+        find_session(&old_key).is_empty(),
+        "nothing of the old client is left"
+    );
+    let folders =
+        fs::read_to_string(fixture.steam_dir().join("config/libraryfolders.vdf")).unwrap();
+    assert!(folders.contains("Z:\\\\"), "{folders}");
+    assert!(
+        !fixture
+            .steam_dir()
+            .join("config/libraryfolders.vdf.applejack")
+            .exists()
+    );
+    fixture.quit_game(0);
+    let (outcome, phases) = join_bounded(&format!("the run of session {id}"), thread);
+    assert_eq!(outcome.unwrap().state, SessionState::Exited);
+    assert!(
+        phases
+            .iter()
+            .any(|line| line.contains("restarting the Steam client")),
+        "{phases:?}"
+    );
+    drop(server);
+}
+
+/// Plan 05 records the build after every client start; a run that starts
+/// the client is one.
+#[test]
+fn a_run_that_starts_the_client_records_its_build() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.sign_in();
+    fixture.stop_client();
+    fixture.db().meta_delete(META_CLIENT_BUILD).unwrap();
+    let running = fixture.start();
+    fixture.quit_game(0);
+    assert_eq!(running.finish().0.unwrap().state, SessionState::Exited);
+    assert_eq!(
+        fixture.db().meta_get(META_CLIENT_BUILD).unwrap().as_deref(),
+        Some("1761720601")
+    );
 }
 
 #[test]
@@ -364,13 +631,11 @@ fn a_redownload_stops_the_client_restores_the_acf_and_fails_as_a2() {
     fs::write(fixture.prefix_dir().join("redownload"), "").unwrap();
     let plan = fixture.core().plan_run(APP, false).unwrap();
     let id = plan.session_id();
-    let error = plan.run(&mut |_, _| {}).unwrap_err();
+    let error = run_plan(plan).unwrap_err();
     assert_eq!(error.code(), ErrorCode::ClientRedownloadRefused, "{error}");
     assert!(error.to_string().contains("A2 failed"), "{error}");
     assert!(
-        error
-            .to_string()
-            .contains("buildid changed from 100 to 101"),
+        error.to_string().contains("StateFlags became 1026"),
         "{error}"
     );
     assert_eq!(
@@ -387,8 +652,43 @@ fn a_redownload_stops_the_client_restores_the_acf_and_fails_as_a2() {
     );
     let record = fixture.db().meta_get(META_REDOWNLOAD).unwrap().unwrap();
     assert!(
-        record.contains(&format!("app {APP} buildid changed")),
+        record.contains(&format!("app {APP} StateFlags became")),
         "{record}"
+    );
+    let _ = fs::remove_file(fixture.prefix_dir().join("server-quit"));
+    drop(server);
+}
+
+/// An install one build behind is patched by the client: the build moves
+/// forward. That is not a refuted A2; the client is stopped and the `.acf`
+/// put back all the same, and the error names `install --update`.
+#[test]
+fn a_routine_patch_is_not_a_refuted_a2() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.sign_in();
+    let before = fs::read_to_string(fixture.acf()).unwrap();
+    let server = spawn_stub_server("server", &fixture.prefix_dir());
+    fs::write(fixture.prefix_dir().join("patch"), "").unwrap();
+    let plan = fixture.core().plan_run(APP, false).unwrap();
+    let id = plan.session_id();
+    let error = run_plan(plan).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::TitleUpdatePending, "{error}");
+    let text = error.to_string();
+    assert!(text.contains("from build 100 to 101"), "{text}");
+    assert!(text.contains(&format!("install {APP} --update")), "{text}");
+    assert!(text.contains("runtime steam stop"), "{text}");
+    assert!(!text.contains("A2"), "{text}");
+    assert_eq!(fs::read_to_string(fixture.acf()).unwrap(), before);
+    assert_eq!(
+        fixture.db().session(id).unwrap().unwrap().state,
+        SessionState::Failed
+    );
+    assert!(fixture.prefix_dir().join("client-quit").exists());
+    assert_eq!(
+        fixture.db().meta_get(META_REDOWNLOAD).unwrap(),
+        None,
+        "a patch is not the A2 finding"
     );
     let _ = fs::remove_file(fixture.prefix_dir().join("server-quit"));
     drop(server);
@@ -402,7 +702,7 @@ fn a_client_that_reports_no_title_times_out_and_is_stopped() {
     fs::write(fixture.prefix_dir().join("never-start"), "").unwrap();
     let plan = fixture.core().plan_run(APP, false).unwrap();
     let id = plan.session_id();
-    let error = plan.run(&mut |_, _| {}).unwrap_err();
+    let error = run_plan(plan).unwrap_err();
     assert_eq!(error.code(), ErrorCode::ClientLaunchTimedOut, "{error}");
     assert_eq!(
         fixture.db().session(id).unwrap().unwrap().state,
@@ -492,6 +792,20 @@ fn repair_restores_the_newest_snapshot_and_reinstall_reruns_the_bootstrapper() {
         "back from the snapshot"
     );
     assert_eq!(status.state, ClientRuntimeState::NeedsLogin);
+    assert_eq!(
+        status.snapshots, 1,
+        "the safety copy of the broken state is not kept"
+    );
+    // A second repair restores the same snapshot, not the broken state.
+    let status = fixture
+        .core()
+        .plan_client_op(ClientOp::Repair { reinstall: false })
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap();
+    assert!(fixture.steam_dir().join("steam.exe").is_file());
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin);
+    assert_eq!(status.snapshots, 1);
 
     fs::remove_file(fixture.steam_dir().join("bootstrapped")).unwrap();
     let fetch = |_: &str, dest: &Path, _: &mut dyn FnMut(u64, Option<u64>)| {

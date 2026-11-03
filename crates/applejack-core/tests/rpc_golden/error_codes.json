@@ -39,6 +39,7 @@
   "TitleExitedEarly": 1018,
   "TitleNotInstallable": 1026,
   "TitleNotInstalled": 1012,
+  "TitleUpdatePending": 1037,
   "UnsignedEngineRefused": 1010,
   "VerifyFailed": 1032
 }

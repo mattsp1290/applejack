@@ -56,6 +56,11 @@ fn runtime_steam_reports_an_absent_client_and_install_needs_an_engine_first() {
     let output = with_data(data.path(), &["runtime", "steam", "status", "--json"]);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["state"], serde_json::json!("absent"));
+    assert_eq!(
+        std::fs::read_dir(data.path()).unwrap().count(),
+        0,
+        "a status read is read-only: no prefixes, no snapshots, no locks"
+    );
     for args in [
         &["runtime", "steam", "install"][..],
         &["runtime", "steam", "update"],

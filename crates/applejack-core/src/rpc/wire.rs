@@ -274,10 +274,13 @@ pub enum ErrorCode {
     ClientRedownloadRefused,
     /// The client reported no running title within the wait.
     ClientLaunchTimedOut,
+    /// The client began a routine update of the title; `app.install` with
+    /// `update` is the way to bring it current.
+    TitleUpdatePending,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::ParseError,
         Self::InvalidRequest,
         Self::MethodNotFound,
@@ -320,6 +323,7 @@ impl ErrorCode {
         Self::ClientRuntimeBroken,
         Self::ClientRedownloadRefused,
         Self::ClientLaunchTimedOut,
+        Self::TitleUpdatePending,
     ];
 
     #[must_use]
@@ -367,6 +371,7 @@ impl ErrorCode {
             Self::ClientRuntimeBroken => 1034,
             Self::ClientRedownloadRefused => 1035,
             Self::ClientLaunchTimedOut => 1036,
+            Self::TitleUpdatePending => 1037,
         }
     }
 
@@ -422,11 +427,13 @@ impl ErrorCode {
             Self::ClientRuntimeBroken => "ClientRuntimeBroken",
             Self::ClientRedownloadRefused => "ClientRedownloadRefused",
             Self::ClientLaunchTimedOut => "ClientLaunchTimedOut",
+            Self::TitleUpdatePending => "TitleUpdatePending",
         }
     }
 
     /// The meaning column of the docs table.
     #[must_use]
+    #[expect(clippy::too_many_lines, reason = "one arm per error code")]
     pub const fn description(self) -> &'static str {
         match self {
             Self::ParseError => "The line is not UTF-8 or not JSON.",
@@ -517,13 +524,16 @@ impl ErrorCode {
                 "`runtime.steam.install`: `SteamSetup.exe` failed its Authenticode check or its signer is not Valve Corp. The file is kept and the message names the signer found."
             }
             Self::ClientRuntimeBroken => {
-                "The Steam client runtime is updating, broken, or never reached the login window. `runtime.steam.status` says which; `runtime.steam.repair` restores the newest snapshot."
+                "The Steam client runtime is updating, broken, or never reached the login window. `runtime.steam.status` says which; `runtime.steam.repair` restores the newest snapshot of a broken one, and an updating one is waited for."
             }
             Self::ClientRedownloadRefused => {
                 "Assumption A2 failed: the client began re-downloading the title. The client was stopped and the `.acf` restored from its backup; the finding is in `meta`."
             }
             Self::ClientLaunchTimedOut => {
                 "The Steam client reported no running title within the wait after `-applaunch`; the client was stopped."
+            }
+            Self::TitleUpdatePending => {
+                "The Steam client began a routine update of the title (a build newer than the one installed), which is not a refuted A2. The client was stopped and the `.acf` restored; `app.install` with `update` brings the title current."
             }
         }
     }

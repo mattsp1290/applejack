@@ -191,6 +191,7 @@ public enum RpcErrorCode: Int, Codable, Sendable, CaseIterable {
     case clientRuntimeBroken = 1034
     case clientRedownloadRefused = 1035
     case clientLaunchTimedOut = 1036
+    case titleUpdatePending = 1037
 }
 
 public struct HelloParams: Codable, Equatable, Sendable {

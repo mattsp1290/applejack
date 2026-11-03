@@ -7,7 +7,7 @@
 //! | State | Read from |
 //! |---|---|
 //! | `absent` | no `drive_c/Program Files (x86)/Steam/steam.exe` in the prefix |
-//! | `installing` | `applejack/client-install.json` in the prefix while the prefix lock is held |
+//! | `installing` | `applejack/client-install.json` in the prefix while another process holds the prefix lock |
 //! | `broken` | the prefix record does not open, a `Steam/` directory without `steam.exe`, or an install marker nobody holds the lock for |
 //! | `updating` | `Steam/package/steam_client_win64.manifest` (or the older `win32` one) is missing, or `Steam/package/tmp/` exists while the client runs |
 //! | `needs_login` | `Steam/config/loginusers.vdf` names no remembered account |
@@ -132,6 +132,24 @@ impl ClientRuntimeState {
             Self::Ready => "ready",
             Self::Updating => "updating",
             Self::Broken => "broken",
+        }
+    }
+}
+
+impl ClientRuntimeState {
+    /// The tail of the `ClientRuntimeBroken` message: what gets the runtime
+    /// out of this state. `repair` is right for `broken` only; it would
+    /// roll back a client that is updating itself.
+    #[must_use]
+    pub const fn advice(self) -> &'static str {
+        match self {
+            Self::Installing => "; wait for the install to finish",
+            Self::Updating => {
+                "; wait for the client's self-update to finish, or run `applejack runtime steam \
+                 install` if the client was stopped"
+            }
+            Self::Broken => ", and `applejack runtime steam repair` restores the newest snapshot",
+            Self::Absent | Self::NeedsLogin | Self::Ready => "",
         }
     }
 }
@@ -268,13 +286,39 @@ pub fn parse_signature_report(output: &str, success: bool) -> SignatureReport {
     SignatureReport { verified, subject }
 }
 
-/// Whether a subject's organisation is Valve Corp.
+/// The organisation Valve signs the bootstrapper as, exactly: the live
+/// signer is `CN=Valve Corp.,O=Valve Corp.,L=Bellevue,ST=Washington,C=US`.
+const VALVE_ORGS: [&str; 1] = ["Valve Corp."];
+
+/// Whether a subject's organisation is Valve Corp., exactly, over RDNs
+/// split on unescaped commas: `O=Valve Corp. Impersonators` and a `CN`
+/// carrying `\, O=Valve Corp.` both fail.
 #[must_use]
 pub fn signer_is_valve(subject: &str) -> bool {
-    subject.split(',').map(str::trim).any(|rdn| {
+    split_rdns(subject).iter().any(|rdn| {
         rdn.strip_prefix("O=")
-            .is_some_and(|org| org.trim().starts_with("Valve Corp"))
+            .is_some_and(|org| VALVE_ORGS.contains(&org.trim()))
     })
+}
+
+/// RDNs split on unescaped commas; `\,` stays inside its value (RFC 2253).
+fn split_rdns(subject: &str) -> Vec<String> {
+    let mut rdns = Vec::new();
+    let mut current = String::new();
+    let mut chars = subject.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ',' => rdns.push(std::mem::take(&mut current).trim().to_owned()),
+            _ => current.push(c),
+        }
+    }
+    rdns.push(current.trim().to_owned());
+    rdns
 }
 
 /// Runs `osslsigncode verify` on `file` and refuses anything but a verified
@@ -308,21 +352,32 @@ pub fn verify_bootstrapper(tool: &Path, file: &Path) -> Result<String, CoreError
         return Err(CoreError::BootstrapperUnverified {
             path: file.to_path_buf(),
             signer,
-            reason: "its signer is not Valve Corp".to_owned(),
+            reason: "its signer is not Valve Corp.".to_owned(),
         });
     }
     Ok(signer)
 }
 
-/// Adds `windows_path` to a `libraryfolders.vdf` document as the client
-/// writes one, or finds it there, and lists `appid` under it with its size.
-/// Returns whether the text changed. Everything else in the file is kept.
-pub fn add_library_folder(
-    document: &mut Document,
-    windows_path: &str,
-    appid: u32,
-    size_on_disk: u64,
-) -> bool {
+/// What an edit of `libraryfolders.vdf` did. A folder the client has not
+/// seen needs a client restart (**unverified** live; the client reads the
+/// file at startup); an app listed under a known folder does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryEdit {
+    Unchanged,
+    AppListed,
+    FolderAdded,
+}
+
+/// The client's own install folder, index `0` of a file the client writes.
+const CLIENT_LIBRARY: &str = "C:\\Program Files (x86)\\Steam";
+
+fn same_library(a: &str, b: &str) -> bool {
+    a.trim_end_matches('\\')
+        .eq_ignore_ascii_case(b.trim_end_matches('\\'))
+}
+
+/// The `libraryfolders` map, made when the document has none.
+fn library_folders(document: &mut Document) -> &mut Vec<Node> {
     let at = document
         .nodes
         .iter()
@@ -335,40 +390,68 @@ pub fn add_library_folder(
     if !matches!(root.value, Value::Map(_)) {
         root.value = Value::Map(Vec::new());
     }
-    let Value::Map(folders) = &mut root.value else {
-        return false;
-    };
-    let same = |path: &str| {
-        path.trim_end_matches('\\')
-            .eq_ignore_ascii_case(windows_path.trim_end_matches('\\'))
-    };
+    match &mut root.value {
+        Value::Map(folders) => folders,
+        Value::Str(_) => unreachable!("made a map above"),
+    }
+}
+
+/// Adds `windows_path` to a `libraryfolders.vdf` document as the client
+/// writes one, with no apps, unless it is there. Everything else in the
+/// file is kept.
+pub fn ensure_library_folder(document: &mut Document, windows_path: &str) -> LibraryEdit {
+    let folders = library_folders(document);
+    let known = folders.iter().any(|folder| {
+        folder
+            .value
+            .get_str("path")
+            .is_some_and(|path| same_library(path, windows_path))
+    });
+    if known {
+        return LibraryEdit::Unchanged;
+    }
+    let index = folders
+        .iter()
+        .filter_map(|folder| folder.key.parse::<u32>().ok())
+        .max()
+        .map_or(0, |max| max + 1);
+    folders.push(Node::map(
+        index.to_string(),
+        vec![
+            Node::str("path", windows_path),
+            Node::str("label", ""),
+            Node::str("contentid", content_id(windows_path).to_string()),
+            Node::str("totalsize", "0"),
+            Node::str("update_clean_bytes_tally", "0"),
+            Node::str("time_last_update_verified", "0"),
+            Node::map("apps", Vec::new()),
+        ],
+    ));
+    LibraryEdit::FolderAdded
+}
+
+/// [`ensure_library_folder`], then lists `appid` under the folder with its
+/// size.
+pub fn add_library_folder(
+    document: &mut Document,
+    windows_path: &str,
+    appid: u32,
+    size_on_disk: u64,
+) -> LibraryEdit {
+    let added = ensure_library_folder(document, windows_path);
+    let folders = library_folders(document);
     let size = size_on_disk.to_string();
     let key = appid.to_string();
-    let found = folders
-        .iter()
-        .position(|folder| folder.value.get_str("path").is_some_and(same));
-    let Some(found) = found else {
-        let index = folders
-            .iter()
-            .filter_map(|folder| folder.key.parse::<u32>().ok())
-            .max()
-            .map_or(0, |max| max + 1);
-        folders.push(Node::map(
-            index.to_string(),
-            vec![
-                Node::str("path", windows_path),
-                Node::str("label", ""),
-                Node::str("contentid", content_id(windows_path).to_string()),
-                Node::str("totalsize", "0"),
-                Node::str("update_clean_bytes_tally", "0"),
-                Node::str("time_last_update_verified", "0"),
-                Node::map("apps", vec![Node::str(key, size)]),
-            ],
-        ));
-        return true;
+    let Some(found) = folders.iter().position(|folder| {
+        folder
+            .value
+            .get_str("path")
+            .is_some_and(|path| same_library(path, windows_path))
+    }) else {
+        return added;
     };
     let Value::Map(fields) = &mut folders[found].value else {
-        return false;
+        return added;
     };
     let apps = fields
         .iter()
@@ -382,9 +465,9 @@ pub fn add_library_folder(
         apps.value = Value::Map(Vec::new());
     }
     let Value::Map(entries) = &mut apps.value else {
-        return false;
+        return added;
     };
-    match entries.iter_mut().find(|entry| entry.key == key) {
+    let listed = match entries.iter_mut().find(|entry| entry.key == key) {
         Some(entry) if entry.value == Value::Str(size.clone()) => false,
         Some(entry) => {
             entry.value = Value::Str(size);
@@ -394,7 +477,51 @@ pub fn add_library_folder(
             entries.push(Node::str(key, size));
             true
         }
+    };
+    match (added, listed) {
+        (LibraryEdit::FolderAdded, _) => LibraryEdit::FolderAdded,
+        (_, true) => LibraryEdit::AppListed,
+        (_, false) => LibraryEdit::Unchanged,
     }
+}
+
+/// Edits the client's `libraryfolders.vdf` so it lists `windows_path`, and
+/// `app` (appid and `SizeOnDisk`) under it. A file made from nothing gets
+/// the client's own folder first, as the client writes it. The write goes
+/// through a sibling and a rename, so the client never reads a partial
+/// file.
+///
+/// # Errors
+///
+/// The read, parse, or write failure.
+pub(crate) fn list_library(
+    paths: &ClientPaths,
+    windows_path: &str,
+    app: Option<(u32, u64)>,
+) -> Result<LibraryEdit, CoreError> {
+    let file = paths.libraryfolders();
+    let mut document = match fs::read_to_string(&file) {
+        Ok(text) => Document::parse(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut document = Document::default();
+            ensure_library_folder(&mut document, CLIENT_LIBRARY);
+            document
+        }
+        Err(error) => return Err(CoreError::io(&file, error)),
+    };
+    let edit = match app {
+        Some((appid, size)) => add_library_folder(&mut document, windows_path, appid, size),
+        None => ensure_library_folder(&mut document, windows_path),
+    };
+    if edit != LibraryEdit::Unchanged {
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).map_err(|error| CoreError::io(parent, error))?;
+        }
+        let sibling = file.with_extension("vdf.applejack");
+        fs::write(&sibling, document.to_text()).map_err(|error| CoreError::io(&sibling, error))?;
+        fs::rename(&sibling, &file).map_err(|error| CoreError::io(&file, error))?;
+    }
+    Ok(edit)
 }
 
 /// A stable stand-in for the random id the client gives a library.
@@ -423,9 +550,23 @@ pub fn library_windows_path(prefix_dir: &Path, library: &Path) -> Result<String,
     Ok(format!("Z:{}", unix.replace('/', "\\")))
 }
 
+/// What the A2 watch saw of the title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redownload {
+    /// The client is fetching the depot over the adopted one: A2 refuted.
+    Refuted(String),
+    /// A routine patch of an install that is behind its branch: the build
+    /// moves forward, by `buildid` or by `TargetBuildID`.
+    Update { from: u64, to: u64 },
+}
+
 /// Watches a title for the client re-downloading it, from the `.acf` and
 /// the install directory. Plan 00's assumption A2 says the client adopts
 /// the install with a verification pass only; this is where it is refuted.
+/// A build moving forward is the client patching an out-of-date install,
+/// which A2 allows for and `install --update` is the answer to; a build
+/// unchanged or going back under update bits, or the directory growing, is
+/// the refutation.
 #[derive(Debug)]
 pub struct RedownloadWatch {
     acf: PathBuf,
@@ -464,18 +605,33 @@ impl RedownloadWatch {
     }
 
     /// What changed, when the client is fetching the title.
-    pub fn redownload(&mut self) -> Option<String> {
+    pub fn redownload(&mut self) -> Option<Redownload> {
+        let from = self.before.buildid;
         if let Ok(text) = fs::read_to_string(&self.acf)
             && let Ok(now) = AppManifest::parse(&text)
         {
-            if now.buildid != self.before.buildid {
-                return Some(format!(
-                    "buildid changed from {} to {}",
-                    self.before.buildid, now.buildid
-                ));
+            if now.buildid > from {
+                return Some(Redownload::Update {
+                    from,
+                    to: now.buildid,
+                });
+            }
+            if now.buildid < from {
+                return Some(Redownload::Refuted(format!(
+                    "buildid changed from {from} to {}",
+                    now.buildid
+                )));
+            }
+            if let Some(to) = target_buildid(&text)
+                && to > from
+            {
+                return Some(Redownload::Update { from, to });
             }
             if now.state_flags & UPDATE_BITS != 0 {
-                return Some(format!("StateFlags became {}", now.state_flags));
+                return Some(Redownload::Refuted(format!(
+                    "StateFlags became {}",
+                    now.state_flags
+                )));
             }
         }
         if self
@@ -485,10 +641,10 @@ impl RedownloadWatch {
             self.scanned_at = Some(Instant::now());
             let size = dir_size(&self.install_dir);
             if size.saturating_sub(self.baseline) >= REDOWNLOAD_GROWTH {
-                return Some(format!(
+                return Some(Redownload::Refuted(format!(
                     "the install directory grew by {} bytes",
                     size - self.baseline
-                ));
+                )));
             }
         }
         None
@@ -503,6 +659,16 @@ impl RedownloadWatch {
         fs::copy(&self.backup, &self.acf).map_err(|error| CoreError::io(&self.acf, error))?;
         Ok(())
     }
+}
+
+/// `TargetBuildID`, which the client writes beside `buildid` while an update
+/// of the title is pending; `0` or absent otherwise.
+fn target_buildid(acf: &str) -> Option<u64> {
+    Document::parse(acf)
+        .ok()?
+        .get_str("AppState/TargetBuildID")?
+        .parse()
+        .ok()
 }
 
 /// `<library>/applejack/<appid>.acf.backup`, beside the download record.
@@ -612,12 +778,22 @@ impl Core {
         Ok(ClientPaths::new(self.prefix_dir(STEAM_CLIENT_PREFIX)?))
     }
 
-    /// The runtime's state and why, from disk.
+    /// The runtime's state and why, from disk. Nothing is written or locked.
     ///
     /// # Errors
     ///
     /// The prefix path failure.
     pub fn client_runtime_state(&self) -> Result<(ClientRuntimeState, String), CoreError> {
+        self.runtime_state(false)
+    }
+
+    /// [`Core::client_runtime_state`]; `lock_held` from a caller that holds
+    /// the prefix lock itself, for whom a marker is a dead install's and
+    /// never its own.
+    pub(crate) fn runtime_state(
+        &self,
+        lock_held: bool,
+    ) -> Result<(ClientRuntimeState, String), CoreError> {
         let paths = self.client_paths()?;
         let dir = &paths.prefix_dir;
         if !dir.is_dir() {
@@ -628,8 +804,9 @@ impl Core {
         }
         let marker = paths.install_marker();
         if marker.exists() {
-            let held = matches!(self.lock_prefix(STEAM_CLIENT_PREFIX), Err(ref e) if crate::runtime::session::busy(e));
-            return Ok(if held {
+            let installing =
+                !lock_held && PrefixLock::is_held(&self.snapshots_root(), STEAM_CLIENT_PREFIX)?;
+            return Ok(if installing {
                 (
                     ClientRuntimeState::Installing,
                     "an install is running".to_owned(),
@@ -689,7 +866,14 @@ impl Core {
     ///
     /// The database or prefix failure.
     pub fn client_runtime_status(&mut self) -> Result<ClientRuntimeStatus, CoreError> {
-        let (state, detail) = self.client_runtime_state()?;
+        self.runtime_status(false)
+    }
+
+    pub(crate) fn runtime_status(
+        &mut self,
+        lock_held: bool,
+    ) -> Result<ClientRuntimeStatus, CoreError> {
+        let (state, detail) = self.runtime_state(lock_held)?;
         let paths = self.client_paths()?;
         let running =
             paths.prefix_dir.is_dir() && wineserver_running(&paths.prefix_dir).unwrap_or(false);
@@ -789,7 +973,7 @@ impl PlannedClientOp {
             ClientOp::Update => self.update(report)?,
             ClientOp::Stop => self.stop(report)?,
         }
-        self.core.client_runtime_status()
+        self.core.runtime_status(true)
     }
 
     fn log_path(&self) -> PathBuf {
@@ -845,6 +1029,16 @@ impl PlannedClientOp {
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
         let prefix = self.ensure_prefix(report)?;
+        // The lock is held, so a marker on disk is a dead install's; left
+        // there it reads `installing` under this lock and `broken` after it.
+        let marker = self.paths.install_marker();
+        if marker.exists() {
+            report(
+                "install",
+                "clearing the marker of an install that died".to_owned(),
+            );
+            fs::remove_file(&marker).map_err(|error| CoreError::io(&marker, error))?;
+        }
         if self.client_running() && !reinstall {
             // The window the user signs in to is up; a second steam.exe
             // would only hand off to it.
@@ -961,6 +1155,16 @@ impl PlannedClientOp {
         if self.client_running() {
             return self.wait_ready(None, report);
         }
+        // The client reads `libraryfolders.vdf` at startup, so the shared
+        // library is listed before the client has ever started.
+        let library = self.core.library_dir()?;
+        let windows_path = library_windows_path(&self.paths.prefix_dir, &library)?;
+        if list_library(&self.paths, &windows_path, None)? == LibraryEdit::FolderAdded {
+            report(
+                "library",
+                format!("listing {windows_path} in libraryfolders.vdf before the client starts"),
+            );
+        }
         report("start", "starting steam.exe for its self-update".to_owned());
         let key = new_session_id("steam-client");
         let spec = LaunchSpec {
@@ -982,9 +1186,9 @@ impl PlannedClientOp {
                 session.log_path.display()
             ),
         );
-        // The loader is the client; it is not reaped here, since the client
-        // outlives this call. The kernel reaps it with this process.
-        std::mem::forget(session);
+        // The loader is the client and outlives this call; `Session`'s drop
+        // is one non-blocking `try_wait`, so nothing here waits on it.
+        drop(session);
         self.wait_ready(Some(&key), report)
     }
 
@@ -1070,21 +1274,11 @@ impl PlannedClientOp {
                     .max(CLIENT_POLL.min(self.core.tuning.tick * 4)),
             );
         }
-        self.record_build(report)?;
-        let (state, detail) = self.core.client_runtime_state()?;
+        if let Some(build) = record_client_build(&mut self.core, &self.paths)? {
+            report("build", format!("client build {build}"));
+        }
+        let (state, detail) = self.core.runtime_state(true)?;
         report(state.as_str(), detail);
-        Ok(())
-    }
-
-    fn record_build(&mut self, report: &mut dyn FnMut(&str, String)) -> Result<(), CoreError> {
-        let Some(build) = fs::read_to_string(self.paths.manifest())
-            .ok()
-            .and_then(|text| client_build_id(&text))
-        else {
-            return Ok(());
-        };
-        self.core.db()?.meta_set(META_CLIENT_BUILD, &build)?;
-        report("build", format!("client build {build}"));
         Ok(())
     }
 
@@ -1117,7 +1311,8 @@ impl PlannedClientOp {
             });
         };
         self.stop(report)?;
-        if self.paths.prefix_dir.is_dir() {
+        let had_prefix = self.paths.prefix_dir.is_dir();
+        if had_prefix {
             Core::settle(&self.paths.prefix_dir)?;
         }
         report(
@@ -1127,19 +1322,49 @@ impl PlannedClientOp {
                 STEAM_CLIENT_PREFIX, newest.timestamp
             ),
         );
-        snapshot::restore(
+        let safety = snapshot::restore(
             &self.paths.prefix_dir,
             &self.core.snapshots_root(),
             STEAM_CLIENT_PREFIX,
             &newest.timestamp,
         )?;
+        // The safety copy is the state just repaired away; kept, it would be
+        // the newest snapshot and the next `repair` would put it back. With
+        // no prefix to copy, `restore` returns the source, which stays.
+        if had_prefix && safety.timestamp != newest.timestamp {
+            report(
+                "repair",
+                format!(
+                    "discarding the safety snapshot {} of the state repaired away",
+                    safety.timestamp
+                ),
+            );
+            fs::remove_dir_all(&safety.dir).map_err(|error| CoreError::io(&safety.dir, error))?;
+        }
         let _ = fs::remove_file(self.paths.install_marker());
         Ok(())
     }
 }
 
+/// Records the client build id from its manifest in `meta`, after a
+/// successful start; `None` when the manifest is not there to read.
+pub(crate) fn record_client_build(
+    core: &mut Core,
+    paths: &ClientPaths,
+) -> Result<Option<String>, CoreError> {
+    let Some(build) = fs::read_to_string(paths.manifest())
+        .ok()
+        .and_then(|text| client_build_id(&text))
+    else {
+        return Ok(None);
+    };
+    core.db()?.meta_set(META_CLIENT_BUILD, &build)?;
+    Ok(Some(build))
+}
+
 /// Backs the title's `.acf` up and lists its library for the client, before
-/// a client launch.
+/// a client launch. A [`LibraryEdit::FolderAdded`] under a running client
+/// is the caller's cue to restart it.
 ///
 /// # Errors
 ///
@@ -1149,23 +1374,15 @@ pub(crate) fn prepare_client_launch(
     library: &Path,
     appid: u32,
     installdir: &str,
-) -> Result<RedownloadWatch, CoreError> {
+) -> Result<(RedownloadWatch, LibraryEdit), CoreError> {
     let watch = RedownloadWatch::start(library, appid, installdir)?;
     let windows_path = library_windows_path(&paths.prefix_dir, library)?;
-    let file = paths.libraryfolders();
-    let mut document = match fs::read_to_string(&file) {
-        Ok(text) => Document::parse(&text)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Document::default(),
-        Err(error) => return Err(CoreError::io(&file, error)),
-    };
-    let size = watch.before.size_on_disk;
-    if add_library_folder(&mut document, &windows_path, appid, size) {
-        if let Some(parent) = file.parent() {
-            fs::create_dir_all(parent).map_err(|error| CoreError::io(parent, error))?;
-        }
-        fs::write(&file, document.to_text()).map_err(|error| CoreError::io(&file, error))?;
-    }
-    Ok(watch)
+    let edit = list_library(
+        paths,
+        &windows_path,
+        Some((appid, watch.before.size_on_disk)),
+    )?;
+    Ok((watch, edit))
 }
 
 #[cfg(test)]
@@ -1205,7 +1422,39 @@ mod tests {
             !signer_is_valve("CN=Valve Corp."),
             "the organisation decides, not the common name"
         );
-        assert!(signer_is_valve("O=Valve Corporation,C=US"));
+        assert!(signer_is_valve("CN=X,O=Valve Corp.,C=US"));
+        for impostor in [
+            "O=Valve Corporation,C=US",
+            "O=Valve Corp,C=US",
+            "CN=Valve Corp. Impersonators,O=Valve Corp. Impersonators,C=US",
+            "O=Valve Corporate Holdings LLC,C=US",
+            "CN=Foo\\, O=Valve Corp.,O=Evil Inc,C=US",
+            "O=Evil Inc\\,O=Valve Corp.",
+        ] {
+            assert!(!signer_is_valve(impostor), "{impostor}");
+        }
+        assert_eq!(
+            split_rdns("CN=Foo\\, O=Valve Corp.,O=Evil Inc"),
+            ["CN=Foo, O=Valve Corp.", "O=Evil Inc"]
+        );
+    }
+
+    #[test]
+    fn the_broken_advice_names_repair_for_a_broken_runtime_only() {
+        let text = |state| {
+            CoreError::ClientRuntimeBroken {
+                state,
+                detail: "d".to_owned(),
+            }
+            .to_string()
+        };
+        assert!(text(ClientRuntimeState::Broken).contains("runtime steam repair"));
+        for state in [ClientRuntimeState::Updating, ClientRuntimeState::Installing] {
+            let text = text(state);
+            assert!(!text.contains("repair"), "{text}");
+            assert!(text.contains("wait"), "{text}");
+        }
+        assert!(!text(ClientRuntimeState::Absent).contains("repair"));
     }
 
     #[test]
@@ -1236,7 +1485,10 @@ mod tests {
     #[test]
     fn a_library_is_added_once_and_the_rest_of_the_file_round_trips() {
         let mut document = Document::parse(FOLDERS).unwrap();
-        assert!(add_library_folder(&mut document, "S:\\", 242_920, 4096));
+        assert_eq!(
+            add_library_folder(&mut document, "S:\\", 242_920, 4096),
+            LibraryEdit::FolderAdded
+        );
         let text = document.to_text();
         assert!(text.contains("\"path\"\t\t\"S:\\\\\""), "{text}");
         assert!(text.contains("\"242920\"\t\t\"4096\""), "{text}");
@@ -1249,13 +1501,19 @@ mod tests {
             "the existing text is unchanged:\n{text}"
         );
         let mut again = Document::parse(&text).unwrap();
-        assert!(
-            !add_library_folder(&mut again, "s:\\", 242_920, 4096),
+        assert_eq!(
+            add_library_folder(&mut again, "s:\\", 242_920, 4096),
+            LibraryEdit::Unchanged,
             "same path, same app, same size"
         );
-        assert!(
+        assert_eq!(
             add_library_folder(&mut again, "S:", 242_921, 1),
-            "a second title joins the folder"
+            LibraryEdit::AppListed,
+            "a second title joins the folder without a restart"
+        );
+        assert_eq!(
+            ensure_library_folder(&mut again, "S:\\"),
+            LibraryEdit::Unchanged
         );
         assert_eq!(again.get_str("libraryfolders/1/apps/242921"), Some("1"));
         assert_eq!(again.get_str("libraryfolders/1/path"), Some("S:\\"));
@@ -1265,18 +1523,99 @@ mod tests {
     #[test]
     fn an_empty_file_gets_the_root_and_the_folder() {
         let mut document = Document::default();
-        assert!(add_library_folder(
-            &mut document,
-            "Z:\\Users\\me\\library",
-            10,
-            1
-        ));
+        assert_eq!(
+            add_library_folder(&mut document, "Z:\\Users\\me\\library", 10, 1),
+            LibraryEdit::FolderAdded
+        );
         let parsed = Document::parse(&document.to_text()).unwrap();
         assert_eq!(
             parsed.get_str("libraryfolders/0/path"),
             Some("Z:\\Users\\me\\library")
         );
         assert_eq!(parsed.get_str("libraryfolders/0/apps/10"), Some("1"));
+    }
+
+    #[test]
+    fn a_folder_listed_before_the_first_start_follows_the_clients_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ClientPaths::new(dir.path());
+        assert_eq!(
+            list_library(&paths, "S:\\", None).unwrap(),
+            LibraryEdit::FolderAdded
+        );
+        let text = fs::read_to_string(paths.libraryfolders()).unwrap();
+        let document = Document::parse(&text).unwrap();
+        assert_eq!(
+            document.get_str("libraryfolders/0/path"),
+            Some(CLIENT_LIBRARY)
+        );
+        assert_eq!(document.get_str("libraryfolders/1/path"), Some("S:\\"));
+        assert!(
+            !paths
+                .libraryfolders()
+                .with_extension("vdf.applejack")
+                .exists(),
+            "written through a sibling and a rename"
+        );
+        assert_eq!(
+            list_library(&paths, "S:\\", Some((7, 9))).unwrap(),
+            LibraryEdit::AppListed
+        );
+        assert_eq!(
+            list_library(&paths, "Z:\\other", Some((8, 9))).unwrap(),
+            LibraryEdit::FolderAdded
+        );
+    }
+
+    fn acf(buildid: u64, state_flags: u32, target: Option<u64>) -> String {
+        let target = target.map_or(String::new(), |target| {
+            format!("\t\"TargetBuildID\"\t\t\"{target}\"\n")
+        });
+        format!(
+            "\"AppState\"\n{{\n\t\"appid\"\t\t\"7\"\n\t\"Universe\"\t\t\"1\"\n\t\"name\"\t\t\"T\"\n\t\"StateFlags\"\t\t\"{state_flags}\"\n\t\"installdir\"\t\t\"T\"\n\t\"buildid\"\t\t\"{buildid}\"\n{target}\t\"LastUpdated\"\t\t\"0\"\n\t\"SizeOnDisk\"\t\t\"1\"\n}}\n"
+        )
+    }
+
+    #[test]
+    fn a_build_moving_forward_is_a_patch_and_anything_else_under_update_bits_a_refutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path();
+        let paths = LibraryPaths::new(library);
+        fs::create_dir_all(paths.install_dir("T")).unwrap();
+        fs::write(paths.acf(7), acf(100, app_state::FULLY_INSTALLED, None)).unwrap();
+        let mut watch = RedownloadWatch::start(library, 7, "T").unwrap();
+        assert_eq!(watch.redownload(), None);
+        let update = Some(Redownload::Update { from: 100, to: 101 });
+        for (text, want) in [
+            (acf(101, 0x0402, None), update.clone()),
+            (acf(100, 0x0402, Some(101)), update.clone()),
+            (acf(101, app_state::FULLY_INSTALLED, None), update),
+            (
+                acf(100, 0x0402, None),
+                Some(Redownload::Refuted("StateFlags became 1026".to_owned())),
+            ),
+            (
+                acf(100, 0x0402, Some(0)),
+                Some(Redownload::Refuted("StateFlags became 1026".to_owned())),
+            ),
+            (
+                acf(99, 0x0402, None),
+                Some(Redownload::Refuted(
+                    "buildid changed from 100 to 99".to_owned(),
+                )),
+            ),
+            (
+                acf(
+                    100,
+                    app_state::FULLY_INSTALLED | app_state::VALIDATING,
+                    None,
+                ),
+                None,
+            ),
+        ] {
+            fs::write(paths.acf(7), &text).unwrap();
+            assert_eq!(watch.redownload(), want, "{text}");
+        }
     }
 
     #[test]

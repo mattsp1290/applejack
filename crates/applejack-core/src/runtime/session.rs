@@ -59,7 +59,9 @@ use applejack_engine::{EngineId, Error as EngineError, InstalledEngine, Prefix, 
 use crate::config::{SessionEnd, SessionRow, SessionState};
 use crate::error::CoreError;
 use crate::prefixes::{SERVER_SETTLE, exit_code};
-use crate::runtime::steam_client::{META_REDOWNLOAD, RedownloadWatch, STEAM_CLIENT_PREFIX};
+use crate::runtime::steam_client::{
+    META_REDOWNLOAD, Redownload, RedownloadWatch, STEAM_CLIENT_PREFIX,
+};
 use crate::state::Core;
 
 /// The registry value the Steam client keeps at the running title's appid
@@ -115,7 +117,7 @@ impl Default for RunTuning {
             early_exit: Duration::from_secs(5),
             term_wait: Duration::from_secs(3),
             cancel_wait: Duration::from_secs(60),
-            client_start_wait: Duration::from_secs(300),
+            client_start_wait: Duration::from_secs(600),
         }
     }
 }
@@ -435,13 +437,13 @@ impl SessionProbe for ClientProbe {
         Ok(None)
     }
 
+    /// The value names this title, or the launch exe runs under one of the
+    /// keys. A value naming another title says nothing about this one: the
+    /// user may have started that title from the client's own window.
     fn title_present(&mut self) -> bool {
         match self.running_appid() {
             Some(running) if running == self.appid => true,
-            Some(0) | None => {
-                !title_processes(&self.keys, &self.exe).is_empty() && !self.exe.is_empty()
-            }
-            Some(_) => false,
+            _ => !self.exe.is_empty() && !title_processes(&self.keys, &self.exe).is_empty(),
         }
     }
 
@@ -449,32 +451,42 @@ impl SessionProbe for ClientProbe {
         Ok(true)
     }
 
+    /// Either way the client is stopped and the `.acf` put back; only a
+    /// refuted A2 is recorded in `meta`, since a routine patch is not the
+    /// finding plan 00 asks about.
     fn trouble(&mut self) -> Result<(), CoreError> {
-        let Some(detail) = self
+        let Some(seen) = self
             .redownload
             .as_mut()
             .and_then(RedownloadWatch::redownload)
         else {
             return Ok(());
         };
-        let _ = log_line(
-            &self.log,
-            &format!("A2 refuted: {detail}; stopping the client"),
-        );
+        let appid = self.appid;
+        let (what, error) = match seen {
+            Redownload::Refuted(detail) => (
+                format!("A2 refuted: {detail}"),
+                CoreError::ClientRedownloadRefused { appid, detail },
+            ),
+            Redownload::Update { from, to } => (
+                format!("the client began a routine update from build {from} to {to}"),
+                CoreError::TitleUpdatePending { appid, from, to },
+            ),
+        };
+        let _ = log_line(&self.log, &format!("{what}; stopping the client"));
         self.stop_client();
         if let Some(watch) = &self.redownload
             && let Err(error) = watch.restore()
         {
             let _ = log_line(&self.log, &format!("the .acf restore failed: {error}"));
         }
-        let record = format!("{} app {} {detail}", utc_now(), self.appid);
-        if let Ok(db) = self.core.db() {
+        if let CoreError::ClientRedownloadRefused { detail, .. } = &error
+            && let Ok(db) = self.core.db()
+        {
+            let record = format!("{} app {appid} {detail}", utc_now());
             let _ = db.meta_set(META_REDOWNLOAD, &record);
         }
-        Err(CoreError::ClientRedownloadRefused {
-            appid: self.appid,
-            detail,
-        })
+        Err(error)
     }
 }
 

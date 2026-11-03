@@ -99,10 +99,13 @@ pub enum CoreError {
         fix: String,
         route: String,
     },
-    /// The runtime is in a state a run or an operation cannot use.
+    /// The runtime is in a state a run or an operation cannot use. The
+    /// advice depends on the state: `repair` would roll back a client that
+    /// is only updating itself.
     #[error(
         "the Steam client runtime is {state}: {detail}. `applejack runtime steam status` shows \
-         it, and `applejack runtime steam repair` restores the newest snapshot"
+         it{}",
+        state.advice()
     )]
     ClientRuntimeBroken {
         state: ClientRuntimeState,
@@ -129,6 +132,15 @@ pub enum CoreError {
          own copy of the title"
     )]
     ClientRedownloadRefused { appid: u32, detail: String },
+    /// The client began a routine patch of a title that is behind its
+    /// branch: not a refuted A2, but the depot stays applejack's to update.
+    #[error(
+        "the Steam client began updating title {appid} from build {from} to {to}; the client \
+         was stopped and appmanifest_{appid}.acf was restored from its backup. Run `applejack \
+         runtime steam stop` if the client is still up, then `applejack install {appid} \
+         --update`, and run the title again"
+    )]
+    TitleUpdatePending { appid: u32, from: u64, to: u64 },
     /// The client never reported the title running.
     #[error(
         "the Steam client reported no running title {appid} within {seconds} seconds; the client \
@@ -245,6 +257,7 @@ impl CoreError {
             Self::BootstrapperUnverified { .. } => ErrorCode::BootstrapperUnverified,
             Self::BootstrapperDownload { .. } => ErrorCode::DownloadFailed,
             Self::ClientRedownloadRefused { .. } => ErrorCode::ClientRedownloadRefused,
+            Self::TitleUpdatePending { .. } => ErrorCode::TitleUpdatePending,
             Self::ClientLaunchTimedOut { .. } => ErrorCode::ClientLaunchTimedOut,
             Self::NoLaunchExe { .. } => ErrorCode::NoLaunchExe,
             Self::NotRunning { .. } => ErrorCode::NotRunning,

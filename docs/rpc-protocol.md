@@ -127,9 +127,10 @@ Swift case; do not edit the table by hand.
 | 1031 | `SteamClientOwnsTitle` | A Windows Steam client is running against the library, or owns this title's update. |
 | 1032 | `VerifyFailed` | `app.install` with `verify` found files that differ from the manifest. |
 | 1033 | `BootstrapperUnverified` | `runtime.steam.install`: `SteamSetup.exe` failed its Authenticode check or its signer is not Valve Corp. The file is kept and the message names the signer found. |
-| 1034 | `ClientRuntimeBroken` | The Steam client runtime is updating, broken, or never reached the login window. `runtime.steam.status` says which; `runtime.steam.repair` restores the newest snapshot. |
+| 1034 | `ClientRuntimeBroken` | The Steam client runtime is updating, broken, or never reached the login window. `runtime.steam.status` says which; `runtime.steam.repair` restores the newest snapshot of a broken one, and an updating one is waited for. |
 | 1035 | `ClientRedownloadRefused` | Assumption A2 failed: the client began re-downloading the title. The client was stopped and the `.acf` restored from its backup; the finding is in `meta`. |
 | 1036 | `ClientLaunchTimedOut` | The Steam client reported no running title within the wait after `-applaunch`; the client was stopped. |
+| 1037 | `TitleUpdatePending` | The Steam client began a routine update of the title (a build newer than the one installed), which is not a refuted A2. The client was stopped and the `.acf` restored; `app.install` with `update` brings the title current. |
 <!-- error-table:end -->
 
 A `job.failed` carries the reason code of its failure when it has one
@@ -363,8 +364,8 @@ core leaves this recovery to the next start.
 
 `docs/steam-runtime.md` is the full account. `runtime.steam.status` answers
 at once; the other four are jobs whose `job.progress` phases are the steps
-(`prefix`, `download`, `verify`, `bootstrap`, `start`, `client`, `build`,
-`snapshot`, `repair`, `stop`), ending with a `status` phase that carries the
+(`prefix`, `install`, `download`, `verify`, `bootstrap`, `library`, `start`,
+`client`, `build`, `snapshot`, `repair`, `stop`), ending with a `status` phase that carries the
 state. The prefix is claimed before the answer, so `PrefixBusy` (a title runs
 through the client) is an error response. `runtime.steam.install` is the one
 method that reaches the network outside Steam's own protocol: it fetches
@@ -380,9 +381,10 @@ state. `exit_code` is null: the title's status is the client's. The client
 stays up after the title, so the session does not drain and the lock is
 free once the row closes. `app.cancel` ends the title and leaves the client;
 `kill_prefix` stops the client too. A client that reports no running title
-within five minutes ends the job with `ClientLaunchTimedOut`; a client that
+within ten minutes ends the job with `ClientLaunchTimedOut`; a client that
 starts downloading the title ends it with `ClientRedownloadRefused` after the
-`.acf` is restored from its backup (assumption A2 refuted).
+`.acf` is restored from its backup (assumption A2 refuted), and one that
+starts a routine patch of it (a newer build) with `TitleUpdatePending`.
 
 ## Steam
 

@@ -39,10 +39,13 @@ const BUNDLE_FILES: &[&str] = &[
 /// `steamwebhelper.exe`) that stays until `$WINEPREFIX/client-quit`; with
 /// `-applaunch <appid>` it starts the client if none is up, then `game.exe`
 /// as the title and `$WINEPREFIX/running-appid` as the registry value, which
-/// `reg query` prints, and clears it when the game exits. A
-/// `$WINEPREFIX/redownload` file makes `-applaunch` rewrite the `.acf` as a
-/// client fetching the title does, and `$WINEPREFIX/never-start` makes it
-/// report nothing.
+/// `reg query` prints and `reg add` writes, and clears it when the game
+/// exits. A `$WINEPREFIX/redownload` file makes `-applaunch` rewrite the
+/// `.acf` as a client fetching the whole title does (update bits, same
+/// build), `patch` as a client applying a routine update does (update bits,
+/// a newer build), `never-start` makes it report nothing, and `no-marker`
+/// starts the title without touching the value. A new client start clears a
+/// `client-quit` left by a stop, and a new title start a `quit`.
 ///
 /// The title is this test binary and not the shell: macOS hides the
 /// environment of platform binaries such as `/bin/sh` from `KERN_PROCARGS2`,
@@ -87,6 +90,16 @@ if [ "$name" = reg ] && [ "$2" = query ]; then
   printf 'HKEY_CURRENT_USER\\Software\\Valve\\Steam\n    RunningAppID    REG_DWORD    0x%x\n' "$(cat "$WINEPREFIX/running-appid")"
   exit 0
 fi
+if [ "$name" = reg ] && [ "$2" = add ]; then
+  data=
+  while [ $# -gt 0 ]; do
+    if [ "$1" = /d ]; then data=$2; shift; fi
+    shift
+  done
+  echo "$data" > "$WINEPREFIX/running-appid"
+  echo "$data" >> "$WINEPREFIX/reg-add"
+  exit 0
+fi
 if [ "$name" = steam.exe ]; then
   if [ "$2" = -applaunch ]; then
     appid=$3
@@ -94,18 +107,32 @@ if [ "$name" = steam.exe ]; then
     echo "$*" > "$WINEPREFIX/args"
     if [ -e "$WINEPREFIX/redownload" ]; then
       acf=$(ls "$WINEPREFIX"/dosdevices/s:/steamapps/appmanifest_*.acf | head -1)
+      sed -i '' -e 's/"StateFlags"\t\t"4"/"StateFlags"\t\t"1026"/' "$acf"
+      exit 0
+    fi
+    if [ -e "$WINEPREFIX/patch" ]; then
+      acf=$(ls "$WINEPREFIX"/dosdevices/s:/steamapps/appmanifest_*.acf | head -1)
       sed -i '' -e 's/"StateFlags"\t\t"4"/"StateFlags"\t\t"1026"/' -e 's/"buildid"\t\t"100"/"buildid"\t\t"101"/' "$acf"
       exit 0
     fi
     if [ -e "$WINEPREFIX/never-start" ]; then
       exit 0
     fi
-    ( "@HELPER@" common::stub_title --exact --ignored --nocapture game.exe; echo 0 > "$WINEPREFIX/running-appid" ) &
-    echo "$appid" > "$WINEPREFIX/running-appid"
+    rm -f "$WINEPREFIX/quit"
+    if [ -e "$WINEPREFIX/no-marker" ]; then
+      "@HELPER@" common::stub_title --exact --ignored --nocapture game.exe &
+    else
+      ( "@HELPER@" common::stub_title --exact --ignored --nocapture game.exe; echo 0 > "$WINEPREFIX/running-appid" ) &
+      echo "$appid" > "$WINEPREFIX/running-appid"
+    fi
     if [ -e "$WINEPREFIX/client-up" ]; then
       exit 0
     fi
   fi
+  # A client a stop just ended polls every 10 ms for its quit file; a fresh
+  # start must not clear it from under them.
+  sleep 0.1
+  rm -f "$WINEPREFIX/client-quit"
   : > "$WINEPREFIX/client-up"
   "@HELPER@" common::stub_title --exact --ignored --nocapture steamwebhelper.exe &
   exec "@HELPER@" common::stub_title --exact --ignored --nocapture steam.exe
