@@ -118,28 +118,6 @@ impl fmt::Debug for Password {
     }
 }
 
-/// A short-lived Steam access token, kept in memory only. Not comparable,
-/// for the same reason as [`Password`].
-#[derive(Clone)]
-pub struct AccessToken(String);
-
-impl AccessToken {
-    pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
-    }
-
-    #[must_use]
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for AccessToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("AccessToken(<redacted>)")
-    }
-}
-
 /// Account name and password for [`AuthMode::Credentials`].
 #[derive(Debug, Clone)]
 pub struct Credentials {
@@ -147,13 +125,13 @@ pub struct Credentials {
     pub password: Password,
 }
 
-/// What a completed auth session yields. Not comparable: the tokens are
-/// secrets, and nothing needs to compare them.
+/// What a completed auth session yields. Not comparable: the token is a
+/// secret, and nothing needs to compare it. The refresh token alone decides:
+/// `logon` sends it, and Steam has answered with no access token.
 #[derive(Debug, Clone)]
 pub struct Tokens {
     pub account_name: String,
     pub refresh_token: RefreshToken,
-    pub access_token: AccessToken,
 }
 
 /// One entry of `CMsgClientLicenseList`. `Debug` omits `access_token`, the

@@ -17,9 +17,9 @@
 //! ever passed on a process command line: this crate spawns no process at
 //! all, so it constructs no `Command` from `std::process` or `tokio::process`
 //! (`clippy.toml` lists both under `disallowed-types`, and
-//! `tests/no_token_argv.rs` greps for them). [`keychain::RefreshToken`],
-//! [`auth::AccessToken`], and [`auth::Password`] redact themselves in `Debug`
-//! and are readable only through `expose()`. `docs/steam-layer.md` under
+//! `tests/no_token_argv.rs` greps for them). [`keychain::RefreshToken`] and
+//! [`auth::Password`] redact themselves in `Debug` and are readable only
+//! through `expose()`. `docs/steam-layer.md` under
 //! "Token handling rules" is the full list.
 
 pub mod acf;
@@ -35,8 +35,8 @@ pub mod vdf;
 
 pub use acf::{AcfWriter, AppManifest, InstalledDepot};
 pub use auth::{
-    AccessToken, AuthError, AuthMode, AuthPoll, Authenticator, Credentials, GuardFactor, License,
-    LoginState, LoginStep, Password, SteamConnection, Tokens,
+    AuthError, AuthMode, AuthPoll, Authenticator, Credentials, GuardFactor, License, LoginState,
+    LoginStep, Password, SteamConnection, Tokens,
 };
 pub use depot::{
     BeforeWrite, CancelRequested, ClientRunning, DepotInstaller, DownloadRecord, InstallOptions,

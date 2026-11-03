@@ -9,7 +9,9 @@ public final class SteamAccountViewModel {
     public var guardCode = ""
     private let app: AppModel
     private let pollDelay: Duration = .seconds(2)
-    private var polling = false
+    /// The session whose loop runs. A replaced login's loop sleeps on until
+    /// its tick, and the new session must not wait for it.
+    private var pollingSession: String?
 
     public init(app: AppModel) {
         self.app = app
@@ -45,9 +47,12 @@ public final class SteamAccountViewModel {
     /// this one: the loop ends, and a late answer does not land on the new
     /// session.
     public func complete() async {
-        guard !polling, case .ready(var session) = login else { return }
-        polling = true
-        defer { polling = false }
+        guard case .ready(var session) = login, pollingSession != session.sessionId else { return }
+        let id = session.sessionId
+        pollingSession = id
+        defer {
+            if pollingSession == id { pollingSession = nil }
+        }
         while holds(session) {
             let code = guardCode.trimmingCharacters(in: .whitespaces)
             let params = SteamLoginCompleteParams(sessionId: session.sessionId, steamGuardCode: code.isEmpty ? nil : code)

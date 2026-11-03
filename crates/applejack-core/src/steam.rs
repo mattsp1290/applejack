@@ -38,6 +38,20 @@ pub const META_ACCOUNT: &str = "steam_account_name";
 /// nothing else would end the wait.
 const LOGIN_WAIT_LIMIT: Duration = Duration::from_secs(120);
 
+/// Refuses a name no account can have, before anything reaches Steam.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidRequest`] for an empty or whitespace name.
+pub fn refuse_blank_account(account_name: &str) -> Result<(), CoreError> {
+    if account_name.trim().is_empty() {
+        return Err(CoreError::InvalidRequest(
+            "the Steam account name is empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Where the core gets its Steam connections and its token store.
 pub trait SteamHost: Send + Sync + 'static {
     type Connection: SteamConnection + Send + 'static;
@@ -247,13 +261,17 @@ impl<H: SteamHost> LoginFlow<H> {
     ///
     /// # Errors
     ///
-    /// The Steam failure, or the runtime's.
+    /// [`CoreError::InvalidRequest`] for a blank account name, with no
+    /// connection made; the Steam failure, or the runtime's.
     pub fn start(
         core: &mut Core,
         host: Arc<H>,
         mode: AuthMode,
         credentials: Option<&Credentials>,
     ) -> Result<Self, CoreError> {
+        if let Some(credentials) = credentials {
+            refuse_blank_account(&credentials.account_name)?;
+        }
         let runtime = steam_runtime()?;
         let mut connection = host.connection();
         let (step, state) = {
@@ -304,8 +322,8 @@ impl<H: SteamHost> LoginFlow<H> {
     ///
     /// [`AuthError::InvalidGuardCode`] leaves the login open for another
     /// code. Any other error ends it, as does
-    /// [`CoreError::SteamLoginStalled`] once [`LoginStep::Waiting`] has
-    /// lasted its limit.
+    /// [`CoreError::SteamLoginStalled`] when a look at the login finds
+    /// [`LoginStep::Waiting`] past its limit.
     pub fn advance(
         &mut self,
         owner: &mut Core,
@@ -313,15 +331,6 @@ impl<H: SteamHost> LoginFlow<H> {
     ) -> Result<LoginStep, CoreError> {
         if matches!(self.step, LoginStep::Done { .. }) {
             return Ok(self.step.clone());
-        }
-        if self
-            .waiting_since
-            .is_some_and(|since| since.elapsed() >= self.wait_limit)
-        {
-            self.state = LoginState::Idle;
-            return Err(CoreError::SteamLoginStalled {
-                seconds: self.wait_limit.as_secs(),
-            });
         }
         let wanted = typed
             .map(str::trim)
@@ -356,6 +365,15 @@ impl<H: SteamHost> LoginFlow<H> {
             None
         };
         self.remember_account(owner)?;
+        if self
+            .waiting_since
+            .is_some_and(|since| since.elapsed() >= self.wait_limit)
+        {
+            self.state = LoginState::Idle;
+            return Err(CoreError::SteamLoginStalled {
+                seconds: self.wait_limit.as_secs(),
+            });
+        }
         Ok(self.step.clone())
     }
 

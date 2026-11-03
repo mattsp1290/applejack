@@ -69,8 +69,24 @@ fn assert_not_implemented(name: &str, args: &[&str]) {
     assert_eq!(stderr.trim(), format!("applejack {name}: not implemented"));
 }
 
+/// A `steam` or `install` run has the network denied, so a mistake in a test
+/// cannot reach Steam.
+fn applejack_for(args: &[&str]) -> Command {
+    if matches!(args.first(), Some(&("steam" | "install"))) {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command.args([
+            "-p",
+            "(version 1)(allow default)(deny network*)",
+            env!("CARGO_BIN_EXE_applejack"),
+        ]);
+        command
+    } else {
+        applejack()
+    }
+}
+
 fn with_data(data_dir: &std::path::Path, args: &[&str]) -> std::process::Output {
-    applejack()
+    applejack_for(args)
         .env("APPLEJACK_DATA_DIR", data_dir)
         .env_remove("APPLEJACK_ALLOW_UNSIGNED_ENGINE")
         .args(args)

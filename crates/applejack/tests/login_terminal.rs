@@ -1,7 +1,8 @@
 //! `steam login` on a real pty. The prompt puts the terminal in raw mode, and
 //! a process that leaves without undoing it leaves the next secret typed
-//! there on screen. Nothing here reaches Steam: both signals land at the
-//! password prompt.
+//! there on screen. Nothing here reaches Steam: every test ends at a prompt,
+//! and the child runs with the network denied, so a broken harness cannot
+//! either.
 
 use std::env;
 use std::fs::{self, File};
@@ -21,6 +22,7 @@ use tempfile::TempDir;
 const TERMINAL: &str = "APPLEJACK_TEST_TERMINAL";
 const OUTCOME: &str = "APPLEJACK_TEST_OUTCOME";
 const WAIT: Duration = Duration::from_secs(20);
+const NO_NETWORK: &str = "(version 1)(allow default)(deny network*)";
 
 /// The `applejack` child, the only reader of `/dev/tty`.
 fn login_in_session(terminal: &Path) -> Child {
@@ -30,7 +32,8 @@ fn login_in_session(terminal: &Path) -> Child {
         .open(terminal)
         .unwrap();
     ioctl_tiocsctty(&tty).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_applejack"))
+    Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", NO_NETWORK, env!("CARGO_BIN_EXE_applejack")])
         .args(["steam", "login"])
         .stdin(tty.try_clone().unwrap())
         .stdout(tty.try_clone().unwrap())
@@ -152,8 +155,8 @@ fn wait_for_file(path: &Path) -> String {
     }
 }
 
-/// At the password prompt, in raw mode. Returns the outcome file.
-fn at_the_prompt(dir: &TempDir) -> (Pty, Child, PathBuf) {
+/// At the account name prompt. Returns the outcome file.
+fn at_the_name_prompt(dir: &TempDir) -> (Pty, Child, PathBuf) {
     let (mut pty, path) = Pty::open();
     let outcome = dir.path().join("outcome");
     let leader = Command::new(env::current_exe().unwrap())
@@ -166,6 +169,12 @@ fn at_the_prompt(dir: &TempDir) -> (Pty, Child, PathBuf) {
         .spawn()
         .unwrap();
     pty.expect("account name");
+    (pty, leader, outcome)
+}
+
+/// At the password prompt, in raw mode. Returns the outcome file.
+fn at_the_prompt(dir: &TempDir) -> (Pty, Child, PathBuf) {
+    let (mut pty, leader, outcome) = at_the_name_prompt(dir);
     pty.send(b"fixture-user\n");
     pty.expect("password");
     pty.wait_for_raw_mode();
@@ -184,7 +193,7 @@ fn control_c_at_the_password_prompt_restores_the_terminal() {
 
 #[test]
 fn termination_at_the_password_prompt_restores_the_terminal() {
-    for signal in ["-TERM", "-HUP"] {
+    for (signal, code) in [("-TERM", 143), ("-HUP", 129), ("-QUIT", 131)] {
         let dir = TempDir::new().unwrap();
         let (_pty, mut leader, outcome) = at_the_prompt(&dir);
         let pid = wait_for_file(&dir.path().join("outcome.pid"));
@@ -195,7 +204,22 @@ fn termination_at_the_password_prompt_restores_the_terminal() {
         assert!(killed.success());
         let text = wait_for_file(&outcome);
         leader.wait().unwrap();
-        let code = if signal == "-TERM" { 143 } else { 129 };
         assert_eq!(text, format!("Some({code}) echo=1 icanon=1 isig=1"));
+    }
+}
+
+/// Red if a blank name goes on to the password prompt, and from there to
+/// Steam.
+#[test]
+fn a_blank_account_name_is_refused_at_the_prompt() {
+    for line in [&b"\n"[..], b"   \n"] {
+        let dir = TempDir::new().unwrap();
+        let (mut pty, mut leader, outcome) = at_the_name_prompt(&dir);
+        pty.send(line);
+        pty.expect("account name is empty");
+        let text = wait_for_file(&outcome);
+        leader.wait().unwrap();
+        assert!(text.starts_with("Some(1) "), "{text}");
+        assert!(!pty.seen.contains("password"), "{:?}", pty.seen);
     }
 }

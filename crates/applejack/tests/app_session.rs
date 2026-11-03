@@ -66,8 +66,26 @@ impl Fixture {
         command
     }
 
+    /// A `steam` or `install` run has the network denied, so a mistake in a
+    /// test cannot reach Steam.
+    fn command_for(&self, args: &[&str]) -> Command {
+        if !matches!(args.first(), Some(&("steam" | "install"))) {
+            return self.command();
+        }
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+            .args([
+                "-p",
+                "(version 1)(allow default)(deny network*)",
+                env!("CARGO_BIN_EXE_applejack"),
+            ])
+            .env("APPLEJACK_DATA_DIR", self.data())
+            .env("APPLEJACK_ALLOW_UNSIGNED_ENGINE", "1");
+        command
+    }
+
     fn output(&self, args: &[&str]) -> Output {
-        self.command().args(args).output().unwrap()
+        self.command_for(args).args(args).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -84,7 +102,7 @@ impl Fixture {
     /// would start a title and stay attached. Ends in a failure, not a hang.
     fn refused_in_time(&self, args: &[&str]) -> String {
         let mut child = self
-            .command()
+            .command_for(args)
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

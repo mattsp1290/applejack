@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use applejack_steam::Error;
 use applejack_steam::auth::{
-    AccessToken, AuthError, AuthMode, AuthPoll, Authenticator, Credentials, GuardFactor, License,
-    LoginState, LoginStep, Password, SteamConnection, Tokens,
+    AuthError, AuthMode, AuthPoll, Authenticator, Credentials, GuardFactor, License, LoginState,
+    LoginStep, Password, SteamConnection, Tokens,
 };
 use applejack_steam::keychain::{InMemoryStore, RefreshToken, RefreshTokenStore};
 use support::FakeSession;
@@ -94,7 +94,6 @@ impl SteamConnection for Fake {
             Ok(AuthPoll::Approved(Tokens {
                 account_name: "redacted".to_owned(),
                 refresh_token: RefreshToken::new(FIXTURE_TOKEN),
-                access_token: AccessToken::new("access"),
             }))
         })
     }
@@ -498,11 +497,9 @@ fn secrets_never_print_their_values() {
     let tokens = Tokens {
         account_name: "redacted".to_owned(),
         refresh_token: RefreshToken::new(FIXTURE_TOKEN),
-        access_token: AccessToken::new("access-fixture"),
     };
     let debug = format!("{tokens:?}");
     assert!(!debug.contains(FIXTURE_TOKEN));
-    assert!(!debug.contains("access-fixture"));
     assert!(!format!("{:?}", credentials()).contains("not-a-real-password"));
     let license = License {
         package_id: 1,

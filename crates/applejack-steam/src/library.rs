@@ -142,6 +142,11 @@ impl LaunchEntry {
         }
     }
 
+    /// Whether a Windows client is ever offered this entry.
+    fn allows_windows(&self) -> bool {
+        self.oslist.is_empty() || self.oslist.iter().any(|os| os == WINDOWS)
+    }
+
     /// A server, an editor, or a config tool is never the title itself.
     fn is_tool(&self) -> bool {
         matches!(
@@ -161,8 +166,8 @@ pub enum LaunchChoice {
     One(LaunchEntry),
     /// Nothing runs on Windows.
     None,
-    /// More than one command fits, or the only one left is not the entry the
-    /// app calls its default. Picking is the user's to do.
+    /// More than one command fits, or the only one left stands behind a
+    /// Windows `default` a filter took. Picking is the user's to do.
     Several(Vec<LaunchEntry>),
 }
 
@@ -284,16 +289,18 @@ impl OwnedApp {
     ///    are [`LaunchChoice::Several`]: Steam would ask the user, and
     ///    guessing would launch a benchmark or a launcher nobody asked for.
     /// 5. The same goes for a lone entry when the app has a `default` entry
-    ///    and rule 1 or 2 took it away: what is left was offered beside the
-    ///    main entry, and no rule says it stands in for it. A lone entry of
-    ///    an app with no `default` at all is that app's entry.
+    ///    that allows Windows and rule 1 or 2 took it away: what is left was
+    ///    offered beside the main entry, and no rule says it stands in for
+    ///    it. A `default` for another OS was never offered on Windows, so it
+    ///    takes nothing away. A lone entry of an app with no Windows
+    ///    `default` at all is that app's entry.
     #[must_use]
     pub fn launch_choice(&self, branch: &str, filter: &DepotFilter) -> LaunchChoice {
         let mut fits: Vec<&LaunchEntry> = self
             .launch
             .iter()
             .filter(|entry| !entry.executable.is_empty() && !entry.is_tool())
-            .filter(|entry| entry.oslist.is_empty() || entry.oslist.iter().any(|os| os == WINDOWS))
+            .filter(|entry| entry.allows_windows())
             .filter(|entry| entry.betakeys.is_empty() || entry.betakeys.iter().any(|b| b == branch))
             .filter(|entry| {
                 entry
@@ -308,7 +315,11 @@ impl OwnedApp {
         let Some(best) = fits.iter().map(|entry| entry.tier()).min() else {
             return LaunchChoice::None;
         };
-        let lost_default = best != 0 && self.launch.iter().any(|entry| entry.tier() == 0);
+        let lost_default = best != 0
+            && self
+                .launch
+                .iter()
+                .any(|entry| entry.tier() == 0 && entry.allows_windows());
         fits.retain(|entry| entry.tier() == best);
         let mut commands: Vec<&LaunchEntry> = Vec::new();
         for entry in fits {

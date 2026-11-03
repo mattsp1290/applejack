@@ -309,6 +309,14 @@ impl PlannedInstall {
     fn verify(&mut self, report: InstallReporter<'_>) -> Result<AppRow, CoreError> {
         let appid = self.request.appid;
         let paths = LibraryPaths::new(&self.library);
+        if paths.record(appid).exists() {
+            report(
+                "verify",
+                None,
+                None,
+                CoreError::download_in_progress(appid, true).to_string(),
+            );
+        }
         report(
             "verify",
             None,

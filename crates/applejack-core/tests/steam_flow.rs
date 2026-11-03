@@ -33,7 +33,7 @@ use applejack_core::steam::{
 use applejack_core::{Core, CoreError};
 use applejack_engine::rosetta_wine::snapshot::PrefixLock;
 use applejack_engine::rosetta_wine::utc_now;
-use applejack_steam::auth::{AccessToken, AuthError, AuthMode, AuthPoll, GuardFactor};
+use applejack_steam::auth::{AuthError, AuthMode, AuthPoll, GuardFactor};
 use applejack_steam::session::{AppInfo, PackageGrants, SteamSession};
 use applejack_steam::{
     Credentials, Error as SteamError, InMemoryStore, License, LoginStep, Password, RefreshToken,
@@ -51,7 +51,6 @@ const MANIFEST: u64 = 900;
 const ACCOUNT: &str = "fixture-user";
 const PASSWORD: &str = "fixture-password-value";
 const REFRESH: &str = "fixture-refresh-token-value";
-const ACCESS: &str = "fixture-access-token-value";
 const CODE: &str = "FXCDE";
 const QR: &str = "https://s.team/q/fixture-challenge";
 
@@ -165,6 +164,7 @@ struct Script {
     polls: usize,
     gate: Option<Arc<Gate>>,
     logons: Vec<(String, String)>,
+    connections: usize,
 }
 
 struct FakeHost {
@@ -296,7 +296,6 @@ impl SteamConnection for FakeConnection {
             AuthPoll::Approved(Tokens {
                 account_name: ACCOUNT.to_owned(),
                 refresh_token: RefreshToken::new(REFRESH),
-                access_token: AccessToken::new(ACCESS),
             })
         }))
     }
@@ -329,6 +328,7 @@ impl SteamHost for FakeHost {
     type Store = InMemoryStore;
 
     fn connection(&self) -> FakeConnection {
+        self.script.lock().unwrap().connections += 1;
         FakeConnection {
             script: Arc::clone(&self.script),
             session: Arc::clone(&self.session),
@@ -420,6 +420,29 @@ fn start_login(fixture: &Fixture, host: FakeHost) -> (Core, Arc<FakeHost>, Login
     )
     .unwrap();
     (core, host, flow)
+}
+
+/// Red if a blank name reaches Steam: a harness did that, in a loop, up to 158
+/// times. The fake takes any name, so only the refusal stops this.
+#[test]
+fn a_blank_account_name_is_refused_before_any_connection() {
+    let fixture = Fixture::new();
+    for blank in ["", "   ", " \t\r\n"] {
+        let host = Arc::new(guarded(0));
+        let credentials = Credentials {
+            account_name: blank.to_owned(),
+            password: Password::new(PASSWORD),
+        };
+        let error = LoginFlow::start(
+            &mut fixture.core(),
+            Arc::clone(&host),
+            AuthMode::Credentials,
+            Some(&credentials),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidParams, "{error}");
+        assert_eq!(host.script.lock().unwrap().connections, 0, "{blank:?}");
+    }
 }
 
 fn guarded(pending_polls: usize) -> FakeHost {
@@ -917,14 +940,53 @@ fn app_info_text_is_made_printable_on_the_install_path() {
 fn a_lone_entry_behind_a_lost_default_refuses_the_install() {
     let fixture = Fixture::new();
     fixture.signed_in();
-    let entries = r#""0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }
+    let entries = r#""0" { "executable" "beta.exe" "type" "default" "config" { "betakey" "beta" } }
                      "1" { "executable" "bench.exe" "type" "option1" }"#;
     let host = FakeHost::signed_in(session(entries, false));
     let error = fixture.install(&host).unwrap_err();
     assert_eq!(error.code(), ErrorCode::LaunchExeAmbiguous);
     assert!(error.to_string().contains("launch_exe_override"), "{error}");
     assert!(error.to_string().contains("bench.exe"), "{error}");
+    assert!(
+        error.to_string().contains("launch_args_override"),
+        "{error}"
+    );
     assert!(!fixture.acf().exists());
+}
+
+/// Red if `verify` reads the old `.acf` and says nothing: "2 files match" on
+/// a title whose run is refused reads as whole.
+#[test]
+fn verify_over_a_stopped_update_says_so() {
+    let fixture = Fixture::new();
+    fixture.signed_in();
+    let host = FakeHost::signed_in(session(ONE_ENTRY, false));
+    fixture.install(&host).unwrap();
+    let verify = |fixture: &Fixture| {
+        let lines = Mutex::new(Vec::new());
+        let request = TitleInstall {
+            verify: true,
+            ..request()
+        };
+        fixture
+            .core()
+            .plan_title_install(request)
+            .unwrap()
+            .run(&host, &|_, _, _, line| lines.lock().unwrap().push(line))
+            .unwrap();
+        lines.into_inner().unwrap().join("\n")
+    };
+    let whole = verify(&fixture);
+    assert!(!whole.contains("--update"), "{whole}");
+
+    fs::create_dir_all(fixture.record().parent().unwrap()).unwrap();
+    fs::write(fixture.record(), "{}").unwrap();
+    let stopped = verify(&fixture);
+    assert!(
+        stopped.contains(&format!("applejack install {APP} --update")),
+        "{stopped}"
+    );
+    assert!(stopped.contains("2 files match"), "{stopped}");
 }
 
 /// Red if a plain install reads the `.acf` alone: `already installed` is a
@@ -1413,7 +1475,6 @@ fn nothing_secret_reaches_the_log() {
         "fixture-wrong-password",
         CODE,
         REFRESH,
-        ACCESS,
         ACCOUNT,
         QR,
     ] {
@@ -1434,7 +1495,6 @@ fn a_store_holds_the_token_and_no_row_or_file_does() {
     for bytes in [db, wal] {
         let text = String::from_utf8_lossy(&bytes);
         assert!(!text.contains(REFRESH));
-        assert!(!text.contains(ACCESS));
         assert!(!text.contains(PASSWORD));
     }
 }
@@ -1570,6 +1630,49 @@ fn a_login_stuck_after_its_code_ends_with_a_typed_failure() {
         "{error}"
     );
     assert_eq!(error.code(), ErrorCode::SteamLoginFailed);
+}
+
+#[test]
+fn a_blank_account_name_over_rpc_is_invalid_params() {
+    let fixture = Fixture::new();
+    let host = guarded(0);
+    let script = Arc::clone(&host.script);
+    let mut handler = handler(&fixture, host);
+    let (notifier, _lines) = Notifier::channel();
+    let error = handler
+        .handle(
+            &Method::SteamLoginStart(SteamLoginStartParams {
+                mode: LoginMode::Credentials {
+                    account_name: "  ".to_owned(),
+                    password: PASSWORD.to_owned(),
+                },
+            }),
+            &notifier,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidParams);
+    assert_eq!(script.lock().unwrap().connections, 0);
+}
+
+/// Red if the limit is tested before the poll: an approval in the last
+/// interval would be thrown away unseen.
+#[test]
+fn a_login_past_its_limit_looks_once_more_before_it_gives_up() {
+    let fixture = Fixture::new();
+    let (mut core, host, flow) = start_login(&fixture, guarded(usize::MAX));
+    let mut flow = flow.with_wait_limit(Duration::from_millis(40));
+    assert_eq!(
+        flow.advance(&mut core, Some(CODE)).unwrap(),
+        LoginStep::Waiting
+    );
+    std::thread::sleep(Duration::from_millis(80));
+    host.script.lock().unwrap().pending_polls = 0;
+    assert_eq!(
+        flow.advance(&mut core, None).unwrap(),
+        LoginStep::Done {
+            account_name: ACCOUNT.to_owned()
+        }
+    );
 }
 
 /// The method table derives `Debug`, and the log is not the only reader.

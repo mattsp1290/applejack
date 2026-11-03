@@ -51,7 +51,7 @@ impl fmt::Display for Id {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub jsonrpc: Version,
@@ -60,6 +60,16 @@ pub struct Request {
     /// Missing `params` reads as `{}` so methods without parameters need none.
     #[serde(default = "empty_params")]
     pub params: Value,
+}
+
+/// Without `params`: a login's password and guard code ride in them.
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Request {
@@ -244,7 +254,7 @@ pub enum ErrorCode {
     AppNotOwned,
     /// The title has nothing this account can install.
     TitleNotInstallable,
-    /// Several launch entries fit; `launch_exe_override` decides.
+    /// No launch entry can be chosen; `launch_exe_override` decides.
     LaunchExeAmbiguous,
     /// The install stopped on request and can resume.
     InstallCancelled,
@@ -466,7 +476,7 @@ impl ErrorCode {
                 "The title has no Windows depot, none on the branch, or none this account licenses."
             }
             Self::LaunchExeAmbiguous => {
-                "Several launch entries fit and none outranks the rest. `launch_exe_override` is the way out."
+                "No launch entry can be chosen: several fit and none outranks the rest, or the only one left stands behind a `default` entry that could have run on Windows. `launch_exe_override` is the way out."
             }
             Self::InstallCancelled => {
                 "The install stopped on request. Its download record stays, and the next install resumes."
@@ -505,6 +515,20 @@ impl<'de> Deserialize<'de> for ErrorCode {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Red on a derived `Debug`, which would print a login's password.
+    #[test]
+    fn a_requests_debug_omits_its_params() {
+        let request = Request::new(
+            Id::Number(1),
+            "steam.login.start",
+            json!({"mode": {"password": "fixture-password-value"}}),
+        );
+        let debug = format!("{request:?}");
+        assert!(debug.contains("steam.login.start"), "{debug}");
+        assert!(!debug.contains("fixture-password-value"), "{debug}");
+        assert!(!debug.contains("params"), "{debug}");
+    }
 
     #[test]
     fn version_accepts_only_2_0() {

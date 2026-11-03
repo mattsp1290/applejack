@@ -908,6 +908,19 @@ impl Cm {
         self.answer(&poll, 1, &body.encode_to_vec());
     }
 
+    async fn answer_poll_with_only_a_refresh_token(&mut self, access_token: Option<String>) {
+        let poll = self
+            .expect_call("Authentication.PollAuthSessionStatus#1")
+            .await;
+        let body = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some(FIXTURE_TOKEN.to_owned()),
+            access_token,
+            account_name: Some("fixture-user".to_owned()),
+            ..Default::default()
+        };
+        self.answer(&poll, 1, &body.encode_to_vec());
+    }
+
     async fn answer_poll(&mut self, tokens: bool) {
         let poll = self
             .expect_call("Authentication.PollAuthSessionStatus#1")
@@ -1014,6 +1027,34 @@ async fn an_answer_with_an_empty_refresh_token_is_not_an_approval() {
     ));
     assert!(store.get().unwrap().is_none());
     script.await.unwrap();
+}
+
+/// Steam consumes the session on this answer, so reading it as pending loses
+/// the login. It has sent refresh tokens with no access token before.
+#[tokio::test]
+async fn a_refresh_token_with_no_access_token_is_a_login() {
+    for access_token in [None, Some(String::new())] {
+        let (client, mut cm) = prepared().await;
+        let script = tokio::spawn(async move {
+            cm.open_credentials_session().await;
+            cm.answer_poll_with_only_a_refresh_token(access_token).await;
+        });
+        let store = InMemoryStore::default();
+        let mut connection = SteamroomConnection::over(client);
+        let mut auth = Authenticator::new(&mut connection, &store);
+        let credentials = fixture_credentials();
+        auth.begin(AuthMode::Credentials, Some(&credentials))
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.poll().await.unwrap(),
+            LoginStep::Done {
+                account_name: "fixture-user".to_owned()
+            }
+        );
+        assert_eq!(store.get().unwrap().unwrap().expose(), FIXTURE_TOKEN);
+        script.await.unwrap();
+    }
 }
 
 #[tokio::test]

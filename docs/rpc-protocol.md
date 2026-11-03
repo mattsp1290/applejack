@@ -120,7 +120,7 @@ Swift case; do not edit the table by hand.
 | 1024 | `SteamUnavailable` | Steam could not be reached or denied one call on a healthy session. |
 | 1025 | `AppNotOwned` | `app.install` for a title this account does not own. |
 | 1026 | `TitleNotInstallable` | The title has no Windows depot, none on the branch, or none this account licenses. |
-| 1027 | `LaunchExeAmbiguous` | Several launch entries fit and none outranks the rest. `launch_exe_override` is the way out. |
+| 1027 | `LaunchExeAmbiguous` | No launch entry can be chosen: several fit and none outranks the rest, or the only one left stands behind a `default` entry that could have run on Windows. `launch_exe_override` is the way out. |
 | 1028 | `InstallCancelled` | The install stopped on request. Its download record stays, and the next install resumes. |
 | 1029 | `LockHeld` | Another process holds this title's install lock or the Steam session. |
 | 1030 | `AlreadyInstalled` | `app.install` for a title that is whole on disk. Use `update` or `verify`. |
@@ -351,7 +351,8 @@ core leaves this recovery to the next start.
 
 A login is a series of short requests. `steam.login.start` takes `{"mode":
 {"kind": "qr"}}` or `{"mode": {"kind": "credentials", "account_name", "password"}}`,
-connects, and answers `{session_id, step}`. `steam.login.complete` takes
+connects, and answers `{session_id, step}`. A blank `account_name` is
+`InvalidParams`, with no connection made. `steam.login.complete` takes
 `session_id` and an optional `steam_guard_code`, and answers the same shape after
 one submit, or one poll when there is no code. `step.kind` is below, with what a
 client does. The app today offers QR only, so it never sees `guard_required`, and

@@ -30,9 +30,7 @@ use tokio::time::timeout;
 pub use cdn::LiveChunks;
 pub use session::SteamroomSession;
 
-use crate::auth::{
-    AccessToken, AuthError, AuthPoll, Credentials, GuardFactor, SteamConnection, Tokens,
-};
+use crate::auth::{AuthError, AuthPoll, Credentials, GuardFactor, SteamConnection, Tokens};
 use crate::keychain::RefreshToken;
 
 /// Pinned crate versions. Mirror `[workspace.dependencies]`.
@@ -111,10 +109,7 @@ impl AuthFlow {
         if let Some(client_id) = answer.new_client_id.filter(|id| *id != 0) {
             self.client_id = client_id;
         }
-        if let (Some(access), Some(refresh)) = (&answer.access_token, &answer.refresh_token)
-            && !access.is_empty()
-            && !refresh.is_empty()
-        {
+        if let Some(refresh) = answer.refresh_token.as_ref().filter(|t| !t.is_empty()) {
             let account_name = answer
                 .account_name
                 .clone()
@@ -124,7 +119,6 @@ impl AuthFlow {
             return Ok(AuthPoll::Approved(Tokens {
                 account_name,
                 refresh_token: RefreshToken::new(refresh.clone()),
-                access_token: AccessToken::new(access.clone()),
             }));
         }
         Ok(AuthPoll::Pending {

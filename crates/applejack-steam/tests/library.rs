@@ -769,32 +769,61 @@ fn chosen(entries: &str) -> (String, Option<String>) {
     }
 }
 
-/// What a filter leaves when it takes the `default` entry is not what the app
-/// calls its main entry. Red if a lone survivor is chosen whatever it is.
+/// What a filter leaves when it takes a `default` a Windows client would have
+/// run is not what the app calls its main entry. Red if a lone survivor is
+/// chosen whatever it is.
 #[test]
-fn a_lone_entry_left_when_a_filter_took_the_default_is_refused() {
-    let default_elsewhere = r#"
-        "0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }"#;
-    for survivor in [
-        r#""1" { "executable" "bench.exe" "type" "option1" "config" { "oslist" "windows" } }"#,
-        r#""1" { "executable" "bench.exe" "type" "benchmark" "config" { "oslist" "windows" } }"#,
-        r#""1" { "executable" "bench.exe" "config" { "oslist" "windows" } }"#,
+fn a_lone_entry_left_when_a_filter_took_a_windows_default_is_refused() {
+    for lost in [
+        r#""0" { "executable" "beta.exe" "type" "default" "config" { "betakey" "beta" } }"#,
+        r#""0" { "executable" "dlc.exe" "type" "default" "config" { "ownsdlc" "99" } }"#,
+        r#""0" { "executable" "old.exe" "type" "default"
+                 "config" { "oslist" "windows" "osarch" "32" } }"#,
+        r#""0" { "executable" "beta.exe" "type" "default"
+                 "config" { "oslist" "macos,windows" "betakey" "beta" } }"#,
     ] {
-        let LaunchChoice::Several(left) = choice(&format!("{default_elsewhere}\n{survivor}"))
-        else {
-            panic!("chose a lone entry for {survivor}");
-        };
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].executable, "bench.exe");
+        for survivor in [
+            r#""1" { "executable" "bench.exe" "type" "option1" "config" { "osarch" "64" } }"#,
+            r#""1" { "executable" "bench.exe" "type" "benchmark" "config" { "osarch" "64" } }"#,
+            r#""1" { "executable" "bench.exe" "config" { "osarch" "64" } }"#,
+        ] {
+            let LaunchChoice::Several(left) = choice(&format!("{lost}\n{survivor}")) else {
+                panic!("chose a lone entry for {lost} and {survivor}");
+            };
+            assert_eq!(left.len(), 1);
+            assert_eq!(left[0].executable, "bench.exe");
+        }
     }
-    let other_branch = r#"
-        "0" { "executable" "beta.exe" "type" "default" "config" { "betakey" "beta" } }
-        "1" { "executable" "manual.exe" "type" "manual" }"#;
-    assert!(matches!(choice(other_branch), LaunchChoice::Several(_)));
-    let other_dlc = r#"
-        "0" { "executable" "dlc.exe" "type" "default" "config" { "ownsdlc" "99" } }
-        "1" { "executable" "tool.exe" "type" "option2" }"#;
-    assert!(matches!(choice(other_dlc), LaunchChoice::Several(_)));
+}
+
+/// A Windows client was never offered a macOS or Linux `default`, so nothing
+/// was lost. Red if every `default` counts. This is the shape Peglin may have.
+#[test]
+fn a_lone_windows_entry_beside_another_platforms_default_is_chosen() {
+    for elsewhere in [
+        r#""0" { "executable" "Game.app" "type" "default" "config" { "oslist" "macos" } }"#,
+        r#""0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }"#,
+        r#""0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux,macos" } }"#,
+    ] {
+        for lone in [
+            r#""1" { "executable" "game.exe" "config" { "oslist" "windows" } }"#,
+            r#""1" { "executable" "game.exe" "type" "none" "config" { "oslist" "windows" } }"#,
+            r#""1" { "executable" "game.exe" "type" "option1" "config" { "oslist" "windows" } }"#,
+            r#""1" { "executable" "game.exe" }"#,
+        ] {
+            assert_eq!(chosen(&format!("{elsewhere}\n{lone}")).0, "game.exe");
+        }
+    }
+}
+
+/// Two commands stay the user's to pick from, whatever else the app lists.
+#[test]
+fn two_windows_entries_beside_another_platforms_default_are_refused() {
+    let entries = r#"
+        "0" { "executable" "game.sh" "type" "default" "config" { "oslist" "linux" } }
+        "1" { "executable" "a.exe" "config" { "oslist" "windows" } }
+        "2" { "executable" "b.exe" "config" { "oslist" "windows" } }"#;
+    assert!(matches!(choice(entries), LaunchChoice::Several(left) if left.len() == 2));
 }
 
 /// The rule does not reach an app that never had a `default`.

@@ -52,10 +52,14 @@ the only implementations that open a socket.
   factor, so polling finishes it), `GuardRequired { factor: EmailCode | DeviceCode }` (poll, and call
   `submit_guard_code` when a code arrives), or `GuardRequired { factor:
   DeviceConfirmation }` (poll). `submit_guard_code` polls once, so `Waiting`
-  from it means the code was taken. `LoginFlow` allows `Waiting` two minutes and
-  then ends the login with `SteamLoginStalled`, code `SteamLoginFailed`; the CLI
-  prints a line while it waits. An answer with an empty refresh token is not an
-  approval: it would store nothing usable and read as signed in.
+  from it means the code was taken. `LoginFlow` allows `Waiting` two minutes,
+  looks once more, and then ends the login with `SteamLoginStalled`, code
+  `SteamLoginFailed`; the CLI prints a line while it waits. A non-empty refresh
+  token is an approval, with or without an access token: `logon` sends only the
+  refresh token, and Steam has answered with no access token. An answer with an
+  empty refresh token is not one: it would store nothing usable and read as
+  signed in. `LoginFlow::start` refuses a blank account name before it connects,
+  and the CLI before it asks for the password.
   `InvalidGuardCode` keeps the session open.
   Any other error from `submit_guard_code` or `poll` ends the login: the
   connection has dropped its auth session, the driver returns to idle, and the
@@ -307,8 +311,8 @@ it. Codes are read with echo on: the reader thread is left blocked when the
 login ends first, and a process that exits mid-read with echo off leaves the
 terminal that way. `rpassword` clears echo, canonical mode, and `ISIG`, reads
 control-C as a character, and raises `SIGINT` before its own restore, so the
-login holds a handler from the password prompt on: `SIGINT`, `SIGTERM`, and
-`SIGHUP` put the terminal back and exit with `128 + signal`.
+login holds a handler from the password prompt on: `SIGINT`, `SIGTERM`,
+`SIGHUP`, and `SIGQUIT` put the terminal back and exit with `128 + signal`.
 
 `steam library` reads the cache, or Steam with `--refresh` or an empty cache.
 Rows go to the `apps` table: `fetched_at` marks the cache, and `size_bytes`,
@@ -361,11 +365,13 @@ type, whose `oslist` allows Windows, whose `betakey` is empty or names the
 branch, and whose `ownsdlc` is owned; `osarch` matching the planned depots, unless
 that leaves nothing; then `default` over untyped over `option1` and its like.
 The entries that remain must agree on executable and arguments. If they do not,
-or if the app has a `default` entry and these filters took it, so that what is
-left was only ever offered beside it, the install refuses with
-`LaunchExeAmbiguous` before a byte arrives and lists them;
-`applejack config <appid> set launch_exe_override <file>` is the way out. A lone
-entry stands only when no filter took a `default`. The rule errs towards refusing.
+or if the app has a `default` entry that allows Windows and these filters took
+it, so that what is left was only ever offered beside it, the install refuses
+with `LaunchExeAmbiguous` before a byte arrives and lists them;
+`applejack config <appid> set launch_exe_override <file>` is the way out, with
+any arguments of the entry in `launch_args_override`. A `default` for another
+OS takes nothing away: a Windows client was never offered it, so a lone Windows
+entry beside it stands. The rule errs towards refusing.
 A title with an override, an exe already recorded, or a client launch
 (`drm = steam` or `launch_mode = client`) needs no choice. Steamworks' uploading
 documentation grounds only the OS and DLC filters. `type`, `osarch`, and
@@ -391,7 +397,7 @@ because a `.acf` is present. It writes through `Core::record_title`.
   Security framework (`SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete`).
   The `security` command line tool is never invoked.
 - The access token stays in memory (`auth::AccessToken`).
-- `RefreshToken`, `AccessToken`, and `Password` redact themselves in `Debug`
+- `RefreshToken` and `Password` redact themselves in `Debug`
   and `Display`; a value is readable only through `expose()`.
 - No token is ever passed on a process command line. The crate constructs no
   `std::process::Command`: `crates/applejack-steam/clippy.toml` lists it and
@@ -410,7 +416,7 @@ because a `.acf` is present. It writes through `Core::record_title`.
   account name lives in each directory's `meta` table. `steam logout` with one
   `APPLEJACK_DATA_DIR` signs every other out, and a login in one leaves another
   naming the old account until its next login.
-- `RefreshToken`, `AccessToken`, `Password`, and `Credentials` are not
+- `RefreshToken`, `Password`, and `Credentials` are not
   comparable (no `PartialEq`: a derived comparison is not constant time and
   nothing needs one), `License::Debug` omits the PICS `access_token`, and the
   `CMsgClientLogon` built in `SteamroomSession::start` carries the refresh

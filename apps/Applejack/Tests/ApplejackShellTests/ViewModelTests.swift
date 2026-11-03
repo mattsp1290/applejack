@@ -361,6 +361,34 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
+    /// Red if `polling` is one flag: the old loop holds it through its sleep,
+    /// so Done on the new login returns with nothing sent, and the app polls
+    /// only after Done.
+    func testDoneOnANewLoginDuringTheOldLoopsSleepPolls() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_ROTATE": "1", "FAKE_CORE_LOGIN_POLLS": "100"])
+        let steam = SteamAccountViewModel(app: app)
+        await steam.startQrLogin()
+        let old = Task { await steam.complete() }
+        while try requests(for: "steam.login.complete").isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        await steam.startQrLogin()
+        let new = Task { await steam.complete() }
+        let deadline = ContinuousClock.now + .milliseconds(1500)
+        while try !requests(for: "steam.login.complete").contains(where: { $0.contains("login-session-fake-2") }) {
+            if ContinuousClock.now > deadline { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let sent = try requests(for: "steam.login.complete")
+        XCTAssertTrue(sent.contains { $0.contains("login-session-fake-2") }, "\(sent)")
+        new.cancel()
+        old.cancel()
+        await new.value
+        await old.value
+        await app.shutdown()
+    }
+
     func testLoginPollsUntilSteamIssuesTheTokens() async throws {
         setenv("FAKE_CORE_LOGIN_POLLS", "1", 1)
         defer { unsetenv("FAKE_CORE_LOGIN_POLLS") }

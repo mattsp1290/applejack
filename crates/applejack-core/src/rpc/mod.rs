@@ -212,8 +212,8 @@ impl<H: SteamHost> CoreHandler<H> {
             return Err(CoreError::NoSuchLogin.into());
         }
         let mut pending = self.login.take().ok_or(CoreError::NoSuchLogin)?;
-        let code = params.steam_guard_code.as_deref();
-        match pending.flow.advance(self.core()?, code) {
+        let steam_guard_code = params.steam_guard_code.as_deref();
+        match pending.flow.advance(self.core()?, steam_guard_code) {
             Ok(step) => {
                 let id = pending.id.clone();
                 if !matches!(step, LoginStep::Done { .. }) {

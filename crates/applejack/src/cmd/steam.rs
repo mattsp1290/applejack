@@ -13,12 +13,12 @@ use std::thread;
 use applejack_core::rpc::wire::ErrorCode;
 use applejack_core::steam::{
     AuthMode, Credentials, GuardFactor, InstallState, LibraryEntry, LiveSteam, LoginFlow,
-    LoginStep, Password, SteamLibraryResult,
+    LoginStep, Password, SteamLibraryResult, refuse_blank_account,
 };
 use applejack_core::{Core, CoreError};
 use clap::{Args, Subcommand};
 use rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 /// What a shell reads as a command ended by control-C.
@@ -64,8 +64,8 @@ pub fn run(args: &SteamArgs) -> ExitCode {
     }
 }
 
-fn say(line: &str) {
-    let _ = writeln!(io::stderr(), "{line}");
+fn say(message: &str) {
+    let _ = writeln!(io::stderr(), "{message}");
 }
 
 fn ask_line(prompt: &str) -> Result<String, CoreError> {
@@ -81,12 +81,14 @@ fn ask_line(prompt: &str) -> Result<String, CoreError> {
 }
 
 /// From here to the end of the process, a signal puts the terminal back and
-/// exits as that signal would have. `rpassword` clears echo, canonical mode,
-/// and `ISIG`, reads control-C as a character, and raises `SIGINT` before its
-/// own restore, so with the default action the terminal stays that way. The
-/// handler stays for good because a signal-hook handler is not undone: the
-/// polling that follows must still answer control-C. With no terminal there
-/// is nothing to restore, and the prompt reports that itself.
+/// exits with the status a shell reports for that signal, `128 + signal`. The
+/// parent sees an exit, not a death by signal. `rpassword` clears echo,
+/// canonical mode, and `ISIG`, reads control-C as a character, and raises
+/// `SIGINT` before its own restore, so with the default action the terminal
+/// stays that way. The handler stays for good because a signal-hook handler
+/// is not undone: the polling that follows must still answer control-C. With
+/// no terminal there is nothing to restore, and the prompt reports that
+/// itself.
 fn restore_terminal_on_signal() -> Result<(), CoreError> {
     let Ok(terminal) = File::options().read(true).write(true).open("/dev/tty") else {
         return Ok(());
@@ -94,7 +96,7 @@ fn restore_terminal_on_signal() -> Result<(), CoreError> {
     let Ok(modes) = tcgetattr(&terminal) else {
         return Ok(());
     };
-    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])
         .map_err(|error| CoreError::Message(format!("cannot handle signals: {error}")))?;
     thread::spawn(move || {
         if let Some(signal) = signals.forever().next() {
@@ -107,6 +109,7 @@ fn restore_terminal_on_signal() -> Result<(), CoreError> {
 
 fn ask_credentials() -> Result<Credentials, CoreError> {
     let account_name = ask_line("Steam account name: ")?;
+    refuse_blank_account(&account_name)?;
     restore_terminal_on_signal()?;
     let password = match rpassword::prompt_password("Steam password: ") {
         Ok(password) => password,

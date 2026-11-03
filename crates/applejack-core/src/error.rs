@@ -40,7 +40,8 @@ pub enum CoreError {
     InvalidRequest(String),
     #[error(
         "title {appid} has no launch entry that can be chosen for you ({}); pick one \
-         with `applejack config {appid} set launch_exe_override <file>`",
+         with `applejack config {appid} set launch_exe_override <file>`, and put anything \
+         listed after the file in `launch_args_override`",
         candidates.join(", ")
     )]
     LaunchExeAmbiguous { appid: u32, candidates: Vec<String> },
