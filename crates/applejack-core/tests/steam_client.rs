@@ -796,7 +796,9 @@ fn repair_restores_the_newest_snapshot_and_reinstall_reruns_the_bootstrapper() {
         status.snapshots, 1,
         "the safety copy of the broken state is not kept"
     );
-    // A second repair restores the same snapshot, not the broken state.
+    // Broken again, a second repair restores the same snapshot, not the
+    // discarded broken state.
+    fs::remove_file(fixture.steam_dir().join("steam.exe")).unwrap();
     let status = fixture
         .core()
         .plan_client_op(ClientOp::Repair { reinstall: false })
@@ -821,6 +823,102 @@ fn repair_restores_the_newest_snapshot_and_reinstall_reruns_the_bootstrapper() {
         fixture.steam_dir().join("bootstrapped").is_file(),
         "the bootstrapper ran again"
     );
+}
+
+#[test]
+fn repair_refuses_a_client_that_is_not_broken_and_keeps_the_sign_in() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.sign_in();
+    fixture.stop_client();
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::Ready
+    );
+    let error = fixture
+        .core()
+        .plan_client_op(ClientOp::Repair { reinstall: false })
+        .unwrap()
+        .run(&mut |_, _| {})
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    let text = error.to_string();
+    assert!(text.contains("is ready: nothing to repair"), "{text}");
+    assert!(
+        text.contains("`applejack prefix restore steam-client <timestamp>`"),
+        "{text}"
+    );
+    assert!(
+        fixture.steam_dir().join("config/loginusers.vdf").is_file(),
+        "the sign-in is still there"
+    );
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::Ready
+    );
+    assert_eq!(
+        fixture
+            .core()
+            .prefix_snapshots(STEAM_CLIENT_PREFIX)
+            .unwrap()
+            .len(),
+        1,
+        "nothing restored, nothing discarded"
+    );
+    fixture.assert_lock_free();
+}
+
+#[test]
+fn repair_over_a_dead_installs_marker_clears_it_and_restores_nothing() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let before = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.sign_in();
+    fixture.stop_client();
+    let marker = fixture.prefix_dir().join("applejack/client-install.json");
+    fs::write(&marker, "{}").unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    assert!(
+        detail.contains("an install stopped before it finished"),
+        "{detail}"
+    );
+    let mut lines = Vec::new();
+    let status = fixture
+        .core()
+        .plan_client_op(ClientOp::Repair { reinstall: false })
+        .unwrap()
+        .run(&mut |phase, line| lines.push(format!("{phase}: {line}")))
+        .unwrap();
+    assert!(
+        lines.contains(
+            &"repair: cleared the marker of an install that died; the client's files are intact"
+                .to_owned()
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("restoring")),
+        "{lines:?}"
+    );
+    assert!(!marker.exists(), "the marker is cleared");
+    assert_eq!(status.state, ClientRuntimeState::Ready, "{}", status.detail);
+    assert!(
+        fixture.steam_dir().join("config/loginusers.vdf").is_file(),
+        "the sign-in, newer than the snapshot, is still there"
+    );
+    let snapshots = fixture
+        .core()
+        .prefix_snapshots(STEAM_CLIENT_PREFIX)
+        .unwrap();
+    assert_eq!(status.snapshots, 1);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        snapshots[0].timestamp, before.timestamp,
+        "the one snapshot is untouched"
+    );
+    fixture.assert_lock_free();
 }
 
 #[test]

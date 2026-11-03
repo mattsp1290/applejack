@@ -57,7 +57,7 @@ process the client starts carries, games included; and
 | `runtime steam install` | `runtime.steam.install` (job) | Clears the marker of an install that died, builds the prefix if needed, downloads `SteamSetup.exe`, verifies it, runs it silently, lists the shared library in `libraryfolders.vdf`, starts the client for its self-update, and leaves it at the login window. With the client installed and up, only the wait for the window: it is the way to open the window for a sign-in |
 | `runtime steam status [--json]` | `runtime.steam.status` | The table above |
 | `runtime steam update` | `runtime.steam.update` (job) | Stops the client, snapshots the prefix, starts the client so it updates itself, records the build |
-| `runtime steam repair` | `runtime.steam.repair` (job) | Stops the client, restores the newest snapshot of the prefix, and discards the safety copy the restore takes of the state repaired away, so a second `repair` restores the same snapshot again |
+| `runtime steam repair` | `runtime.steam.repair` (job) | Refuses with `ClientRuntimeBroken` unless the runtime is `broken`. A dead install's marker over an intact `steam.exe` is only cleared, nothing restored. Otherwise stops the client, restores the newest snapshot of the prefix, and discards the safety copy the restore takes of the state repaired away (a state without `steam.exe`), so a second `repair` restores the same snapshot again. `applejack prefix restore steam-client <timestamp>` is the deliberate rollback that keeps a safety copy |
 | `runtime steam repair --reinstall` | `reinstall: true` | Stops the client, removes `Steam/package/`, and runs the bootstrapper and first run again |
 | `runtime steam stop` | `runtime.steam.stop` (job) | `<server> -k` on the prefix |
 
@@ -109,8 +109,15 @@ passes credentials to the client.
 ### Snapshots and repair
 
 `update` snapshots the prefix before the client touches itself (decision
-9); `repair` restores the newest snapshot and discards the safety copy the
-restore takes, which is the state just repaired away. A run that finds the
+9); `repair` refuses unless the runtime is `broken`, since the restore
+discards what it replaces: the sign-in in `config/loginusers.vdf` and
+`userdata/` would have no copy. `applejack prefix restore steam-client
+<timestamp>` is the deliberate rollback and keeps a safety copy. When the
+runtime is `broken` only by the marker of an install that died and
+`steam.exe` is present, `repair` clears the marker and restores nothing.
+Otherwise `repair` restores the newest snapshot and discards the safety copy
+the restore takes, which is the state just repaired away and has no
+`steam.exe`. A run that finds the
 client updating refuses with `ClientRuntimeBroken { state: updating }`
 rather than snapshotting under it (plan 05 asked for the snapshot; a
 snapshot needs the server gone, which a running client is not), and that
@@ -241,10 +248,11 @@ criterion 5 may be rewritten so the in-prefix client keeps its own copy.
 | Payload without `probes/osslsigncode` | `ClientRuntimeBroken` | Install a payload that ships the tool |
 | `SteamSetup.exe` failed or ran over ten minutes | `ClientRuntimeBroken` | The session log under `logs/` has the output; `repair --reinstall` tries again |
 | First run never reached the window | `ClientRuntimeBroken { updating }` | The client was stopped; `install` again, or `repair` once a snapshot exists |
-| An install died and left its marker | `ClientRuntimeBroken { broken }` | `install` again: it holds the lock, so the marker is a dead install's and is cleared first |
+| An install died and left its marker | `ClientRuntimeBroken { broken }` | `install` again: it holds the lock, so the marker is a dead install's and is cleared first. `repair` with `steam.exe` present only clears the marker |
 | Run with no client | `ClientRuntimeUnavailable { absent }` | `applejack runtime steam install` |
 | Run with no account | `ClientRuntimeUnavailable { needs_login }` | `applejack runtime steam install`, sign in inside the window |
 | Run while updating or broken | `ClientRuntimeBroken` | `status`; wait for an update to finish, `repair` a broken client. The message's advice follows the state |
+| `repair` of a runtime that is not broken | `ClientRuntimeBroken { ready }` (or the state found) | Nothing to repair; `applejack prefix restore steam-client <timestamp>` rolls back deliberately and keeps a safety copy |
 | Client reported no running title | `ClientLaunchTimedOut` | The client was stopped, with any title in it; the session log names the run. A title the client refuses to launch (ownership, region) shows here |
 | The client began downloading the title | `ClientRedownloadRefused` | A2 refuted; see above |
 | The client began a routine patch of the title | `TitleUpdatePending` | Not a refuted A2. `runtime steam stop`, `install <appid> --update`, run again |
@@ -253,7 +261,9 @@ criterion 5 may be rewritten so the in-prefix client keeps its own copy.
 ## Recovery
 
 - A client that will not start: `applejack runtime steam repair` restores
-  the newest snapshot; `--reinstall` keeps the prefix and user data, drops
+  the newest snapshot of a `broken` client (or only clears a dead install's
+  marker when `steam.exe` is intact) and refuses any other state;
+  `--reinstall` keeps the prefix and user data, drops
   `Steam/package/`, and reruns the bootstrapper. The CodeWeavers note that
   every client update "breaks the bottle" and a fresh one fixes it is why
   `update` snapshots first.

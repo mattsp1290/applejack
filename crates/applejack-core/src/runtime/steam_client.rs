@@ -138,8 +138,10 @@ impl ClientRuntimeState {
 
 impl ClientRuntimeState {
     /// The tail of the `ClientRuntimeBroken` message: what gets the runtime
-    /// out of this state. `repair` is right for `broken` only; it would
-    /// roll back a client that is updating itself.
+    /// out of this state. `repair` is right for `broken` only; it refuses
+    /// any other state, since a restore would roll back a client worth
+    /// keeping, and on a `broken` client whose files are intact it only
+    /// clears the marker of a dead install.
     #[must_use]
     pub const fn advice(self) -> &'static str {
         match self {
@@ -148,7 +150,10 @@ impl ClientRuntimeState {
                 "; wait for the client's self-update to finish, or run `applejack runtime steam \
                  install` if the client was stopped"
             }
-            Self::Broken => ", and `applejack runtime steam repair` restores the newest snapshot",
+            Self::Broken => {
+                ", and `applejack runtime steam repair` restores the newest snapshot, or only \
+                 clears the marker of a dead install when the client's files are intact"
+            }
             Self::Absent | Self::NeedsLogin | Self::Ready => "",
         }
     }
@@ -959,8 +964,8 @@ impl PlannedClientOp {
     /// # Errors
     ///
     /// [`CoreError::BootstrapperDownload`], [`CoreError::BootstrapperUnverified`],
-    /// [`CoreError::ClientRuntimeBroken`] when the client never comes up, or
-    /// the engine failure.
+    /// [`CoreError::ClientRuntimeBroken`] when the client never comes up or
+    /// a `repair` finds nothing broken, or the engine failure.
     pub fn run_with(
         mut self,
         fetch: Fetcher<'_>,
@@ -1300,8 +1305,34 @@ impl PlannedClientOp {
         self.first_run(&prefix, report)
     }
 
-    /// Restores the newest snapshot.
+    /// Repairs a `broken` runtime and refuses any other state: the restore
+    /// below discards what it replaces, so a client worth keeping (its
+    /// sign-in, its `userdata/`) must go through `prefix restore`, which
+    /// keeps a safety copy. A dead install's marker over an intact client
+    /// is cleared without restoring anything.
     fn repair(&mut self, report: &mut dyn FnMut(&str, String)) -> Result<(), CoreError> {
+        let (state, detail) = self.core.runtime_state(true)?;
+        if state != ClientRuntimeState::Broken {
+            return Err(CoreError::ClientRuntimeBroken {
+                state,
+                detail: format!(
+                    "nothing to repair ({detail}); `applejack prefix restore {STEAM_CLIENT_PREFIX} \
+                     <timestamp>` restores a chosen snapshot and keeps a safety copy of the \
+                     current state"
+                ),
+            });
+        }
+        let had_steam_exe = self.paths.steam_exe().is_file();
+        let marker = self.paths.install_marker();
+        if had_steam_exe && marker.exists() {
+            fs::remove_file(&marker).map_err(|error| CoreError::io(marker, error))?;
+            report(
+                "repair",
+                "cleared the marker of an install that died; the client's files are intact"
+                    .to_owned(),
+            );
+            return Ok(());
+        }
         let Some(newest) = self.core.prefix_snapshots(STEAM_CLIENT_PREFIX)?.pop() else {
             return Err(CoreError::ClientRuntimeBroken {
                 state: ClientRuntimeState::Broken,
@@ -1330,8 +1361,10 @@ impl PlannedClientOp {
         )?;
         // The safety copy is the state just repaired away; kept, it would be
         // the newest snapshot and the next `repair` would put it back. With
-        // no prefix to copy, `restore` returns the source, which stays.
-        if had_prefix && safety.timestamp != newest.timestamp {
+        // no prefix to copy, `restore` returns the source, which stays. A
+        // state that still had `steam.exe` (a prefix record that does not
+        // open) may hold a sign-in, so its copy stays too.
+        if had_prefix && !had_steam_exe && safety.timestamp != newest.timestamp {
             report(
                 "repair",
                 format!(

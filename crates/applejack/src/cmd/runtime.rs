@@ -39,7 +39,8 @@ enum Action {
     },
     /// Snapshot the prefix, then start the client so it updates itself
     Update,
-    /// Restore the newest snapshot of the prefix
+    /// Repair a broken client: restore the newest snapshot of the prefix, or
+    /// only clear a dead install's marker when the client's files are intact
     Repair {
         /// Remove the client's package directory and rerun the bootstrapper
         #[arg(long)]
