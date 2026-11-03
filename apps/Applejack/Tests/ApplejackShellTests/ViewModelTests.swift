@@ -372,6 +372,61 @@ final class ViewModelTests: XCTestCase {
         await refusing.shutdown()
     }
 
+    /// `SessionRow` (`sessions.rs`): `starting` at the claim, `running` once
+    /// the marker appears, `cancel_requested` from the cancel, and the end
+    /// state with `ended_at`; the fake's row moves the same way, so a shell
+    /// that reads `state` or `cancel_requested` learns what the core says.
+    func testTheSessionRowFollowsRunCancelAndExit() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RUN_DELAY_MS": "300"])
+        let logs = LogsViewModel(app: app)
+        func row() async throws -> SessionEntry {
+            await logs.load(appid: 220)
+            return try XCTUnwrap(logs.sessions.value?.sessions.first)
+        }
+        var seen = try await row()
+        XCTAssertEqual(seen.id, 1)
+        XCTAssertEqual(seen.state, .running)
+        XCTAssertFalse(seen.cancelRequested)
+
+        let detail = app.detail(for: 220)
+        let run = Task { await detail.run() }
+        try await waitUntil { detail.runState == .loading }
+        seen = try await row()
+        XCTAssertEqual(seen.id, 41)
+        XCTAssertEqual(seen.state, .starting, "claimed, not yet seen running")
+        XCTAssertNil(seen.endedAt)
+        XCTAssertFalse(seen.cancelRequested)
+        await run.value
+        try await waitUntil { detail.session.value?.phase == "running" }
+        seen = try await row()
+        XCTAssertEqual(seen.state, .running)
+        XCTAssertNil(seen.endedAt)
+
+        await detail.cancel()
+        try await waitUntil { detail.session.value?.finished == true }
+        seen = try await row()
+        XCTAssertEqual(seen.id, 41)
+        XCTAssertEqual(seen.state, .cancelled)
+        XCTAssertTrue(seen.cancelRequested, "the cancel flagged the row before its job closed it")
+        XCTAssertNotNil(seen.endedAt)
+        XCTAssertNil(seen.exitCode)
+        await app.shutdown()
+
+        let exiting = makeApp(environment: ["FAKE_CORE_RUN_OUTCOME": "exits"])
+        let other = exiting.detail(for: 220)
+        await other.run()
+        try await waitUntil { other.session.value?.finished == true }
+        let more = LogsViewModel(app: exiting)
+        await more.load(appid: 220)
+        let ended = try XCTUnwrap(more.sessions.value?.sessions.first)
+        XCTAssertEqual(ended.id, 41)
+        XCTAssertEqual(ended.state, .exited)
+        XCTAssertEqual(ended.exitCode, 0)
+        XCTAssertFalse(ended.cancelRequested)
+        XCTAssertNotNil(ended.endedAt)
+        await exiting.shutdown()
+    }
+
     func testExportSendsThePathAndReportsWhereTheCoreWrote() async throws {
         let app = makeApp()
         let detail = app.detail(for: 220)
@@ -434,14 +489,20 @@ final class ViewModelTests: XCTestCase {
     func testRuntimeButtonsFollowTheStatus() async throws {
         typealias Action = SteamClientRuntimeViewModel.Action
         let all: [Action] = [.install, .update, .repair, .reinstall, .stop]
-        let expected: [(String, [Action])] = [
-            ("absent", [.install]),
-            ("ready", [.install, .update, .repair, .reinstall]),
-            ("needs_login", all),
-            ("broken", [.install, .update, .repair, .reinstall]),
+        // Stop follows `running`, not the state: a client left running by a
+        // signed-in account is `ready` with `running: true`.
+        let expected: [(String, String?, [Action])] = [
+            ("absent", nil, [.install]),
+            ("ready", nil, [.install, .update, .repair, .reinstall]),
+            ("ready", "1", all),
+            ("needs_login", nil, all),
+            ("needs_login", "0", [.install, .update, .repair, .reinstall]),
+            ("broken", nil, [.install, .update, .repair, .reinstall]),
         ]
-        for (state, enabled) in expected {
-            let app = makeApp(environment: ["FAKE_CORE_RUNTIME_STATE": state])
+        for (state, running, enabled) in expected {
+            var environment = ["FAKE_CORE_RUNTIME_STATE": state]
+            if let running { environment["FAKE_CORE_RUNTIME_RUNNING"] = running }
+            let app = makeApp(environment: environment)
             let runtime = SteamClientRuntimeViewModel(app: app)
             XCTAssertEqual(all.filter { runtime.canPerform($0) }, [.install], "before the status is read only Install is offered (\(state))")
             await runtime.load()
@@ -519,8 +580,11 @@ final class ViewModelTests: XCTestCase {
         guard case .failed(.rpc(let error)) = detail.snapshots.reset else {
             return XCTFail("expected the reset to fail, got \(detail.snapshots.reset)")
         }
-        // The code is the cause's (the fake picks PrefixUnusable); the message is what matters here.
-        XCTAssertTrue(error.message.contains("`applejack prefix restore 220 20261103T140000Z`"), error.message)
+        // `ResetFailed` carries its cause's code and text: a wineboot that
+        // fails inside the rebuild is `WineCommandFailed`, Internal (1003).
+        XCTAssertEqual(error.code, RpcErrorCode.internal.rawValue)
+        XCTAssertTrue(error.message.hasPrefix("resetting prefix 220 failed; `applejack prefix restore 220 20261103T140000Z` brings it back: `"), error.message)
+        XCTAssertTrue(error.message.hasSuffix("wineboot --init` failed (exit status: 1); log at `/data/logs/prefixes/220/wineboot.log`"), error.message)
         XCTAssertEqual(detail.snapshots.resetFailureSnapshot, "20261103T140000Z")
         XCTAssertEqual(detail.snapshots.knownTimestamps, ["20261103T140000Z"])
         await detail.snapshots.restore(timestamp: "20261103T140000Z")
@@ -620,7 +684,7 @@ final class ViewModelTests: XCTestCase {
         steam.guardCode = "WRONG"
         steam.submitGuardCode()
         try await waitUntil { steam.guardRejection != nil }
-        XCTAssertEqual(steam.guardRejection, "the Steam Guard code was wrong; the login is still open")
+        XCTAssertEqual(steam.guardRejection, "Steam Guard code rejected", "AuthError::InvalidGuardCode's text, as the core sends it")
         guard case .ready(let session) = steam.login, case .guardRequired(let factor) = session.step else {
             return XCTFail("the login stays open for another code, got \(steam.login)")
         }
