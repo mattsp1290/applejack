@@ -36,8 +36,9 @@ use crate::runtime::session::{
 };
 use crate::runtime::steam_client::RedownloadWatch;
 use crate::runtime::steam_client::{
-    ClientPaths, ClientRuntimeState, LibraryEdit, META_CLIENT_SESSION, STEAM_CLIENT_PREFIX,
-    ensure_webhelper_shim, prepare_client_launch, record_client_build,
+    ClientPaths, ClientRuntimeState, LibraryEdit, META_CLIENT_SESSION, NOVERIFYFILES,
+    STEAM_CLIENT_PREFIX, ensure_webhelper_shim, prepare_client_launch, record_client_build,
+    runtime_refused,
 };
 use crate::state::Core;
 
@@ -231,7 +232,12 @@ impl PlannedRun {
                 if !up {
                     // This run starts the client, so its key is the one the
                     // client's processes, and the games it starts, carry.
-                    ensure_webhelper_shim(&self.installed.root, &paths, report)?;
+                    let pass = ensure_webhelper_shim(&self.installed.root, &paths, report)?;
+                    if pass.helper_missing {
+                        // The client's file check lays the helper down; the
+                        // next client start stashes it and puts the shim back.
+                        self.spec.args.retain(|arg| arg != NOVERIFYFILES);
+                    }
                     self.core
                         .db()?
                         .meta_set(META_CLIENT_SESSION, &self.session.session_key)?;
@@ -628,7 +634,7 @@ impl Core {
             ClientRuntimeState::Installing
             | ClientRuntimeState::Updating
             | ClientRuntimeState::Broken => {
-                return Err(CoreError::ClientRuntimeBroken { state, detail });
+                return Err(runtime_refused(state, detail));
             }
         };
         Err(CoreError::ClientRuntimeUnavailable {

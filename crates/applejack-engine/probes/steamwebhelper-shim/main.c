@@ -58,9 +58,11 @@ static const wchar_t *command_tail(const wchar_t *cmd)
     return cmd;
 }
 
+/* `--type=` as its own switch, after a blank, not inside a value such as
+ * a cache directory. The tail keeps the blank before its first switch. */
 static int is_cef_child(const wchar_t *tail)
 {
-    return wcsstr(tail, L"--type=") != NULL;
+    return wcsstr(tail, L" --type=") != NULL || wcsstr(tail, L"\t--type=") != NULL;
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show)

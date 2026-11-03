@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `absent` | no `drive_c/Program Files (x86)/Steam/steam.exe` in the prefix |
 //! | `installing` | `applejack/client-install.json` in the prefix while another process holds the prefix lock |
-//! | `broken` | the prefix record does not open, a `Steam/` directory without `steam.exe`, or an install marker nobody holds the lock for |
+//! | `broken` | the prefix record does not open, a `Steam/` directory without `steam.exe`, an install marker nobody holds the lock for, or a `cef.win*/steamwebhelper.exe` that is the web helper shim with no `steamwebhelper_real.exe` beside it |
 //! | `updating` | `Steam/package/steam_client_win64.manifest` (or the older `win32` one) is missing, or `Steam/package/tmp/` exists while the client runs |
 //! | `needs_login` | `Steam/config/loginusers.vdf` names no remembered account |
 //! | `ready` | it names one |
@@ -104,9 +104,15 @@ pub const LOGIN_WINDOW_MARK: &str = "DesktopLoginWindow_uid0";
 /// holds its main loop; unanswered, the client dies about 3 minutes in.
 pub const STALL_ASSERTION: &str = "BMainLoop appears to have stalled";
 
-/// Every client start: the client's own check of its files would write
-/// its helper back over the shim.
+/// Every client start but one: the client's own check of its files would
+/// write its helper back over the shim. The one start without it is the
+/// start after an orphan shim was removed, so that check lays the helper
+/// down again.
 pub const NOVERIFYFILES: &str = "-noverifyfiles";
+
+/// The sentence a `ClientRuntimeBroken` carries when `runtime_state`
+/// reads the same finding from disk, so `status` shows it.
+const STATUS_SHOWS_IT: &str = "`applejack runtime steam status` shows it";
 
 /// How long the bootstrapper and the first run may each take.
 pub const FIRST_RUN_TIMEOUT: Duration = Duration::from_secs(600);
@@ -155,7 +161,7 @@ const SETTLED_LOOKS: u32 = 5;
 
 /// How long a `steamwebhelper.exe` process is given to log the login
 /// window before the process alone counts as the window. On the one host
-/// tried the line comes about 7 s after the start.
+/// tried the line comes 17 to 22 s after the start.
 const WINDOW_FALLBACK_GRACE: Duration = Duration::from_secs(90);
 
 /// The client's own dump for an assertion, under `Steam/dumps/`; one written
@@ -233,7 +239,7 @@ pub(crate) enum BrokenReason {
     /// The engine payload has no web helper shim at the path.
     NoShim(PathBuf),
     /// A `cef.win*` directory holds the shim as `steamwebhelper.exe` and no
-    /// real helper beside it.
+    /// real helper beside it (or a stash that is itself a shim).
     ShimWithoutReal(PathBuf),
     /// `repair` found no snapshot at all.
     NoSnapshot,
@@ -276,6 +282,17 @@ impl BrokenReason {
                  `applejack runtime steam install` starts it again",
                 log.display()
             ),
+            Self::ClientStalledOnPrompt(evidence)
+                if evidence.extension().is_some_and(|ext| ext == "dmp") =>
+            {
+                format!(
+                    "the client died after writing an assertion dump since the start ({}); the \
+                     usual cause is a macOS permission prompt for \"applejack\" (the \
+                     microphone) left unanswered: answer it (Don't Allow is fine) and run \
+                     `applejack runtime steam install` again",
+                    evidence.display()
+                )
+            }
             Self::ClientStalledOnPrompt(evidence) => format!(
                 "the client's main loop stalled and the client died (`{STALL_ASSERTION}`, see \
                  {}): a macOS permission prompt for \"applejack\" (the microphone) was left \
@@ -291,7 +308,9 @@ impl BrokenReason {
             ),
             Self::ShimWithoutReal(dir) => format!(
                 "{}/{WEBHELPER_EXE} is the shim and {WEBHELPER_REAL} is missing beside it; \
-                 {REINSTALL_RERUNS}, which lays the client's own helper down again",
+                 `applejack runtime steam install` removes the orphan shim and starts the \
+                 client once with its file check on, which lays the client's own helper down \
+                 again, then stashes it and puts the shim back",
                 dir.display()
             ),
             Self::NoSnapshot => {
@@ -307,6 +326,47 @@ impl BrokenReason {
                  {REINSTALL_RERUNS}"
             ),
         }
+    }
+}
+
+impl BrokenReason {
+    /// Whether `runtime_state` reads this same finding from disk, so that
+    /// `applejack runtime steam status` shows it. A bootstrapper or client
+    /// that died, or a payload fault, is an event `status` cannot see.
+    pub(crate) const fn shown_by_status(&self) -> bool {
+        match self {
+            Self::DeadInstall
+            | Self::RecordDoesNotOpen(_)
+            | Self::NoSteamExe(_)
+            | Self::ShimWithoutReal(_)
+            | Self::NoSnapshot
+            | Self::NoUsableSnapshot(_)
+            | Self::StillBroken { .. } => true,
+            Self::BootstrapperTimedOut(_)
+            | Self::BootstrapperExited(..)
+            | Self::BootstrapperLeftNoExe(_)
+            | Self::ClientExitedEarly(_)
+            | Self::ClientStalledOnPrompt(_)
+            | Self::NoShim(_) => false,
+        }
+    }
+
+    /// The `ClientRuntimeBroken` for this reason, with the `status` sentence
+    /// only where it is true.
+    pub(crate) fn into_error(self) -> CoreError {
+        CoreError::ClientRuntimeBroken {
+            state: ClientRuntimeState::Broken,
+            detail: shown_detail(self.detail(), self.shown_by_status()),
+        }
+    }
+}
+
+/// `detail`, with [`STATUS_SHOWS_IT`] appended when `shown`.
+fn shown_detail(detail: String, shown: bool) -> String {
+    if shown {
+        format!("{detail}. {STATUS_SHOWS_IT}")
+    } else {
+        detail
     }
 }
 
@@ -415,6 +475,12 @@ pub enum ShimEdit {
     Reapplied,
     /// An older build of the shim was the helper; this payload's is now.
     Upgraded,
+    /// The stash was there and nothing in front of it; the shim is back.
+    Rewritten,
+    /// The helper was a shim with no real helper beside it, so nothing it
+    /// could run: it is gone, and the client's file check lays the helper
+    /// down at the next start.
+    OrphanRemoved,
 }
 
 impl ShimEdit {
@@ -428,6 +494,10 @@ impl ShimEdit {
                 "a client update replaced the web helper; stashed the new one and put the shim back"
             }
             Self::Upgraded => "replaced an older build of the shim with this payload's",
+            Self::Rewritten => "put the shim back in front of the stashed web helper",
+            Self::OrphanRemoved => {
+                "removed an orphan shim; the client's self-update lays its helper down"
+            }
         }
     }
 }
@@ -465,77 +535,158 @@ fn hash_and_marker(path: &Path) -> Result<([u8; 32], bool), CoreError> {
     Ok((Sha256::digest(&bytes).into(), marked))
 }
 
-fn read_shim(engine_root: &Path) -> Result<(Vec<u8>, [u8; 32]), CoreError> {
+/// The payload's shim, or `NoShim` naming the path.
+fn shim_path(engine_root: &Path) -> Result<PathBuf, CoreError> {
     let path = engine_root.join(WEBHELPER_SHIM);
-    let bytes = fs::read(&path).map_err(|_| CoreError::ClientRuntimeBroken {
-        state: ClientRuntimeState::Broken,
-        detail: BrokenReason::NoShim(path.clone()).detail(),
-    })?;
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(BrokenReason::NoShim(path).into_error())
+    }
+}
+
+fn read_shim(engine_root: &Path) -> Result<(Vec<u8>, [u8; 32]), CoreError> {
+    let path = shim_path(engine_root)?;
+    let bytes = fs::read(&path).map_err(|error| CoreError::io(&path, error))?;
     let hash = Sha256::digest(&bytes).into();
     Ok((bytes, hash))
 }
 
+/// Whether the file is a shim: this payload's by hash, or any build's by
+/// its marker. `None` when the file is not there.
+fn shim_file(path: &Path, shim_hash: Option<&[u8; 32]>) -> Result<Option<bool>, CoreError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let (hash, marked) = hash_and_marker(path)?;
+    Ok(Some(marked || shim_hash.is_some_and(|shim| *shim == hash)))
+}
+
+/// The first `cef.win*` directory whose `steamwebhelper.exe` is a shim by
+/// its marker with no client helper beside it: the shim has nothing to run,
+/// and the runtime is `broken` until the helper is laid down again. Needs
+/// no payload, so `status`, `repair`, and `install` read the same thing.
+fn orphan_shim(paths: &ClientPaths) -> Result<Option<PathBuf>, CoreError> {
+    for dir in cef_dirs(paths)? {
+        if shim_file(&dir.join(WEBHELPER_EXE), None)? == Some(true)
+            && shim_file(&dir.join(WEBHELPER_REAL), None)? != Some(false)
+        {
+            return Ok(Some(dir));
+        }
+    }
+    Ok(None)
+}
+
+/// Writes `shim` over `helper` through a sibling and a rename, with the
+/// permissions of `mode_of`.
+fn write_shim(helper: &Path, shim: &[u8], mode_of: &Path) -> Result<(), CoreError> {
+    let staged = helper.with_extension("exe.applejack");
+    fs::write(&staged, shim).map_err(|error| CoreError::io(&staged, error))?;
+    let mode = fs::metadata(mode_of)
+        .map_err(|error| CoreError::io(mode_of, error))?
+        .permissions();
+    fs::set_permissions(&staged, mode).map_err(|error| CoreError::io(&staged, error))?;
+    fs::rename(&staged, helper).map_err(|error| CoreError::io(helper, error))
+}
+
+/// What one pass of [`ensure_webhelper_shim`] left behind.
+#[derive(Debug, Default)]
+pub(crate) struct ShimPass {
+    pub edits: Vec<(PathBuf, ShimEdit)>,
+    /// A `cef.win*` directory has no `steamwebhelper.exe` (an orphan shim
+    /// was removed, or the client's tree is missing it): the next start must
+    /// run without `-noverifyfiles`, so the client's file check lays the
+    /// helper down.
+    pub helper_missing: bool,
+}
+
 /// Puts the payload's shim in front of the client's web helper under every
-/// `bin/cef/cef.win*/` directory that holds one. A helper that is not the
-/// shim (by SHA-256 against the payload's, never by size) is copied to
+/// `bin/cef/cef.win*/` directory. A helper that is not a shim (by SHA-256
+/// against the payload's and by the marker, never by size) is copied to
 /// `steamwebhelper_real.exe`, over any older stash, and the shim written in
 /// its place, so after a client self-update, which writes the new helper
 /// over the shim, the next start stashes the new helper: the real one is
-/// never older than the client. Every start of the client goes through
-/// here. One edit per directory, in order, each reported under `shim`.
+/// never older than the client. A shim with no client helper beside it (or
+/// a stash that is itself a shim, which it would run in a loop) is removed,
+/// and the pass says so in `helper_missing`; a stash with nothing in front
+/// of it gets the shim back. Every start of the client goes through here.
+/// One edit per directory, in order, each reported under `shim`.
 ///
 /// # Errors
 ///
-/// [`CoreError::ClientRuntimeBroken`] when the payload has no shim or a
-/// directory holds the shim without the real helper beside it; the copy or
-/// write failure.
+/// [`CoreError::ClientRuntimeBroken`] when the payload has no shim; the
+/// read, copy, or write failure.
 pub(crate) fn ensure_webhelper_shim(
     engine_root: &Path,
     paths: &ClientPaths,
     report: &mut dyn FnMut(&str, String),
-) -> Result<Vec<(PathBuf, ShimEdit)>, CoreError> {
+) -> Result<ShimPass, CoreError> {
     let (shim, shim_hash) = read_shim(engine_root)?;
-    let mut edits = Vec::new();
-    for dir in cef_dirs(paths)? {
+    let mut pass = ShimPass::default();
+    let dirs = cef_dirs(paths)?;
+    if dirs.is_empty() {
+        report(
+            "shim",
+            "no bin/cef/cef.win* directory yet; the client's self-update brings it".to_owned(),
+        );
+    }
+    for dir in dirs {
         let helper = dir.join(WEBHELPER_EXE);
-        if !helper.is_file() {
-            continue;
-        }
         let real = dir.join(WEBHELPER_REAL);
-        let (helper_hash, is_a_shim) = hash_and_marker(&helper)?;
-        let is_this_shim = helper_hash == shim_hash;
-        if (is_this_shim || is_a_shim) && !real.is_file() {
-            return Err(CoreError::ClientRuntimeBroken {
-                state: ClientRuntimeState::Broken,
-                detail: BrokenReason::ShimWithoutReal(dir).detail(),
-            });
-        }
-        let edit = if is_this_shim {
-            ShimEdit::InPlace
-        } else {
-            let had_real = real.is_file();
-            if !is_a_shim {
-                fs::copy(&helper, &real).map_err(|error| CoreError::io(&real, error))?;
+        let has_real = match shim_file(&real, Some(&shim_hash))? {
+            Some(false) => true,
+            Some(true) => {
+                fs::remove_file(&real).map_err(|error| CoreError::io(&real, error))?;
+                report(
+                    "shim",
+                    format!(
+                        "{}: removed a stashed {WEBHELPER_REAL} that was itself a shim",
+                        dir.display()
+                    ),
+                );
+                false
             }
-            let staged = dir.join("steamwebhelper.exe.applejack");
-            fs::write(&staged, &shim).map_err(|error| CoreError::io(&staged, error))?;
-            let mode = fs::metadata(&helper)
-                .map_err(|error| CoreError::io(&helper, error))?
-                .permissions();
-            fs::set_permissions(&staged, mode).map_err(|error| CoreError::io(&staged, error))?;
-            fs::rename(&staged, &helper).map_err(|error| CoreError::io(&helper, error))?;
-            if is_a_shim {
+            None => false,
+        };
+        let edit = if !helper.is_file() && !has_real {
+            pass.helper_missing = true;
+            report(
+                "shim",
+                format!(
+                    "{}: no {WEBHELPER_EXE}; the client's file check lays it down",
+                    dir.display()
+                ),
+            );
+            continue;
+        } else if !helper.is_file() {
+            write_shim(&helper, &shim, &real)?;
+            ShimEdit::Rewritten
+        } else {
+            let (helper_hash, marked) = hash_and_marker(&helper)?;
+            let is_this_shim = helper_hash == shim_hash;
+            if (is_this_shim || marked) && !has_real {
+                fs::remove_file(&helper).map_err(|error| CoreError::io(&helper, error))?;
+                pass.helper_missing = true;
+                ShimEdit::OrphanRemoved
+            } else if is_this_shim {
+                ShimEdit::InPlace
+            } else if marked {
+                write_shim(&helper, &shim, &helper)?;
                 ShimEdit::Upgraded
-            } else if had_real {
-                ShimEdit::Reapplied
             } else {
-                ShimEdit::Applied
+                fs::copy(&helper, &real).map_err(|error| CoreError::io(&real, error))?;
+                write_shim(&helper, &shim, &helper)?;
+                if has_real {
+                    ShimEdit::Reapplied
+                } else {
+                    ShimEdit::Applied
+                }
             }
         };
         report("shim", format!("{}: {}", dir.display(), edit.describe()));
-        edits.push((dir, edit));
+        pass.edits.push((dir, edit));
     }
-    Ok(edits)
+    Ok(pass)
 }
 
 /// Whether any `cef.win*` helper is not the payload's shim: a client
@@ -562,6 +713,12 @@ fn log_has_since(path: &Path, offset: u64, wanted: impl Fn(&str) -> bool) -> boo
     use std::io::{Read as _, Seek as _, SeekFrom};
     let Ok(mut file) = fs::File::open(path) else {
         return false;
+    };
+    // A log rotated or truncated during the wait is shorter than it was:
+    // everything in it is this run's.
+    let offset = match file.metadata() {
+        Ok(meta) if meta.len() < offset => 0,
+        _ => offset,
     };
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return false;
@@ -1258,6 +1415,12 @@ impl Core {
                 )
             });
         }
+        if let Some(dir) = orphan_shim(&paths)? {
+            return Ok((
+                ClientRuntimeState::Broken,
+                BrokenReason::ShimWithoutReal(dir).detail(),
+            ));
+        }
         if !paths.manifest().is_file() {
             return Ok((
                 ClientRuntimeState::Updating,
@@ -1464,7 +1627,17 @@ impl PlannedClientOp {
         }
         if self.client_running() && !reinstall {
             // The window the user signs in to is up; a second steam.exe
-            // would only hand off to it.
+            // would only hand off to it. A payload fault is reported when
+            // the client next starts, not here.
+            if helper_replaced(&self.installed.root, &self.paths).unwrap_or(false) {
+                report(
+                    "shim",
+                    "the web helper is not the shim (a client started outside applejack \
+                     wrote its own back); `applejack runtime steam stop`, then `install`, \
+                     put the shim in front again"
+                        .to_owned(),
+                );
+            }
             self.wait_window(None, None, report)?;
             return self.finish(report);
         }
@@ -1502,6 +1675,8 @@ impl PlannedClientOp {
                 ),
             });
         }
+        // Before the download: without the shim the window would not draw.
+        shim_path(&self.installed.root)?;
         let file = self.paths.bootstrapper();
         if let Some(parent) = file.parent() {
             fs::create_dir_all(parent).map_err(|error| CoreError::io(parent, error))?;
@@ -1536,38 +1711,33 @@ impl PlannedClientOp {
             }
             if Instant::now() >= deadline {
                 let _ = session.cancel();
-                return Err(CoreError::ClientRuntimeBroken {
-                    state: ClientRuntimeState::Broken,
-                    detail: BrokenReason::BootstrapperTimedOut(session.log_path.clone()).detail(),
-                });
+                return Err(
+                    BrokenReason::BootstrapperTimedOut(session.log_path.clone()).into_error()
+                );
             }
             std::thread::sleep(CLIENT_POLL);
         };
         if !status.success() {
-            return Err(CoreError::ClientRuntimeBroken {
-                state: ClientRuntimeState::Broken,
-                detail: BrokenReason::BootstrapperExited(
-                    status.to_string(),
-                    session.log_path.clone(),
-                )
-                .detail(),
-            });
+            return Err(BrokenReason::BootstrapperExited(
+                status.to_string(),
+                session.log_path.clone(),
+            )
+            .into_error());
         }
         Core::settle(&prefix.dir)?;
         if !self.paths.steam_exe().is_file() {
-            return Err(CoreError::ClientRuntimeBroken {
-                state: ClientRuntimeState::Broken,
-                detail: BrokenReason::BootstrapperLeftNoExe(self.paths.steam_exe()).detail(),
-            });
+            return Err(BrokenReason::BootstrapperLeftNoExe(self.paths.steam_exe()).into_error());
         }
         Ok(())
     }
 
     /// Starts `steam.exe` and waits for its self-update and the login
-    /// window. The client stays up for the user. A self-update that wrote
-    /// the client's helper over the shim is caught after the wait: the
-    /// client is stopped, the new helper stashed, and the client started
-    /// once more, so an `install` ends with a window that draws.
+    /// window. The client stays up for the user. A helper the client laid
+    /// down over (or in place of) the shim during the wait, by its first
+    /// self-update or by the file check after an orphan shim was removed,
+    /// is caught after the wait: the client is stopped, the new helper
+    /// stashed, and the client started once more, so an `install` ends with
+    /// a window that draws.
     fn first_run(
         &mut self,
         prefix: &Prefix,
@@ -1613,7 +1783,7 @@ impl PlannedClientOp {
         prefix: &Prefix,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
-        ensure_webhelper_shim(&self.installed.root, &self.paths, report)?;
+        let pass = ensure_webhelper_shim(&self.installed.root, &self.paths, report)?;
         report(
             "start",
             "macOS may ask whether \"applejack\" may use the microphone within about 15 s of \
@@ -1621,12 +1791,24 @@ impl PlannedClientOp {
              stalls and dies about 3 minutes in"
                 .to_owned(),
         );
-        report("start", "starting steam.exe for its self-update".to_owned());
+        let args = if pass.helper_missing {
+            report(
+                "start",
+                format!(
+                    "starting steam.exe for its self-update, without {NOVERIFYFILES}: a web \
+                     helper is missing and the client's file check lays it down"
+                ),
+            );
+            Vec::new()
+        } else {
+            report("start", "starting steam.exe for its self-update".to_owned());
+            vec![NOVERIFYFILES.into()]
+        };
         let key = new_session_id("steam-client");
         let spec = LaunchSpec {
             session_id: Some(key.clone()),
             exe: self.paths.steam_exe(),
-            args: vec![NOVERIFYFILES.into()],
+            args,
             env_extras: Vec::new(),
             cwd: self.paths.steam_dir(),
             log_dir: self.core.log_dir().to_path_buf(),
@@ -1652,14 +1834,11 @@ impl PlannedClientOp {
     /// The client exited during the wait: the stall when one was seen,
     /// else a bare exit pointing at the client's bootstrap log.
     fn client_gone(stalled: Option<PathBuf>, steam: &Path) -> CoreError {
-        let reason = match stalled {
+        match stalled {
             Some(evidence) => BrokenReason::ClientStalledOnPrompt(evidence),
             None => BrokenReason::ClientExitedEarly(steam.join(STALL_LOGS[1])),
-        };
-        CoreError::ClientRuntimeBroken {
-            state: ClientRuntimeState::Broken,
-            detail: reason.detail(),
         }
+        .into_error()
     }
 
     /// [`FIRST_RUN_TIMEOUT`] passed without the window: the client is
@@ -1912,14 +2091,11 @@ impl PlannedClientOp {
         let _ = fs::remove_file(self.paths.install_marker());
         let (state, detail) = self.core.runtime_state(true)?;
         if state == ClientRuntimeState::Broken {
-            return Err(CoreError::ClientRuntimeBroken {
-                state,
-                detail: BrokenReason::StillBroken {
-                    timestamp: newest.timestamp,
-                    detail,
-                }
-                .detail(),
-            });
+            return Err(BrokenReason::StillBroken {
+                timestamp: newest.timestamp,
+                detail,
+            }
+            .into_error());
         }
         Ok(())
     }
@@ -1940,15 +2116,12 @@ impl PlannedClientOp {
                 ),
             }
         }
-        let reason = if snapshots.is_empty() {
+        Err(if snapshots.is_empty() {
             BrokenReason::NoSnapshot
         } else {
             BrokenReason::NoUsableSnapshot(snapshots.len())
-        };
-        Err(CoreError::ClientRuntimeBroken {
-            state: ClientRuntimeState::Broken,
-            detail: reason.detail(),
-        })
+        }
+        .into_error())
     }
 
     /// Why `repair` cannot restore the snapshot at `dir`, or `None` when it
@@ -1957,8 +2130,15 @@ impl PlannedClientOp {
         if let Err(error) = self.core.engine.open_prefix(dir) {
             return Some(format!("its prefix record does not open: {error}"));
         }
-        if !ClientPaths::new(dir).steam_exe().is_file() {
+        let paths = ClientPaths::new(dir);
+        if !paths.steam_exe().is_file() {
             return Some("it has no steam.exe".to_owned());
+        }
+        if let Ok(Some(cef)) = orphan_shim(&paths) {
+            return Some(format!(
+                "{} holds the web helper shim with no {WEBHELPER_REAL} beside it",
+                cef.display()
+            ));
         }
         None
     }
@@ -1978,7 +2158,19 @@ fn nothing_to_repair(state: ClientRuntimeState, detail: &str) -> CoreError {
              <timestamp>` restores a chosen snapshot and keeps a safety copy of the current state"
         ),
     };
-    CoreError::ClientRuntimeBroken { state, detail }
+    CoreError::ClientRuntimeBroken {
+        state,
+        detail: shown_detail(detail, true),
+    }
+}
+
+/// The refusal of a run or an operation for a state `runtime_state` read,
+/// which `status` therefore shows.
+pub(crate) fn runtime_refused(state: ClientRuntimeState, detail: String) -> CoreError {
+    CoreError::ClientRuntimeBroken {
+        state,
+        detail: shown_detail(detail, true),
+    }
 }
 
 /// Records the client build id from its manifest in `meta`, after a
@@ -2084,7 +2276,13 @@ mod tests {
             BrokenReason::BootstrapperTimedOut(log.clone()),
             BrokenReason::BootstrapperExited("exit status: 1".to_owned(), log.clone()),
             BrokenReason::BootstrapperLeftNoExe(PathBuf::from("/x/Steam/steam.exe")),
-            BrokenReason::ClientExitedEarly(log),
+            BrokenReason::ClientExitedEarly(log.clone()),
+            BrokenReason::ClientStalledOnPrompt(log),
+            BrokenReason::ClientStalledOnPrompt(PathBuf::from(
+                "/x/Steam/dumps/assert_steam.exe_20260101000000_1.dmp",
+            )),
+            BrokenReason::NoShim(PathBuf::from("/e/probes/steamwebhelper-shim.exe")),
+            BrokenReason::ShimWithoutReal(PathBuf::from("/x/Steam/bin/cef/cef.win64")),
             BrokenReason::NoSnapshot,
             BrokenReason::NoUsableSnapshot(2),
             BrokenReason::StillBroken {
@@ -2093,30 +2291,50 @@ mod tests {
             },
         ];
         for reason in reasons {
-            let text = CoreError::ClientRuntimeBroken {
-                state: ClientRuntimeState::Broken,
-                detail: reason.detail(),
-            }
-            .to_string();
-            assert!(
-                text.contains("`applejack runtime steam status` shows it"),
-                "{text}"
+            // What `runtime_state` reads from disk, listed here on its own so
+            // the method cannot agree with itself.
+            let shown = matches!(
+                reason,
+                BrokenReason::DeadInstall
+                    | BrokenReason::RecordDoesNotOpen(_)
+                    | BrokenReason::NoSteamExe(_)
+                    | BrokenReason::ShimWithoutReal(_)
+                    | BrokenReason::NoSnapshot
+                    | BrokenReason::NoUsableSnapshot(_)
+                    | BrokenReason::StillBroken { .. }
             );
-            assert!(text.contains("`applejack "), "no command in {text}");
+            assert_eq!(reason.shown_by_status(), shown, "{reason:?}");
             let snapshot_may_be_missing = !matches!(
                 reason,
                 BrokenReason::RecordDoesNotOpen(_)
                     | BrokenReason::NoSteamExe(_)
                     | BrokenReason::StillBroken { .. }
             );
+            let payload_fault = matches!(reason, BrokenReason::NoShim(_));
+            let dump = matches!(&reason, BrokenReason::ClientStalledOnPrompt(path) if path.extension().is_some_and(|ext| ext == "dmp"));
+            let text = reason.into_error().to_string();
+            // `status` reads the finding from disk, or the sentence is a lie.
+            assert_eq!(text.contains(STATUS_SHOWS_IT), shown, "{text}");
+            if payload_fault {
+                assert!(text.contains("install a payload"), "{text}");
+            } else {
+                assert!(text.contains("`applejack "), "no command in {text}");
+            }
             if snapshot_may_be_missing {
                 assert!(!text.contains("restore"), "{text}");
             } else {
                 assert!(text.contains("restore"), "{text}");
             }
+            if dump {
+                assert!(text.contains("the usual cause"), "{text}");
+                assert!(!text.contains("was left unanswered"), "{text}");
+            }
             let reinstall = text.contains("repair --reinstall");
             assert!(
-                reinstall || text.contains("runtime steam install") || text.contains("restores"),
+                payload_fault
+                    || reinstall
+                    || text.contains("runtime steam install")
+                    || text.contains("restores"),
                 "{text}"
             );
         }
@@ -2133,6 +2351,23 @@ mod tests {
             assert!(text.contains("wait"), "{text}");
         }
         assert!(!text(ClientRuntimeState::Absent).contains("repair"));
+        let refused = runtime_refused(ClientRuntimeState::Updating, "d".to_owned()).to_string();
+        assert!(refused.contains(STATUS_SHOWS_IT), "{refused}");
+        let refused = nothing_to_repair(ClientRuntimeState::NeedsLogin, "d").to_string();
+        assert!(refused.contains(STATUS_SHOWS_IT), "{refused}");
+    }
+
+    #[test]
+    fn a_log_shorter_than_its_recorded_offset_is_read_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("webhelper.txt");
+        fs::write(&log, "old line\nold line\n").unwrap();
+        let offset = log_offset(&log);
+        fs::write(&log, "x\n").unwrap();
+        assert!(log_has_since(&log, offset, |line| line == "x"));
+        fs::write(&log, "old line\nold line\nnew\n").unwrap();
+        assert!(log_has_since(&log, offset, |line| line == "new"));
+        assert!(!log_has_since(&log, offset, |line| line == "old line"));
     }
 
     #[test]

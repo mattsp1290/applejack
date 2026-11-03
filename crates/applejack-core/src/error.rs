@@ -101,12 +101,10 @@ pub enum CoreError {
     },
     /// The runtime is in a state a run or an operation cannot use. The
     /// advice depends on the state: `repair` would roll back a client that
-    /// is only updating itself.
-    #[error(
-        "the Steam client runtime is {state}: {detail}. `applejack runtime steam status` shows \
-         it{}",
-        state.advice()
-    )]
+    /// is only updating itself. The detail says whether `status` shows the
+    /// finding: it does for a state read from disk, not for a client or a
+    /// bootstrapper that died or a payload fault.
+    #[error("the Steam client runtime is {state}: {detail}{}", state.advice())]
     ClientRuntimeBroken {
         state: ClientRuntimeState,
         detail: String,

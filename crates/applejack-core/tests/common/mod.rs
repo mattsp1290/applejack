@@ -34,10 +34,16 @@ const BUNDLE_FILES: &[&str] = &[
 /// before it starts `helper.exe`. The arguments go to `$WINEPREFIX/args`, so a
 /// test can see them without the log having to.
 ///
-/// The Steam client: `SteamSetup.exe /S` lays the client down under
-/// `drive_c/Program Files (x86)/Steam` with its manifest; `steam.exe` with no
-/// arguments is the first run, a client (`steam.exe` plus a
-/// `steamwebhelper.exe`) that stays until `$WINEPREFIX/client-quit`; with
+/// The Steam client, in the shape the real one has: `SteamSetup.exe /S` lays
+/// only `steam.exe` under `drive_c/Program Files (x86)/Steam`; the first
+/// `steam.exe` start is the self-update, which writes the client manifest
+/// and the CEF tree (`bin/cef/cef.win7x64/steamwebhelper.exe` =
+/// `REAL-HELPER-1`); a later start lays a missing helper down only when its
+/// file check runs (no `-noverifyfiles`), and `$WINEPREFIX/self-update`
+/// makes it write `REAL-HELPER-2` over the helper once, as a client update
+/// does. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`)
+/// that stays until `$WINEPREFIX/client-quit`; its arguments append to
+/// `$WINEPREFIX/client-args`; with
 /// `-applaunch <appid>` it starts the client if none is up, then `game.exe`
 /// as the title and `$WINEPREFIX/running-appid` as the registry value, which
 /// `reg query` prints and `reg add` writes, and clears it when the game
@@ -80,11 +86,9 @@ if [ "$name" = quick.exe ]; then
 fi
 if [ "$name" = SteamSetup.exe ]; then
   steam="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
-  mkdir -p "$steam/package" "$steam/config" "$steam/bin/cef/cef.win7x64"
+  mkdir -p "$steam/config"
   echo "$*" > "$steam/bootstrapped"
   : > "$steam/steam.exe"
-  printf 'REAL-HELPER-1' > "$steam/bin/cef/cef.win7x64/steamwebhelper.exe"
-  printf '"steam_client_win32"\n{\n\t"version"\t\t"1761720601"\n}\n' > "$steam/package/steam_client_win32.manifest"
   exit 0
 fi
 if [ "$name" = reg ] && [ "$2" = query ]; then
@@ -103,7 +107,7 @@ if [ "$name" = reg ] && [ "$2" = add ]; then
   exit 0
 fi
 if [ "$name" = steam.exe ]; then
-  echo "$*" > "$WINEPREFIX/client-args"
+  echo "$*" >> "$WINEPREFIX/client-args"
   if [ "$2" = -applaunch ]; then
     appid=$3
     shift 3
@@ -143,8 +147,20 @@ if [ "$name" = steam.exe ]; then
     printf '%s\n' 'src\clientdll\steamengine.cpp (2716) : Assertion Failed: CSteamEngine::BMainLoop appears to have stalled > 15 seconds without event signalled' >> "$steam/logs/console_log.txt"
     exit 0
   fi
+  cef="$steam/bin/cef/cef.win7x64"
+  if [ ! -f "$steam/package/steam_client_win32.manifest" ]; then
+    mkdir -p "$steam/package" "$cef"
+    printf '"steam_client_win32"\n{\n\t"version"\t\t"1761720601"\n}\n' > "$steam/package/steam_client_win32.manifest"
+    [ -f "$cef/steamwebhelper.exe" ] || printf 'REAL-HELPER-1' > "$cef/steamwebhelper.exe"
+  elif [ ! -f "$cef/steamwebhelper.exe" ]; then
+    case " $* " in
+      *" -noverifyfiles "*) ;;
+      *) mkdir -p "$cef"; printf 'REAL-HELPER-1' > "$cef/steamwebhelper.exe" ;;
+    esac
+  fi
   if [ -e "$WINEPREFIX/self-update" ]; then
-    printf 'REAL-HELPER-2' > "$steam/bin/cef/cef.win7x64/steamwebhelper.exe"
+    mkdir -p "$cef"
+    printf 'REAL-HELPER-2' > "$cef/steamwebhelper.exe"
     rm -f "$WINEPREFIX/self-update"
   fi
   # A client a stop just ended polls every 10 ms for its quit file; a fresh
@@ -313,6 +329,12 @@ pub fn write_stub_bundle(root: &Path, version: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, relative.as_bytes()).unwrap();
     }
+    // The payload's shim carries its marker, as every real build does.
+    fs::write(
+        root.join("probes/steamwebhelper-shim.exe"),
+        b"STUB applejack steamwebhelper shim STUB",
+    )
+    .unwrap();
     let helper = std::env::current_exe().unwrap();
     let wine = WINE.replace("@HELPER@", helper.to_str().unwrap());
     script(&root.join("wine/bin/wine64"), &wine);
