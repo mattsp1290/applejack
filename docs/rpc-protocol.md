@@ -280,7 +280,7 @@ Refused with an error response, before anything starts or any row is written:
 | `TitleNotInstalled` | No `apps` row, no complete `appmanifest_<appid>.acf` for this appid, an empty install directory, an `installdir` that is not one plain directory name, or a relative library |
 | `DownloadInProgress` | `<library>/applejack/<appid>.download.json` exists |
 | `ClientRuntimeUnavailable` | The title takes the client path and the runtime is `absent` or `needs_login`; the message names `applejack runtime steam install` and the sign-in |
-| `ClientRuntimeBroken` | The title takes the client path and the runtime is `installing`, `updating`, or `broken` (which includes a web helper shim with no real helper beside it); or the run starts the client and the engine payload has no web helper shim |
+| `ClientRuntimeBroken` | The title takes the client path and the runtime is `installing`, `updating`, or `broken` (which includes a web helper shim with no real helper beside it, and a `cef.win*` directory with no web helper at all) |
 | `NoLaunchExe` | `launch_exe_override` is empty, is not a PE image, or leaves the install directory |
 | `EngineNotInstalled` | No active engine, and none pinned by the game configuration |
 | `AlreadyRunning` | The title has an open session, in this core or another process |
@@ -289,7 +289,10 @@ Refused with an error response, before anything starts or any row is written:
 
 After the answer, a failure is a `job.failed`: a session that could not start
 is `failed`, with the reason in `note` and in its log, and a `wineserver` that
-will not leave the prefix is `PrefixUnusable`. A failure a cancel asked for is
+will not leave the prefix is `PrefixUnusable`; a run that starts the client and
+finds no web helper shim in the engine payload, or a `cef.win*` directory that
+lost its web helper since the answer, fails the same way, after `prepare`, with
+`ClientRuntimeBroken` as the reason. A failure a cancel asked for is
 `cancelled`, and its job is a `job.done`. A title that ends within five seconds
 on its own, leaving nothing behind, is `exited`, and its job fails with
 `TitleExitedEarly`.
