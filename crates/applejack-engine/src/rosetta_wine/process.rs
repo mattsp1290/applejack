@@ -113,6 +113,46 @@ pub fn find_session(session_id: &str) -> Vec<Process> {
     found
 }
 
+/// The same-uid processes whose environment names `prefix_dir` as
+/// `WINEPREFIX`, whatever session started them: what runs in a prefix,
+/// including a client started by `prefix exec` or by a launcher that is
+/// gone. Reported under an empty session id. Costs one process-table read,
+/// like [`find_session`].
+#[must_use]
+pub fn find_in_prefix(prefix_dir: &Path) -> Vec<Process> {
+    let uid = rustix::process::getuid().as_raw();
+    let mut wanted = Vec::from(WINE_PREFIX_ENTRY);
+    wanted.extend_from_slice(prefix_dir.as_os_str().as_bytes());
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_user(UpdateKind::Always)
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    let mut found: Vec<Process> = system
+        .processes()
+        .values()
+        .filter(|process| process.user_id().map(|id| **id) == Some(uid))
+        .filter(|process| {
+            process
+                .environ()
+                .iter()
+                .any(|entry| entry.as_bytes() == wanted.as_slice())
+        })
+        .map(|process| Process {
+            pid: process.pid().as_u32(),
+            exe: executable_name(process.cmd(), process.exe()),
+            session_id: String::new(),
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 /// The [`Process`] for `record` when it is owned by `uid` and belongs to
 /// `session_id`; `None` otherwise. An `APPLEJACK_SESSION=` entry in
 /// `environ` decides when there is one, and `cmd` is then all arguments.

@@ -22,7 +22,7 @@ from disk every time; nothing caches it.
 | `absent` | no `prefixes/steam-client/drive_c/Program Files (x86)/Steam/steam.exe` |
 | `installing` | `applejack/client-install.json` in the prefix while the prefix lock is held by a live process |
 | `broken` | the prefix record does not open, `Steam/` exists without `steam.exe`, or the install marker is there and nobody holds the lock (an install died) |
-| `updating` | `Steam/package/steam_client_win32.manifest` is missing (the first self-update has not finished), or `Steam/package/tmp/` exists while the client runs |
+| `updating` | `Steam/package/steam_client_win64.manifest` (the 2024 bootstrapper installs the 64-bit client; an older one writes `steam_client_win32.manifest`) is missing (the first self-update has not finished), or `Steam/package/tmp/` exists while the client runs |
 | `needs_login` | `Steam/config/loginusers.vdf` is missing or names no account with `RememberPassword "1"` (and `AllowAutoLogin` not `"0"`) |
 | `ready` | it names one |
 
@@ -30,7 +30,7 @@ from disk every time; nothing caches it.
 the state and nothing else: not a row, not a log, not an error message.
 
 `meta` holds three keys: `steam_client_buildid`, the `version` in
-`steam_client_win32.manifest` after each successful start; `steam_client_session`,
+`steam_client_win64.manifest` (or `win32`) after each successful start; `steam_client_session`,
 the `APPLEJACK_SESSION` the running client was started with, which every
 process the client starts carries, games included; and
 `steam_client_redownload`, the A2 finding when it has happened.
@@ -74,7 +74,7 @@ minutes, and installs under `C:\Program Files (x86)\Steam`.
 
 `steam.exe` is started with no arguments under a session key of its own,
 recorded in `meta.steam_client_session`. The client downloads the rest of
-itself from Valve. Readiness is read as: `package/steam_client_win32.manifest`
+itself from Valve. Readiness is read as: `package/steam_client_win64.manifest` (or `win32`)
 exists, nothing is under `package/tmp/` for five looks in a row, and a
 `steamwebhelper.exe` (the process that draws the window) is under the key,
 or `config/loginusers.vdf` changed since the start. Ten minutes without it

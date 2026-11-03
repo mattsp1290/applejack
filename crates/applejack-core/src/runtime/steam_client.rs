@@ -9,7 +9,7 @@
 //! | `absent` | no `drive_c/Program Files (x86)/Steam/steam.exe` in the prefix |
 //! | `installing` | `applejack/client-install.json` in the prefix while the prefix lock is held |
 //! | `broken` | the prefix record does not open, a `Steam/` directory without `steam.exe`, or an install marker nobody holds the lock for |
-//! | `updating` | `Steam/package/steam_client_win32.manifest` is missing, or `Steam/package/tmp/` exists while the client runs |
+//! | `updating` | `Steam/package/steam_client_win64.manifest` (or the older `win32` one) is missing, or `Steam/package/tmp/` exists while the client runs |
 //! | `needs_login` | `Steam/config/loginusers.vdf` names no remembered account |
 //! | `ready` | it names one |
 //!
@@ -28,7 +28,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::launch::new_session_id;
-use applejack_engine::rosetta_wine::process::{find_session, wineserver_running};
+use applejack_engine::rosetta_wine::process::{find_in_prefix, find_session, wineserver_running};
 use applejack_engine::rosetta_wine::snapshot::{self, PrefixLock};
 use applejack_engine::rosetta_wine::utc_now;
 use applejack_engine::{Engine, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec, Prefix};
@@ -62,8 +62,13 @@ pub const META_REDOWNLOAD: &str = "steam_client_redownload";
 /// Where the bootstrapper installs the client, inside the prefix.
 pub const STEAM_DIR: &str = "drive_c/Program Files (x86)/Steam";
 
-/// The client manifest the build id comes from.
-pub const CLIENT_MANIFEST: &str = "package/steam_client_win32.manifest";
+/// The client manifests the build id comes from, newest client first: the
+/// 2024 bootstrapper installs the 64-bit client and writes the first; an
+/// older one wrote the second (plan 05 named it).
+pub const CLIENT_MANIFESTS: [&str; 2] = [
+    "package/steam_client_win64.manifest",
+    "package/steam_client_win32.manifest",
+];
 
 /// The host-arch Authenticode tool inside the engine payload.
 pub const OSSLSIGNCODE: &str = "probes/osslsigncode";
@@ -174,9 +179,16 @@ impl ClientPaths {
         self.steam_dir().join(STEAM_EXE)
     }
 
+    /// The client manifest on disk, or the one a 64-bit client would
+    /// write when neither is there yet.
     #[must_use]
     pub fn manifest(&self) -> PathBuf {
-        self.steam_dir().join(CLIENT_MANIFEST)
+        let steam = self.steam_dir();
+        CLIENT_MANIFESTS
+            .iter()
+            .map(|name| steam.join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| steam.join(CLIENT_MANIFESTS[0]))
     }
 
     #[must_use]
@@ -221,7 +233,8 @@ pub fn remembered_login(text: &str) -> Option<bool> {
     }))
 }
 
-/// The client build id from `steam_client_win32.manifest`.
+/// The client build id from `steam_client_win64.manifest` (or `win32`): the
+/// root key's `version`.
 #[must_use]
 pub fn client_build_id(text: &str) -> Option<String> {
     let document = Document::parse(text).ok()?;
@@ -704,11 +717,16 @@ impl Core {
         if paths.prefix_dir.is_dir() && wineserver_running(&paths.prefix_dir).unwrap_or(true) {
             return Ok(true);
         }
-        Ok(self.client_session_key()?.is_some_and(|key| {
+        if self.client_session_key()?.is_some_and(|key| {
             find_session(&key)
                 .iter()
                 .any(|process| process.exe.eq_ignore_ascii_case(STEAM_EXE))
-        }))
+        }) {
+            return Ok(true);
+        }
+        Ok(find_in_prefix(&paths.prefix_dir)
+            .iter()
+            .any(|process| process.exe.eq_ignore_ascii_case(STEAM_EXE)))
     }
 
     /// Claims the client prefix for `op`. Refused while a title runs through
@@ -987,15 +1005,20 @@ impl PlannedClientOp {
             .ok();
         let deadline = Instant::now() + FIRST_RUN_TIMEOUT;
         let mut settled = 0;
+        let mut gone = 0;
         let mut last_phase = String::new();
         loop {
             let manifest = self.paths.manifest().is_file();
             let tmp = self.paths.package_tmp().is_dir();
-            let helper = key.as_deref().is_some_and(|key| {
-                find_session(key)
-                    .iter()
-                    .any(|process| process.exe.eq_ignore_ascii_case("steamwebhelper.exe"))
-            });
+            // By the key when this core started the client, else by the
+            // prefix: a client `prefix exec` or an earlier core started.
+            let is_helper = |process: &applejack_engine::rosetta_wine::Process| {
+                process.exe.eq_ignore_ascii_case("steamwebhelper.exe")
+            };
+            let helper = key
+                .as_deref()
+                .is_some_and(|key| find_session(key).iter().any(is_helper))
+                || find_in_prefix(&self.paths.prefix_dir).iter().any(is_helper);
             let login_changed = fs::metadata(self.paths.loginusers())
                 .and_then(|meta| meta.modified())
                 .ok()
@@ -1015,11 +1038,19 @@ impl PlannedClientOp {
             if manifest && !tmp && (helper || login_changed) && settled >= SETTLED_LOOKS {
                 break;
             }
-            if !self.client_running() && settled >= SETTLED_LOOKS {
+            // A client that is gone will not come up; its own
+            // `logs/bootstrap_log.txt` and the session log say why.
+            gone = if self.client_running() { 0 } else { gone + 1 };
+            if gone >= SETTLED_LOOKS {
                 return Err(CoreError::ClientRuntimeBroken {
                     state: ClientRuntimeState::Broken,
-                    detail: "the client exited before its window came up; see the session log"
-                        .to_owned(),
+                    detail: format!(
+                        "the client exited before its window came up; see {} and the session log",
+                        self.paths
+                            .steam_dir()
+                            .join("logs/bootstrap_log.txt")
+                            .display()
+                    ),
                 });
             }
             if Instant::now() >= deadline {
