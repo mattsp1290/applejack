@@ -60,16 +60,58 @@ const SECRET_NAMES: &[&str] = &[
     "steam_guard_code",
 ];
 
-/// What a guard code is called where one is handled. Too common a set of
-/// words to hold anywhere else.
-const GUARD_NAMES: &[&str] = &["code", "line", "text", "typed"];
+/// What a guard code or a refresh token is called where one is handled. Too
+/// common a set of words to hold anywhere else.
+const GUARD_NAMES: &[&str] = &["code", "line", "text", "typed", "refresh", "wanted"];
 
 /// Fine in a string that is built, and only there: nearly every `format!`
-/// has one, and no secret goes by these names alone.
+/// has one, and no secret goes by these names alone. Except in the depot
+/// module, where `key` is the depot key.
 const GENERIC_NAMES: &[&str] = &["key", "value"];
 
-/// The CDN's auth token, which belongs in the request URL it builds.
+/// The CDN's auth token, which belongs in the request URL the CDN module
+/// builds, and nowhere else.
 const ALLOWED: &[&str] = &[r#"format!("?{token}")"#];
+
+/// What the scanned file handles, which decides what its prints may say.
+#[derive(Clone, Copy, Default)]
+struct Scope {
+    /// A guard code or a refresh token goes through here under a short name.
+    guard_code: bool,
+    /// The CDN module, where [`ALLOWED`] holds.
+    cdn: bool,
+    /// The depot module, where `key` is a secret.
+    depot: bool,
+    /// Bindings in this file that hold a secret under a name of their own:
+    /// a decoded Steam message, or the field of a secret newtype.
+    holders: &'static [&'static str],
+}
+
+const GUARD: Scope = Scope {
+    guard_code: true,
+    cdn: false,
+    depot: false,
+    holders: &[],
+};
+
+/// Where a secret sits under a name the lists do not know: the decoded poll
+/// answer and its raw response in live.rs (prost derives `Debug` over the
+/// token fields), the logon message in live/session.rs, the depot key cache
+/// (steamroom's `DepotKey` derives `Debug` over its bytes), and `self.0` of
+/// `Password` and `RefreshToken`.
+fn holders(root: &Path, path: &Path) -> &'static [&'static str] {
+    if path == root.join("src/live.rs") {
+        &["answer", "response", "request", "sealed"]
+    } else if path == root.join("src/live/session.rs") {
+        &["logon", "response", "bytes", "reply"]
+    } else if path == root.join("src/depot.rs") {
+        &["keys"]
+    } else if path == root.join("src/auth.rs") || path == root.join("src/keychain.rs") {
+        &["self.0"]
+    } else {
+        &[]
+    }
+}
 
 /// Every print call in `text`, parentheses balanced, so a call split across
 /// lines is seen whole. Panics on a call it cannot read, such as a brace form
@@ -144,33 +186,53 @@ fn pieces(call: &str) -> Vec<&str> {
     found
 }
 
-/// The first secret name a call mentions, in its code or as a `{name:?}`. The
-/// rest of a literal is printed as written, so it can say `password`.
-/// `guard_code` says the file handles one.
-fn secret_in(call: &str, guard_code: bool) -> Option<&str> {
-    if ALLOWED.contains(&call) {
+/// The first secret name a call mentions, in its code or as a `{name:?}`. A
+/// literal that `format!` or `say(` builds is a message, printed as written,
+/// so it can say `password`; a literal in any other print counts, since a
+/// print that names a token is how one leaks under a short name. Guard
+/// names are too common to count in any literal.
+fn secret_in(call: &str, scope: Scope) -> Option<&str> {
+    if scope.cdn && ALLOWED.contains(&call) {
         return None;
     }
     let built = call.starts_with("format!") || call.starts_with(SAY);
-    let is_secret = |word: &&str| {
+    let is_secret = |word: &str, literal: bool| {
         let word = word.to_lowercase();
         let word = word.as_str();
-        (SECRET_NAMES.contains(&word) && !(built && GENERIC_NAMES.contains(&word)))
-            || (guard_code && GUARD_NAMES.contains(&word))
+        let generic = built && GENERIC_NAMES.contains(&word) && !(scope.depot && word == "key");
+        (SECRET_NAMES.contains(&word) && !generic)
+            || (scope.guard_code && !literal && GUARD_NAMES.contains(&word))
+            || (!literal && scope.holders.contains(&word))
     };
     let separator = |character: char| !character.is_alphanumeric() && character != '_';
+    // A holder such as `self.0` splits into `self` and `0`, so it is sought
+    // whole in the code.
+    let dotted_holder = |piece: &str| {
+        scope
+            .holders
+            .iter()
+            .copied()
+            .find(|holder| holder.contains('.') && piece.contains(holder))
+    };
     pieces(call)
         .into_iter()
         .enumerate()
         .find_map(|(index, piece)| {
             if index % 2 == 0 {
-                piece.split(separator).find(is_secret)
-            } else {
                 piece
+                    .split(separator)
+                    .find(|word| is_secret(word, false))
+                    .or_else(|| dotted_holder(piece))
+            } else {
+                let holes = piece
                     .split('{')
                     .skip(1)
                     .filter_map(|hole| hole.split([':', '}']).next())
-                    .find(is_secret)
+                    .map(str::trim)
+                    .find(|name| is_secret(name, false));
+                holes.or_else(|| {
+                    (!built).then(|| piece.split(separator).find(|word| is_secret(word, true)))?
+                })
             }
         })
 }
@@ -179,21 +241,49 @@ fn secret_in(call: &str, guard_code: bool) -> Option<&str> {
 fn the_print_scan_sees_split_calls_and_inline_captures() {
     let split = "println!(\n    \"{}\",\n    token.expose()\n);\nlet other = 1;";
     assert_eq!(print_calls(split).len(), 1);
-    assert_eq!(secret_in(print_calls(split)[0], false), Some("token"));
+    assert_eq!(
+        secret_in(print_calls(split)[0], Scope::default()),
+        Some("token")
+    );
 
     let inline = r#"println!("{key:?} (done)");"#;
-    assert_eq!(secret_in(print_calls(inline)[0], false), Some("key"));
+    assert_eq!(
+        secret_in(print_calls(inline)[0], Scope::default()),
+        Some("key")
+    );
 
     let tracing = r#"tracing::warn!(cdn_token = %x, "(oops");"#;
-    assert_eq!(secret_in(print_calls(tracing)[0], false), Some("cdn_token"));
+    assert_eq!(
+        secret_in(print_calls(tracing)[0], Scope::default()),
+        Some("cdn_token")
+    );
 
     let clean = r#"println!("installed: {} files", outcome.files_written);"#;
-    assert_eq!(secret_in(print_calls(clean)[0], false), None);
+    assert_eq!(secret_in(print_calls(clean)[0], Scope::default()), None);
 
     assert_eq!(
-        secret_in("println!(\"{:?}\", Credentials)", false),
+        secret_in("println!(\"{:?}\", Credentials)", Scope::default()),
         Some("Credentials")
     );
+}
+
+/// Final-login S1 and S2: a literal in a print that is not built still names
+/// what it prints, and a `{name }` hole is the name.
+#[test]
+fn the_print_scan_reads_literals_and_padded_holes_in_plain_prints() {
+    for (call, name) in [
+        (r#"eprintln!("password={}", p);"#, "password"),
+        (r#"tracing::warn!("refresh token rejected: {t}");"#, "token"),
+        (r#"println!("{password }");"#, "password"),
+        (r#"format!("?{token }")"#, "token"),
+        (r#"format!("{ depot_key :?}")"#, "depot_key"),
+    ] {
+        assert_eq!(
+            secret_in(print_calls(call)[0], Scope::default()),
+            Some(name),
+            "{call}"
+        );
+    }
 }
 
 /// Each of these reached a print with the scan green: `say` is how the CLI
@@ -214,10 +304,21 @@ fn the_print_scan_sees_the_routes_the_cli_prints_by() {
     ] {
         let calls = print_calls(call);
         assert!(
-            calls.iter().any(|seen| secret_in(seen, true) == Some(name)),
+            calls
+                .iter()
+                .any(|seen| secret_in(seen, GUARD) == Some(name)),
             "{call}: {calls:?}"
         );
     }
+}
+
+/// Final-login S3: the refresh token and the guard code go by these names in
+/// the files that handle them.
+#[test]
+fn the_print_scan_sees_the_refresh_token_and_the_wanted_code() {
+    assert_eq!(secret_in(r#"format!("{refresh}")"#, GUARD), Some("refresh"));
+    assert_eq!(secret_in(r#"format!("{wanted:?}")"#, GUARD), Some("wanted"));
+    assert_eq!(secret_in(r#"format!("{refresh}")"#, Scope::default()), None);
 }
 
 /// `fn say` is no call, `essay(` is another name, and a message may say the
@@ -227,28 +328,121 @@ fn the_print_scan_reads_only_names() {
     assert_eq!(print_calls("fn say(message: &str) {}"), [] as [&str; 0]);
     assert_eq!(print_calls("essay(password);"), [] as [&str; 0]);
     assert_eq!(
-        secret_in(r#"say("Type the Steam Guard code");"#, true),
+        secret_in(r#"say("Type the Steam Guard code");"#, GUARD),
         None
     );
     assert_eq!(
-        secret_in(r#"format!("cannot read the password: {error}")"#, true),
+        secret_in(r#"println!("Type the Steam Guard code");"#, GUARD),
         None
     );
     assert_eq!(
-        secret_in(r#"say("a \" {password}");"#, false),
+        secret_in(r#"format!("cannot read the password: {error}")"#, GUARD),
+        None
+    );
+    assert_eq!(
+        secret_in(r#"say("a \" {password}");"#, Scope::default()),
         Some("password")
     );
 }
 
 /// Guard names count only where a guard code goes, and `key` and `value` only
 /// in a print: elsewhere they are every config line and VDF parser message.
+/// Final-login S4: the CDN's URL is allowed in the CDN module alone, and
+/// `key` is the depot key in the depot module.
 #[test]
 fn the_print_scan_keeps_common_words_to_where_they_can_be_secrets() {
-    assert_eq!(secret_in(r#"println!("{line}");"#, false), None);
-    assert_eq!(secret_in(r#"format!("{key} = {value:?}")"#, false), None);
-    assert_eq!(secret_in(r#"println!("{value}");"#, false), Some("value"));
-    assert_eq!(secret_in(r#"format!("?{token}")"#, false), None);
-    assert_eq!(secret_in(r#"format!("{token}")"#, false), Some("token"));
+    let cdn = Scope {
+        cdn: true,
+        ..Scope::default()
+    };
+    let depot = Scope {
+        depot: true,
+        ..Scope::default()
+    };
+    assert_eq!(secret_in(r#"println!("{line}");"#, Scope::default()), None);
+    assert_eq!(
+        secret_in(r#"format!("{key} = {value:?}")"#, Scope::default()),
+        None
+    );
+    assert_eq!(
+        secret_in(r#"println!("{value}");"#, Scope::default()),
+        Some("value")
+    );
+    assert_eq!(secret_in(r#"format!("?{token}")"#, cdn), None);
+    assert_eq!(
+        secret_in(r#"format!("?{token}")"#, Scope::default()),
+        Some("token")
+    );
+    assert_eq!(secret_in(r#"format!("{token}")"#, cdn), Some("token"));
+    assert_eq!(
+        secret_in(r#"CoreError::Message(format!("{key:?}"))"#, depot),
+        Some("key")
+    );
+    assert_eq!(secret_in(r#"format!("{value}")"#, depot), None);
+}
+
+/// A secret under a name of the file's own: the decoded poll answer, the
+/// logon message, the depot key cache, and the field of a secret newtype.
+/// Each counts only in its file, and only in code or a hole, never in a
+/// message.
+#[test]
+fn the_print_scan_sees_the_holders_of_a_file() {
+    let live = Scope {
+        holders: &["answer", "response", "request", "sealed"],
+        ..Scope::default()
+    };
+    let session = Scope {
+        holders: &["logon", "response", "bytes", "reply"],
+        ..Scope::default()
+    };
+    let depot = Scope {
+        depot: true,
+        holders: &["keys"],
+        ..Scope::default()
+    };
+    let auth = Scope {
+        guard_code: true,
+        holders: &["self.0"],
+        ..Scope::default()
+    };
+    assert_eq!(secret_in(r#"format!("{answer:?}")"#, live), Some("answer"));
+    assert_eq!(secret_in("dbg!(&answer);", live), Some("answer"));
+    assert_eq!(
+        secret_in("tracing::debug!(response = ?response);", live),
+        Some("response")
+    );
+    assert_eq!(
+        secret_in(r#"tracing::debug!(?logon, "sending logon");"#, session),
+        Some("logon")
+    );
+    assert_eq!(
+        secret_in(r#"format!("{:?}", self.keys)"#, depot),
+        Some("keys")
+    );
+    assert_eq!(
+        secret_in(r#"format!("{:?}", reply.body)"#, session),
+        Some("reply")
+    );
+    assert_eq!(
+        secret_in(r#"tracing::debug!(?request, "begin auth")"#, live),
+        Some("request")
+    );
+    assert_eq!(
+        secret_in(r#"println!("{}", self.0);"#, auth),
+        Some("self.0")
+    );
+    assert_eq!(
+        secret_in(r#"write!(f, "{}", self.0)"#, auth),
+        Some("self.0")
+    );
+    assert_eq!(
+        secret_in(r#"format!("{answer:?}")"#, Scope::default()),
+        None
+    );
+    assert_eq!(secret_in(r#"format!("{logon:?}")"#, live), None);
+    assert_eq!(secret_in(r#"format!("no answer yet")"#, live), None);
+    assert_eq!(secret_in(r#"println!("the answer")"#, live), None);
+    assert_eq!(secret_in(r#"println!("{}", self.1);"#, auth), None);
 }
 
 #[test]
@@ -273,6 +467,9 @@ fn no_print_or_debug_format_touches_a_token() {
     rust_files(&root.join("src"), &mut files);
     rust_files(&root.join("../applejack-core/src/rpc"), &mut files);
     rust_files(&root.join("../applejack/src/cmd"), &mut files);
+    // rpc/mod.rs is scanned but not a guard file: its guard code goes by
+    // `steam_guard_code` alone, and it prints JSON-RPC `error.code.name()`
+    // and `.code()`, which `code` as a guard name would flag.
     let guard_files = [
         root.join("src/auth.rs"),
         root.join("src/live.rs"),
@@ -280,14 +477,19 @@ fn no_print_or_debug_format_touches_a_token() {
         root.join("../applejack/src/cmd/steam.rs"),
     ];
     for path in files {
-        let guard_code = guard_files.contains(&path);
+        let scope = Scope {
+            guard_code: guard_files.contains(&path),
+            cdn: path == root.join("src/live/cdn.rs"),
+            depot: path == root.join("src/depot.rs"),
+            holders: holders(&root, &path),
+        };
         let text = fs::read_to_string(&path).unwrap();
         let code: Vec<&str> = text
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect();
         for call in print_calls(&code.join("\n")) {
-            if let Some(name) = secret_in(call, guard_code) {
+            if let Some(name) = secret_in(call, scope) {
                 panic!("{}: `{call}` mentions `{name}`", path.display());
             }
         }

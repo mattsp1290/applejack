@@ -6,10 +6,10 @@
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,6 +69,42 @@ fn session_leader() {
         ),
     )
     .unwrap();
+}
+
+/// The session leader and, through the pid it writes, the login it spawned.
+/// A test that fails at a prompt would otherwise leave both there, with
+/// launchd as their parent.
+struct Leader {
+    child: Child,
+    pid_file: PathBuf,
+}
+
+impl Leader {
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
+    }
+}
+
+impl Drop for Leader {
+    fn drop(&mut self) {
+        if self.child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        if let Ok(pid) = fs::read_to_string(&self.pid_file) {
+            let pid = pid.trim();
+            // Only while the login is still the leader's child is the pid
+            // its own; signalled after, it could be anyone's.
+            let parent = Command::new("/bin/ps")
+                .args(["-o", "ppid=", "-p", pid])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            if parent.is_ok_and(|parent| parent == self.child.id().to_string()) {
+                let _ = Command::new("/bin/kill").args(["-TERM", pid]).status();
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 struct Pty {
@@ -156,10 +192,10 @@ fn wait_for_file(path: &Path) -> String {
 }
 
 /// At the account name prompt. Returns the outcome file.
-fn at_the_name_prompt(dir: &TempDir) -> (Pty, Child, PathBuf) {
+fn at_the_name_prompt(dir: &TempDir) -> (Pty, Leader, PathBuf) {
     let (mut pty, path) = Pty::open();
     let outcome = dir.path().join("outcome");
-    let leader = Command::new(env::current_exe().unwrap())
+    let child = Command::new(env::current_exe().unwrap())
         .args(["--exact", "session_leader", "--nocapture"])
         .env(TERMINAL, path)
         .env(OUTCOME, &outcome)
@@ -168,12 +204,16 @@ fn at_the_name_prompt(dir: &TempDir) -> (Pty, Child, PathBuf) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    let leader = Leader {
+        child,
+        pid_file: dir.path().join("outcome.pid"),
+    };
     pty.expect("account name");
     (pty, leader, outcome)
 }
 
 /// At the password prompt, in raw mode. Returns the outcome file.
-fn at_the_prompt(dir: &TempDir) -> (Pty, Child, PathBuf) {
+fn at_the_prompt(dir: &TempDir) -> (Pty, Leader, PathBuf) {
     let (mut pty, leader, outcome) = at_the_name_prompt(dir);
     pty.send(b"fixture-user\n");
     pty.expect("password");

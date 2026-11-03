@@ -56,9 +56,10 @@ the only implementations that open a socket.
   looks once more, and then ends the login with `SteamLoginStalled`, code
   `SteamLoginFailed`; the CLI prints a line while it waits. A non-empty refresh
   token is an approval, with or without an access token: `logon` sends only the
-  refresh token, and Steam has answered with no access token. An answer with an
-  empty refresh token is not one: it would store nothing usable and read as
-  signed in. `LoginFlow::start` refuses a blank account name before it connects,
+  refresh token, so an answer with no access token, should Steam send one, is
+  still a login. An answer with an empty refresh token is not one: it would
+  store nothing usable and read as signed in. An answer with a blank account
+  name is refused: `logon` would be handed that name on the next command. `LoginFlow::start` refuses a blank account name before it connects,
   and the CLI before it asks for the password.
   `InvalidGuardCode` keeps the session open.
   Any other error from `submit_guard_code` or `poll` ends the login: the
@@ -365,11 +366,15 @@ type, whose `oslist` allows Windows, whose `betakey` is empty or names the
 branch, and whose `ownsdlc` is owned; `osarch` matching the planned depots, unless
 that leaves nothing; then `default` over untyped over `option1` and its like.
 The entries that remain must agree on executable and arguments. If they do not,
-or if the app has a `default` entry that allows Windows and these filters took
-it, so that what is left was only ever offered beside it, the install refuses
-with `LaunchExeAmbiguous` before a byte arrives and lists them;
+or if a Windows entry of a better kind (`default` over untyped over `option1`
+and its like) was taken by the branch, DLC, or architecture filter, so that
+what is left was only ever offered beside it, the install refuses with
+`LaunchExeAmbiguous` before a byte arrives and lists them. An `option1` or
+other typed option that the branch or DLC filter took counts the same way
+for a lone option left, since options are offered beside each other; the
+option for the other architecture does not, being the same offering.
 `applejack config <appid> set launch_exe_override <file>` is the way out, with
-any arguments of the entry in `launch_args_override`. A `default` for another
+any arguments of the entry in `launch_args_override`. An entry for another
 OS takes nothing away: a Windows client was never offered it, so a lone Windows
 entry beside it stands. The rule errs towards refusing.
 A title with an override, an exe already recorded, or a client launch

@@ -2079,15 +2079,17 @@ async fn nothing_is_written_while_a_client_is_running() {
 async fn a_client_that_starts_mid_download_stops_the_run_with_its_record() {
     let bench = Bench::new();
     let files = bench.v1_files();
-    // Long enough for the once-a-second check to come round mid-download.
+    // The check comes round once a second, whatever the download has
+    // reached. Keyed on the last file's fetch, it finds game.exe finished
+    // under any load, and only the stop ends that fetch.
     let slow = chunk_of(&files[2], 0);
     bench
         .session
         .chunks
-        .fault(&slow, Fault::Slow(Duration::from_millis(2500)));
+        .fault(&slow, Fault::Slow(Duration::from_secs(60)));
     bench.session.add_manifest(DEPOT, manifest(V1, files));
     let chunks = &bench.session.chunks;
-    let running = || chunks.fetches() > 0;
+    let running = || chunks.fetched.lock().unwrap().contains(&slow);
     let result = bench.installer(&running).install(&plan(V1, 11)).await;
     assert!(matches!(result, Err(Error::ClientRunning { .. })));
     assert!(!bench.paths().acf(APPID).exists());
@@ -2108,11 +2110,11 @@ async fn a_cancel_mid_download_stops_the_run_with_its_record() {
     bench
         .session
         .chunks
-        .fault(&slow, Fault::Slow(Duration::from_millis(2500)));
+        .fault(&slow, Fault::Slow(Duration::from_secs(60)));
     bench.session.add_manifest(DEPOT, manifest(V1, files));
     let chunks = &bench.session.chunks;
     let running = || false;
-    let cancel = || chunks.fetches() > 0;
+    let cancel = || chunks.fetched.lock().unwrap().contains(&slow);
     let result = bench
         .installer(&running)
         .with_cancel(&cancel)
@@ -2120,7 +2122,8 @@ async fn a_cancel_mid_download_stops_the_run_with_its_record() {
         .await;
     assert!(matches!(result, Err(Error::Cancelled { appid: APPID })));
     assert!(!bench.paths().acf(APPID).exists());
-    assert!(bench.paths().record(APPID).exists());
+    assert!(bench.record().depots[0].files.contains("bin\\game.exe"));
+    assert!(!bench.game().join("old/gone.txt").exists());
 
     bench.session.chunks.clear_faults();
     bench.install(&plan(V1, 11)).await.unwrap();
@@ -2180,9 +2183,15 @@ async fn a_stopped_run_cannot_reach_the_file_of_a_later_run() {
     let bench = Bench::new();
     let chunks = &bench.session.chunks;
     let old = file(chunks, "big.bin", &[b"V1 V1 V1 V1 "]);
-    chunks.fault(&chunk_of(&old, 0), Fault::Slow(Duration::from_millis(1800)));
+    let slow = chunk_of(&old, 0);
+    // Held, not slowed: only the stop can end the fetch, and the gate opens
+    // once the later run is done, when a task that outlived the stop would
+    // write V1 into that run's file. A timer would wake it outside the
+    // check.
+    let (open, gate) = tokio::sync::watch::channel(false);
+    chunks.fault(&slow, Fault::Until(gate));
     bench.session.add_manifest(DEPOT, manifest(V1, vec![old]));
-    let predicate = || bench.session.chunks.fetches() > 0;
+    let predicate = || chunks.fetched.lock().unwrap().contains(&slow);
     let result = bench.installer(&predicate).install(&plan(V1, 11)).await;
     assert!(matches!(result, Err(Error::ClientRunning { .. })));
     assert_eq!(bench.session.chunks.fetches(), 1, "the stop came mid-fetch");
@@ -2190,7 +2199,8 @@ async fn a_stopped_run_cannot_reach_the_file_of_a_later_run() {
     let new = file(chunks, "big.bin", &[b"V2 V2 V2 V2 "]);
     bench.session.add_manifest(DEPOT, manifest(V2, vec![new]));
     bench.install(&plan(V2, 12)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    open.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
         fs::read(bench.game().join("big.bin")).unwrap(),

@@ -921,6 +921,18 @@ impl Cm {
         self.answer(&poll, 1, &body.encode_to_vec());
     }
 
+    async fn answer_poll_with_an_account_name(&mut self, account_name: Option<String>) {
+        let poll = self
+            .expect_call("Authentication.PollAuthSessionStatus#1")
+            .await;
+        let body = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some(FIXTURE_TOKEN.to_owned()),
+            account_name,
+            ..Default::default()
+        };
+        self.answer(&poll, 1, &body.encode_to_vec());
+    }
+
     async fn answer_poll(&mut self, tokens: bool) {
         let poll = self
             .expect_call("Authentication.PollAuthSessionStatus#1")
@@ -1030,7 +1042,8 @@ async fn an_answer_with_an_empty_refresh_token_is_not_an_approval() {
 }
 
 /// Steam consumes the session on this answer, so reading it as pending loses
-/// the login. It has sent refresh tokens with no access token before.
+/// the login. Whether it ever sends a refresh token with no access token is
+/// unconfirmed; `logon` needs only the refresh token either way.
 #[tokio::test]
 async fn a_refresh_token_with_no_access_token_is_a_login() {
     for access_token in [None, Some(String::new())] {
@@ -1053,6 +1066,31 @@ async fn a_refresh_token_with_no_access_token_is_a_login() {
             }
         );
         assert_eq!(store.get().unwrap().unwrap().expose(), FIXTURE_TOKEN);
+        script.await.unwrap();
+    }
+}
+
+/// Final-login S6. `remember_account` would store the blank name, and the
+/// next `library` or `install` would hand it to `logon`. Red when `Some("")`
+/// passes as a name.
+#[tokio::test]
+async fn a_blank_account_name_from_steam_is_refused() {
+    for account_name in [None, Some(String::new()), Some(" \t".to_owned())] {
+        let (client, mut cm) = prepared().await;
+        let script = tokio::spawn(async move {
+            cm.open_credentials_session().await;
+            cm.answer_poll_with_an_account_name(account_name).await;
+        });
+        let store = InMemoryStore::default();
+        let mut connection = SteamroomConnection::over(client);
+        let mut auth = Authenticator::new(&mut connection, &store);
+        let credentials = fixture_credentials();
+        auth.begin(AuthMode::Credentials, Some(&credentials))
+            .await
+            .unwrap();
+        let error = auth.poll().await.unwrap_err();
+        assert!(error.to_string().contains("account_name"), "{error}");
+        assert!(store.get().unwrap().is_none());
         script.await.unwrap();
     }
 }
