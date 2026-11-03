@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use applejack_engine::rosetta_wine::launch::{check_dxmt_copies, new_session_id};
-use applejack_engine::rosetta_wine::process::find_session;
+use applejack_engine::rosetta_wine::process::{find_session, wineserver_running};
 use applejack_engine::rosetta_wine::snapshot::{self, PrefixLock};
 use applejack_engine::rosetta_wine::{CpuidProbe, utc_now};
 use applejack_engine::{
@@ -29,7 +29,13 @@ use crate::error::CoreError;
 use crate::prefixes::pick_sync;
 use crate::runtime::direct::{DirectLaunch, resolve_launch, takes_direct_path};
 use crate::runtime::session::{
-    NOTE_EARLY, NOTE_LINGERED, OwnedProbe, WatchEnd, WatchEvent, log_line, watch,
+    NOTE_CLIENT, NOTE_EARLY, NOTE_LINGERED, OwnedProbe, WatchEnd, WatchEvent, WatchStyle, log_line,
+    watch,
+};
+use crate::runtime::steam_client::RedownloadWatch;
+use crate::runtime::steam_client::{
+    ClientPaths, ClientRuntimeState, META_CLIENT_SESSION, STEAM_CLIENT_PREFIX,
+    prepare_client_launch,
 };
 use crate::state::Core;
 
@@ -83,6 +89,14 @@ impl PrefixWish {
     }
 }
 
+/// What a client launch carries beside the direct one.
+#[derive(Debug)]
+struct ClientRun {
+    /// The title's own prefix lock, so an install cannot start under it.
+    _title: PrefixLock,
+    installdir: String,
+}
+
 /// A claimed session: the prefix lock is held and the row is open.
 #[derive(Debug)]
 pub struct PlannedRun {
@@ -94,6 +108,7 @@ pub struct PlannedRun {
     wish: PrefixWish,
     spec: LaunchSpec,
     probe_direct: bool,
+    client: Option<ClientRun>,
 }
 
 impl PlannedRun {
@@ -181,12 +196,38 @@ impl PlannedRun {
         if self.cancel_requested()? {
             return Ok(None);
         }
+        let redownload = match &self.client {
+            Some(client) => {
+                let paths = ClientPaths::new(prefix.dir.clone());
+                let appid = self.session.appid;
+                report(
+                    "prepare",
+                    format!(
+                        "backing up appmanifest_{appid}.acf and listing its library for the client"
+                    ),
+                );
+                let watch =
+                    prepare_client_launch(&paths, &self.library, appid, &client.installdir)?;
+                if !self.core.client_is_up()? {
+                    // This run starts the client, so its key is the one the
+                    // client's processes, and the games it starts, carry.
+                    self.core
+                        .db()?
+                        .meta_set(META_CLIENT_SESSION, &self.session.session_key)?;
+                }
+                Some(watch)
+            }
+            None => None,
+        };
         report("starting", self.session.launch_exe.clone());
         let mut session = self
             .core
             .engine
             .launch(&self.installed, &prefix, &self.spec)?;
-        let watched = self.watch_spawned(&mut session, report);
+        let watched = match redownload {
+            Some(watch) => self.watch_client(&mut session, watch, report),
+            None => self.watch_spawned(&mut session, report),
+        };
         if let Err(error) = &watched {
             let log = &self.session.log_path;
             let _ = log_line(log, &format!("ending the title: {error}"));
@@ -211,6 +252,47 @@ impl PlannedRun {
         self.watch_title(session, report)
     }
 
+    /// The client path: the marker is the client's, a cancel before the
+    /// marker shows ends the title by name, and the loader is reaped when it
+    /// hands off.
+    fn watch_client(
+        &mut self,
+        session: &mut Session,
+        redownload: RedownloadWatch,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<WatchEnd, CoreError> {
+        let row = self.session.clone();
+        let tuning = self.core.tuning;
+        let mut probe = self.core.client_probe(&row, Some(redownload))?;
+        let style = WatchStyle::Client {
+            appid: row.appid,
+            start_wait: tuning.client_start_wait,
+        };
+        let id = row.id;
+        let log = row.log_path.clone();
+        let core = &mut self.core;
+        let outcome = watch(&mut probe, &tuning, false, style, &mut |event| {
+            if event == WatchEvent::Running {
+                match core
+                    .db()
+                    .and_then(|db| Ok(db.mark_session_running(id, &utc_now())?))
+                {
+                    Ok(()) => {
+                        report("running", format!("session {id}"));
+                        return true;
+                    }
+                    Err(error) => {
+                        let _ = log_line(&log, &format!("could not record running: {error}"));
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        let _ = session.try_wait();
+        outcome
+    }
+
     fn watch_title(
         &mut self,
         session: &mut Session,
@@ -223,36 +305,43 @@ impl PlannedRun {
         let core = &mut self.core;
         let mut probe = OwnedProbe { session, exe: &exe };
         let mut warned = false;
-        watch(&mut probe, &tuning, false, &mut |event| match event {
-            WatchEvent::Running => {
-                let stamped = core
-                    .db()
-                    .and_then(|db| Ok(db.mark_session_running(id, &utc_now())?));
-                match stamped {
-                    Ok(()) => {
-                        report("running", format!("session {id}"));
-                        true
-                    }
-                    // A missed stamp is not the end of a game.
-                    Err(error) => {
-                        if !warned {
-                            warned = true;
-                            let _ = log_line(&log, &format!("could not record running: {error}"));
+        watch(
+            &mut probe,
+            &tuning,
+            false,
+            WatchStyle::Direct,
+            &mut |event| match event {
+                WatchEvent::Running => {
+                    let stamped = core
+                        .db()
+                        .and_then(|db| Ok(db.mark_session_running(id, &utc_now())?));
+                    match stamped {
+                        Ok(()) => {
+                            report("running", format!("session {id}"));
+                            true
                         }
-                        false
+                        // A missed stamp is not the end of a game.
+                        Err(error) => {
+                            if !warned {
+                                warned = true;
+                                let _ =
+                                    log_line(&log, &format!("could not record running: {error}"));
+                            }
+                            false
+                        }
                     }
                 }
-            }
-            WatchEvent::Lingering => {
-                // A launcher can be gone before the first look.
-                if let Ok(db) = core.db() {
-                    let _ = db.mark_session_running(id, &utc_now());
+                WatchEvent::Lingering => {
+                    // A launcher can be gone before the first look.
+                    if let Ok(db) = core.db() {
+                        let _ = db.mark_session_running(id, &utc_now());
+                    }
+                    let _ = log_line(&log, NOTE_LINGERED);
+                    report("lingering", format!("session {id} outlived {exe}"));
+                    true
                 }
-                let _ = log_line(&log, NOTE_LINGERED);
-                report("lingering", format!("session {id} outlived {exe}"));
-                true
-            }
-        })
+            },
+        )
     }
 
     fn close(
@@ -271,13 +360,17 @@ impl PlannedRun {
         let ended_at = end.map_or_else(utc_now, |end| end.ended_at.clone());
         let lingered = end.is_some_and(|end| end.lingered);
         let early_exit = self.core.tuning.early_exit;
+        let client = self.client.is_some();
         // A launcher is quick and the game behind it is no sign of DRM.
-        let early =
-            state == SessionState::Exited && !lingered && end.is_some_and(|e| e.lived < early_exit);
+        let early = !client
+            && state == SessionState::Exited
+            && !lingered
+            && end.is_some_and(|e| e.lived < early_exit);
         let notes: Vec<&str> = [
             early.then_some(NOTE_EARLY),
             lingered.then_some(NOTE_LINGERED),
             self.probe_direct.then_some(NOTE_PROBE),
+            client.then_some(NOTE_CLIENT),
         ]
         .into_iter()
         .flatten()
@@ -321,6 +414,12 @@ impl PlannedRun {
                 self.library.clone(),
             );
         }
+        if self.client.is_some() && wineserver_running(&dir)? {
+            // The client is up and owns the prefix; overrides wait for a
+            // stop. Its settings were applied when it was last built.
+            let (_, prefix) = self.core.open_prefix(name)?;
+            return Ok(prefix);
+        }
         Core::settle(&dir)?;
         let (_, prefix) = self.core.open_prefix(name)?;
         let backend = wish.backend.unwrap_or(prefix.backend);
@@ -355,7 +454,8 @@ impl Core {
     /// # Errors
     ///
     /// [`CoreError::TitleNotInstalled`], [`CoreError::DownloadInProgress`],
-    /// [`CoreError::ClientRuntimeUnavailable`], [`CoreError::NoLaunchExe`],
+    /// [`CoreError::ClientRuntimeUnavailable`] and
+    /// [`CoreError::ClientRuntimeBroken`] on the client path, [`CoreError::NoLaunchExe`],
     /// [`CoreError::NoActiveEngine`], [`CoreError::AlreadyRunning`],
     /// `PrefixBusy`, `PrefixUnusable`.
     pub fn plan_run(&mut self, appid: u32, probe_direct: bool) -> Result<PlannedRun, CoreError> {
@@ -364,26 +464,50 @@ impl Core {
             .ok_or_else(|| not_installed(appid, NOT_INSTALLED))?;
         let config = self.config_get(appid)?;
         let install_dir = installed_dir(&app)?;
-        if !takes_direct_path(&app, &config, probe_direct) {
-            return Err(CoreError::ClientRuntimeUnavailable {
-                appid,
-                drm: app.drm,
-                route: client_free_route(&app, &config),
-            });
+        let client = !takes_direct_path(&app, &config, probe_direct);
+        if client {
+            self.require_client_ready(&app, &config)?;
         }
         // The exe stays inside the install directory and that inside the
         // title's library, which may be on another volume (plan 02).
-        let launch = resolve_launch(appid, &install_dir, &launch_config(&app, &config))?;
+        let launch = if client {
+            None
+        } else {
+            Some(resolve_launch(
+                appid,
+                &install_dir,
+                &launch_config(&app, &config),
+            )?)
+        };
         let installed = self.run_engine(&config)?;
         let wish = PrefixWish::of(&config)?;
-        let name = appid.to_string();
-        let lock = self.claim_session_prefix(appid, &name)?;
+        let title = appid.to_string();
+        let (name, lock, title_lock) = if client {
+            let title_lock = self.claim_idle_title(appid, &title, false)?;
+            let lock = self.claim_session_prefix(appid, STEAM_CLIENT_PREFIX)?;
+            (STEAM_CLIENT_PREFIX.to_owned(), lock, Some(title_lock))
+        } else {
+            (
+                title.clone(),
+                self.claim_session_prefix(appid, &title)?,
+                None,
+            )
+        };
         // An install that took the lock after the look above has gone by
         // now; one that got there first left its record.
         installed_dir(&app)?;
         let key = new_session_id("run");
         let log_path = self.log_dir().join(&key).join("wine.log");
         let log_text = log_path.to_string_lossy().into_owned();
+        let exe_name = launch.as_ref().map_or_else(
+            || {
+                launch_config(&app, &config)
+                    .launch_exe_override
+                    .map(|exe| exe_file_name(&exe))
+                    .unwrap_or_default()
+            },
+            |launch| launch.exe_name.clone(),
+        );
         let id = self
             .db()?
             .insert_session(&NewSession {
@@ -394,11 +518,14 @@ impl Core {
                 log_path: &log_text,
                 session_key: &key,
                 prefix: &name,
-                launch_exe: &launch.exe_name,
+                launch_exe: &exe_name,
             })?
             .ok_or(CoreError::AlreadyRunning { appid })?;
         let session = self.session_row(id)?;
-        let spec = self.launch_spec(&config, &key, launch)?;
+        let spec = match launch {
+            Some(launch) => self.launch_spec(&config, &key, launch)?,
+            None => self.client_launch_spec(&config, &key, appid)?,
+        };
         Ok(PlannedRun {
             core: self.detached(),
             _lock: lock,
@@ -408,6 +535,81 @@ impl Core {
             wish,
             spec,
             probe_direct,
+            client: title_lock.map(|title| ClientRun {
+                _title: title,
+                installdir: app.installdir.clone().unwrap_or_default(),
+            }),
+        })
+    }
+
+    /// The client path needs a signed-in client; anything else is a refusal
+    /// that names the way there.
+    fn require_client_ready(&mut self, app: &AppRow, config: &GameConfig) -> Result<(), CoreError> {
+        let appid = app.appid;
+        let (state, detail) = self.client_runtime_state()?;
+        let fix = match state {
+            ClientRuntimeState::Ready => return Ok(()),
+            ClientRuntimeState::Absent => "run `applejack runtime steam install`",
+            ClientRuntimeState::NeedsLogin => {
+                "run `applejack runtime steam install` and sign in inside the Steam window"
+            }
+            ClientRuntimeState::Installing
+            | ClientRuntimeState::Updating
+            | ClientRuntimeState::Broken => {
+                return Err(CoreError::ClientRuntimeBroken { state, detail });
+            }
+        };
+        Err(CoreError::ClientRuntimeUnavailable {
+            appid,
+            drm: app.drm,
+            state,
+            fix: fix.to_owned(),
+            route: client_free_route(app, config),
+        })
+    }
+
+    /// `steam.exe -applaunch <appid> -silent -noverifyfiles [args]` in the
+    /// client prefix. `-silent` keeps the client's window down, which a
+    /// signed-in client does not need; `-noverifyfiles` skips the client's
+    /// own check of its files, not the title's. The overlay and Steam Input
+    /// toggles are read and logged, not applied yet (docs/steam-runtime.md).
+    fn client_launch_spec(
+        &mut self,
+        config: &GameConfig,
+        key: &str,
+        appid: u32,
+    ) -> Result<LaunchSpec, CoreError> {
+        let paths = self.client_paths()?;
+        let mut args: Vec<OsString> = vec![
+            "-applaunch".into(),
+            appid.to_string().into(),
+            "-silent".into(),
+            "-noverifyfiles".into(),
+        ];
+        args.extend(
+            config
+                .launch_args_override
+                .as_deref()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(OsString::from),
+        );
+        let cpuid_probe = self
+            .reading(|db| Ok(db.meta_get(META_CPUID_PROBE)?))?
+            .and_then(|json| serde_json::from_str::<CpuidProbe>(&json).ok());
+        Ok(LaunchSpec {
+            session_id: Some(key.to_owned()),
+            exe: paths.steam_exe(),
+            args,
+            env_extras: config
+                .extra_env
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect(),
+            cwd: paths.steam_dir(),
+            log_dir: self.log_dir().to_path_buf(),
+            advertise_avx: config.rosetta_advertise_avx.unwrap_or(false),
+            cpuid_probe,
         })
     }
 
@@ -682,6 +884,15 @@ pub(crate) fn launch_config(app: &AppRow, config: &GameConfig) -> GameConfig {
         }
     }
     merged
+}
+
+/// The file name of a launch exe setting, whichever separator it uses.
+fn exe_file_name(exe: &str) -> String {
+    exe.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(exe)
+        .trim()
+        .to_owned()
 }
 
 /// A manifest's `name` reaches terminals and logs.

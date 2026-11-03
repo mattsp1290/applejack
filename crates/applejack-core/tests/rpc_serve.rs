@@ -280,7 +280,11 @@ fn pending_methods_answer_not_implemented_naming_the_work_package() {
         .into_iter()
         .filter(|method| matches!(method.status(), MethodStatus::Pending { .. }))
         .collect();
-    assert!(pending.len() > 1, "the table has pending methods");
+    // Every work package has landed its methods; the loop below is for the
+    // next one that adds a row before its handler.
+    if pending.is_empty() {
+        return;
+    }
     for (index, method) in pending.iter().enumerate() {
         let request = json!({
             "jsonrpc": "2.0",

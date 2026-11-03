@@ -3,3 +3,4 @@
 
 pub mod direct;
 pub mod session;
+pub mod steam_client;

@@ -50,15 +50,26 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use applejack_engine::rosetta_wine::launch::{parse_reg_dword, reg_query};
 use applejack_engine::rosetta_wine::process::{self, Process, find_session, wineserver_running};
 use applejack_engine::rosetta_wine::snapshot::PrefixLock;
 use applejack_engine::rosetta_wine::utc_now;
-use applejack_engine::{EngineId, Error as EngineError, InstalledEngine, Session, Version};
+use applejack_engine::{EngineId, Error as EngineError, InstalledEngine, Prefix, Session, Version};
 
 use crate::config::{SessionEnd, SessionRow, SessionState};
 use crate::error::CoreError;
 use crate::prefixes::{SERVER_SETTLE, exit_code};
+use crate::runtime::steam_client::{META_REDOWNLOAD, RedownloadWatch, STEAM_CLIENT_PREFIX};
 use crate::state::Core;
+
+/// The registry value the Steam client keeps at the running title's appid
+/// (plan 05); read live through `reg query`, never from `user.reg`.
+pub const RUNNING_APPID_KEY: &str = "HKCU\\Software\\Valve\\Steam";
+pub const RUNNING_APPID_VALUE: &str = "RunningAppID";
+
+/// The note on a session the Steam client launched.
+pub const NOTE_CLIENT: &str =
+    "launched through the Steam client; the title's exit code is not visible";
 
 /// The note on a session whose owner died with the title gone.
 pub const NOTE_LOST: &str = "the core that owned this session died; exit code unknown";
@@ -90,6 +101,9 @@ pub struct RunTuning {
     pub term_wait: Duration,
     /// How long a cancel waits for the owner to let go of the prefix.
     pub cancel_wait: Duration,
+    /// How long the Steam client has to report the title running after
+    /// `-applaunch`: a verification pass of a large title takes a while.
+    pub client_start_wait: Duration,
 }
 
 impl Default for RunTuning {
@@ -101,8 +115,22 @@ impl Default for RunTuning {
             early_exit: Duration::from_secs(5),
             term_wait: Duration::from_secs(3),
             cancel_wait: Duration::from_secs(60),
+            client_start_wait: Duration::from_secs(300),
         }
     }
+}
+
+/// Which lifecycle a watch follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchStyle {
+    /// The loader is the title: its exit ends a title that never showed,
+    /// and the session drains after the title.
+    Direct,
+    /// The loader is `steam.exe -applaunch`, which hands off and exits when
+    /// the client already runs; only the marker says anything, it must
+    /// appear within `start_wait`, and the client stays up afterwards, so
+    /// nothing drains.
+    Client { appid: u32, start_wait: Duration },
 }
 
 /// What the watch loop can see of a session.
@@ -124,6 +152,16 @@ pub trait SessionProbe {
     ///
     /// Returns the prefix `stat` failure.
     fn drained(&mut self) -> Result<bool, CoreError>;
+
+    /// Something that must end the watch now, checked at every look: the
+    /// client re-downloading the title. The default sees nothing.
+    ///
+    /// # Errors
+    ///
+    /// The reason the watch ends, after whatever the probe did about it.
+    fn trouble(&mut self) -> Result<(), CoreError> {
+        Ok(())
+    }
 }
 
 /// What a watch tells its owner as it goes.
@@ -166,6 +204,7 @@ pub fn watch(
     probe: &mut dyn SessionProbe,
     tuning: &RunTuning,
     seen: bool,
+    style: WatchStyle,
     on_event: &mut dyn FnMut(WatchEvent) -> bool,
 ) -> Result<WatchEnd, CoreError> {
     let watching = Instant::now();
@@ -174,6 +213,7 @@ pub fn watch(
     let mut misses = 0;
     let mut code = None;
     loop {
+        probe.trouble()?;
         if code.is_none() {
             code = probe.loader_exit()?;
         }
@@ -188,13 +228,32 @@ pub fn watch(
             misses += 1;
         }
         let cleared = seen && misses >= tuning.marker_misses;
-        if cleared || (code.is_some() && !present) {
-            break;
+        match style {
+            WatchStyle::Direct if cleared || (code.is_some() && !present) => break,
+            WatchStyle::Client { .. } if cleared => break,
+            WatchStyle::Client { appid, start_wait }
+                if !seen && watching.elapsed() >= start_wait =>
+            {
+                return Err(CoreError::ClientLaunchTimedOut {
+                    appid,
+                    seconds: start_wait.as_secs(),
+                });
+            }
+            _ => {}
         }
         std::thread::sleep(tuning.tick);
     }
     let title_ended = utc_now();
     let lived = watching.elapsed();
+    if let WatchStyle::Client { .. } = style {
+        return Ok(WatchEnd {
+            ended_at: title_ended,
+            exit_code: None,
+            seen,
+            lingered: false,
+            lived,
+        });
+    }
     let deadline = Instant::now() + tuning.drain;
     let mut lingered = false;
     loop {
@@ -272,6 +331,153 @@ impl SessionProbe for ForeignProbe<'_> {
     }
 }
 
+/// The Steam client's own processes and Wine's services: what a cancel of a
+/// client session with no known exe must leave alone.
+const CLIENT_PROCESSES: &[&str] = &[
+    "steam.exe",
+    "steamwebhelper.exe",
+    "steamservice.exe",
+    "steamerrorreporter.exe",
+    "steamerrorreporter64.exe",
+    "gameoverlayui.exe",
+    "services.exe",
+    "winedevice.exe",
+    "plugplay.exe",
+    "explorer.exe",
+    "rpcss.exe",
+    "svchost.exe",
+    "conhost.exe",
+    "start.exe",
+    "reg.exe",
+    "reg",
+    "wineserver",
+    "wine",
+    "wine64",
+    "wine-preloader",
+    "wine64-preloader",
+];
+
+fn is_client_process(name: &str) -> bool {
+    CLIENT_PROCESSES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
+}
+
+/// Whether `row` is a session the Steam client launched.
+#[must_use]
+pub fn is_client_session(row: &SessionRow) -> bool {
+    row.prefix == STEAM_CLIENT_PREFIX
+}
+
+/// The processes of `row`'s title under any of `keys`: the launch exe by
+/// name, or with no exe known, whatever is not the client or Wine itself.
+fn title_processes(keys: &[String], exe: &str) -> Vec<Process> {
+    let mut found: Vec<Process> = keys
+        .iter()
+        .flat_map(|key| find_session(key))
+        .filter(|process| {
+            if exe.is_empty() {
+                !is_client_process(&process.exe)
+            } else {
+                is_title(process, exe)
+            }
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// A session the Steam client runs. The marker is `RunningAppID`, read
+/// through the loader; the launch exe by name under the run's key and the
+/// client's is the fallback when the value is absent. `trouble` is the A2
+/// watch: a re-download stops the client, puts the `.acf` back, records the
+/// finding, and ends the watch.
+pub(crate) struct ClientProbe {
+    pub core: Core,
+    pub appid: u32,
+    pub keys: Vec<String>,
+    pub exe: String,
+    pub installed: InstalledEngine,
+    pub prefix: Prefix,
+    pub redownload: Option<RedownloadWatch>,
+    pub log: String,
+}
+
+impl ClientProbe {
+    fn running_appid(&self) -> Option<u32> {
+        let key = self.keys.first().map_or("", String::as_str);
+        reg_query(
+            &self.installed,
+            &self.prefix,
+            key,
+            RUNNING_APPID_KEY,
+            RUNNING_APPID_VALUE,
+        )
+        .ok()
+        .flatten()
+        .and_then(|data| parse_reg_dword(&data))
+    }
+
+    fn stop_client(&self) {
+        if let Err(error) =
+            self.core
+                .engine
+                .stop_server(&self.installed, &self.prefix.dir, Path::new(&self.log))
+        {
+            let _ = log_line(&self.log, &format!("the client stop failed: {error}"));
+        }
+    }
+}
+
+impl SessionProbe for ClientProbe {
+    fn loader_exit(&mut self) -> Result<Option<i32>, CoreError> {
+        Ok(None)
+    }
+
+    fn title_present(&mut self) -> bool {
+        match self.running_appid() {
+            Some(running) if running == self.appid => true,
+            Some(0) | None => {
+                !title_processes(&self.keys, &self.exe).is_empty() && !self.exe.is_empty()
+            }
+            Some(_) => false,
+        }
+    }
+
+    fn drained(&mut self) -> Result<bool, CoreError> {
+        Ok(true)
+    }
+
+    fn trouble(&mut self) -> Result<(), CoreError> {
+        let Some(detail) = self
+            .redownload
+            .as_mut()
+            .and_then(RedownloadWatch::redownload)
+        else {
+            return Ok(());
+        };
+        let _ = log_line(
+            &self.log,
+            &format!("A2 refuted: {detail}; stopping the client"),
+        );
+        self.stop_client();
+        if let Some(watch) = &self.redownload
+            && let Err(error) = watch.restore()
+        {
+            let _ = log_line(&self.log, &format!("the .acf restore failed: {error}"));
+        }
+        let record = format!("{} app {} {detail}", utc_now(), self.appid);
+        if let Ok(db) = self.core.db() {
+            let _ = db.meta_set(META_REDOWNLOAD, &record);
+        }
+        Err(CoreError::ClientRedownloadRefused {
+            appid: self.appid,
+            detail,
+        })
+    }
+}
+
 /// Appends a line to the session log; it may not exist yet, and a session
 /// that failed before the spawn should still have one to read.
 pub(crate) fn log_line(path: &str, line: &str) -> Result<(), CoreError> {
@@ -306,18 +512,28 @@ impl Adopted {
         let dir = self.core.prefix_dir(&row.prefix)?;
         report("running", format!("took over session {}", row.id));
         let note_lingering = format!("session {} outlived {}", row.id, row.launch_exe);
-        let mut probe = ForeignProbe {
-            key: &row.session_key,
-            exe: &row.launch_exe,
-            prefix_dir: &dir,
-        };
         let tuning = self.core.tuning;
-        let end = watch(&mut probe, &tuning, true, &mut |event| {
+        let mut on_event = |event| {
             if event == WatchEvent::Lingering {
                 report("lingering", note_lingering.clone());
             }
             true
-        })?;
+        };
+        let end = if is_client_session(&row) {
+            let mut probe = self.core.client_probe(&row, None)?;
+            let style = WatchStyle::Client {
+                appid: row.appid,
+                start_wait: tuning.client_start_wait,
+            };
+            watch(&mut probe, &tuning, true, style, &mut on_event)?
+        } else {
+            let mut probe = ForeignProbe {
+                key: &row.session_key,
+                exe: &row.launch_exe,
+                prefix_dir: &dir,
+            };
+            watch(&mut probe, &tuning, true, WatchStyle::Direct, &mut on_event)?
+        };
         let cancelled = self
             .core
             .reading(|db| Ok(db.session(row.id)?))?
@@ -382,12 +598,19 @@ impl PlannedCancel {
         let row = self.session.clone();
         let tuning = self.core.tuning;
         let dir = self.core.prefix_dir(&row.prefix)?;
+        if is_client_session(&row) && !self.kill_prefix {
+            return self.run_client(&row, report);
+        }
         if self.kill_prefix {
             report("cancel", "stopping the prefix's server".to_owned());
             self.stop_server_logged(&row);
         } else {
             report("cancel", format!("ending {}", row.launch_exe));
-            end_title(&row, &tuning)?;
+            end_title(
+                std::slice::from_ref(&row.session_key),
+                &row.launch_exe,
+                &tuning,
+            )?;
             let mut probe = ForeignProbe {
                 key: &row.session_key,
                 exe: &row.launch_exe,
@@ -426,6 +649,70 @@ impl PlannedCancel {
                 note: Some(NOTE_LOST),
             },
         )?;
+        drop(lock);
+        report("cancelled", format!("session {} ended", row.id));
+        self.core.session_row(row.id)
+    }
+
+    /// Ends the title the client runs and leaves the client up (plan 05:
+    /// the whole prefix goes only with `kill_prefix`). The owner closes the
+    /// row when the marker clears; with no owner it is closed here.
+    fn run_client(
+        mut self,
+        row: &SessionRow,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<SessionRow, CoreError> {
+        let tuning = self.core.tuning;
+        let keys = self.core.session_keys(row)?;
+        let what = if row.launch_exe.is_empty() {
+            "the title's processes".to_owned()
+        } else {
+            row.launch_exe.clone()
+        };
+        report(
+            "cancel",
+            format!("ending {what}; the Steam client stays up"),
+        );
+        end_title(&keys, &row.launch_exe, &tuning)?;
+        let deadline = Instant::now() + tuning.cancel_wait;
+        let lock = loop {
+            match self.core.lock_prefix(&row.prefix) {
+                Ok(lock) => break lock,
+                Err(error) if busy(&error) && Instant::now() < deadline => {
+                    std::thread::sleep(tuning.tick);
+                }
+                Err(error) if busy(&error) => {
+                    return Err(CoreError::Message(format!(
+                        "the owner of session {} did not let go of prefix {}; cancel again, or \
+                         with kill_prefix to stop the Steam client too",
+                        row.id, row.prefix
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let left = title_processes(&keys, &row.launch_exe);
+        if !left.is_empty() {
+            let mut names = String::new();
+            for process in &left {
+                let _ = write!(names, " {} ({})", process.exe, process.pid);
+            }
+            return Err(CoreError::Message(format!(
+                "session {} still has processes after the cancel:{names}",
+                row.id
+            )));
+        }
+        if self.core.session_row(row.id)?.ended_at.is_none() {
+            self.core.db()?.end_session(
+                row.id,
+                &SessionEnd {
+                    ended_at: &utc_now(),
+                    state: SessionState::Cancelled,
+                    exit_code: None,
+                    note: Some(NOTE_LOST),
+                },
+            )?;
+        }
         drop(lock);
         report("cancelled", format!("session {} ended", row.id));
         self.core.session_row(row.id)
@@ -481,13 +768,8 @@ impl PlannedCancel {
 }
 
 /// `SIGTERM` to the title's processes, then `SIGKILL` to what is left.
-fn end_title(row: &SessionRow, tuning: &RunTuning) -> Result<(), CoreError> {
-    let titles = || -> Vec<Process> {
-        find_session(&row.session_key)
-            .into_iter()
-            .filter(|process| is_title(process, &row.launch_exe))
-            .collect()
-    };
+fn end_title(keys: &[String], exe: &str, tuning: &RunTuning) -> Result<(), CoreError> {
+    let titles = || title_processes(keys, exe);
     for process in titles() {
         process::signal(process.pid, false)?;
     }
@@ -531,6 +813,42 @@ fn end_stragglers(row: &SessionRow, tuning: &RunTuning) -> Result<(), CoreError>
 }
 
 impl Core {
+    /// The keys a client session's processes carry: the run's own, and the
+    /// one the client was started with, since the client starts the game.
+    pub(crate) fn session_keys(&mut self, row: &SessionRow) -> Result<Vec<String>, CoreError> {
+        let mut keys = vec![row.session_key.clone()];
+        if is_client_session(row)
+            && let Some(client) = self.client_session_key()?
+            && !keys.contains(&client)
+        {
+            keys.push(client);
+        }
+        Ok(keys)
+    }
+
+    /// A [`ClientProbe`] for `row`, over the engine the row names.
+    pub(crate) fn client_probe(
+        &mut self,
+        row: &SessionRow,
+        redownload: Option<RedownloadWatch>,
+    ) -> Result<ClientProbe, CoreError> {
+        let id: EngineId = row.engine_id.parse()?;
+        let version = Version::new(row.engine_version.clone())?;
+        let installed = InstalledEngine::open(self.layout(), id, &version)?;
+        let (_, prefix) = self.open_prefix(&row.prefix)?;
+        let keys = self.session_keys(row)?;
+        Ok(ClientProbe {
+            core: self.detached(),
+            appid: row.appid,
+            keys,
+            exe: row.launch_exe.clone(),
+            installed,
+            prefix,
+            redownload,
+            log: row.log_path.clone(),
+        })
+    }
+
     pub(crate) fn session_row(&mut self, id: i64) -> Result<SessionRow, CoreError> {
         self.reading(|db| Ok(db.session(id)?))?
             .ok_or_else(|| CoreError::Message(format!("session {id} has no row")))
@@ -579,7 +897,20 @@ impl Core {
     /// left, whether or not that is the launch exe; a session that has left
     /// gets its row closed.
     pub(crate) fn settle_orphan(&mut self, row: &SessionRow) -> Result<bool, CoreError> {
-        if !find_session(&row.session_key).is_empty() {
+        let alive = if is_client_session(row) {
+            // The client's own processes carry the key for as long as it
+            // runs; only the title's marker says the session is alive.
+            self.client_probe(row, None).map_or_else(
+                |_| {
+                    !title_processes(std::slice::from_ref(&row.session_key), &row.launch_exe)
+                        .is_empty()
+                },
+                |mut probe| probe.title_present(),
+            )
+        } else {
+            !find_session(&row.session_key).is_empty()
+        };
+        if alive {
             return Ok(true);
         }
         let state = if row.cancel_requested {
@@ -673,11 +1004,12 @@ mod tests {
         early_exit: Duration::ZERO,
         term_wait: Duration::ZERO,
         cancel_wait: Duration::ZERO,
+        client_start_wait: Duration::from_millis(200),
     };
 
     fn run(probe: &mut Scripted, seen: bool) -> (WatchEnd, u32) {
         let mut running = 0;
-        let end = watch(probe, &FAST, seen, &mut |event| {
+        let end = watch(probe, &FAST, seen, WatchStyle::Direct, &mut |event| {
             if event == WatchEvent::Running {
                 running += 1;
             }
@@ -766,10 +1098,16 @@ mod tests {
         tuning.drain = Duration::ZERO;
         let mut probe = Scripted::new(&looks, 50);
         let mut events = Vec::new();
-        let end = watch(&mut probe, &tuning, false, &mut |event| {
-            events.push(event);
-            true
-        })
+        let end = watch(
+            &mut probe,
+            &tuning,
+            false,
+            WatchStyle::Direct,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        )
         .unwrap();
         assert_eq!(
             probe.drained_after, 0,
@@ -791,7 +1129,7 @@ mod tests {
         ];
         let mut probe = Scripted::new(&looks, 0);
         let mut asked = 0;
-        let end = watch(&mut probe, &FAST, false, &mut |_| {
+        let end = watch(&mut probe, &FAST, false, WatchStyle::Direct, &mut |_| {
             asked += 1;
             asked == 2
         })
@@ -824,8 +1162,95 @@ mod tests {
     #[test]
     fn a_failed_look_at_the_prefix_is_not_drained_and_not_the_end() {
         let mut probe = BrokenPrefix(3);
-        watch(&mut probe, &FAST, false, &mut |_| true).unwrap();
+        watch(&mut probe, &FAST, false, WatchStyle::Direct, &mut |_| true).unwrap();
         assert_eq!(probe.0, 0);
+    }
+
+    const CLIENT: WatchStyle = WatchStyle::Client {
+        appid: 7,
+        start_wait: Duration::from_millis(200),
+    };
+
+    #[test]
+    fn a_client_session_ignores_the_loader_and_ends_at_the_marker_without_draining() {
+        // The loader hands off and exits before the marker shows.
+        let mut probe = Scripted::new(
+            &[
+                Look(false, Some(0)),
+                Look(false, Some(0)),
+                Look(true, Some(0)),
+                Look(true, Some(0)),
+                Look(false, Some(0)),
+                Look(false, Some(0)),
+            ],
+            50,
+        );
+        let mut running = 0;
+        let end = watch(&mut probe, &FAST, false, CLIENT, &mut |event| {
+            if event == WatchEvent::Running {
+                running += 1;
+            }
+            true
+        })
+        .unwrap();
+        assert_eq!(running, 1);
+        assert!(end.seen);
+        assert_eq!(end.exit_code, None, "the title's status is the client's");
+        assert!(!end.lingered);
+        assert_eq!(
+            probe.drained_after, 50,
+            "nothing waited for the client to drain"
+        );
+    }
+
+    #[test]
+    fn a_client_session_whose_marker_never_shows_times_out() {
+        let mut probe = Scripted::new(&[Look(false, Some(0))], 0);
+        let mut tuning = FAST;
+        tuning.tick = Duration::from_millis(5);
+        let error = watch(&mut probe, &tuning, false, CLIENT, &mut |_| true).unwrap_err();
+        assert!(
+            matches!(error, CoreError::ClientLaunchTimedOut { appid: 7, .. }),
+            "{error}"
+        );
+    }
+
+    struct Troubled(u32);
+
+    impl SessionProbe for Troubled {
+        fn loader_exit(&mut self) -> Result<Option<i32>, CoreError> {
+            Ok(None)
+        }
+
+        fn title_present(&mut self) -> bool {
+            true
+        }
+
+        fn drained(&mut self) -> Result<bool, CoreError> {
+            Ok(true)
+        }
+
+        fn trouble(&mut self) -> Result<(), CoreError> {
+            self.0 += 1;
+            if self.0 == 3 {
+                return Err(CoreError::ClientRedownloadRefused {
+                    appid: 7,
+                    detail: "scripted".to_owned(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trouble_ends_a_running_watch_with_its_error() {
+        let mut probe = Troubled(0);
+        let error = watch(&mut probe, &FAST, false, CLIENT, &mut |_| true).unwrap_err();
+        assert!(
+            matches!(error, CoreError::ClientRedownloadRefused { .. }),
+            "{error}"
+        );
+        assert_eq!(probe.0, 3, "checked at every look, before the marker");
     }
 
     #[test]

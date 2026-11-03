@@ -149,7 +149,7 @@ impl Core {
     }
 
     /// The shared library directory, created on first use.
-    fn library_dir(&self) -> Result<PathBuf, CoreError> {
+    pub(crate) fn library_dir(&self) -> Result<PathBuf, CoreError> {
         let dir = self.data_dir().join(LIBRARY_DIR);
         fs::create_dir_all(&dir).map_err(|error| CoreError::io(&dir, error))?;
         Ok(dir)

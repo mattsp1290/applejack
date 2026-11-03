@@ -42,6 +42,7 @@ const FAST: RunTuning = RunTuning {
     early_exit: Duration::ZERO,
     term_wait: Duration::from_millis(300),
     cancel_wait: Duration::from_secs(10),
+    client_start_wait: Duration::from_secs(5),
 };
 
 struct Fixture {

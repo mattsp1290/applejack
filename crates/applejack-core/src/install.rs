@@ -28,11 +28,9 @@ use crate::error::CoreError;
 use crate::run::{launch_config, printable};
 use crate::runtime::direct::resolve_launch;
 use crate::runtime::session::busy;
+use crate::runtime::steam_client::STEAM_CLIENT_PREFIX;
 use crate::state::Core;
 use crate::steam::{SteamHost, silent_logon, steam_runtime};
-
-/// The prefix plan 05 keeps for the Windows Steam client.
-const STEAM_CLIENT_PREFIX: &str = "steam-client";
 
 /// A busy download reports per chunk; a pipe or a terminal needs far less.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);

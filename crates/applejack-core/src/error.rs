@@ -10,6 +10,7 @@ use applejack_steam::{AuthError, Error as SteamError};
 
 use crate::config::{ALLOW_UNSIGNED_ENV, DataDirError, Drm, Error as ConfigError};
 use crate::rpc::wire::{ErrorCode, RpcError};
+use crate::runtime::steam_client::ClientRuntimeState;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -85,12 +86,55 @@ pub enum CoreError {
     DownloadInProgress { appid: u32, finish: String },
     #[error("title {appid} is already running")]
     AlreadyRunning { appid: u32 },
-    /// The title takes the client path, which does not exist yet.
+    /// The title takes the client path, and the runtime is not there to
+    /// take it: absent, or waiting for a sign-in.
     #[error(
-        "title {appid} (drm = {drm}) launches through the Steam client, and the client runtime \
-         is not available yet. {route}"
+        "title {appid} (drm = {drm}) launches through the Steam client, which is {state}: {fix}. \
+         {route}"
     )]
-    ClientRuntimeUnavailable { appid: u32, drm: Drm, route: String },
+    ClientRuntimeUnavailable {
+        appid: u32,
+        drm: Drm,
+        state: ClientRuntimeState,
+        fix: String,
+        route: String,
+    },
+    /// The runtime is in a state a run or an operation cannot use.
+    #[error(
+        "the Steam client runtime is {state}: {detail}. `applejack runtime steam status` shows \
+         it, and `applejack runtime steam repair` restores the newest snapshot"
+    )]
+    ClientRuntimeBroken {
+        state: ClientRuntimeState,
+        detail: String,
+    },
+    /// Plan 05: refuse, keep the file, name the signer found.
+    #[error(
+        "refusing to run {}: {reason} (signer: {signer}); the file is kept for inspection",
+        path.display()
+    )]
+    BootstrapperUnverified {
+        path: PathBuf,
+        signer: String,
+        reason: String,
+    },
+    #[error("could not download {url}: {reason}")]
+    BootstrapperDownload { url: String, reason: String },
+    /// Assumption A2 refuted: the client fetched the title instead of
+    /// adopting it. The question for the user is plan 00's.
+    #[error(
+        "assumption A2 failed: the Steam client started re-downloading title {appid} ({detail}). \
+         The client was stopped and appmanifest_{appid}.acf was restored from its backup. \
+         Criterion 5 cannot be met as written: decide whether the in-prefix client may keep its \
+         own copy of the title"
+    )]
+    ClientRedownloadRefused { appid: u32, detail: String },
+    /// The client never reported the title running.
+    #[error(
+        "the Steam client reported no running title {appid} within {seconds} seconds; the client \
+         was stopped and the session log kept"
+    )]
+    ClientLaunchTimedOut { appid: u32, seconds: u64 },
     #[error("title {appid} has no usable launch executable: {reason}")]
     NoLaunchExe { appid: u32, reason: String },
     #[error("title {appid} is not running")]
@@ -197,6 +241,11 @@ impl CoreError {
             Self::DownloadInProgress { .. } => ErrorCode::DownloadInProgress,
             Self::AlreadyRunning { .. } => ErrorCode::AlreadyRunning,
             Self::ClientRuntimeUnavailable { .. } => ErrorCode::ClientRuntimeUnavailable,
+            Self::ClientRuntimeBroken { .. } => ErrorCode::ClientRuntimeBroken,
+            Self::BootstrapperUnverified { .. } => ErrorCode::BootstrapperUnverified,
+            Self::BootstrapperDownload { .. } => ErrorCode::DownloadFailed,
+            Self::ClientRedownloadRefused { .. } => ErrorCode::ClientRedownloadRefused,
+            Self::ClientLaunchTimedOut { .. } => ErrorCode::ClientLaunchTimedOut,
             Self::NoLaunchExe { .. } => ErrorCode::NoLaunchExe,
             Self::NotRunning { .. } => ErrorCode::NotRunning,
             Self::TitleExitedEarly { .. } => ErrorCode::TitleExitedEarly,

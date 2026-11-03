@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "build_id": "1761720601",
+    "detail": "no account is signed in; run `applejack runtime steam install` and sign in inside the Steam window",
+    "prefix": "/data/prefixes/steam-client",
+    "running": true,
+    "snapshots": 1,
+    "state": "needs_login"
+  }
+}

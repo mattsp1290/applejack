@@ -9,6 +9,7 @@ pub use crate::engines::{CpuidProbeResult, D3dmetalImportResult, EngineEntry, En
 pub use crate::game_config::ConfigImportResult;
 use crate::host::HostFacts;
 pub use crate::prefixes::SnapshotResult;
+pub use crate::runtime::steam_client::{ClientRuntimeState, ClientRuntimeStatus};
 pub use crate::steam::{InstallState, LibraryEntry, SteamLibraryResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -53,10 +54,6 @@ macro_rules! methods {
 
 const IMPLEMENTED: MethodStatus = MethodStatus::Implemented;
 
-const fn pending(work_package: &'static str) -> MethodStatus {
-    MethodStatus::Pending { work_package }
-}
-
 methods! {
     Hello = "hello": HelloParams => IMPLEMENTED;
     HostDoctor = "host.doctor": HostDoctorParams => IMPLEMENTED;
@@ -74,10 +71,11 @@ methods! {
     AppInstall = "app.install": AppInstallParams => IMPLEMENTED;
     AppRun = "app.run": AppRunParams => IMPLEMENTED;
     AppCancel = "app.cancel": AppCancelParams => IMPLEMENTED;
-    RuntimeSteamInstall = "runtime.steam.install": RuntimeSteamInstallParams => pending("5");
-    RuntimeSteamUpdate = "runtime.steam.update": RuntimeSteamUpdateParams => pending("5");
-    RuntimeSteamRepair = "runtime.steam.repair": RuntimeSteamRepairParams => pending("5");
-    RuntimeSteamStop = "runtime.steam.stop": RuntimeSteamStopParams => pending("5");
+    RuntimeSteamInstall = "runtime.steam.install": RuntimeSteamInstallParams => IMPLEMENTED;
+    RuntimeSteamUpdate = "runtime.steam.update": RuntimeSteamUpdateParams => IMPLEMENTED;
+    RuntimeSteamRepair = "runtime.steam.repair": RuntimeSteamRepairParams => IMPLEMENTED;
+    RuntimeSteamStop = "runtime.steam.stop": RuntimeSteamStopParams => IMPLEMENTED;
+    RuntimeSteamStatus = "runtime.steam.status": RuntimeSteamStatusParams => IMPLEMENTED;
     ConfigGet = "config.get": ConfigGetParams => IMPLEMENTED;
     ConfigSet = "config.set": ConfigSetParams => IMPLEMENTED;
     ConfigExport = "config.export": ConfigExportParams => IMPLEMENTED;
@@ -178,6 +176,7 @@ impl Method {
             Self::RuntimeSteamUpdate(RuntimeSteamUpdateParams {}),
             Self::RuntimeSteamRepair(RuntimeSteamRepairParams { reinstall: false }),
             Self::RuntimeSteamStop(RuntimeSteamStopParams {}),
+            Self::RuntimeSteamStatus(RuntimeSteamStatusParams {}),
             Self::ConfigGet(ConfigGetParams { appid: 220 }),
             Self::ConfigSet(ConfigSetParams {
                 appid: 220,
@@ -427,6 +426,10 @@ pub struct RuntimeSteamRepairParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSteamStopParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSteamStatusParams {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -33,6 +33,17 @@ const BUNDLE_FILES: &[&str] = &[
 /// before it starts `helper.exe`. The arguments go to `$WINEPREFIX/args`, so a
 /// test can see them without the log having to.
 ///
+/// The Steam client: `SteamSetup.exe /S` lays the client down under
+/// `drive_c/Program Files (x86)/Steam` with its manifest; `steam.exe` with no
+/// arguments is the first run, a client (`steam.exe` plus a
+/// `steamwebhelper.exe`) that stays until `$WINEPREFIX/client-quit`; with
+/// `-applaunch <appid>` it starts the client if none is up, then `game.exe`
+/// as the title and `$WINEPREFIX/running-appid` as the registry value, which
+/// `reg query` prints, and clears it when the game exits. A
+/// `$WINEPREFIX/redownload` file makes `-applaunch` rewrite the `.acf` as a
+/// client fetching the title does, and `$WINEPREFIX/never-start` makes it
+/// report nothing.
+///
 /// The title is this test binary and not the shell: macOS hides the
 /// environment of platform binaries such as `/bin/sh` from `KERN_PROCARGS2`,
 /// so a shell stub could never be found by its session.
@@ -63,6 +74,42 @@ fi
 if [ "$name" = quick.exe ]; then
   exit 0
 fi
+if [ "$name" = SteamSetup.exe ]; then
+  steam="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
+  mkdir -p "$steam/package" "$steam/config"
+  echo "$*" > "$steam/bootstrapped"
+  : > "$steam/steam.exe"
+  printf '"steam_client_win32"\n{\n\t"version"\t\t"1761720601"\n}\n' > "$steam/package/steam_client_win32.manifest"
+  exit 0
+fi
+if [ "$name" = reg ] && [ "$2" = query ]; then
+  [ -f "$WINEPREFIX/running-appid" ] || exit 1
+  printf 'HKEY_CURRENT_USER\\Software\\Valve\\Steam\n    RunningAppID    REG_DWORD    0x%x\n' "$(cat "$WINEPREFIX/running-appid")"
+  exit 0
+fi
+if [ "$name" = steam.exe ]; then
+  if [ "$2" = -applaunch ]; then
+    appid=$3
+    shift 3
+    echo "$*" > "$WINEPREFIX/args"
+    if [ -e "$WINEPREFIX/redownload" ]; then
+      acf=$(ls "$WINEPREFIX"/dosdevices/s:/steamapps/appmanifest_*.acf | head -1)
+      sed -i '' -e 's/"StateFlags"\t\t"4"/"StateFlags"\t\t"1026"/' -e 's/"buildid"\t\t"100"/"buildid"\t\t"101"/' "$acf"
+      exit 0
+    fi
+    if [ -e "$WINEPREFIX/never-start" ]; then
+      exit 0
+    fi
+    ( "@HELPER@" common::stub_title --exact --ignored --nocapture game.exe; echo 0 > "$WINEPREFIX/running-appid" ) &
+    echo "$appid" > "$WINEPREFIX/running-appid"
+    if [ -e "$WINEPREFIX/client-up" ]; then
+      exit 0
+    fi
+  fi
+  : > "$WINEPREFIX/client-up"
+  "@HELPER@" common::stub_title --exact --ignored --nocapture steamwebhelper.exe &
+  exec "@HELPER@" common::stub_title --exact --ignored --nocapture steam.exe
+fi
 if [ "$name" = wineboot ]; then
   mkdir -p "$WINEPREFIX/dosdevices" "$WINEPREFIX/drive_c/windows/system32" "$WINEPREFIX/drive_c/windows/syswow64" "$WINEPREFIX/drive_c/users/me"
 fi
@@ -79,9 +126,31 @@ exit 0
 const SERVER: &str = r#"#!/bin/sh
 if [ "$1" = -k ] && [ -e "$WINEPREFIX/server-up" ]; then
   echo 99 > "$WINEPREFIX/quit"
+  : > "$WINEPREFIX/client-quit"
+  rm -f "$WINEPREFIX/client-up"
   : > "$WINEPREFIX/server-quit"
 fi
 exit 0
+"#;
+
+/// Stands in for the payload's Authenticode tool: the file's text says what
+/// the real tool would find. The output is the real tool's, cut down.
+const OSSLSIGNCODE: &str = r#"#!/bin/sh
+file=
+while [ $# -gt 0 ]; do
+  if [ "$1" = -in ]; then file=$2; shift; fi
+  shift
+done
+if grep -q VALVE-SIGNED "$file" 2>/dev/null; then
+  printf "Signer's certificate:\n\tSigner #0:\n\t\tSubject: CN=Valve Corp.,O=Valve Corp.,L=Bellevue,ST=Washington,C=US\n\nSignature verification: ok\n\nNumber of verified signatures: 1\nSucceeded\n"
+  exit 0
+fi
+if grep -q OTHER-SIGNED "$file" 2>/dev/null; then
+  printf "Signer's certificate:\n\tSigner #0:\n\t\tSubject: CN=Fixture Signer,O=Not Valve\n\nSignature verification: ok\n\nNumber of verified signatures: 1\nSucceeded\n"
+  exit 0
+fi
+printf "No signature found\nUnable to extract existing signature\nFailed\n"
+exit 1
 "#;
 
 /// Prints the JSON line `cpuid` prints; `ROSETTA_ADVERTISE_AVX` changes it.
@@ -92,9 +161,10 @@ echo "{\"avx\":$avx,\"avx2\":false,\"osxsave\":true,\"xcr0_ymm\":$avx}"
 "#;
 
 /// What a stub title runs: stays until `$WINEPREFIX/quit` holds an exit code.
-/// `helper.exe` ignores that. Each leaves with its prefix, so a failed test
-/// leaves nothing running. Without a prefix there is nothing to wait for, for
-/// `cargo test -- --ignored`.
+/// `helper.exe` ignores that; the client's processes (`steam.exe`,
+/// `steamwebhelper.exe`) ignore it too and leave on `$WINEPREFIX/client-quit`.
+/// Each leaves with its prefix, so a failed test leaves nothing running.
+/// Without a prefix there is nothing to wait for, for `cargo test -- --ignored`.
 #[test]
 #[ignore = "the stub title, started by the stub loader"]
 fn stub_title() {
@@ -103,8 +173,13 @@ fn stub_title() {
     };
     let prefix = Path::new(&prefix);
     let quit = prefix.join("quit");
-    let obeys = std::env::args().next_back().as_deref() != Some("helper.exe");
+    let name = std::env::args().next_back().unwrap_or_default();
+    let client = name == "steam.exe" || name == "steamwebhelper.exe";
+    let obeys = name != "helper.exe" && !client;
     while prefix.is_dir() {
+        if client && prefix.join("client-quit").exists() {
+            std::process::exit(0);
+        }
         if let Some(code) = fs::read_to_string(&quit)
             .ok()
             .filter(|_| obeys)
@@ -192,6 +267,7 @@ pub fn write_stub_bundle(root: &Path, version: &str) {
     script(&root.join("wine/bin/wine64"), &wine);
     script(&root.join("wine/bin/wineserver"), SERVER);
     script(&root.join("probes/cpuid"), CPUID);
+    script(&root.join("probes/osslsigncode"), OSSLSIGNCODE);
     let toml = BUNDLE_TOML.replace("version = \"10.0.0\"", &format!("version = \"{version}\""));
     fs::write(root.join("BUNDLE.toml"), toml).unwrap();
 }

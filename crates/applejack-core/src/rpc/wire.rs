@@ -230,7 +230,7 @@ pub enum ErrorCode {
     DownloadInProgress,
     /// `app.run` for a title with an open session.
     AlreadyRunning,
-    /// `app.run` for a title that launches through the Steam client.
+    /// `app.run` for a client title while the runtime is absent or needs a sign-in.
     ClientRuntimeUnavailable,
     /// `app.run` for a title with no launch executable, or one outside it.
     NoLaunchExe,
@@ -266,10 +266,18 @@ pub enum ErrorCode {
     SteamClientOwnsTitle,
     /// Files differ from the manifest.
     VerifyFailed,
+    /// The bootstrapper failed its Authenticode check or is not Valve's.
+    BootstrapperUnverified,
+    /// The Steam client runtime is updating, broken, or never came up.
+    ClientRuntimeBroken,
+    /// Assumption A2 failed: the client re-downloaded the title.
+    ClientRedownloadRefused,
+    /// The client reported no running title within the wait.
+    ClientLaunchTimedOut,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 42] = [
         Self::ParseError,
         Self::InvalidRequest,
         Self::MethodNotFound,
@@ -308,6 +316,10 @@ impl ErrorCode {
         Self::AlreadyInstalled,
         Self::SteamClientOwnsTitle,
         Self::VerifyFailed,
+        Self::BootstrapperUnverified,
+        Self::ClientRuntimeBroken,
+        Self::ClientRedownloadRefused,
+        Self::ClientLaunchTimedOut,
     ];
 
     #[must_use]
@@ -351,6 +363,10 @@ impl ErrorCode {
             Self::AlreadyInstalled => 1030,
             Self::SteamClientOwnsTitle => 1031,
             Self::VerifyFailed => 1032,
+            Self::BootstrapperUnverified => 1033,
+            Self::ClientRuntimeBroken => 1034,
+            Self::ClientRedownloadRefused => 1035,
+            Self::ClientLaunchTimedOut => 1036,
         }
     }
 
@@ -402,6 +418,10 @@ impl ErrorCode {
             Self::AlreadyInstalled => "AlreadyInstalled",
             Self::SteamClientOwnsTitle => "SteamClientOwnsTitle",
             Self::VerifyFailed => "VerifyFailed",
+            Self::BootstrapperUnverified => "BootstrapperUnverified",
+            Self::ClientRuntimeBroken => "ClientRuntimeBroken",
+            Self::ClientRedownloadRefused => "ClientRedownloadRefused",
+            Self::ClientLaunchTimedOut => "ClientLaunchTimedOut",
         }
     }
 
@@ -446,7 +466,7 @@ impl ErrorCode {
             }
             Self::AlreadyRunning => "`app.run` for a title with an open session.",
             Self::ClientRuntimeUnavailable => {
-                "`app.run` for a title that launches through the Steam client, which is not available yet."
+                "`app.run` for a title that launches through the Steam client while the runtime is absent (`runtime.steam.install`) or needs a sign-in inside the client window."
             }
             Self::NoLaunchExe => {
                 "`app.run` for a title with no launch executable, or one outside its install directory."
@@ -492,6 +512,18 @@ impl ErrorCode {
             }
             Self::VerifyFailed => {
                 "`app.install` with `verify` found files that differ from the manifest."
+            }
+            Self::BootstrapperUnverified => {
+                "`runtime.steam.install`: `SteamSetup.exe` failed its Authenticode check or its signer is not Valve Corp. The file is kept and the message names the signer found."
+            }
+            Self::ClientRuntimeBroken => {
+                "The Steam client runtime is updating, broken, or never reached the login window. `runtime.steam.status` says which; `runtime.steam.repair` restores the newest snapshot."
+            }
+            Self::ClientRedownloadRefused => {
+                "Assumption A2 failed: the client began re-downloading the title. The client was stopped and the `.acf` restored from its backup; the finding is in `meta`."
+            }
+            Self::ClientLaunchTimedOut => {
+                "The Steam client reported no running title within the wait after `-applaunch`; the client was stopped."
             }
         }
     }

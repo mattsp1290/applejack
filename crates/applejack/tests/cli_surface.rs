@@ -5,8 +5,6 @@ const SUBCOMMANDS: [&str; 11] = [
     "doctor",
 ];
 
-const STUBS: [&str; 1] = ["runtime"];
-
 const DOCTOR_KEYS: [&str; 6] = [
     "macos_version",
     "arch",
@@ -45,34 +43,39 @@ fn version_prints_crate_version() {
     );
 }
 
+/// The runtime commands answer with the client's state before anything else;
+/// `install` with no engine stops before the network, under the sandbox.
 #[test]
-fn stubs_exit_with_ex_unavailable() {
-    for name in STUBS {
-        assert_not_implemented(name, &[]);
+fn runtime_steam_reports_an_absent_client_and_install_needs_an_engine_first() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["runtime", "steam", "status"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let text = stdout_of(&output);
+    assert!(text.contains("steam client absent"), "{text}");
+    assert!(text.contains("build -"), "{text}");
+    let output = with_data(data.path(), &["runtime", "steam", "status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["state"], serde_json::json!("absent"));
+    for args in [
+        &["runtime", "steam", "install"][..],
+        &["runtime", "steam", "update"],
+        &["runtime", "steam", "repair"],
+        &["runtime", "steam", "stop"],
+    ] {
+        let output = with_data(data.path(), args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let text = stderr_of(&output);
+        assert!(
+            text.contains("no engine is active") || text.contains("runtime steam install"),
+            "{args:?}: {text}"
+        );
     }
 }
 
-#[test]
-fn stubs_ignore_trailing_arguments() {
-    assert_not_implemented("runtime", &["install"]);
-}
-
-fn assert_not_implemented(name: &str, args: &[&str]) {
-    let output = applejack().arg(name).args(args).output().expect("runs");
-    assert_eq!(
-        output.status.code(),
-        Some(69),
-        "`{name} {}` exit code",
-        args.join(" ")
-    );
-    let stderr = String::from_utf8(output.stderr).expect("utf-8");
-    assert_eq!(stderr.trim(), format!("applejack {name}: not implemented"));
-}
-
-/// A `steam` or `install` run has the network denied, so a mistake in a test
-/// cannot reach Steam.
+/// A `steam`, `install`, or `runtime` run has the network denied, so a
+/// mistake in a test cannot reach Steam or Valve's CDN.
 fn applejack_for(args: &[&str]) -> Command {
-    if matches!(args.first(), Some(&("steam" | "install"))) {
+    if matches!(args.first(), Some(&("steam" | "install" | "runtime"))) {
         let mut command = Command::new("/usr/bin/sandbox-exec");
         command.args([
             "-p",

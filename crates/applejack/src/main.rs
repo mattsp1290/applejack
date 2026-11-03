@@ -3,13 +3,9 @@
 mod cmd;
 
 use applejack_core::host::HostFacts;
-use clap::{Args, Parser, Subcommand};
-use std::ffi::OsString;
+use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use std::process::ExitCode;
-
-/// `EX_UNAVAILABLE` from sysexits(3): the subcommand exists but is not implemented yet.
-const EXIT_NOT_IMPLEMENTED: u8 = 69;
 
 #[derive(Parser)]
 #[command(
@@ -20,14 +16,6 @@ const EXIT_NOT_IMPLEMENTED: u8 = 69;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-}
-
-/// Arguments a stub accepts and ignores, so callers see exit 69 rather than a
-/// usage error until the subcommand's work package lands.
-#[derive(Args)]
-struct Pending {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    _args: Vec<OsString>,
 }
 
 #[derive(Subcommand)]
@@ -49,7 +37,7 @@ enum Command {
     /// Create, snapshot, and reset Wine prefixes
     Prefix(cmd::prefix::PrefixArgs),
     /// Manage the shared Steam client prefix
-    Runtime(Pending),
+    Runtime(cmd::runtime::RuntimeArgs),
     /// Serve JSON-RPC over stdio for the app shell
     Serve(cmd::serve::ServeArgs),
     /// Report host readiness facts
@@ -58,24 +46,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-}
-
-impl Command {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Engine(_) => "engine",
-            Self::Steam(_) => "steam",
-            Self::Install(_) => "install",
-            Self::Run(_) => "run",
-            Self::App(_) => "app",
-            Self::Session(_) => "session",
-            Self::Config(_) => "config",
-            Self::Prefix(_) => "prefix",
-            Self::Runtime(_) => "runtime",
-            Self::Serve(_) => "serve",
-            Self::Doctor { .. } => "doctor",
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -91,13 +61,8 @@ fn main() -> ExitCode {
         Command::Session(args) => cmd::session::run(&args),
         Command::Steam(args) => cmd::steam::run(&args),
         Command::Install(args) => cmd::install::run(args),
-        stub @ Command::Runtime(_) => not_implemented(stub.name()),
+        Command::Runtime(args) => cmd::runtime::run(&args),
     }
-}
-
-fn not_implemented(name: &str) -> ExitCode {
-    eprintln!("applejack {name}: not implemented");
-    ExitCode::from(EXIT_NOT_IMPLEMENTED)
 }
 
 fn doctor(json: bool) -> ExitCode {

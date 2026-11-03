@@ -13,6 +13,7 @@ use crate::error::CoreError;
 use crate::game_config::config_value_text;
 use crate::host::HostFacts;
 use crate::install::TitleInstall;
+use crate::runtime::steam_client::ClientOp;
 use crate::state::Core;
 use crate::steam::{LiveSteam, LoginFlow, NoSteam, SteamHost};
 use applejack_engine::rosetta_wine::launch::new_session_id;
@@ -313,6 +314,23 @@ impl<H: SteamHost> CoreHandler<H> {
         })?)
     }
 
+    /// `runtime.steam.install|update|repair|stop` as a job; the prefix is
+    /// claimed before the answer, so a busy runtime is an error response.
+    fn runtime_op(&mut self, op: ClientOp, notifier: &Notifier) -> Result<Value, RpcError> {
+        let plan = self.core()?.plan_client_op(op)?;
+        to_result(&notifier.start_job(move |job| {
+            let status =
+                plan.run(&mut |phase, message| job.progress(phase, None, None, message))?;
+            job.progress(
+                "status",
+                None,
+                None,
+                format!("{}: {}", status.state, status.detail),
+            );
+            Ok(())
+        })?)
+    }
+
     /// Closes sessions whose core died and takes over those whose title
     /// still runs. Best effort: `hello` must answer with a broken data
     /// directory, and the rows wait for the next call.
@@ -427,13 +445,22 @@ impl<H: SteamHost> Handler for CoreHandler<H> {
             Method::AppInstall(params) => self.app_install(params, notifier),
             Method::AppRun(params) => self.app_run(params, notifier),
             Method::AppCancel(params) => self.app_cancel(params, notifier),
+            Method::RuntimeSteamInstall(_) => self.runtime_op(ClientOp::Install, notifier),
+            Method::RuntimeSteamUpdate(_) => self.runtime_op(ClientOp::Update, notifier),
+            Method::RuntimeSteamRepair(params) => self.runtime_op(
+                ClientOp::Repair {
+                    reinstall: params.reinstall,
+                },
+                notifier,
+            ),
+            Method::RuntimeSteamStop(_) => self.runtime_op(ClientOp::Stop, notifier),
+            Method::RuntimeSteamStatus(_) => to_result(&self.core()?.client_runtime_status()?),
             Method::SessionList(params) => {
                 self.adopt_sessions(notifier);
                 to_result(&SessionListResult {
                     sessions: self.core()?.session_list(params.appid)?,
                 })
             }
-            pending => Err(not_implemented(pending)),
         }
     }
 }
