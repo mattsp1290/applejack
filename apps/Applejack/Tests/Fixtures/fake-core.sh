@@ -17,11 +17,12 @@
 #   FAKE_CORE_MUTE=1           read every request and answer none of them
 #   FAKE_CORE_PID_FILE=<path>  write the fake's pid there at startup
 #   FAKE_CORE_IMPLEMENTED=1    answer the view-model methods (engine.*,
-#                              steam.*, config.*, session.list, app.install)
-#                              with canned results shaped like the Rust types;
-#                              engine.install, app.install, and steam.library
-#                              with refresh run as jobs that emit two
-#                              job.progress then job.done
+#                              steam.*, config.*, session.list, app.install,
+#                              runtime.steam.*) with canned results shaped
+#                              like the Rust types; engine.install,
+#                              app.install, steam.library with refresh, and
+#                              the runtime.steam operations run as jobs that
+#                              emit two job.progress then job.done
 #   FAKE_CORE_LOGIN_POLLS=<n>  steam.login.complete answers `waiting` n times
 #                              before `done`
 #   FAKE_CORE_LOGIN_ROTATE=1   each steam.login.start answers a new session id,
@@ -189,6 +190,13 @@ implemented() {
       ;;
     session.list)
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"sessions":[{"id":1,"appid":220,"started_at":"2026-10-30T00:00:00Z","ended_at":null,"engine_id":"rosetta-wine","engine_version":"10.0.1","exit_code":null,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'","state":"running","session_key":"fake-session","prefix":"220","launch_exe":"hl2.exe","note":null,"cancel_requested":false}]}}'
+      ;;
+    runtime.steam.status)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"state":"needs_login","prefix":"/data/prefixes/steam-client","build_id":"1761720601","running":true,"snapshots":1,"detail":"no account is signed in"}}'
+      ;;
+    runtime.steam.install|runtime.steam.update|runtime.steam.repair|runtime.steam.stop)
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":10}}'
+      job 10
       ;;
     *)
       return 1

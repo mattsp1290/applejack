@@ -634,3 +634,182 @@ pub fn check_32bit(
     }
     Ok(())
 }
+
+/// How long one `reg query` may take before its loader is killed.
+pub const REG_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Reads one registry value through `<loader> reg query <key> /v <value>`
+/// in `prefix`, which is the live view: `wineserver` writes `user.reg`
+/// lazily. Returns the value's data text (`0x3b508` for a `REG_DWORD`), or
+/// `None` when the key or value is absent, which `reg` reports with a
+/// non-zero status. The process carries `session_id` like any launch into
+/// the prefix, so it is found and ended with that session.
+///
+/// # Errors
+///
+/// Returns the spawn failure, or [`Error::WineCommandFailed`] when the
+/// query ran past [`REG_QUERY_TIMEOUT`].
+pub fn reg_query(
+    installed: &InstalledEngine,
+    prefix: &Prefix,
+    session_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<Option<String>> {
+    let rows = engine_rows(
+        installed,
+        &prefix.dir,
+        session_id,
+        prefix.backend,
+        prefix.sync_mode,
+        false,
+    );
+    let (env, _) = assemble_env(installed, &prefix.dir, &[], &rows)?;
+    let loader = installed.root.join(&installed.bundle.wine.loader);
+    let mut child = Command::new(&loader)
+        .args(["reg", "query", key, "/v", value])
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(&prefix.dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| Error::Spawn {
+            program: loader.clone(),
+            source: error,
+        })?;
+    let pid = child.id();
+    let mut stdout = child.stdout.take();
+    let Some(status) = wait_bounded(&mut child, &loader, REG_QUERY_TIMEOUT)? else {
+        return Err(timed_out(
+            format!("{} reg query {key} /v {value}", loader.display()),
+            REG_QUERY_TIMEOUT,
+            &prefix.dir,
+            pid,
+        ));
+    };
+    if !status.success() {
+        return Ok(None);
+    }
+    let mut text = Vec::new();
+    if let Some(stdout) = stdout.as_mut() {
+        let _ = stdout.read_to_end(&mut text);
+    }
+    Ok(reg_value_data(&String::from_utf8_lossy(&text), value))
+}
+
+/// Writes one `REG_DWORD` through `<loader> reg add <key> /v <value> /t
+/// REG_DWORD /d <data> /f` in `prefix`, carrying `session_id` as
+/// [`reg_query`] does.
+///
+/// # Errors
+///
+/// Returns the spawn failure, or [`Error::WineCommandFailed`] when `reg`
+/// failed or ran past [`REG_QUERY_TIMEOUT`].
+pub fn reg_set_dword(
+    installed: &InstalledEngine,
+    prefix: &Prefix,
+    session_id: &str,
+    key: &str,
+    value: &str,
+    data: u32,
+) -> Result<()> {
+    let rows = engine_rows(
+        installed,
+        &prefix.dir,
+        session_id,
+        prefix.backend,
+        prefix.sync_mode,
+        false,
+    );
+    let (env, _) = assemble_env(installed, &prefix.dir, &[], &rows)?;
+    let loader = installed.root.join(&installed.bundle.wine.loader);
+    let data = data.to_string();
+    let mut child = Command::new(&loader)
+        .args([
+            "reg",
+            "add",
+            key,
+            "/v",
+            value,
+            "/t",
+            "REG_DWORD",
+            "/d",
+            &data,
+            "/f",
+        ])
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(&prefix.dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| Error::Spawn {
+            program: loader.clone(),
+            source: error,
+        })?;
+    let pid = child.id();
+    let command = format!("{} reg add {key} /v {value} /d {data}", loader.display());
+    let Some(status) = wait_bounded(&mut child, &loader, REG_QUERY_TIMEOUT)? else {
+        return Err(timed_out(command, REG_QUERY_TIMEOUT, &prefix.dir, pid));
+    };
+    if !status.success() {
+        return Err(Error::WineCommandFailed {
+            command,
+            status: status.to_string(),
+            log: prefix.dir.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The data column of `value`'s row in `reg query` output
+/// (`    RunningAppID    REG_DWORD    0x3b508`).
+#[must_use]
+pub fn reg_value_data(output: &str, value: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let name = fields.next()?;
+        if !name.eq_ignore_ascii_case(value) {
+            return None;
+        }
+        let _kind = fields.next()?;
+        fields.next().map(str::to_owned)
+    })
+}
+
+/// A `REG_DWORD` as `reg query` prints it (`0x3b508`), or decimal text.
+#[must_use]
+pub fn parse_reg_dword(data: &str) -> Option<u32> {
+    let data = data.trim();
+    match data.strip_prefix("0x").or_else(|| data.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => data.parse().ok(),
+    }
+}
+
+#[cfg(test)]
+mod reg_tests {
+    use super::*;
+
+    #[test]
+    fn the_value_row_is_read_whatever_the_rest_of_the_output_is() {
+        let output = "\nHKEY_CURRENT_USER\\Software\\Valve\\Steam\n    RunningAppID    REG_DWORD    0x3b4e8\n\n";
+        assert_eq!(
+            reg_value_data(output, "runningappid").as_deref(),
+            Some("0x3b4e8")
+        );
+        assert_eq!(reg_value_data(output, "Other"), None);
+        assert_eq!(reg_value_data("", "RunningAppID"), None);
+    }
+
+    #[test]
+    fn a_dword_reads_in_hex_or_decimal() {
+        assert_eq!(parse_reg_dword("0x3b4e8"), Some(242_920));
+        assert_eq!(parse_reg_dword("0x0"), Some(0));
+        assert_eq!(parse_reg_dword("242920"), Some(242_920));
+        assert_eq!(parse_reg_dword("x"), None);
+    }
+}

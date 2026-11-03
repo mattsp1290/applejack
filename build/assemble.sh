@@ -7,7 +7,7 @@
 #   dxmt/{x86_64-windows,i386-windows}      DXMT DLLs, the ones that load as native without Wine's builtin marker
 #   vkd3d/{x64,x86}                         vkd3d-proton DLLs
 #   vulkan/                                 libMoltenVK.dylib (x86_64) and MoltenVK_icd.json
-#   probes/                                 hello32.exe, dx11-sample.exe, xinput-check.exe, cpuid, osslsigncode (host-arch)
+#   probes/                                 hello32.exe, dx11-sample.exe, xinput-check.exe, steamwebhelper-shim.exe, cpuid, osslsigncode (host-arch)
 #   BUNDLE.toml, THIRD_PARTY_NOTICES.md     rendered from build/bundle-spec.toml
 #   wine/lib/*.dylib                        the x86-64 Homebrew libraries Wine links or dlopens, copied in by
 #                                           `cargo xtask engine-payload --close` (docs/engines/payload-build.md step 7),
@@ -87,6 +87,7 @@ copy_probe() {
 copy_probe "$probes/hello32.exe" hello32.exe "sh crates/applejack-engine/probes/hello32/build.sh"
 copy_probe "$probes/dx11-sample-x86_64.exe" dx11-sample.exe "sh crates/applejack-engine/probes/dx11-sample/build.sh"
 copy_probe "$probes/xinput-check-x86_64.exe" xinput-check.exe "sh crates/applejack-engine/probes/xinput-check/build.sh"
+copy_probe "$probes/steamwebhelper-shim.exe" steamwebhelper-shim.exe "sh crates/applejack-engine/probes/steamwebhelper-shim/build.sh"
 copy_probe "$probes/cpuid" cpuid "sh crates/applejack-engine/probes/cpuid/build.sh"
 copy_probe "$WORK/osslsigncode/osslsigncode" osslsigncode "sh build/osslsigncode/build.sh"
 

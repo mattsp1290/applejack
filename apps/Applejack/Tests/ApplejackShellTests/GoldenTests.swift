@@ -50,6 +50,7 @@ final class GoldenTests: XCTestCase {
                 "empty.result.json", "engine.d3dmetal.import.result.json", "engine.doctor.result.json",
                 "engine.install.result.json", "engine.list.result.json", "engine.probe_cpuid.result.json",
                 "hello.result.json", "host.doctor.result.json", "prefix.snapshot.result.json",
+                "runtime.steam.install.result.json", "runtime.steam.status.result.json",
                 "session.list.result.json", "steam.library.result.json",
                 "steam.login.complete.result.json", "steam.login.start.result.json",
             ]
@@ -148,6 +149,11 @@ final class GoldenTests: XCTestCase {
         let plan = try typedResult("config.import.result.json", as: ConfigImportResult.self)
         XCTAssertTrue(plan.needsConfirmation)
         XCTAssertEqual(plan.rejected.first?.field, "extra_env.PATH")
+        _ = try typedResult("runtime.steam.install.result.json", as: JobStarted.self)
+        let runtime = try typedResult("runtime.steam.status.result.json", as: ClientRuntimeStatus.self)
+        XCTAssertEqual(runtime.state, .needsLogin)
+        XCTAssertEqual(runtime.buildId, "1761720601")
+        XCTAssertTrue(runtime.running)
     }
 
     func testJobMirrorsDecodeTheNotificationGoldens() throws {
@@ -189,7 +195,10 @@ final class GoldenTests: XCTestCase {
         try check("steam.login.start", SteamLoginStartParams.self)
         try check("steam.login.complete", SteamLoginCompleteParams.self)
         try check("session.list", SessionListParams.self)
-        for method in ["engine.list", "engine.doctor", "engine.probe_cpuid", "steam.logout", "host.doctor"] {
+        for method in [
+            "engine.list", "engine.doctor", "engine.probe_cpuid", "steam.logout", "host.doctor",
+            "runtime.steam.install", "runtime.steam.update", "runtime.steam.stop", "runtime.steam.status",
+        ] {
             try check(method, EmptyParams.self)
         }
         let credentials = try RpcCoding.encoder().encode(SteamLoginStartParams(mode: .credentials(accountName: "a", password: "p")))

@@ -96,6 +96,32 @@ impl PrefixLock {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Whether some process holds the lock for `name`, read without taking
+    /// it: no lock file is made and nothing is settled, so a status read
+    /// has no side effects. The probe is on a descriptor of its own, so a
+    /// caller that holds the lock itself reads `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSnapshotName`] or [`Error::Io`].
+    pub fn is_held(snapshots_root: &Path, name: &str) -> Result<bool> {
+        check_name(name)?;
+        let path = snapshots_root.join(LOCKS_DIR).join(format!("{name}.lock"));
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(Error::io(&path, error)),
+        };
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
+                Ok(false)
+            }
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(true),
+            Err(error) => Err(Error::io(path, error.into())),
+        }
+    }
 }
 
 impl Drop for PrefixLock {

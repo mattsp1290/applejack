@@ -108,7 +108,7 @@ Swift case; do not edit the table by hand.
 | 1012 | `TitleNotInstalled` | `app.run` for a title with no `apps` row or nothing in the library. |
 | 1013 | `DownloadInProgress` | `app.run` for a title with a download record, or `app.install` without `update` for a stopped update. |
 | 1014 | `AlreadyRunning` | `app.run` for a title with an open session. |
-| 1015 | `ClientRuntimeUnavailable` | `app.run` for a title that launches through the Steam client, which is not available yet. |
+| 1015 | `ClientRuntimeUnavailable` | `app.run` for a title that launches through the Steam client while the runtime is absent (`runtime.steam.install`) or needs a sign-in inside the client window. |
 | 1016 | `NoLaunchExe` | `app.run` for a title with no launch executable, or one outside its install directory. |
 | 1017 | `NotRunning` | `app.cancel` for a title with no open session. |
 | 1018 | `TitleExitedEarly` | A direct launch ended within five seconds; the title may require the Steam client. |
@@ -126,6 +126,11 @@ Swift case; do not edit the table by hand.
 | 1030 | `AlreadyInstalled` | `app.install` for a title that is whole on disk. Use `update` or `verify`. |
 | 1031 | `SteamClientOwnsTitle` | A Windows Steam client is running against the library, or owns this title's update. |
 | 1032 | `VerifyFailed` | `app.install` with `verify` found files that differ from the manifest. |
+| 1033 | `BootstrapperUnverified` | `runtime.steam.install`: `SteamSetup.exe` failed its Authenticode check or its signer is not Valve Corp. The file is kept and the message names the signer found. |
+| 1034 | `ClientRuntimeBroken` | The Steam client runtime is updating, broken, or never reached the login window, or `runtime.steam.repair` found nothing broken or no usable snapshot. `runtime.steam.status` says which; `runtime.steam.repair` clears a dead install's marker and, unless the client is intact after that, restores the newest usable snapshot of a broken one (a prefix record that opens and a `steam.exe`); an updating one is waited for. |
+| 1035 | `ClientRedownloadRefused` | Assumption A2 failed: the client began re-downloading the title. The client was stopped and the `.acf` restored from its backup; the finding is in `meta`. |
+| 1036 | `ClientLaunchTimedOut` | The Steam client reported no running title within the wait after `-applaunch`; the client was stopped. |
+| 1037 | `TitleUpdatePending` | The Steam client began a routine update of the title (a build newer than the one installed), which is not a refuted A2. The client was stopped and the `.acf` restored; `app.install` with `update` brings the title current. |
 <!-- error-table:end -->
 
 A `job.failed` carries the reason code of its failure when it has one
@@ -164,10 +169,11 @@ by hand.
 | `app.install` | implemented |
 | `app.run` | implemented |
 | `app.cancel` | implemented |
-| `runtime.steam.install` | pending (work package 5) |
-| `runtime.steam.update` | pending (work package 5) |
-| `runtime.steam.repair` | pending (work package 5) |
-| `runtime.steam.stop` | pending (work package 5) |
+| `runtime.steam.install` | implemented |
+| `runtime.steam.update` | implemented |
+| `runtime.steam.repair` | implemented |
+| `runtime.steam.stop` | implemented |
+| `runtime.steam.status` | implemented |
 | `config.get` | implemented |
 | `config.set` | implemented |
 | `config.export` | implemented |
@@ -203,6 +209,11 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `app.install` | `JobStarted`; see [Steam](#steam) |
 | `app.run` | `{id, log_path, job_id}`; see [Sessions](#sessions) |
 | `app.cancel` | `JobStarted`; see [Sessions](#sessions) |
+| `runtime.steam.install` | `JobStarted`; see [Steam client runtime](#steam-client-runtime) |
+| `runtime.steam.update` | `JobStarted` |
+| `runtime.steam.repair` | `JobStarted`. `reinstall` removes the client's package directory and reruns the bootstrapper |
+| `runtime.steam.stop` | `JobStarted` |
+| `runtime.steam.status` | `{state, prefix, build_id, running, snapshots, detail}`; `state` is one of `absent`, `installing`, `needs_login`, `ready`, `updating`, `broken` |
 | `session.list` | `{"sessions": [SessionRow]}`, newest first; `appid` narrows it to one title |
 | `prefix.snapshot` | `{prefix, timestamp, dir}` |
 | `prefix.restore` | The same shape, naming the safety snapshot of the replaced state, or the restored snapshot when the prefix was gone and there was nothing to replace |
@@ -257,9 +268,10 @@ library the prefix was created with. Everything else Wine is handed stays inside
 the data directory. `prefix exec`, a CLI command and no RPC method, refuses only
 an absolute Unix path outside the data directory.
 
-Only client-free titles run. A title takes the direct path with `drm = none`,
-with `launch_mode = direct` and a `direct_verified_at`, or with `probe_direct`.
-`launch_mode = client` wins over `drm = none`.
+A title takes the direct path with `drm = none`, with `launch_mode = direct`
+and a `direct_verified_at`, or with `probe_direct`. `launch_mode = client`
+wins over `drm = none`. Every other title runs through the Windows Steam
+client in the `steam-client` prefix; see [Steam client runtime](#steam-client-runtime).
 
 Refused with an error response, before anything starts or any row is written:
 
@@ -267,7 +279,8 @@ Refused with an error response, before anything starts or any row is written:
 |---|---|
 | `TitleNotInstalled` | No `apps` row, no complete `appmanifest_<appid>.acf` for this appid, an empty install directory, an `installdir` that is not one plain directory name, or a relative library |
 | `DownloadInProgress` | `<library>/applejack/<appid>.download.json` exists |
-| `ClientRuntimeUnavailable` | The title takes the client path, which is not built yet |
+| `ClientRuntimeUnavailable` | The title takes the client path and the runtime is `absent` or `needs_login`; the message names `applejack runtime steam install` and the sign-in |
+| `ClientRuntimeBroken` | The title takes the client path and the runtime is `installing`, `updating`, or `broken` (which includes a web helper shim with no real helper beside it, and a `cef.win*` directory with no web helper at all) |
 | `NoLaunchExe` | `launch_exe_override` is empty, is not a PE image, or leaves the install directory |
 | `EngineNotInstalled` | No active engine, and none pinned by the game configuration |
 | `AlreadyRunning` | The title has an open session, in this core or another process |
@@ -276,7 +289,10 @@ Refused with an error response, before anything starts or any row is written:
 
 After the answer, a failure is a `job.failed`: a session that could not start
 is `failed`, with the reason in `note` and in its log, and a `wineserver` that
-will not leave the prefix is `PrefixUnusable`. A failure a cancel asked for is
+will not leave the prefix is `PrefixUnusable`; a run that starts the client and
+finds no web helper shim in the engine payload, or a `cef.win*` directory that
+lost its web helper since the answer, fails the same way, after `prepare`, with
+`ClientRuntimeBroken` as the reason. A failure a cancel asked for is
 `cancelled`, and its job is a `job.done`. A title that ends within five seconds
 on its own, leaving nothing behind, is `exited`, and its job fails with
 `TitleExitedEarly`.
@@ -346,6 +362,33 @@ notifications. The CLI does not take over, since it would have to stay: its
 starts or `app cancel` ends it. `serve` waits for its jobs at EOF, so a shell
 that closes stdin leaves a core behind until the title exits; one that kills the
 core leaves this recovery to the next start.
+
+## Steam client runtime
+
+`docs/steam-runtime.md` is the full account. `runtime.steam.status` answers
+at once; the other four are jobs whose `job.progress` phases are the steps
+(`prefix`, `install`, `download`, `verify`, `bootstrap`, `library`, `shim`,
+`start`, `client`, `build`, `snapshot`, `repair`, `stop`), ending with a `status` phase that carries the
+state. The prefix is claimed before the answer, so `PrefixBusy` (a title runs
+through the client) is an error response. `runtime.steam.install` is the one
+method that reaches the network outside Steam's own protocol: it fetches
+Valve's `SteamSetup.exe`, refuses it with `BootstrapperUnverified` unless its
+Authenticode chain verifies with Valve Corp as the signer, runs it, and
+starts the client to its login window, which the user signs in to; the core
+never sees credentials.
+
+A client session is a `sessions` row with `prefix = "steam-client"`. Its job
+reports `prepare` (the `.acf` backup and `libraryfolders.vdf`), `shim` when
+the run starts the client (the web helper shim check), `starting`,
+`running` when the client's `RunningAppID` equals the appid, and the end
+state. `exit_code` is null: the title's status is the client's. The client
+stays up after the title, so the session does not drain and the lock is
+free once the row closes. `app.cancel` ends the title and leaves the client;
+`kill_prefix` stops the client too. A client that reports no running title
+within ten minutes ends the job with `ClientLaunchTimedOut`; a client that
+starts downloading the title ends it with `ClientRedownloadRefused` after the
+`.acf` is restored from its backup (assumption A2 refuted), and one that
+starts a routine patch of it (a newer build) with `TitleUpdatePending`.
 
 ## Steam
 

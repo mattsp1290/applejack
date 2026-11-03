@@ -1041,14 +1041,22 @@ fn a_prefix_lock_excludes_a_second_holder_until_it_drops() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join(".snapshots");
     let prefix = dir.path().join("steam");
+    assert!(
+        !snapshot::PrefixLock::is_held(&root, "steam").unwrap(),
+        "no lock file yet"
+    );
+    assert!(!root.exists(), "a probe makes nothing");
     let held = snapshot::PrefixLock::acquire(&prefix, &root, "steam").unwrap();
     assert_eq!(held.name(), "steam");
     assert!(matches!(
         snapshot::PrefixLock::acquire(&prefix, &root, "steam").unwrap_err(),
         Error::PrefixBusy { name } if name == "steam"
     ));
+    assert!(snapshot::PrefixLock::is_held(&root, "steam").unwrap());
+    assert!(!snapshot::PrefixLock::is_held(&root, "other").unwrap());
     snapshot::PrefixLock::acquire(&prefix, &root, "other").unwrap();
     drop(held);
+    assert!(!snapshot::PrefixLock::is_held(&root, "steam").unwrap());
     snapshot::PrefixLock::acquire(&prefix, &root, "steam").unwrap();
     assert!(matches!(
         snapshot::PrefixLock::acquire(&prefix, &root, ".locks").unwrap_err(),

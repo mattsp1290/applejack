@@ -25,7 +25,7 @@ wine/lib/GStreamer.framework   signed framework
 dxmt/                          DXMT DLLs for the pinned Wine; its Wine-side files are under wine/lib/wine (winemetal.so, winemetal.dll)
 vkd3d/                         vkd3d-proton x86-64 DLLs
 vulkan/                        MoltenVK ICD JSON and dylib; KosmicKrisp ICD when shipped
-probes/                        cpuid (x86-64 Mach-O), dx11-sample (PE), xinput-check (PE)
+probes/                        cpuid (x86-64 Mach-O), dx11-sample (PE), xinput-check (PE), steamwebhelper-shim (PE, the Steam client's web helper shim)
 ```
 
 Next to it:

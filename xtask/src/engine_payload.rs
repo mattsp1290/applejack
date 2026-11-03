@@ -52,6 +52,7 @@ const BUILD_SCRIPTS: &[&str] = &[
     "crates/applejack-engine/probes/hello32/build.sh",
     "crates/applejack-engine/probes/dx11-sample/build.sh",
     "crates/applejack-engine/probes/xinput-check/build.sh",
+    "crates/applejack-engine/probes/steamwebhelper-shim/build.sh",
     "crates/applejack-engine/probes/cpuid/build.sh",
     "build/assemble.sh",
 ];

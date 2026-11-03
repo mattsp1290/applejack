@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 use applejack_core::config::{Drm, SessionRow, SessionState};
 use applejack_core::run::AppRegistration;
+use applejack_core::runtime::session::is_client_session;
 use applejack_core::{Core, CoreError};
 use clap::{Args, Subcommand};
 
@@ -102,11 +103,14 @@ fn step(phase: &str, message: &str) {
     say(&format!("{phase}: {message}"));
 }
 
-/// A session with no status to report is not a success.
+/// A session with no status to report is not a success, except one the
+/// Steam client ran to its end: the title's status is the client's, and
+/// the marker clearing is all a clean exit shows.
 fn exit_status(row: &SessionRow) -> u8 {
+    let unknown = u8::from(!(is_client_session(row) && row.state == SessionState::Exited));
     // The status of a child; 0 to 255 by construction of `& 0xff`.
     row.exit_code
-        .map_or(1, |code| u8::try_from(code & 0xff).unwrap_or(1))
+        .map_or(unknown, |code| u8::try_from(code & 0xff).unwrap_or(1))
 }
 
 pub fn run_title(args: &RunArgs) -> ExitCode {
@@ -224,5 +228,18 @@ mod tests {
         assert_eq!(exit_status(&row(Some(143), SessionState::Cancelled)), 143);
         assert_eq!(exit_status(&row(None, SessionState::Cancelled)), 1);
         assert_eq!(exit_status(&row(None, SessionState::Exited)), 1);
+    }
+
+    #[test]
+    fn a_client_session_that_exited_is_a_success_and_a_cancelled_one_is_not() {
+        let mut exited = row(None, SessionState::Exited);
+        exited.prefix = "steam-client".to_owned();
+        assert_eq!(exit_status(&exited), 0);
+        let mut cancelled = row(None, SessionState::Cancelled);
+        cancelled.prefix = "steam-client".to_owned();
+        assert_eq!(exit_status(&cancelled), 1);
+        let mut failed = row(None, SessionState::Failed);
+        failed.prefix = "steam-client".to_owned();
+        assert_eq!(exit_status(&failed), 1);
     }
 }

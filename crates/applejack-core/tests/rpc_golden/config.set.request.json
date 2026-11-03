@@ -1,6 +1,6 @@
 {
   "jsonrpc": "2.0",
-  "id": 22,
+  "id": 23,
   "method": "config.set",
   "params": {
     "appid": 220,

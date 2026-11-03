@@ -187,6 +187,11 @@ public enum RpcErrorCode: Int, Codable, Sendable, CaseIterable {
     case alreadyInstalled = 1030
     case steamClientOwnsTitle = 1031
     case verifyFailed = 1032
+    case bootstrapperUnverified = 1033
+    case clientRuntimeBroken = 1034
+    case clientRedownloadRefused = 1035
+    case clientLaunchTimedOut = 1036
+    case titleUpdatePending = 1037
 }
 
 public struct HelloParams: Codable, Equatable, Sendable {
@@ -321,5 +326,39 @@ enum RpcCoding {
 
     static func decoder() -> JSONDecoder {
         JSONDecoder()
+    }
+}
+
+/// `ClientRuntimeState` in `runtime/steam_client.rs`.
+public enum ClientRuntimeState: String, Codable, Sendable {
+    case absent
+    case installing
+    case needsLogin = "needs_login"
+    case ready
+    case updating
+    case broken
+}
+
+/// The result of `runtime.steam.status` (`ClientRuntimeStatus`).
+public struct ClientRuntimeStatus: Codable, Equatable, Sendable {
+    public var state: ClientRuntimeState
+    public var prefix: String
+    public var buildId: String?
+    public var running: Bool
+    public var snapshots: Int
+    public var detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case state, prefix, running, snapshots, detail
+        case buildId = "build_id"
+    }
+
+    public init(state: ClientRuntimeState, prefix: String, buildId: String?, running: Bool, snapshots: Int, detail: String) {
+        self.state = state
+        self.prefix = prefix
+        self.buildId = buildId
+        self.running = running
+        self.snapshots = snapshots
+        self.detail = detail
     }
 }

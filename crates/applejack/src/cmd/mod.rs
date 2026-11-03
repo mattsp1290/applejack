@@ -6,6 +6,7 @@ pub mod config;
 pub mod engine;
 pub mod install;
 pub mod prefix;
+pub mod runtime;
 pub mod serve;
 pub mod session;
 pub mod steam;

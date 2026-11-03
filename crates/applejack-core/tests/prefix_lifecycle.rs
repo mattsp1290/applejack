@@ -143,6 +143,7 @@ fn every_operation_refuses_a_prefix_someone_else_holds() {
         "p",
         Path::new("exit7.exe"),
         &[OsString::from("x")],
+        &[],
         &mut io::sink(),
     ));
     assert!(core.data_dir().join("prefixes/p").is_dir());

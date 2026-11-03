@@ -555,6 +555,10 @@ the `.acf` files after `wineserver_alive` turns false. An
 is false) belongs to the client; `install --update` refuses and names
 `applejack runtime steam` as the owner.
 
+The client side of this rule, the `steam-client` prefix, the `.acf` backup
+before each client launch, and the re-download refusal, is in
+`docs/steam-runtime.md`.
+
 ## `.acf` and `.vdf`
 
 `vdf::Document` reads Valve's text KeyValues: quoted and bare tokens, nested

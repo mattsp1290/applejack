@@ -9,10 +9,10 @@ use applejack_core::host::{HostFacts, ScreenRecordingState};
 use applejack_core::rpc::PROTOCOL_VERSION;
 use applejack_core::rpc::jobs::{JobDone, JobFailed, JobId, JobProgress, JobStarted};
 use applejack_core::rpc::methods::{
-    AppRunResult, ConfigExportResult, ConfigImportResult, CpuidProbeResult, D3dmetalImportResult,
-    EmptyResult, EngineEntry, EngineListResult, GuardFactorWire, HelloResult, InstallState,
-    LibraryEntry, LoginSession, LoginStepWire, Method, MethodStatus, SessionListResult,
-    SnapshotResult, SteamLibraryResult,
+    AppRunResult, ClientRuntimeState, ClientRuntimeStatus, ConfigExportResult, ConfigImportResult,
+    CpuidProbeResult, D3dmetalImportResult, EmptyResult, EngineEntry, EngineListResult,
+    GuardFactorWire, HelloResult, InstallState, LibraryEntry, LoginSession, LoginStepWire, Method,
+    MethodStatus, SessionListResult, SnapshotResult, SteamLibraryResult,
 };
 use applejack_core::rpc::wire::{ErrorCode, Id, Notification, Request, Response};
 use applejack_engine::rosetta_wine::{CpuidFeatures, CpuidProbe};
@@ -258,6 +258,21 @@ fn session_results(files: &mut BTreeMap<String, String>) {
     add(
         "app.cancel",
         &result_response(&JobStarted { job_id: JobId(8) }),
+    );
+    add(
+        "runtime.steam.install",
+        &result_response(&JobStarted { job_id: JobId(10) }),
+    );
+    add(
+        "runtime.steam.status",
+        &result_response(&ClientRuntimeStatus {
+            state: ClientRuntimeState::NeedsLogin,
+            prefix: PathBuf::from("/data/prefixes/steam-client"),
+            build_id: Some("1761720601".to_owned()),
+            running: true,
+            snapshots: 1,
+            detail: "no account is signed in; run `applejack runtime steam install` and sign in inside the Steam window".to_owned(),
+        }),
     );
     add(
         "session.list",

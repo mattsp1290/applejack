@@ -2,7 +2,11 @@
   "AlreadyInstalled": 1030,
   "AlreadyRunning": 1014,
   "AppNotOwned": 1025,
+  "BootstrapperUnverified": 1033,
   "ChecksumMismatch": 1006,
+  "ClientLaunchTimedOut": 1036,
+  "ClientRedownloadRefused": 1035,
+  "ClientRuntimeBroken": 1034,
   "ClientRuntimeUnavailable": 1015,
   "DiskFull": 1008,
   "DownloadFailed": 1009,
@@ -35,6 +39,7 @@
   "TitleExitedEarly": 1018,
   "TitleNotInstallable": 1026,
   "TitleNotInstalled": 1012,
+  "TitleUpdatePending": 1037,
   "UnsignedEngineRefused": 1010,
   "VerifyFailed": 1032
 }
