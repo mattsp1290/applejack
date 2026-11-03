@@ -43,7 +43,8 @@ enum Action {
     Update,
     /// Repair a broken client: clear a dead install's marker, and unless the
     /// client is intact after that, restore the newest usable snapshot of the
-    /// prefix (one whose record opens and that holds steam.exe)
+    /// prefix (one whose record opens and that holds steam.exe and a web
+    /// helper that reads, beside the shim)
     Repair {
         /// Remove the client's package directory and rerun the bootstrapper
         #[arg(long)]
