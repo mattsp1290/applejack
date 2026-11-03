@@ -36,9 +36,9 @@ use crate::runtime::session::{
 };
 use crate::runtime::steam_client::RedownloadWatch;
 use crate::runtime::steam_client::{
-    ClientPaths, ClientRuntimeState, LibraryEdit, META_CLIENT_SESSION, NOVERIFYFILES,
-    STEAM_CLIENT_PREFIX, ensure_webhelper_shim, prepare_client_launch, record_client_build,
-    runtime_refused,
+    BrokenReason, ClientPaths, ClientRuntimeState, LibraryEdit, META_CLIENT_SESSION,
+    STEAM_CLIENT_PREFIX, ensure_webhelper_shim, missing_web_helper, prepare_client_launch,
+    record_client_build, runtime_refused,
 };
 use crate::state::Core;
 
@@ -234,9 +234,12 @@ impl PlannedRun {
                     // client's processes, and the games it starts, carry.
                     let pass = ensure_webhelper_shim(&self.installed.root, &paths, report)?;
                     if pass.helper_missing {
-                        // The client's file check lays the helper down; the
-                        // next client start stashes it and puts the shim back.
-                        self.spec.args.retain(|arg| arg != NOVERIFYFILES);
+                        // `plan_run` refused a helper-less prefix before the
+                        // answer; one that lost its helper since is refused
+                        // here too, since only `install` runs the client's
+                        // file check and restarts it with the shim.
+                        let dir = missing_web_helper(&paths)?.unwrap_or_else(|| paths.cef_dir());
+                        return Err(BrokenReason::NoWebHelper(dir).into_error());
                     }
                     self.core
                         .db()?

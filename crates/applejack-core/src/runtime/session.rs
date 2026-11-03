@@ -106,6 +106,9 @@ pub struct RunTuning {
     /// How long the Steam client has to report the title running after
     /// `-applaunch`: a verification pass of a large title takes a while.
     pub client_start_wait: Duration,
+    /// How long the bootstrapper, and then the client's first run to its
+    /// login window, may each take under `runtime steam install`.
+    pub first_run_timeout: Duration,
 }
 
 impl Default for RunTuning {
@@ -118,6 +121,7 @@ impl Default for RunTuning {
             term_wait: Duration::from_secs(3),
             cancel_wait: Duration::from_secs(60),
             client_start_wait: Duration::from_secs(600),
+            first_run_timeout: crate::runtime::steam_client::FIRST_RUN_TIMEOUT,
         }
     }
 }
@@ -1018,6 +1022,7 @@ mod tests {
         term_wait: Duration::ZERO,
         cancel_wait: Duration::ZERO,
         client_start_wait: Duration::from_millis(200),
+        first_run_timeout: Duration::from_secs(600),
     };
 
     fn run(probe: &mut Scripted, seen: bool) -> (WatchEnd, u32) {

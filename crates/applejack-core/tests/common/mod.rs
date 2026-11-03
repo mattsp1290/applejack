@@ -39,9 +39,12 @@ const BUNDLE_FILES: &[&str] = &[
 /// `steam.exe` start is the self-update, which writes the client manifest
 /// and the CEF tree (`bin/cef/cef.win7x64/steamwebhelper.exe` =
 /// `REAL-HELPER-1`); a later start lays a missing helper down only when its
-/// file check runs (no `-noverifyfiles`), and `$WINEPREFIX/self-update`
+/// file check runs (no `-noverifyfiles`) and `$WINEPREFIX/no-file-check`
+/// is absent (under it the check lays nothing down, the live shape the
+/// recovery has not been seen to rule out), and `$WINEPREFIX/self-update`
 /// makes it write `REAL-HELPER-2` over the helper once, as a client update
-/// does. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`)
+/// does. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`
+/// when a helper file exists to run; without one no window line is written)
 /// that stays until `$WINEPREFIX/client-quit`; its arguments append to
 /// `$WINEPREFIX/client-args`; with
 /// `-applaunch <appid>` it starts the client if none is up, then `game.exe`
@@ -152,7 +155,7 @@ if [ "$name" = steam.exe ]; then
     mkdir -p "$steam/package" "$cef"
     printf '"steam_client_win32"\n{\n\t"version"\t\t"1761720601"\n}\n' > "$steam/package/steam_client_win32.manifest"
     [ -f "$cef/steamwebhelper.exe" ] || printf 'REAL-HELPER-1' > "$cef/steamwebhelper.exe"
-  elif [ ! -f "$cef/steamwebhelper.exe" ]; then
+  elif [ ! -f "$cef/steamwebhelper.exe" ] && [ ! -e "$WINEPREFIX/no-file-check" ]; then
     case " $* " in
       *" -noverifyfiles "*) ;;
       *) mkdir -p "$cef"; printf 'REAL-HELPER-1' > "$cef/steamwebhelper.exe" ;;
@@ -169,8 +172,10 @@ if [ "$name" = steam.exe ]; then
   sleep 0.1
   rm -f "$WINEPREFIX/client-quit"
   : > "$WINEPREFIX/client-up"
-  echo 'SP DesktopLoginWindow_uid0: Created window: size: 700,440 pos: 0,0 mode: System window: 0000000000030106' >> "$steam/logs/webhelper.txt"
-  "@HELPER@" common::stub_title --exact --ignored --nocapture steamwebhelper.exe &
+  if [ -f "$cef/steamwebhelper.exe" ]; then
+    echo 'SP DesktopLoginWindow_uid0: Created window: size: 700,440 pos: 0,0 mode: System window: 0000000000030106' >> "$steam/logs/webhelper.txt"
+    "@HELPER@" common::stub_title --exact --ignored --nocapture steamwebhelper.exe &
+  fi
   exec "@HELPER@" common::stub_title --exact --ignored --nocapture steam.exe
 fi
 if [ "$name" = wineboot ]; then
