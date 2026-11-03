@@ -2,7 +2,9 @@ import Foundation
 import Observation
 
 /// The config editor for one title: `config.get`, `config.set` per key,
-/// preset import with the launch-override confirmation, and `app.run`.
+/// preset import with the launch-override confirmation, `config.export`,
+/// `app.run` with its session followed, `app.cancel`, and the title's
+/// prefix snapshots. One instance per title lives in `AppModel`.
 @Observable @MainActor
 public final class GameDetailViewModel {
     /// A preset whose launch overrides wait for the user's answer. The alert
@@ -29,7 +31,17 @@ public final class GameDetailViewModel {
     /// Set while a preset's launch overrides wait for confirmation.
     public private(set) var pendingImport: PendingImport?
     public private(set) var runState: FlowState<AppRunResult> = .idle
+    /// The run's job: the session's phases, then `finished` once the row
+    /// closed, or `failed` with the session's reason.
+    public private(set) var session: FlowState<JobSnapshot> = .idle
+    /// An open `sessions` row for this title that this model did not start
+    /// (another core, the CLI, or an earlier app run), from `session.list`.
+    public private(set) var openSession: SessionEntry?
+    public private(set) var cancelState: FlowState<JobSnapshot> = .idle
+    public private(set) var exportState: FlowState<ConfigExportResult> = .idle
+    public let snapshots: PrefixSnapshotsViewModel
     private let app: AppModel
+    private var follow: Task<Void, Never>?
     /// Counts `config.import` previews so a slow one answered after a newer
     /// preset's preview cannot replace that preset's pending plan.
     private var importToken = 0
@@ -40,6 +52,19 @@ public final class GameDetailViewModel {
     public init(app: AppModel, appid: UInt32) {
         self.app = app
         self.appid = appid
+        snapshots = PrefixSnapshotsViewModel(app: app, prefix: String(appid))
+    }
+
+    /// Whether a session this model started is still open.
+    public var isRunning: Bool {
+        guard case .ready(let snapshot) = session else { return false }
+        return !snapshot.finished
+    }
+
+    /// Cancel is offered for a session this model started, and for an open
+    /// row `session.list` showed (the view confirms that one first).
+    public var canCancel: Bool {
+        !cancelState.isLoading && (isRunning || openSession != nil)
     }
 
     public func load() async {
@@ -47,6 +72,18 @@ public final class GameDetailViewModel {
         if let next = await app.run({ try await $0.call("config.get", params: ConfigGetParams(appid: appid)) as GameConfig }) {
             config = next
         }
+        await loadSessions()
+    }
+
+    /// `session.list` for this title; an open row that is not this model's
+    /// run becomes `openSession`.
+    public func loadSessions() async {
+        guard let next = await app.run({ try await $0.call("session.list", params: SessionListParams(appid: appid)) as SessionListResult }) else {
+            return
+        }
+        guard case .ready(let list) = next else { return }
+        let own = isRunning ? runState.value?.id : nil
+        openSession = list.sessions.first { $0.endedAt == nil && $0.id != own }
     }
 
     public func set(_ key: ConfigKey, to value: JSONValue) async {
@@ -91,13 +128,56 @@ public final class GameDetailViewModel {
     }
 
     /// `app.run` for this title, one at a time: a second call while one is
-    /// in flight sends nothing. A ready result names the session's log,
-    /// which the view hands to Logs.
+    /// in flight or while its session is open sends nothing. Returns once
+    /// the core answered: a ready result names the session's log, which the
+    /// view hands to Logs. The run's job is followed on a task of the
+    /// model's own, in `session`, until the row closes. `runState` never
+    /// stays loading: a cancelled or failed start leaves it idle or failed.
     public func run() async {
         if case .loading = runState { return }
+        if isRunning { return }
         runState = .loading
-        if let next = await app.run({ try await $0.call("app.run", params: AppRunParams(appid: appid)) as AppRunResult }) {
-            runState = next
+        session = .idle
+        cancelState = .idle
+        await withCheckedContinuation { (answered: CheckedContinuation<Void, Never>) in
+            let answer = Once(answered)
+            follow = Task { [weak self] in
+                defer { answer.resume() }
+                guard let self else { return }
+                await app.runJob(
+                    "app.run", params: AppRunParams(appid: appid), jobId: { JobId(rawValue: $0.jobId) },
+                    onStarted: { state in
+                        runState = state
+                        if !state.isLoading { answer.resume() }
+                    },
+                    onChange: { session = $0 }
+                )
+                if case .loading = runState { runState = .idle }
+                // A follow that ended without a terminal event was cancelled;
+                // the row, if still open, is `session.list`'s to show.
+                if isRunning { session = .idle }
+                await loadSessions()
+            }
+        }
+    }
+
+    /// `app.cancel` for this title, followed to its end; `session.list` is
+    /// read again afterwards, so a row the cancel closed leaves `openSession`.
+    public func cancel(killPrefix: Bool = false) async {
+        if cancelState.isLoading { return }
+        await app.runJob("app.cancel", params: AppCancelParams(appid: appid, killPrefix: killPrefix)) { cancelState = $0 }
+        if case .loading = cancelState { cancelState = .idle }
+        await loadSessions()
+    }
+
+    /// `config.export` to `path`; the core applies the export denylist.
+    public func export(to path: String) async {
+        exportState = .loading
+        let params = ConfigExportParams(appid: appid, path: path)
+        if let next = await app.run({ try await $0.call("config.export", params: params) as ConfigExportResult }) {
+            exportState = next
+        } else {
+            exportState = .idle
         }
     }
 
@@ -124,5 +204,21 @@ public final class GameDetailViewModel {
                 await load()
             }
         }
+    }
+}
+
+/// Resumes a continuation once, whichever of the answer and the task's end
+/// comes first.
+@MainActor
+private final class Once {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
     }
 }

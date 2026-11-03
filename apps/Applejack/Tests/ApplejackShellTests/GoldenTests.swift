@@ -154,6 +154,11 @@ final class GoldenTests: XCTestCase {
         XCTAssertEqual(runtime.state, .needsLogin)
         XCTAssertEqual(runtime.buildId, "1761720601")
         XCTAssertTrue(runtime.running)
+        let snapshot = try typedResult("prefix.snapshot.result.json", as: SnapshotResult.self)
+        XCTAssertEqual(snapshot.prefix, "220")
+        XCTAssertEqual(snapshot.timestamp, "20261031T120000Z")
+        let export = try typedResult("config.export.result.json", as: ConfigExportResult.self)
+        XCTAssertEqual(export.path, "/tmp/220.preset.json")
     }
 
     func testJobMirrorsDecodeTheNotificationGoldens() throws {
@@ -195,6 +200,11 @@ final class GoldenTests: XCTestCase {
         try check("steam.login.start", SteamLoginStartParams.self)
         try check("steam.login.complete", SteamLoginCompleteParams.self)
         try check("session.list", SessionListParams.self)
+        try check("runtime.steam.repair", RuntimeSteamRepairParams.self)
+        try check("config.export", ConfigExportParams.self)
+        try check("prefix.snapshot", PrefixSnapshotParams.self)
+        try check("prefix.restore", PrefixRestoreParams.self)
+        try check("prefix.reset", PrefixResetParams.self)
         for method in [
             "engine.list", "engine.doctor", "engine.probe_cpuid", "steam.logout", "host.doctor",
             "runtime.steam.install", "runtime.steam.update", "runtime.steam.stop", "runtime.steam.status",

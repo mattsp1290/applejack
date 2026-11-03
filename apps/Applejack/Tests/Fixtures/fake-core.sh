@@ -42,6 +42,20 @@
 #                               background
 #   FAKE_CORE_REQUEST_LOG=<path>  append every request line to that file
 #   FAKE_CORE_SESSION_LOG=<path>  the log_path session.list and app.run report
+#   FAKE_CORE_RUN_OUTCOME=exits   app.run's job (12) ends with job.done after
+#                                 `running`; without it the job stays open
+#                                 until app.cancel ends it
+#   FAKE_CORE_CANCEL_REFUSED=1    app.cancel answers NotRunning (1017)
+#   FAKE_CORE_RUNTIME_STATE=<s>   runtime.steam.status answers state <s>
+#                                 (absent|ready|broken; default needs_login)
+#   FAKE_CORE_RUNTIME_OUTCOME=broken  the runtime.steam jobs end with
+#                                 job.failed 1034 after their `start:` line
+#   FAKE_CORE_RESET_OUTCOME=failed  prefix.reset ends with job.failed 1003
+#                                 naming the safety snapshot to restore
+#   FAKE_CORE_LOGIN_GUARD=<factor>  steam.login.start answers guard_required
+#                                 with that factor instead of qr_ready
+#   FAKE_CORE_LOGIN_FAIL=1        steam.login.complete answers
+#                                 SteamLoginFailed (1021)
 set -u
 
 count=0
@@ -100,6 +114,58 @@ job() {
   ) &
 }
 
+# runtime_job <id>: the notification sequence of a runtime.steam job, whose
+# `start` line is the one the shell must not swallow.
+runtime_job() {
+  (
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":'"$1"',"phase":"prefix","done_bytes":null,"total_bytes":null,"message":"claimed steam-client"}}'
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":'"$1"',"phase":"start","done_bytes":null,"total_bytes":null,"message":"macOS may ask whether \"applejack\" may use the microphone within about 15 s of the client'"'"'s start: answer it (Don'"'"'t Allow is fine); left unanswered, the client stalls and dies about 3 minutes in"}}'
+    sleep 0.05
+    if [ "${FAKE_CORE_RUNTIME_OUTCOME:-done}" = "broken" ]; then
+      write '{"jsonrpc":"2.0","method":"job.failed","params":{"job_id":'"$1"',"code":1034,"message":"the Steam client never reached the login window; run `applejack runtime steam repair`"}}'
+    else
+      write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":'"$1"',"phase":"status","done_bytes":null,"total_bytes":null,"message":"ready"}}'
+      sleep 0.05
+      write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":'"$1"'}}'
+    fi
+  ) &
+}
+
+# run_job: app.run's job 12, the session's phases; it stays open until
+# app.cancel ends it unless FAKE_CORE_RUN_OUTCOME says the title exits.
+run_job() {
+  (
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"starting","done_bytes":null,"total_bytes":null,"message":""}}'
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"running","done_bytes":null,"total_bytes":null,"message":""}}'
+    if [ "${FAKE_CORE_RUN_OUTCOME:-open}" = "exits" ]; then
+      sleep 0.05
+      write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"exited","done_bytes":null,"total_bytes":null,"message":"exit code 0"}}'
+      write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":12}}'
+    fi
+  ) &
+}
+
+# cancel_job <end run job>: app.cancel's job 13; with a run open, job 12
+# ends after it, as a session a cancel asked for ends in job.done.
+cancel_job() {
+  (
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":13,"phase":"cancel","done_bytes":null,"total_bytes":null,"message":"SIGTERM sent"}}'
+    sleep 0.05
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":13,"phase":"cancelled","done_bytes":null,"total_bytes":null,"message":""}}'
+    write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":13}}'
+    if [ "$1" = "1" ]; then
+      sleep 0.05
+      write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"cancelled","done_bytes":null,"total_bytes":null,"message":""}}'
+      write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":12}}'
+    fi
+  ) &
+}
+
 # implemented <id> <method> <line>: the canned answer for a view-model
 # method, or 1 when the method has none.
 implemented() {
@@ -117,12 +183,52 @@ implemented() {
       ;;
     app.run)
       response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":41,"job_id":12,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
+      run_open=1
       if [ -n "${FAKE_CORE_RUN_DELAY_MS:-}" ]; then
         seconds=$(awk -v ms="$FAKE_CORE_RUN_DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
         ( sleep "$seconds"; write "$response" ) &
       else
         emit "$response"
       fi
+      run_job
+      ;;
+    app.cancel)
+      if [ "${FAKE_CORE_CANCEL_REFUSED:-0}" = "1" ]; then
+        emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1017,"message":"app 220 has no open session"}}'
+      else
+        emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":13}}'
+        cancel_job "${run_open:-0}"
+        run_open=0
+      fi
+      ;;
+    config.export)
+      path=$(printf '%s' "$3" | sed -nE 's/.*"path":"([^"]*)".*/\1/p')
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"path":"'"$path"'"}}'
+      ;;
+    prefix.snapshot)
+      prefix=$(printf '%s' "$3" | sed -nE 's/.*"prefix":"([^"]*)".*/\1/p')
+      snapshot_serial=$((${snapshot_serial:-0} + 1))
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"prefix":"'"$prefix"'","timestamp":"20261103T12000'"$snapshot_serial"'Z","dir":"/data/prefixes/.snapshots/'"$prefix"'/20261103T12000'"$snapshot_serial"'Z"}}'
+      ;;
+    prefix.restore)
+      prefix=$(printf '%s' "$3" | sed -nE 's/.*"prefix":"([^"]*)".*/\1/p')
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"prefix":"'"$prefix"'","timestamp":"20261103T130000Z","dir":"/data/prefixes/.snapshots/'"$prefix"'/20261103T130000Z"}}'
+      ;;
+    prefix.reset)
+      prefix=$(printf '%s' "$3" | sed -nE 's/.*"prefix":"([^"]*)".*/\1/p')
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":14}}'
+      (
+        sleep 0.05
+        write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":14,"phase":"reset","done_bytes":null,"total_bytes":null,"message":"rebuilding prefix '"$prefix"'"}}'
+        sleep 0.05
+        if [ "${FAKE_CORE_RESET_OUTCOME:-done}" = "failed" ]; then
+          write '{"jsonrpc":"2.0","method":"job.failed","params":{"job_id":14,"code":1003,"message":"resetting prefix '"$prefix"' failed; `applejack prefix restore '"$prefix"' 20261103T140000Z` brings it back: wineboot exited 1"}}'
+        else
+          write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":14,"phase":"reset","done_bytes":null,"total_bytes":null,"message":"safety snapshot 20261103T140000Z"}}'
+          sleep 0.05
+          write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":14}}'
+        fi
+      ) &
       ;;
     app.install)
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":8}}'
@@ -142,9 +248,17 @@ implemented() {
         login_serial=$((${login_serial:-0} + 1))
         login_session="login-session-fake-$login_serial"
       fi
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"qr_ready","payload":"https://s.team/q/1/fake-challenge"}}}'
+      if [ -n "${FAKE_CORE_LOGIN_GUARD:-}" ]; then
+        emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"guard_required","factor":"'"$FAKE_CORE_LOGIN_GUARD"'"}}}'
+      else
+        emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"qr_ready","payload":"https://s.team/q/1/fake-challenge"}}}'
+      fi
       ;;
     steam.login.complete)
+      if [ "${FAKE_CORE_LOGIN_FAIL:-0}" = "1" ]; then
+        emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1021,"message":"the login is over; begin again"}}'
+        return 0
+      fi
       case "${FAKE_CORE_LOGIN_POLLS:-0}" in
         0) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"session_id":"'"${login_session:-login-session-fake}"'","step":{"kind":"done","account_name":"fake-account"}}}' ;;
         *)
@@ -192,11 +306,24 @@ implemented() {
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"sessions":[{"id":1,"appid":220,"started_at":"2026-10-30T00:00:00Z","ended_at":null,"engine_id":"rosetta-wine","engine_version":"10.0.1","exit_code":null,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'","state":"running","session_key":"fake-session","prefix":"220","launch_exe":"hl2.exe","note":null,"cancel_requested":false}]}}'
       ;;
     runtime.steam.status)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"state":"needs_login","prefix":"/data/prefixes/steam-client","build_id":"1761720601","running":true,"snapshots":1,"detail":"no account is signed in"}}'
+      case "${FAKE_CORE_RUNTIME_STATE:-needs_login}" in
+        absent)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"state":"absent","prefix":"/data/prefixes/steam-client","build_id":null,"running":false,"snapshots":0,"detail":"no steam-client prefix"}}'
+          ;;
+        ready)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"state":"ready","prefix":"/data/prefixes/steam-client","build_id":"1761720601","running":false,"snapshots":2,"detail":""}}'
+          ;;
+        broken)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"state":"broken","prefix":"/data/prefixes/steam-client","build_id":"1761720601","running":false,"snapshots":2,"detail":"the client never reached the login window; `runtime.steam.repair` restores the newest usable snapshot"}}'
+          ;;
+        *)
+          emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"state":"needs_login","prefix":"/data/prefixes/steam-client","build_id":"1761720601","running":true,"snapshots":1,"detail":"no account is signed in"}}'
+          ;;
+      esac
       ;;
     runtime.steam.install|runtime.steam.update|runtime.steam.repair|runtime.steam.stop)
       emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":10}}'
-      job 10
+      runtime_job 10
       ;;
     *)
       return 1

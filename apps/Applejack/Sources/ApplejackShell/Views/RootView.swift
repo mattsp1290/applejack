@@ -11,6 +11,7 @@ public final class ShellModels {
     public let library: LibraryViewModel
     public let engines: EnginesViewModel
     public let steam: SteamAccountViewModel
+    public let runtime: SteamClientRuntimeViewModel
     public let logs: LogsViewModel
     public let controllers: ControllersViewModel
     public let d3dmetal: D3DMetalImportViewModel
@@ -29,6 +30,7 @@ public final class ShellModels {
         library = LibraryViewModel(app: app)
         engines = EnginesViewModel(app: app)
         steam = SteamAccountViewModel(app: app)
+        runtime = SteamClientRuntimeViewModel(app: app)
         logs = LogsViewModel(app: app)
         controllers = ControllersViewModel()
         d3dmetal = D3DMetalImportViewModel(app: app)
@@ -43,7 +45,8 @@ public final class ShellModels {
         case .logs: await logs.load()
         case .host: await host.load()
         case .controllers: controllers.refresh()
-        case .steam, .d3dmetal: break
+        case .steam: await runtime.load()
+        case .d3dmetal: break
         }
     }
 }
@@ -105,7 +108,7 @@ public struct RootView: View {
         switch models.section {
         case .library: LibraryView(models: models)
         case .engines: EnginesView(model: models.engines)
-        case .steam: SteamAccountView(model: models.steam)
+        case .steam: SteamAccountView(model: models.steam, runtime: models.runtime)
         case .logs: LogsView(model: models.logs)
         case .controllers: ControllersView(model: models.controllers)
         case .d3dmetal: D3DMetalImportView(model: models.d3dmetal)

@@ -1,39 +1,68 @@
 import SwiftUI
 
+/// The Steam account (sign-in) and, below it, the Windows Steam client
+/// runtime: both are the one Steam row in the sidebar, and the runtime's
+/// `needs_login` state is a sign-in too, inside the client window.
 public struct SteamAccountView: View {
     @Bindable var model: SteamAccountViewModel
+    let runtime: SteamClientRuntimeViewModel
 
-    public init(model: SteamAccountViewModel) {
+    public init(model: SteamAccountViewModel, runtime: SteamClientRuntimeViewModel) {
         self.model = model
+        self.runtime = runtime
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            FlowStateView(model.login, idle: "Sign-in state unknown. Sign in with QR to continue.", retry: { Task { await model.startQrLogin() } }) { session in
-                switch session.step {
-                case .qrReady(let payload):
-                    Text("Scan with the Steam mobile app, then press Done.")
-                    QRCodeView(payload: payload).frame(width: 240, height: 240)
-                    Button("Done") { Task { await model.complete() } }
-                case .guardRequired(let factor):
-                    Text("Steam Guard (\(factor)): type the code, or approve in the Steam mobile app, then press Submit.")
-                    TextField("Code", text: $model.guardCode).frame(maxWidth: 160)
-                    Button("Submit") { Task { await model.complete() } }
-                case .waiting:
-                    Text("Waiting for Steam.")
-                case .done(let accountName):
-                    Label("Signed in as \(accountName)", systemImage: "checkmark.circle")
-                }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                account
+                Divider()
+                SteamClientRuntimeView(model: runtime)
             }
-            HStack {
-                Button("Sign in with QR") { Task { await model.startQrLogin() } }
-                Button("Sign out") { Task { await model.signOut() } }
-            }
-            FlowStateView(model.logout, idle: "") { _ in Text("Signed out.") }
-            Spacer()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
         }
-        .padding()
         .navigationTitle("Steam Account")
+        .task {
+            model.startPolling()
+            await runtime.load()
+        }
+        .onDisappear { model.stopPolling() }
+    }
+
+    @ViewBuilder
+    private var account: some View {
+        FlowStateView(model.login, idle: "Sign-in state unknown. Sign in with QR to continue.", retry: { Task { await model.startQrLogin() } }) { session in
+            switch session.step {
+            case .qrReady(let payload):
+                Text("Scan with the Steam mobile app; the sign-in completes on its own.")
+                QRCodeView(payload: payload).frame(width: 240, height: 240)
+            case .guardRequired(let factor):
+                if model.guardCodeWanted {
+                    Text("Steam Guard (\(factor)): type the code, or approve in the Steam mobile app.")
+                    HStack {
+                        TextField("Code", text: $model.guardCode).frame(maxWidth: 160)
+                            .onSubmit { model.submitGuardCode() }
+                        Button("Submit") { model.submitGuardCode() }
+                            .disabled(model.guardCode.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                } else {
+                    Text("Steam Guard: approve the sign-in in the Steam mobile app.")
+                }
+            case .waiting:
+                Text("Waiting for Steam.")
+            case .done(let accountName):
+                Label("Signed in as \(accountName)", systemImage: "checkmark.circle")
+            }
+            if model.isPolling, !session.step.isDone {
+                ProgressView().controlSize(.small)
+            }
+        }
+        HStack {
+            Button("Sign in with QR") { Task { await model.startQrLogin() } }
+            Button("Sign out") { Task { await model.signOut() } }
+        }
+        FlowStateView(model.logout, idle: "") { _ in Text("Signed out.") }
     }
 }
 

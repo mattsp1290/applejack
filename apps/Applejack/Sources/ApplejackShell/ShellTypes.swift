@@ -77,6 +77,75 @@ public struct AppRunResult: Codable, Equatable, Sendable {
     }
 }
 
+public struct RuntimeSteamRepairParams: Codable, Equatable, Sendable {
+    public var reinstall: Bool
+
+    public init(reinstall: Bool) { self.reinstall = reinstall }
+}
+
+public struct ConfigExportParams: Codable, Equatable, Sendable {
+    public var appid: UInt32
+    public var path: String
+
+    public init(appid: UInt32, path: String) {
+        self.appid = appid
+        self.path = path
+    }
+}
+
+/// The result of `config.export` (`ConfigExportResult`): where the preset
+/// was written, after the core applied the export denylist.
+public struct ConfigExportResult: Codable, Equatable, Sendable {
+    public var path: String
+
+    public init(path: String) { self.path = path }
+}
+
+public struct PrefixSnapshotParams: Codable, Equatable, Sendable {
+    public var prefix: String
+
+    public init(prefix: String) { self.prefix = prefix }
+}
+
+public struct PrefixRestoreParams: Codable, Equatable, Sendable {
+    public var prefix: String
+    public var timestamp: String
+
+    public init(prefix: String, timestamp: String) {
+        self.prefix = prefix
+        self.timestamp = timestamp
+    }
+}
+
+public struct PrefixResetParams: Codable, Equatable, Sendable {
+    public var prefix: String
+    public var keepUserData: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case prefix
+        case keepUserData = "keep_user_data"
+    }
+
+    public init(prefix: String, keepUserData: Bool) {
+        self.prefix = prefix
+        self.keepUserData = keepUserData
+    }
+}
+
+/// `SnapshotResult` in `prefixes.rs`: what `prefix.snapshot` made, or for
+/// `prefix.restore` the safety snapshot of the replaced state.
+public struct SnapshotResult: Codable, Equatable, Sendable {
+    public var prefix: String
+    public var timestamp: String
+    public var dir: String
+
+    public init(prefix: String, timestamp: String, dir: String) {
+        self.prefix = prefix
+        self.timestamp = timestamp
+        self.dir = dir
+    }
+}
+
 public struct ConfigGetParams: Codable, Equatable, Sendable {
     public var appid: UInt32
 

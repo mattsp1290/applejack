@@ -47,7 +47,8 @@ are lazy and capped at three, and the model only reads the outcome:
 - `.exited(status)`: the core died, whether a request was in flight or not.
   The banner's "Restart" calls `hello()` again, which respawns under the cap.
 - `.stopped(error)`: `notRunning`, `launchFailed`, or `handshakeTimedOut`,
-  and a `hello` whose answer could not be read (`malformedResponse`, or an
+  and a `hello` whose answer could not be read (`malformedResponse`, shown
+  as the binary's path and one line saying which member was wrong, or an
   `rpc` error other than the protocol mismatch). No core is running and no
   exit status was seen; under the lazy restart policy the next call
   respawns it, so the banner offers the same "Restart".
@@ -153,12 +154,45 @@ Flows that need an answer before the core sends a request:
 
 Run with log tail: "Run" in the game detail sends `app.run` (`AppRunResult`:
 `id`, `log_path`, and the `job_id` that reports the session). The button is
-disabled only until the core answers, which it does before the title is on
-screen. If the user is still on the detail then, the shell switches
-to Logs and follows it; the library's navigation path lives in
-`ShellModels`, so returning to Library lands on the same detail. The core
-refuses a second launch of a running title with `AlreadyRunning`. The shell
-does not yet follow the job or offer `app.cancel`.
+disabled until the core answers, which it does before the title is on
+screen, and then while the session is open. If the user is still on the
+detail then, the shell switches to Logs and follows it; the library's
+navigation path lives in `ShellModels`, so returning to Library lands on the
+same detail. `AppModel.detail(for:)` keeps one `GameDetailViewModel` per
+title for the app's lifetime, so the rebuilt detail finds its run and its
+session, and two views of one title cannot each send `app.run`. The run's
+job is followed on a task of the model's own (`CoreClient.startJob(_:params:jobId:)`
+subscribes before the request is written, so an early phase is not lost):
+`session` shows the phases and `finished` once the row closed. A run whose
+start was cancelled leaves `runState` idle, never loading. The core refuses a
+second launch of a running title with `AlreadyRunning`.
+
+Cancel: "Cancel" sends `app.cancel` for a session this model started, and,
+after a confirmation, for an open row `session.list` showed that some other
+process owns (`openSession`). Its job is followed in `cancelState`
+(`cancel`, `cancelled`), and the sessions are read again when it ends.
+`NotRunning` and the other refusals show the core's message.
+
+Export: "Export preset…" opens a save panel and sends `config.export` with
+the chosen path; the core applies the export denylist and writes the file.
+
+Prefix snapshots (`PrefixSnapshotsViewModel`, shown on the game detail for
+the title's prefix and under the Steam client for `steam-client`): Snapshot
+shows the timestamp `prefix.snapshot` made; Restore takes a timestamp from a
+text field or from the picker of timestamps this model saw this session
+(there is no listing method; the follow-up is in `docs/rpc-protocol.md`,
+"Jobs"); Reset is a job whose safety snapshot is read from its progress
+line, and a failed reset's message names the snapshot to restore, which the
+view offers as a button.
+
+Steam client runtime (`SteamClientRuntimeViewModel`, under the account on
+the Steam view, since `needs_login` is a sign-in too): `runtime.steam.status`
+is read when the view appears and after every action; Install, Update,
+Repair, Reinstall (`repair` with `reinstall: true`) and Stop run one at a
+time as jobs, and every `job.progress` line is listed, not only the latest,
+because the `start` phase carries the macOS microphone warning the user has
+about 15 s to act on. A `job.failed` (`ClientRuntimeBroken` and the other
+103x codes) shows the core's message verbatim; it names the remedy.
 
 Logs: `session.list` names each session's `log_path`; `LogsViewModel`
 follows it with `LogTailer` (a polling file reader, so a log that does not
@@ -170,7 +204,15 @@ to the new one. Controllers come from the GameController framework, not
 the core.
 
 Steam account: there is no `steam.status` method, so before any call the
-view says the sign-in state is unknown rather than "not signed in".
+view says the sign-in state is unknown rather than "not signed in". Once
+`steam.login.start` answers, the model polls `steam.login.complete` every
+two seconds on a task of its own, from the moment the challenge is up: an
+approval in the Steam mobile app ends the login without a button. The loop
+ends on `done`, on an error, when the view disappears (`stopPolling()`; it
+resumes when the view comes back), and when another login starts. A
+`guard_required` step shows a code field unless the factor is
+`device_confirmation`; Submit restarts the loop so the code goes out at
+once. The shell logs nothing of these requests; the core redacts them.
 
 The `config.import` result the shell expects (`applied`, `accepted`,
 `rejected`, `confirmations`) is the shell's proposal for how
