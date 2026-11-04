@@ -1119,7 +1119,7 @@ fn a_cancel_leaves_the_server_of_a_prefix_still_being_built() {
     let plan = fixture.core().plan_run(APP, false).unwrap();
     let id = plan.session_id();
     // The build's server carries the build's own session id.
-    let mut server = spawn_stub_server("prefix-build", &fixture.prefix_dir());
+    let mut server = spawn_stub_server(&own_key("prefix-build"), &fixture.prefix_dir());
     let mut tuning = FAST;
     tuning.drain = Duration::from_millis(100);
     tuning.cancel_wait = Duration::from_millis(500);
@@ -1150,7 +1150,7 @@ fn a_cancel_of_a_row_with_no_process_leaves_the_server_alone() {
         .db()
         .mark_session_running(id, "2026-11-01T00:00:01Z")
         .unwrap();
-    let mut server = spawn_stub_server("prefix-exec", &fixture.prefix_dir());
+    let mut server = spawn_stub_server(&own_key("prefix-exec"), &fixture.prefix_dir());
     let row = fixture
         .core()
         .with_run_tuning(SHORT_DRAIN)
@@ -1392,7 +1392,7 @@ fn a_run_waits_out_the_server_the_last_one_left() {
     fixture.quit(0);
     running.finish();
     fs::remove_file(fixture.prefix_dir().join("quit")).unwrap();
-    let mut server = spawn_stub_server("run-before", &fixture.prefix_dir());
+    let mut server = spawn_stub_server(&own_key("run-before"), &fixture.prefix_dir());
     let quit = fixture.prefix_dir().join("server-quit");
     let leaves = thread::spawn(move || {
         thread::sleep(Duration::from_millis(300));
@@ -1518,7 +1518,7 @@ fn a_dead_owners_session_answers_busy_at_once_not_after_the_settle() {
     let key = own_key("run-gap");
     orphan_row(&fixture, &key);
     let _title = Orphan::start(&fixture, &key);
-    let mut server = spawn_stub_server("run-gap", &fixture.prefix_dir());
+    let mut server = spawn_stub_server(&key, &fixture.prefix_dir());
     let started = Instant::now();
     let mut core = fixture.core();
     assert_busy(core.prefix_snapshot(PREFIX));
@@ -1868,6 +1868,7 @@ fn hello_takes_over_what_a_dead_core_left() {
         SessionState::Lost
     );
 
+    let live = own_key("run-hello-live");
     let adopted = fixture
         .db()
         .insert_session(&NewSession {
@@ -1876,13 +1877,13 @@ fn hello_takes_over_what_a_dead_core_left() {
             engine_id: "rosetta-wine",
             engine_version: "10.0.0",
             log_path: "/nonexistent/wine.log",
-            session_key: "run-hello-live",
+            session_key: &live,
             prefix: PREFIX,
             launch_exe: "title.exe",
         })
         .unwrap()
         .unwrap();
-    let title = Orphan::start(&fixture, "run-hello-live");
+    let title = Orphan::start(&fixture, &live);
     request(&mut handler, &notifier, &hello).unwrap();
     let progress: Value =
         serde_json::from_str(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
