@@ -7,8 +7,9 @@ mod common;
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -1587,11 +1588,13 @@ fn cancel_ends_a_title_nobody_owns() {
 
 /// Keeps a helper of the session running on its own thread, the way a
 /// watchdog no list has seen yet would: each time the helper is killed the
-/// next is started, `respawns` times, so the last kill pass leaves nothing
-/// and no spawn can land after it. Started only after the first helper is up.
+/// next is started, `respawns` times (`respawns + 1` helpers in all), so the
+/// last kill pass leaves nothing and no spawn can run while a look is taking
+/// its process-table snapshot. `start` returns with the first helper
+/// spawned, not yet necessarily listed; `stop` says how each helper died.
 struct Respawner {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<Vec<ExitStatus>>>,
 }
 
 impl Respawner {
@@ -1602,11 +1605,13 @@ impl Respawner {
         let key = key.to_owned();
         let mut child = spawn_stub_title(&key, &prefix, "helper.exe");
         let thread = thread::spawn(move || {
+            let mut deaths = Vec::new();
             let mut left = respawns;
             while !stopping.load(Ordering::Relaxed) {
-                if matches!(child.try_wait(), Ok(Some(_))) {
+                if let Ok(Some(status)) = child.try_wait() {
+                    deaths.push(status);
                     if left == 0 {
-                        return;
+                        return deaths;
                     }
                     left -= 1;
                     child = spawn_stub_title(&key, &prefix, "helper.exe");
@@ -1615,11 +1620,22 @@ impl Respawner {
             }
             let _ = child.kill();
             let _ = child.wait();
+            deaths
         });
         Self {
             stop,
             thread: Some(thread),
         }
+    }
+
+    /// Stops the respawner; how each helper that died before the stop died.
+    /// A respawner thread that panicked (a spawn that failed) panics here,
+    /// where `Drop` would swallow it.
+    fn stop(mut self) -> Vec<ExitStatus> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread
+            .take()
+            .map_or_else(Vec::new, |thread| thread.join().unwrap())
     }
 }
 
@@ -1636,12 +1652,17 @@ impl Drop for Respawner {
 fn cancel_keeps_killing_until_the_session_is_empty() {
     let fixture = Fixture::new();
     let id = orphan_row(&fixture, "run-respawn-ends");
+    let respawns = 2;
     // A look comes `tick` after each kill pass: wide enough for the next
-    // helper to be up and seen, so every look until the last is non-empty.
+    // helper, spawned a few ms after the kill, to precede the look's
+    // snapshot, so every look until the last is non-empty. The passes must
+    // also fit the second `term_wait` `end_stragglers` allows:
+    // (respawns + 2) * (tick + look) <= term_wait, about 1.5 s of the 2 s
+    // bound with a 30 ms look.
     let mut tuning = SHORT_DRAIN;
     tuning.term_wait = Duration::from_secs(1);
     tuning.tick = Duration::from_millis(100);
-    let respawner = Respawner::start(&fixture, "run-respawn-ends", 2);
+    let respawner = Respawner::start(&fixture, "run-respawn-ends", respawns);
     let row = fixture
         .core()
         .with_run_tuning(tuning)
@@ -1652,7 +1673,16 @@ fn cancel_keeps_killing_until_the_session_is_empty() {
     assert_eq!(row.id, id);
     assert_eq!(row.state, SessionState::Cancelled);
     assert_eq!(find_session("run-respawn-ends"), []);
-    drop(respawner);
+    let deaths = respawner.stop();
+    assert_eq!(
+        deaths.len(),
+        respawns + 1,
+        "every helper was killed by the cancel: {deaths:?}"
+    );
+    assert!(
+        deaths.iter().all(|status| status.signal() == Some(9)),
+        "each helper died of the cancel's SIGKILL: {deaths:?}"
+    );
     fixture.assert_lock_free();
 }
 
@@ -1672,7 +1702,11 @@ fn a_cancel_that_cannot_empty_the_session_leaves_the_row_open() {
     let row = fixture.db().session(id).unwrap().unwrap();
     assert_eq!(row.ended_at, None);
     assert!(row.cancel_requested);
-    drop(respawner);
+    let deaths = respawner.stop();
+    assert!(
+        !deaths.is_empty() && deaths.iter().all(|status| status.signal() == Some(9)),
+        "the cancel kept killing helpers while the row stayed open: {deaths:?}"
+    );
 }
 
 // Over RPC.
