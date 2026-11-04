@@ -637,7 +637,8 @@ final class ViewModelTests: XCTestCase {
         try await waitUntil { (try? self.requests(for: "steam.login.complete").count) ?? 0 >= 2 }
         steam.stopPolling()
         XCTAssertFalse(steam.isPolling)
-        let sent = try await settledRequestCount(for: "steam.login.complete")
+        await fence(app)
+        let sent = try requests(for: "steam.login.complete").count
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(try requests(for: "steam.login.complete").count, sent, "a stopped loop sends nothing more")
         guard case .ready(let pending) = steam.login, !pending.step.isDone else {
@@ -739,6 +740,7 @@ final class ViewModelTests: XCTestCase {
             try await waitUntil { (try? self.requests(for: "steam.login.complete").count) ?? 0 >= 2 }
         }
         try await waitUntil { weakModel == nil }
+        await fence(app)
         let sent = try requests(for: "steam.login.complete").count
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(try requests(for: "steam.login.complete").count, sent, "a dropped model sends nothing more")
@@ -1309,20 +1311,14 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
-    /// The count once the fake's log has stood still for 200 ms. The log is
-    /// the fake's view, behind the pipe: a poll the shell wrote just before
-    /// a stop can still be unread by a loaded fake when the stop lands.
-    private func settledRequestCount(for method: String, in log: URL? = nil, file: StaticString = #filePath, line: UInt = #line) async throws -> Int {
-        let deadline = ContinuousClock.now + .seconds(5)
-        var count = try requests(for: method, in: log).count
-        while ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(200))
-            let next = try requests(for: method, in: log).count
-            if next == count { return count }
-            count = next
-        }
-        XCTFail("the \(method) count did not settle within 5 s", file: file, line: line)
-        return count
+    /// Everything the shell wrote before this call is in the fake's log once
+    /// it answers: the fake reads its pipe in order and logs each line before
+    /// it acts on it. The log is the fake's view, behind the pipe, so a count
+    /// taken at the instant of a stop can miss the poll already written; a
+    /// count taken after the fence is exact, and a request the stop left
+    /// behind lands after it.
+    private func fence(_ app: AppModel) async {
+        _ = await app.run { try await $0.call("engine.list", params: EmptyParams()) as JSONValue }
     }
 
     private func waitUntil(_ condition: @MainActor () -> Bool, within limit: Duration = .seconds(5), file: StaticString = #filePath, line: UInt = #line) async throws {
