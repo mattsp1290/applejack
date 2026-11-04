@@ -429,7 +429,7 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(seen.state, .cancelled)
         XCTAssertTrue(seen.cancelRequested, "the cancel flagged the row before its job closed it")
         XCTAssertNotNil(seen.endedAt)
-        XCTAssertNil(seen.exitCode)
+        XCTAssertNil(seen.exitCode, "the cancel job closed the row with nothing reaped (`PlannedCancel::run`)")
         await app.shutdown()
 
         let exiting = makeApp(environment: ["FAKE_CORE_RUN_OUTCOME": "exits"])
@@ -448,9 +448,9 @@ final class ViewModelTests: XCTestCase {
     }
 
     /// The core's owner closes a row by its flag (`PlannedRun::close`): a
-    /// cancel asked for before the title exited ends the row `cancelled`
-    /// with no exit code, whichever job closes it. The fake's cancel job is
-    /// held past the exit, so the run job is the one that closes the row.
+    /// cancel asked for before the title exited ends the row `cancelled`,
+    /// and the owner still records the exit it reaped. The fake's cancel job
+    /// is held past the exit, so the run job is the one that closes the row.
     func testACancelBeforeTheExitEndsTheRowCancelled() async throws {
         let app = makeApp(environment: ["FAKE_CORE_RUN_OUTCOME": "exits", "FAKE_CORE_CANCEL_CLOSE_MS": "500"])
         let detail = app.detail(for: 220)
@@ -465,7 +465,7 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(row.id, 41)
         XCTAssertEqual(row.state, .cancelled)
         XCTAssertTrue(row.cancelRequested)
-        XCTAssertNil(row.exitCode, "the cancel path records no exit code")
+        XCTAssertEqual(row.exitCode, 0, "the owner reaped the title, so the row carries its status whatever the state (`PlannedRun::close`)")
         XCTAssertNotNil(row.endedAt)
         await app.shutdown()
     }
