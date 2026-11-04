@@ -78,7 +78,10 @@
 # from the request and `running` from the job's `running` phase; app.cancel
 # sets `cancel_requested` at the request and its job closes the row
 # `cancelled`; the title's exit (FAKE_CORE_RUN_OUTCOME=exits) closes it
-# `exited`. A cancel without a run closes row 1.
+# `exited`. A cancel without a run closes row 1. The row is a state machine,
+# `starting -> running -> {cancelled | exited}`, and a terminal state never
+# changes: the core ends a row once (`end_session`) and never reopens it, so
+# a run job that wakes late must not put `running` over a `cancelled`.
 set -u
 # A writer whose reader is gone must release the lock, not die holding it:
 # with SIGPIPE ignored the write fails with EPIPE and `write` ends the
@@ -104,20 +107,27 @@ write_failed() {
   exit 1
 }
 
+# acquire <lock dir> <what is dropped>: a bounded mkdir lock shared by the
+# subshells and the fake itself; a holder that keeps it 5 s is a bug, and
+# the waiter says what it drops.
+acquire() {
+  spins=0
+  while ! mkdir "$1" 2>/dev/null; do
+    # In a `( ... ) &` subshell `$$` is still the parent; a parent that was
+    # killed without running its EXIT trap must not leave this loop spinning,
+    # and neither must a lock a dead writer left behind.
+    { [ -d "$lockdir" ] && kill -0 $$ 2>/dev/null; } || write_failed "the fake is gone; dropping: $2"
+    spins=$((spins + 1))
+    [ "$spins" -lt 500 ] || write_failed "the lock $(basename "$1") was held for 5 s; dropping: $2"
+    sleep 0.01
+  done
+}
+
 # One writer at a time: a split response and a background echo must not
 # interleave on stdout. The only silent exit is a reader that is gone
 # (EPIPE); every other failure is a write_failed.
 write() {
-  spins=0
-  while ! mkdir "$lock" 2>/dev/null; do
-    # In a `( ... ) &` subshell `$$` is still the parent; a parent that was
-    # killed without running its EXIT trap must not leave this loop spinning,
-    # and neither must a lock a dead writer left behind.
-    { [ -d "$lockdir" ] && kill -0 $$ 2>/dev/null; } || write_failed "the fake is gone; dropping: $1"
-    spins=$((spins + 1))
-    [ "$spins" -lt 500 ] || write_failed "the output lock was held for 5 s; dropping: $1"
-    sleep 0.01
-  done
+  acquire "$lock" "$1"
   written=0
   error="$lockdir/write-error"
   : > "$error"
@@ -140,9 +150,23 @@ write() {
 }
 
 # set_run_state <state>: the state of the run's row 41, replaced whole so a
-# session.list between two writes never reads half a word.
+# session.list between two writes never reads half a word. `starting`
+# inserts the row (a new run, whatever the last one left); any other write
+# against a terminal state is refused with 1, under a lock so the run job
+# and the cancel job cannot interleave their read-check-replace.
 set_run_state() {
-  printf '%s\n' "$1" > "$lockdir/run.next" && mv -f "$lockdir/run.next" "$lockdir/run"
+  acquire "$lockdir/run.lock" "run state $1"
+  current=
+  [ -f "$lockdir/run" ] && read -r current < "$lockdir/run"
+  changed=0
+  case "$1:$current" in
+    starting:*|*:|*:starting|*:running)
+      printf '%s\n' "$1" > "$lockdir/run.next" && mv -f "$lockdir/run.next" "$lockdir/run"
+      changed=1
+      ;;
+  esac
+  rmdir "$lockdir/run.lock"
+  [ "$changed" = "1" ]
 }
 
 emit() {
@@ -191,18 +215,20 @@ runtime_job() {
 # (delayed by <seconds> with FAKE_CORE_RUN_DELAY_MS); the row is `running`
 # from the job's `running` phase, as the core's is from the marker. The job
 # stays open until app.cancel ends it unless FAKE_CORE_RUN_OUTCOME says the
-# title exits.
+# title exits. A cancel that closed the row first also ended job 12, and a
+# done job says nothing more (CoreClient's forwarder drops a line after
+# job.done anyway), so a refused state write sends no progress line.
 run_job() {
   (
     sleep "${1:-0}"
     sleep 0.05
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"starting","done_bytes":null,"total_bytes":null,"message":""}}'
     sleep 0.05
-    set_run_state running
+    set_run_state running || exit 0
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"running","done_bytes":null,"total_bytes":null,"message":""}}'
     if [ "${FAKE_CORE_RUN_OUTCOME:-open}" = "exits" ]; then
       sleep 0.05
-      set_run_state exited
+      set_run_state exited || exit 0
       write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"exited","done_bytes":null,"total_bytes":null,"message":"exit code 0"}}'
       write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":12}}'
     fi
@@ -261,20 +287,22 @@ reset_job() {
 
 # cancel_job <end run job>: app.cancel's job 13; it closes the row
 # `cancelled` before it reports so, and with a run open, job 12 ends after
-# it, as a session a cancel asked for ends in job.done.
+# it, as a session a cancel asked for ends in job.done. A row the title's
+# exit closed first stays `exited`, and job 12 already ended.
 cancel_job() {
   (
     sleep 0.05
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":13,"phase":"cancel","done_bytes":null,"total_bytes":null,"message":"SIGTERM sent"}}'
     sleep 0.05
+    ends_run=0
     if [ "$1" = "1" ]; then
-      set_run_state cancelled
+      set_run_state cancelled && ends_run=1
     else
       : > "$lockdir/cancelled"
     fi
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":13,"phase":"cancelled","done_bytes":null,"total_bytes":null,"message":""}}'
     write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":13}}'
-    if [ "$1" = "1" ]; then
+    if [ "$ends_run" = "1" ]; then
       sleep 0.05
       write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"cancelled","done_bytes":null,"total_bytes":null,"message":""}}'
       write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":12}}'
@@ -300,7 +328,9 @@ implemented() {
     app.run)
       response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":41,"job_id":12,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
       run_open=1
-      # The core inserts the row, `starting`, before it answers.
+      # The core inserts the row, `starting`, before it answers; a new row
+      # carries no cancel request.
+      rm -f "$lockdir/cancel_requested"
       set_run_state starting
       seconds=0
       if [ -n "${FAKE_CORE_RUN_DELAY_MS:-}" ]; then
