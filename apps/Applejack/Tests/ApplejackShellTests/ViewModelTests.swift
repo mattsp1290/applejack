@@ -12,7 +12,7 @@ final class ViewModelTests: XCTestCase {
     /// One directory per test for the fake's request logs: a fake still
     /// draining its pipe appends after `tearDown`, and an append into a
     /// removed directory leaves nothing behind.
-    nonisolated let logDir = ViewModelTests.makeLogDir()
+    nonisolated let logDir = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-requests-\(UUID().uuidString)", isDirectory: true)
     nonisolated var requestLog: URL { logDir.appendingPathComponent("requests.log") }
     /// For a test's second app. `shutdown` only closes the first fake's
     /// stdin; a request already in the pipe is read and logged after
@@ -20,10 +20,12 @@ final class ViewModelTests: XCTestCase {
     /// first fake's last request for the second app's.
     nonisolated var secondRequestLog: URL { logDir.appendingPathComponent("second.log") }
 
-    nonisolated static func makeLogDir() -> URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-requests-\(UUID().uuidString)", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+    override func setUp() {
+        super.setUp()
+        // Made here, not in the property: XCTest instantiates the class once
+        // per test method to build the suite, and only the instances it runs
+        // reach `tearDown`.
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
     }
 
     override func tearDown() {
