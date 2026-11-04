@@ -431,7 +431,7 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(seen.state, .cancelled)
         XCTAssertTrue(seen.cancelRequested, "the cancel flagged the row before its job closed it")
         XCTAssertNotNil(seen.endedAt)
-        XCTAssertNil(seen.exitCode, "the cancel job closed the row with nothing reaped (`PlannedCancel::run`)")
+        XCTAssertEqual(seen.exitCode, 143, "the owner was alive, so it closed the row with the status it reaped from the title the cancel ended, SIGTERM (`PlannedRun::close`); only a dead owner's row has none")
         await app.shutdown()
 
         let exiting = makeApp(environment: ["FAKE_CORE_RUN_OUTCOME": "exits"])

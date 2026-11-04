@@ -80,24 +80,34 @@
 #
 # session.list reflects what happened, as the core's `sessions` row does: the
 # canned open row 1 (running) until app.run, then the run's row 41, `starting`
-# from the request and `running` from the job's `running` phase; app.cancel
-# sets `cancel_requested` at the request and its job closes the row
-# `cancelled`; the title's exit (FAKE_CORE_RUN_OUTCOME=exits) closes it
-# `exited`, or `cancelled` when a cancel was asked for first, since the
-# core's owner closes a row by the flag (`PlannedRun::close`) and still
-# records the exit it reaped (`WatchEnd.exit_code`, whatever the state); only
-# the cancel's own close, with no owner and nothing reaped, records none
-# (`PlannedCancel::run`). The flag is read and the row closed under one lock,
-# and the cancel request flags the row under it, so a cancel cannot land
-# between the two and leave an `exited` row flagged. A cancel without a run
-# closes row 1. `app.run` over an open row 41 answers AlreadyRunning (1014)
-# and `app.cancel` on a closed row NotRunning (1017), as `plan_run` and
+# from the request and `running` from the job's `running` phase (about 100 ms
+# after the answer here, where the core takes seconds to ensure the prefix
+# and spawn the title); app.cancel sets `cancel_requested` at the request and
+# its job closes the row `cancelled`; the title's exit
+# (FAKE_CORE_RUN_OUTCOME=exits) closes it `exited`, or `cancelled` when a
+# cancel was asked for first, since the core's owner closes a row by the flag
+# (`PlannedRun::close`). A row closed while its owner was alive carries the
+# status the owner reaped (`WatchEnd.exit_code`, whatever the state): 0 for a
+# title that exited on its own, 143 for one the cancel ended (`end_title`
+# sends SIGTERM and the title leaves on it well inside `term_wait`;
+# `prefixes::exit_code` maps signal 15 to 128 + 15). Only a close with no
+# owner alive, the cancel's own (`PlannedCancel::run`, `NOTE_LOST`), records
+# none; row 1 is such a row here. The flag is read and the row closed under
+# one lock, the cancel request flags the row under it, and session.list reads
+# under it, so a cancel cannot land between the check and the close and a
+# reader never sees a row half written. A cancel without a run closes row 1.
+# `app.run` over an open row 41 answers AlreadyRunning (1014) and
+# `app.cancel` on a closed row NotRunning (1017), as `plan_run` and
 # `plan_cancel` do. The row is a state machine, `starting -> running ->
 # {cancelled | exited}` (or `starting -> cancelled` when the cancel's close
 # lands before the running marker), and a terminal state never changes: the
 # core ends a row once (`end_session`) and never reopens it, so a run job
 # that wakes late must not put `running` over a `cancelled` (a repeated
-# `running` is accepted here and a no-op in the core).
+# `running` is accepted here and a no-op in the core). Each run carries a
+# serial, stamped at `starting`; a job of an earlier run writes with the
+# serial it was born with and is refused once a later run replaced the row,
+# as the core's `end_session(id)` and `mark_session_running(id)` are by row
+# id and never touch the next row.
 set -u
 # A writer whose reader is gone must release the lock, not die holding it:
 # with SIGPIPE ignored the write fails with EPIPE and `write` ends the
@@ -169,33 +179,46 @@ write() {
   write_failed "write failed ($(cat "$error" 2>/dev/null)); dropping: $1"
 }
 
-# set_run_state <state>: the state of the run's row 41, replaced whole so a
-# session.list between two writes never reads half a word. `starting`
-# inserts the row (a new run after the last one ended); any other write
-# against a terminal state is refused with 1, under a lock so the run job
+# set_run_state <state> <serial>: the state of the run's row 41, replaced
+# whole and under the lock session.list reads under. `starting` inserts the
+# row (a new run after the last one ended) with no flag and no reaped exit,
+# stamped with the run's serial; any other write is refused with 1 against a
+# terminal state, or when the row's serial is not the writer's (a job of an
+# earlier run, whose row a later run replaced), under a lock so the run job
 # and the cancel job cannot interleave their read-check-replace. `ended` is
 # the title's exit: the owner closes by the flag (`PlannedRun::close`), read
 # here under the lock app.cancel flags under, so a cancel cannot land between
-# the check and the write; the `reaped` marker says the row carries the
-# exit's code whatever the state. In that mode the state chosen is printed,
-# so call it as `$(set_run_state ended)`.
+# the check and the write; the `reaped` file carries the status the owner
+# reaped, 0 for the exit, 143 for `cancelled` from the cancel job (the title
+# left on the SIGTERM). In `ended` mode the state chosen is printed, so call
+# it as `$(set_run_state ended "$serial")`.
 set_run_state() {
   acquire "$lockdir/run.lock" "run state $1"
-  current=
+  current=; serial=
   [ -f "$lockdir/run" ] && read -r current < "$lockdir/run"
+  [ -f "$lockdir/run.serial" ] && read -r serial < "$lockdir/run.serial"
   state=$1
   if [ "$state" = ended ]; then
     state=exited
     [ -f "$lockdir/cancel_requested" ] && state=cancelled
   fi
   changed=0
-  case "$state:$current" in
-    starting:*|*:|*:starting|*:running)
-      printf '%s\n' "$state" > "$lockdir/run.next" && mv -f "$lockdir/run.next" "$lockdir/run"
-      [ "$1" = ended ] && : > "$lockdir/reaped"
-      changed=1
-      ;;
-  esac
+  if [ "$state" = starting ] || [ "${2:-}" = "$serial" ]; then
+    case "$state:$current" in
+      starting:*|*:|*:starting|*:running)
+        if [ "$state" = starting ]; then
+          rm -f "$lockdir/cancel_requested" "$lockdir/reaped"
+          printf '%s\n' "$2" > "$lockdir/run.serial"
+        fi
+        case "$1" in
+          ended) printf '%s\n' 0 > "$lockdir/reaped" ;;
+          cancelled) printf '%s\n' 143 > "$lockdir/reaped" ;;
+        esac
+        printf '%s\n' "$state" > "$lockdir/run.next" && mv -f "$lockdir/run.next" "$lockdir/run"
+        changed=1
+        ;;
+    esac
+  fi
   rmdir "$lockdir/run.lock"
   [ "$changed" = "1" ] || return 1
   [ "$1" = ended ] && printf '%s\n' "$state"
@@ -244,25 +267,25 @@ runtime_job() {
   ) &
 }
 
-# run_job <seconds>: app.run's job 12, the session's phases, after the answer
-# (delayed by <seconds> with FAKE_CORE_RUN_DELAY_MS); the row is `running`
-# from the job's `running` phase, as the core's is from the marker. The job
-# stays open until app.cancel ends it unless FAKE_CORE_RUN_OUTCOME says the
-# title exits. A cancel that closed the row first also ended job 12, and a
-# done job says nothing more (CoreClient's forwarder drops a line after
-# job.done anyway), so a refused state write sends no progress line.
+# run_job <seconds> <serial>: app.run's job 12, the session's phases, after
+# the answer (delayed by <seconds> with FAKE_CORE_RUN_DELAY_MS); the row is
+# `running` from the job's `running` phase, as the core's is from the marker.
+# The job stays open until app.cancel ends it unless FAKE_CORE_RUN_OUTCOME
+# says the title exits. A cancel that closed the row first also ended job
+# 12, and a done job says nothing more (CoreClient's forwarder drops a line
+# after job.done anyway), so a refused state write sends no progress line.
 run_job() {
   (
     sleep "${1:-0}"
     sleep 0.05
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"starting","done_bytes":null,"total_bytes":null,"message":""}}'
     sleep 0.05
-    set_run_state running || exit 0
+    set_run_state running "$2" || exit 0
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"running","done_bytes":null,"total_bytes":null,"message":""}}'
     if [ "${FAKE_CORE_RUN_OUTCOME:-open}" = "exits" ]; then
       sleep 0.05
       # The title left: the owner closes the row by the flag, under the lock.
-      end=$(set_run_state ended) || exit 0
+      end=$(set_run_state ended "$2") || exit 0
       write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"'"$end"'","done_bytes":null,"total_bytes":null,"message":"session 41 ended"}}'
       write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":12}}'
     fi
@@ -270,8 +293,10 @@ run_job() {
 }
 
 # session_row: the one row session.list answers, as the run and cancel
-# requests and their jobs left it (see the header).
+# requests and their jobs left it (see the header), read under the lock the
+# writers take so a row is never seen half written.
 session_row() {
+  acquire "$lockdir/run.lock" "session.list"
   id=1; state=running; ended=null; exit_code=null; cancel_requested=false
   if [ -f "$lockdir/run" ]; then
     id=41
@@ -281,14 +306,15 @@ session_row() {
   fi
   [ -f "$lockdir/cancel_requested" ] && cancel_requested=true
   case "$state" in
-    cancelled)
+    cancelled|exited)
       ended='"2026-10-30T00:01:00Z"'
-      # Closed by the owner after the title left: the launch exe's status.
-      # Closed by the cancel (no exit to reap): none, as `PlannedCancel::run`.
-      [ -f "$lockdir/reaped" ] && exit_code=0
+      # Closed by an owner that was alive (the exit, or a cancel it reaped
+      # the title for): the launch exe's status. Closed with no owner (row
+      # 1, a dead owner's row: `PlannedCancel::run`, `NOTE_LOST`): none.
+      [ -f "$lockdir/reaped" ] && read -r exit_code < "$lockdir/reaped"
       ;;
-    exited) ended='"2026-10-30T00:01:00Z"'; exit_code=0 ;;
   esac
+  rmdir "$lockdir/run.lock"
   printf '%s' '{"id":'"$id"',"appid":220,"started_at":"2026-10-30T00:00:00Z","ended_at":'"$ended"',"engine_id":"rosetta-wine","engine_version":"10.0.1","exit_code":'"$exit_code"',"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'","state":"'"$state"'","session_key":"fake-session","prefix":"220","launch_exe":"hl2.exe","note":null,"cancel_requested":'"$cancel_requested"'}'
 }
 
@@ -324,13 +350,16 @@ reset_job() {
   ) &
 }
 
-# cancel_job <end run job>: app.cancel's job 13; it closes the row
+# cancel_job <end run job> <serial>: app.cancel's job 13; it closes the row
 # `cancelled` before it reports so, and with a run open, job 12 reports its
-# end state first: the core's owner closes the row and reports it before it
-# lets go of the lock the cancel waits for (`PlannedCancel::run`); job 12's
-# `job.done` follows the lock drop, so it is written here before job 13's
-# lines as the likely order, not a promised one. A row the title's exit
-# closed first stays as the exit left it, and job 12 already ended.
+# end state first: the cancel waits on the owner's lock, and the owner
+# closes the row with the status it reaped from the title the cancel ended
+# and reports it before it lets go (`PlannedCancel::run`, `PlannedRun::close`),
+# so the close here stands in for the owner's and leaves the reaped status;
+# job 12's `job.done` follows the lock drop, so it is written here before
+# job 13's lines as the likely order, not a promised one. A row the title's
+# exit closed first stays as the exit left it, and job 12 already ended; a
+# row a later run replaced is not this job's and is left alone.
 cancel_job() {
   (
     sleep 0.05
@@ -344,7 +373,7 @@ cancel_job() {
     row=1
     if [ "$1" = "1" ]; then
       row=41
-      set_run_state cancelled && ends_run=1
+      set_run_state cancelled "$2" && ends_run=1
     else
       : > "$lockdir/cancelled"
     fi
@@ -383,10 +412,9 @@ implemented() {
       fi
       response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":41,"job_id":12,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
       run_open=1
-      # The core inserts the row, `starting`, before it answers; a new row
-      # carries no cancel request and no reaped exit.
-      rm -f "$lockdir/cancel_requested" "$lockdir/reaped"
-      set_run_state starting
+      run_serial=$((${run_serial:-0} + 1))
+      # The core inserts the row, `starting`, before it answers.
+      set_run_state starting "$run_serial"
       seconds=0
       if [ -n "${FAKE_CORE_RUN_DELAY_MS:-}" ]; then
         seconds=$(awk -v ms="$FAKE_CORE_RUN_DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
@@ -394,12 +422,14 @@ implemented() {
       else
         emit "$response"
       fi
-      run_job "$seconds"
+      run_job "$seconds" "$run_serial"
       ;;
     app.cancel)
-      # `plan_cancel` reads the open row and flags it at the request, in one
-      # transaction; its job closes it. The read and the flag go under the
-      # run lock so the title's exit cannot close the row between them.
+      # `plan_cancel` reads the open row and flags it at the request in two
+      # statements; `request_session_cancel`'s `WHERE ended_at IS NULL` keeps
+      # a closed row unflagged. Here the read and the flag go under the run
+      # lock, which also refuses the one pair the core can still show in
+      # that window (`exited` with the flag set); its job closes the row.
       acquire "$lockdir/run.lock" "cancel of row 41"
       closed=0
       if [ -f "$lockdir/run" ] && read -r current < "$lockdir/run"; then
@@ -418,7 +448,7 @@ implemented() {
         emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1017,"message":"app 220 has no open session"}}'
       else
         emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":13}}'
-        cancel_job "${run_open:-0}"
+        cancel_job "${run_open:-0}" "${run_serial:-0}"
         run_open=0
       fi
       ;;
