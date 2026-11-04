@@ -17,6 +17,9 @@ public final class SteamAccountViewModel {
     /// The loop driving the current login; cancelled by the next login, by
     /// a submit, and by `stopPolling()` when the view goes away.
     private var poll: Task<Void, Never>?
+    /// Which loop `poll` holds. A loop cannot name its own handle, so it
+    /// clears `poll` by this instead, and only when no newer loop replaced it.
+    private var pollGeneration = 0
 
     public init(app: AppModel, pollDelay: Duration = .seconds(2)) {
         self.app = app
@@ -109,7 +112,12 @@ public final class SteamAccountViewModel {
         guard case .ready(let session) = login, !session.step.isDone else { return }
         stopPolling()
         let delay = pollDelay
+        pollGeneration += 1
+        let generation = pollGeneration
         let task = Task<Void, Never> { [weak self] in
+            // Cleared here, before the task completes, so `isPolling` is
+            // false for anyone that awaited the loop, not one hop later.
+            defer { self?.endPoll(generation) }
             var session = session
             var first = true
             while !Task.isCancelled {
@@ -122,11 +130,11 @@ public final class SteamAccountViewModel {
             }
         }
         poll = task
-        Task { [weak self] in
-            await task.value
-            guard let self, poll == task else { return }
-            poll = nil
-        }
+    }
+
+    private func endPoll(_ generation: Int) {
+        guard generation == pollGeneration else { return }
+        poll = nil
     }
 
     /// One `steam.login.complete` for `session`; the session to poll next,
