@@ -7,8 +7,9 @@ mod common;
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -1118,7 +1119,7 @@ fn a_cancel_leaves_the_server_of_a_prefix_still_being_built() {
     let plan = fixture.core().plan_run(APP, false).unwrap();
     let id = plan.session_id();
     // The build's server carries the build's own session id.
-    let mut server = spawn_stub_server("prefix-build", &fixture.prefix_dir());
+    let mut server = spawn_stub_server(&own_key("prefix-build"), &fixture.prefix_dir());
     let mut tuning = FAST;
     tuning.drain = Duration::from_millis(100);
     tuning.cancel_wait = Duration::from_millis(500);
@@ -1149,7 +1150,7 @@ fn a_cancel_of_a_row_with_no_process_leaves_the_server_alone() {
         .db()
         .mark_session_running(id, "2026-11-01T00:00:01Z")
         .unwrap();
-    let mut server = spawn_stub_server("prefix-exec", &fixture.prefix_dir());
+    let mut server = spawn_stub_server(&own_key("prefix-exec"), &fixture.prefix_dir());
     let row = fixture
         .core()
         .with_run_tuning(SHORT_DRAIN)
@@ -1391,7 +1392,7 @@ fn a_run_waits_out_the_server_the_last_one_left() {
     fixture.quit(0);
     running.finish();
     fs::remove_file(fixture.prefix_dir().join("quit")).unwrap();
-    let mut server = spawn_stub_server("run-before", &fixture.prefix_dir());
+    let mut server = spawn_stub_server(&own_key("run-before"), &fixture.prefix_dir());
     let quit = fixture.prefix_dir().join("server-quit");
     let leaves = thread::spawn(move || {
         thread::sleep(Duration::from_millis(300));
@@ -1405,6 +1406,14 @@ fn a_run_waits_out_the_server_the_last_one_left() {
 }
 
 // A core that died.
+
+/// A session key no other process on the host shares: `find_session` reads
+/// the whole process table, so a second copy of a test running beside this
+/// one (another worktree's suite) would otherwise see, adopt or cancel this
+/// one's helpers.
+fn own_key(name: &str) -> String {
+    format!("{name}-{}", std::process::id())
+}
 
 /// An open row as a dead core leaves it: nobody holds the lock.
 fn orphan_row(fixture: &Fixture, key: &str) -> i64 {
@@ -1483,8 +1492,9 @@ fn a_new_run_closes_a_dead_session_and_proceeds() {
 #[test]
 fn a_live_title_with_no_core_is_refused_as_running_and_stays_open() {
     let fixture = Fixture::new();
-    let id = orphan_row(&fixture, "run-live");
-    let _title = Orphan::start(&fixture, "run-live");
+    let key = own_key("run-live");
+    let id = orphan_row(&fixture, &key);
+    let _title = Orphan::start(&fixture, &key);
     assert_refused(&fixture, ErrorCode::AlreadyRunning);
     drop(fixture.core().reconcile_sessions().unwrap());
     assert_eq!(fixture.db().session(id).unwrap().unwrap().ended_at, None);
@@ -1505,9 +1515,10 @@ fn a_session_owned_by_a_live_core_is_not_touched() {
 #[test]
 fn a_dead_owners_session_answers_busy_at_once_not_after_the_settle() {
     let fixture = Fixture::new();
-    orphan_row(&fixture, "run-gap");
-    let _title = Orphan::start(&fixture, "run-gap");
-    let mut server = spawn_stub_server("run-gap", &fixture.prefix_dir());
+    let key = own_key("run-gap");
+    orphan_row(&fixture, &key);
+    let _title = Orphan::start(&fixture, &key);
+    let mut server = spawn_stub_server(&key, &fixture.prefix_dir());
     let started = Instant::now();
     let mut core = fixture.core();
     assert_busy(core.prefix_snapshot(PREFIX));
@@ -1529,8 +1540,9 @@ fn a_dead_owners_session_answers_busy_at_once_not_after_the_settle() {
 #[test]
 fn a_game_a_dead_owners_launcher_left_is_taken_over_not_lost() {
     let fixture = Fixture::new();
-    let id = orphan_row(&fixture, "run-left");
-    let game = Orphan::named(&fixture, "run-left", "game.exe");
+    let key = own_key("run-left");
+    let id = orphan_row(&fixture, &key);
+    let game = Orphan::named(&fixture, &key, "game.exe");
     let mut adopted = fixture.core().reconcile_sessions().unwrap();
     assert_eq!(adopted.len(), 1, "title.exe is gone and its game is not");
     assert_eq!(fixture.db().session(id).unwrap().unwrap().ended_at, None);
@@ -1546,8 +1558,9 @@ fn a_game_a_dead_owners_launcher_left_is_taken_over_not_lost() {
 #[test]
 fn a_new_core_takes_over_a_live_title_and_holds_the_prefix() {
     let fixture = Fixture::new();
-    let id = orphan_row(&fixture, "run-adopt");
-    let title = Orphan::start(&fixture, "run-adopt");
+    let key = own_key("run-adopt");
+    let id = orphan_row(&fixture, &key);
+    let title = Orphan::start(&fixture, &key);
     let mut adopted = fixture.core().reconcile_sessions().unwrap();
     assert_eq!(adopted.len(), 1);
     let session = adopted.pop().unwrap();
@@ -1565,8 +1578,9 @@ fn a_new_core_takes_over_a_live_title_and_holds_the_prefix() {
 #[test]
 fn cancel_ends_a_title_nobody_owns() {
     let fixture = Fixture::new();
-    let id = orphan_row(&fixture, "run-cancel-orphan");
-    let mut title = Orphan::start(&fixture, "run-cancel-orphan");
+    let key = own_key("run-cancel-orphan");
+    let id = orphan_row(&fixture, &key);
+    let mut title = Orphan::start(&fixture, &key);
     // The test is the parent here: reap in the background as launchd would.
     let reaper = thread::spawn(move || {
         let _ = title.0.wait();
@@ -1580,44 +1594,68 @@ fn cancel_ends_a_title_nobody_owns() {
         .unwrap();
     assert_eq!(row.id, id);
     assert_eq!(row.state, SessionState::Cancelled);
-    assert_eq!(find_session("run-cancel-orphan"), []);
+    assert_eq!(find_session(&key), []);
     drop(reaper.join().unwrap());
     fixture.assert_lock_free();
 }
 
-/// Keeps starting helpers of the session on its own thread, the way a
-/// watchdog no list has seen yet would, until it is dropped or `for_how_long`
-/// has passed.
+/// Keeps a helper of the session running on its own thread, the way a
+/// watchdog no list has seen yet would: each time the helper dies the next
+/// is started, `respawns` times (`respawns + 1` helpers in all), so with a
+/// bounded `respawns` the last kill pass leaves nothing, and every spawn
+/// follows a death by a few ms, never a clock. `start` returns with the
+/// first helper spawned, not yet necessarily listed; `stop` says how each
+/// helper that died before it died (the one it kills itself is not listed)
+/// and `drop` kills whichever is current.
 struct Respawner {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<Vec<ExitStatus>>>,
 }
 
 impl Respawner {
-    fn start(fixture: &Fixture, key: &str, for_how_long: Duration) -> Self {
+    fn start(fixture: &Fixture, key: &str, respawns: usize) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let prefix = fixture.prefix_dir();
         let key = key.to_owned();
+        let mut child = spawn_stub_title(&key, &prefix, "helper.exe");
         let thread = thread::spawn(move || {
-            let mut children: Vec<Child> = Vec::new();
-            let until = Instant::now() + for_how_long;
+            let mut deaths = Vec::new();
+            let mut left = respawns;
             while !stopping.load(Ordering::Relaxed) {
-                if Instant::now() < until {
-                    children.push(spawn_stub_title(&key, &prefix, "helper.exe"));
+                if let Ok(Some(status)) = child.try_wait() {
+                    deaths.push(status);
+                    if left == 0 {
+                        return deaths;
+                    }
+                    left -= 1;
+                    child = spawn_stub_title(&key, &prefix, "helper.exe");
                 }
-                children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(2));
             }
-            for child in &mut children {
+            // A death the loop had not polled yet is the core's, not ours.
+            if let Ok(Some(status)) = child.try_wait() {
+                deaths.push(status);
+            } else {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            deaths
         });
         Self {
             stop,
             thread: Some(thread),
         }
+    }
+
+    /// Stops the respawner; how each helper that died before the stop died.
+    /// A respawner thread that panicked (a spawn that failed) panics here,
+    /// where `Drop` would swallow it.
+    fn stop(mut self) -> Vec<ExitStatus> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread
+            .take()
+            .map_or_else(Vec::new, |thread| thread.join().unwrap())
     }
 }
 
@@ -1633,10 +1671,22 @@ impl Drop for Respawner {
 #[test]
 fn cancel_keeps_killing_until_the_session_is_empty() {
     let fixture = Fixture::new();
-    let id = orphan_row(&fixture, "run-respawn-ends");
+    let key = own_key("run-respawn-ends");
+    let id = orphan_row(&fixture, &key);
+    let respawns = 2;
+    // A look comes `tick` after each kill pass: wide enough for the next
+    // helper, spawned a few ms after the kill, to precede the look's
+    // snapshot, so every look until the last is non-empty (the respawner's
+    // 2 ms poll plus a spawn must stay well under `tick`). The kill passes
+    // must also fit the second `term_wait` `end_stragglers` allows: the
+    // last kill lands at worst term_wait + (respawns + 1) * (tick + look),
+    // about 0.4 s into the second 1 s with a 30 ms look, and the empty look
+    // after it (which returns at any `waited`) lands near 1.5 s of the 2 s
+    // bound.
     let mut tuning = SHORT_DRAIN;
     tuning.term_wait = Duration::from_secs(1);
-    let respawner = Respawner::start(&fixture, "run-respawn-ends", Duration::from_millis(1600));
+    tuning.tick = Duration::from_millis(100);
+    let respawner = Respawner::start(&fixture, &key, respawns);
     let row = fixture
         .core()
         .with_run_tuning(tuning)
@@ -1646,16 +1696,32 @@ fn cancel_keeps_killing_until_the_session_is_empty() {
         .unwrap();
     assert_eq!(row.id, id);
     assert_eq!(row.state, SessionState::Cancelled);
-    assert_eq!(find_session("run-respawn-ends"), []);
-    drop(respawner);
+    // The look precedes the stop, which would kill the current helper.
+    let left = find_session(&key);
+    let deaths = respawner.stop();
+    assert_eq!(
+        deaths.len(),
+        respawns + 1,
+        "every helper was killed by the cancel: {deaths:?}; left {left:?}"
+    );
+    assert!(
+        deaths.iter().all(|status| status.signal() == Some(9)),
+        "each helper died of the cancel's SIGKILL: {deaths:?}"
+    );
+    assert_eq!(
+        left,
+        [],
+        "nothing of the session outlived the row: {deaths:?}"
+    );
     fixture.assert_lock_free();
 }
 
 #[test]
 fn a_cancel_that_cannot_empty_the_session_leaves_the_row_open() {
     let fixture = Fixture::new();
-    let id = orphan_row(&fixture, "run-respawn-stays");
-    let respawner = Respawner::start(&fixture, "run-respawn-stays", Duration::from_secs(60));
+    let key = own_key("run-respawn-stays");
+    let id = orphan_row(&fixture, &key);
+    let respawner = Respawner::start(&fixture, &key, usize::MAX);
     let error = fixture
         .core()
         .with_run_tuning(SHORT_DRAIN)
@@ -1667,7 +1733,11 @@ fn a_cancel_that_cannot_empty_the_session_leaves_the_row_open() {
     let row = fixture.db().session(id).unwrap().unwrap();
     assert_eq!(row.ended_at, None);
     assert!(row.cancel_requested);
-    drop(respawner);
+    let deaths = respawner.stop();
+    assert!(
+        !deaths.is_empty() && deaths.iter().all(|status| status.signal() == Some(9)),
+        "the cancel kept killing helpers while the row stayed open: {deaths:?}"
+    );
 }
 
 // Over RPC.
@@ -1798,6 +1868,7 @@ fn hello_takes_over_what_a_dead_core_left() {
         SessionState::Lost
     );
 
+    let live = own_key("run-hello-live");
     let adopted = fixture
         .db()
         .insert_session(&NewSession {
@@ -1806,13 +1877,13 @@ fn hello_takes_over_what_a_dead_core_left() {
             engine_id: "rosetta-wine",
             engine_version: "10.0.0",
             log_path: "/nonexistent/wine.log",
-            session_key: "run-hello-live",
+            session_key: &live,
             prefix: PREFIX,
             launch_exe: "title.exe",
         })
         .unwrap()
         .unwrap();
-    let title = Orphan::start(&fixture, "run-hello-live");
+    let title = Orphan::start(&fixture, &live);
     request(&mut handler, &notifier, &hello).unwrap();
     let progress: Value =
         serde_json::from_str(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
