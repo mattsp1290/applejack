@@ -49,7 +49,14 @@
 #   FAKE_CORE_RUN_OUTCOME=exits   app.run's job (12) ends with job.done after
 #                                 `running`; without it the job stays open
 #                                 until app.cancel ends it
-#   FAKE_CORE_CANCEL_REFUSED=1    app.cancel answers NotRunning (1017)
+#   FAKE_CORE_CANCEL_REFUSED=1    app.cancel answers NotRunning (1017); a
+#                                 cancel of a row already closed answers it
+#                                 unasked, and app.run over an open row
+#                                 answers AlreadyRunning (1014)
+#   FAKE_CORE_CANCEL_CLOSE_MS=<n>  app.cancel's job (13) closes the row n
+#                                 milliseconds after its `cancel` phase
+#                                 instead of 50, so a title's exit can land
+#                                 first
 #   FAKE_CORE_RUNTIME_STATE=<s>   runtime.steam.status answers state <s>
 #                                 (absent|ready|broken; default needs_login)
 #   FAKE_CORE_RUNTIME_RUNNING=<0|1>  runtime.steam.status answers that
@@ -78,10 +85,13 @@
 # from the request and `running` from the job's `running` phase; app.cancel
 # sets `cancel_requested` at the request and its job closes the row
 # `cancelled`; the title's exit (FAKE_CORE_RUN_OUTCOME=exits) closes it
-# `exited`. A cancel without a run closes row 1. The row is a state machine,
-# `starting -> running -> {cancelled | exited}`, and a terminal state never
-# changes: the core ends a row once (`end_session`) and never reopens it, so
-# a run job that wakes late must not put `running` over a `cancelled`.
+# `exited`, or `cancelled` when a cancel was asked for first, since the
+# core's owner closes a row by the flag (`PlannedRun::close`) and records no
+# exit code for it. A cancel without a run closes row 1. The row is a state
+# machine, `starting -> running -> {cancelled | exited}`, and a terminal
+# state never changes: the core ends a row once (`end_session`) and never
+# reopens it, so a run job that wakes late must not put `running` over a
+# `cancelled` (a repeated `running` is accepted here and a no-op in the core).
 set -u
 # A writer whose reader is gone must release the lock, not die holding it:
 # with SIGPIPE ignored the write fails with EPIPE and `write` ends the
@@ -108,8 +118,9 @@ write_failed() {
 }
 
 # acquire <lock dir> <what is dropped>: a bounded mkdir lock shared by the
-# subshells and the fake itself; a holder that keeps it 5 s is a bug, and
-# the waiter says what it drops.
+# subshells and the fake itself; a holder that keeps it for 500 tries (about
+# 11 s unloaded, each try a `sleep` spawn) is a bug, and the waiter says what
+# it drops.
 acquire() {
   spins=0
   while ! mkdir "$1" 2>/dev/null; do
@@ -118,7 +129,7 @@ acquire() {
     # and neither must a lock a dead writer left behind.
     { [ -d "$lockdir" ] && kill -0 $$ 2>/dev/null; } || write_failed "the fake is gone; dropping: $2"
     spins=$((spins + 1))
-    [ "$spins" -lt 500 ] || write_failed "the lock $(basename "$1") was held for 5 s; dropping: $2"
+    [ "$spins" -lt 500 ] || write_failed "the lock $(basename "$1") was not released in 500 tries; dropping: $2"
     sleep 0.01
   done
 }
@@ -151,7 +162,7 @@ write() {
 
 # set_run_state <state>: the state of the run's row 41, replaced whole so a
 # session.list between two writes never reads half a word. `starting`
-# inserts the row (a new run, whatever the last one left); any other write
+# inserts the row (a new run after the last one ended); any other write
 # against a terminal state is refused with 1, under a lock so the run job
 # and the cancel job cannot interleave their read-check-replace.
 set_run_state() {
@@ -228,8 +239,14 @@ run_job() {
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"running","done_bytes":null,"total_bytes":null,"message":""}}'
     if [ "${FAKE_CORE_RUN_OUTCOME:-open}" = "exits" ]; then
       sleep 0.05
-      set_run_state exited || exit 0
-      write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"exited","done_bytes":null,"total_bytes":null,"message":"exit code 0"}}'
+      # The owner closes the row by the flag (`PlannedRun::close`): a cancel
+      # asked for before the title left ends it `cancelled`, with no exit code.
+      end=exited; message="exit code 0"
+      if [ -f "$lockdir/cancel_requested" ]; then
+        end=cancelled; message=""
+      fi
+      set_run_state "$end" || exit 0
+      write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"'"$end"'","done_bytes":null,"total_bytes":null,"message":"'"$message"'"}}'
       write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":12}}'
     fi
   ) &
@@ -286,27 +303,31 @@ reset_job() {
 }
 
 # cancel_job <end run job>: app.cancel's job 13; it closes the row
-# `cancelled` before it reports so, and with a run open, job 12 ends after
-# it, as a session a cancel asked for ends in job.done. A row the title's
-# exit closed first stays `exited`, and job 12 already ended.
+# `cancelled` before it reports so, and with a run open, job 12 ends first:
+# the core's owner closes the row and ends its job before the cancel takes
+# the lock and reports (`PlannedCancel::run`). A row the title's exit closed
+# first stays as the exit left it, and job 12 already ended.
 cancel_job() {
   (
     sleep 0.05
     write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":13,"phase":"cancel","done_bytes":null,"total_bytes":null,"message":"SIGTERM sent"}}'
-    sleep 0.05
+    if [ -n "${FAKE_CORE_CANCEL_CLOSE_MS:-}" ]; then
+      sleep "$(awk -v ms="$FAKE_CORE_CANCEL_CLOSE_MS" 'BEGIN { printf "%.3f", ms / 1000 }')"
+    else
+      sleep 0.05
+    fi
     ends_run=0
     if [ "$1" = "1" ]; then
       set_run_state cancelled && ends_run=1
     else
       : > "$lockdir/cancelled"
     fi
-    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":13,"phase":"cancelled","done_bytes":null,"total_bytes":null,"message":""}}'
-    write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":13}}'
     if [ "$ends_run" = "1" ]; then
-      sleep 0.05
       write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":12,"phase":"cancelled","done_bytes":null,"total_bytes":null,"message":""}}'
       write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":12}}'
     fi
+    write '{"jsonrpc":"2.0","method":"job.progress","params":{"job_id":13,"phase":"cancelled","done_bytes":null,"total_bytes":null,"message":""}}'
+    write '{"jsonrpc":"2.0","method":"job.done","params":{"job_id":13}}'
   ) &
 }
 
@@ -326,6 +347,13 @@ implemented() {
       job 7
       ;;
     app.run)
+      # The core's `sessions_one_open` index refuses a second open row
+      # (AlreadyRunning); a new run here reuses row 41 where the core would
+      # insert a new id.
+      if [ -f "$lockdir/run" ] && read -r current < "$lockdir/run" && { [ "$current" = starting ] || [ "$current" = running ]; }; then
+        emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1014,"message":"app 220 already has an open session"}}'
+        return 0
+      fi
       response='{"jsonrpc":"2.0","id":'"$1"',"result":{"id":41,"job_id":12,"log_path":"'"${FAKE_CORE_SESSION_LOG:-/tmp/fake-core-session.log}"'"}}'
       run_open=1
       # The core inserts the row, `starting`, before it answers; a new row
@@ -342,7 +370,15 @@ implemented() {
       run_job "$seconds"
       ;;
     app.cancel)
-      if [ "${FAKE_CORE_CANCEL_REFUSED:-0}" = "1" ]; then
+      # `plan_cancel` reads the open row first and answers NotRunning for a
+      # closed one; only an open row is flagged.
+      closed=0
+      if [ -f "$lockdir/run" ] && read -r current < "$lockdir/run"; then
+        case "$current" in cancelled|exited) closed=1 ;; esac
+      elif [ -f "$lockdir/cancelled" ]; then
+        closed=1
+      fi
+      if [ "${FAKE_CORE_CANCEL_REFUSED:-0}" = "1" ] || [ "$closed" = "1" ]; then
         emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1017,"message":"app 220 has no open session"}}'
       else
         emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"job_id":13}}'

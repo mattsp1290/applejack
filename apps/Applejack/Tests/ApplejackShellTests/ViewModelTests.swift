@@ -9,20 +9,25 @@ import XCTest
 /// method is `NotImplemented`.
 @MainActor
 final class ViewModelTests: XCTestCase {
-    nonisolated let requestLog = ViewModelTests.makeRequestLog()
+    /// One directory per test for the fake's request logs: a fake still
+    /// draining its pipe appends after `tearDown`, and an append into a
+    /// removed directory leaves nothing behind.
+    nonisolated let logDir = ViewModelTests.makeLogDir()
+    nonisolated var requestLog: URL { logDir.appendingPathComponent("requests.log") }
     /// For a test's second app. `shutdown` only closes the first fake's
     /// stdin; a request already in the pipe is read and logged after
     /// `shutdown` returns, so a count over one shared log would take the
     /// first fake's last request for the second app's.
-    nonisolated let secondRequestLog = ViewModelTests.makeRequestLog()
+    nonisolated var secondRequestLog: URL { logDir.appendingPathComponent("second.log") }
 
-    nonisolated static func makeRequestLog() -> URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-requests-\(UUID().uuidString).log")
+    nonisolated static func makeLogDir() -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-requests-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 
     override func tearDown() {
-        try? FileManager.default.removeItem(at: requestLog)
-        try? FileManager.default.removeItem(at: secondRequestLog)
+        try? FileManager.default.removeItem(at: logDir)
         super.tearDown()
     }
 
@@ -440,6 +445,29 @@ final class ViewModelTests: XCTestCase {
         XCTAssertFalse(ended.cancelRequested)
         XCTAssertNotNil(ended.endedAt)
         await exiting.shutdown()
+    }
+
+    /// The core's owner closes a row by its flag (`PlannedRun::close`): a
+    /// cancel asked for before the title exited ends the row `cancelled`
+    /// with no exit code, whichever job closes it. The fake's cancel job is
+    /// held past the exit, so the run job is the one that closes the row.
+    func testACancelBeforeTheExitEndsTheRowCancelled() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RUN_OUTCOME": "exits", "FAKE_CORE_CANCEL_CLOSE_MS": "500"])
+        let detail = app.detail(for: 220)
+        await detail.run()
+        await detail.cancel()
+        try await waitUntil { detail.session.value?.finished == true }
+        XCTAssertEqual(detail.session.value?.phase, "cancelled", "job 12 reports the end state the flag picked")
+        XCTAssertEqual(detail.cancelState.value?.finished, true)
+        let logs = LogsViewModel(app: app)
+        await logs.load(appid: 220)
+        let row = try XCTUnwrap(logs.sessions.value?.sessions.first)
+        XCTAssertEqual(row.id, 41)
+        XCTAssertEqual(row.state, .cancelled)
+        XCTAssertTrue(row.cancelRequested)
+        XCTAssertNil(row.exitCode, "the cancel path records no exit code")
+        XCTAssertNotNil(row.endedAt)
+        await app.shutdown()
     }
 
     func testExportSendsThePathAndReportsWhereTheCoreWrote() async throws {

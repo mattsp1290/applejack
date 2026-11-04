@@ -227,7 +227,8 @@ view says the sign-in state is unknown rather than "not signed in". Once
 two seconds on a task of its own, from the moment the challenge is up: an
 approval in the Steam mobile app ends the login without a button. The loop
 ends on `done`, on an error, when the view disappears (`stopPolling()`; it
-resumes when the view comes back), and when another login starts. A
+resumes when the view comes back), and when another login starts; a small
+progress indicator shows while the loop runs and clears the moment it ends. A
 `guard_required` step shows a code field unless the factor is
 `device_confirmation`, worded by factor (the code from the email, or from
 the mobile app, which can also approve instead); Submit restarts the loop
