@@ -9,29 +9,56 @@ import XCTest
 /// method is `NotImplemented`.
 @MainActor
 final class ViewModelTests: XCTestCase {
-    nonisolated let requestLog = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-requests-\(UUID().uuidString).log")
+    /// One directory per test for the fake's request logs: a fake still
+    /// draining its pipe appends after `tearDown`, and an append into a
+    /// removed directory leaves nothing behind.
+    nonisolated let logDir = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-requests-\(UUID().uuidString)", isDirectory: true)
+    nonisolated var requestLog: URL { logDir.appendingPathComponent("requests.log") }
+    /// For a test's second app. `shutdown` only closes the first fake's
+    /// stdin; a request already in the pipe is read and logged after
+    /// `shutdown` returns, so a count over one shared log would take the
+    /// first fake's last request for the second app's.
+    nonisolated var secondRequestLog: URL { logDir.appendingPathComponent("second.log") }
+
+    override func setUp() {
+        super.setUp()
+        // Made here, not in the property: XCTest instantiates the class once
+        // per test method to build the suite, and only the instances it runs
+        // reach `tearDown`.
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+    }
 
     override func tearDown() {
-        try? FileManager.default.removeItem(at: requestLog)
+        try? FileManager.default.removeItem(at: logDir)
         super.tearDown()
     }
 
+    /// The fake logs its requests to `requestLog` unless `environment`
+    /// names another file.
     func makeApp(implemented: Bool = true, environment: [String: String] = [:]) -> AppModel {
         var env = environment
-        env["FAKE_CORE_REQUEST_LOG"] = requestLog.path
+        if env["FAKE_CORE_REQUEST_LOG"] == nil {
+            env["FAKE_CORE_REQUEST_LOG"] = requestLog.path
+        }
         if implemented {
             env["FAKE_CORE_IMPLEMENTED"] = "1"
         }
         return AppModel(client: CoreClient(executable: CoreClientTests.fakeCore, arguments: [], environment: env))
     }
 
-    func requests() throws -> [String] {
-        guard FileManager.default.fileExists(atPath: requestLog.path) else { return [] }
-        return try String(contentsOf: requestLog, encoding: .utf8).split(separator: "\n").map(String.init)
+    func requests(in log: URL? = nil) throws -> [String] {
+        let log = log ?? requestLog
+        guard FileManager.default.fileExists(atPath: log.path) else { return [] }
+        return try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map(String.init)
     }
 
-    func requests(for method: String) throws -> [String] {
-        try requests().filter { $0.contains("\"method\":\"\(method)\"") }
+    func requests(for method: String, in log: URL? = nil) throws -> [String] {
+        try requests(in: log).filter { $0.contains("\"method\":\"\(method)\"") }
+    }
+
+    /// The first request for `method`; a failure, not a crash, when none was sent.
+    func request(for method: String, file: StaticString = #filePath, line: UInt = #line) throws -> String {
+        try XCTUnwrap(requests(for: method).first, "no `\(method)` request was sent", file: file, line: line)
     }
 
     // MARK: - NotImplemented maps to unavailable
@@ -87,11 +114,11 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(apps.map(\.appid), [220, 440])
         XCTAssertEqual(apps.map(\.installState), [.installed, .notInstalled])
         XCTAssertEqual(apps[0].drm, .steam)
-        XCTAssertTrue(try requests(for: "steam.library")[0].contains("\"params\":{\"refresh\":true}"))
+        XCTAssertTrue(try request(for: "steam.library").contains("\"params\":{\"refresh\":true}"))
 
         await library.install(440)
         XCTAssertNil(library.installs[440], "a finished install hands the row back to the library's install state")
-        XCTAssertTrue(try requests(for: "app.install")[0].contains("\"params\":{\"appid\":440,\"update\":false,\"verify\":false}"))
+        XCTAssertTrue(try request(for: "app.install").contains("\"params\":{\"appid\":440,\"update\":false,\"verify\":false}"))
         XCTAssertEqual(try requests(for: "steam.library").count, 3, "a refresh is a job and a read; a finished install reloads the library")
         await app.shutdown()
     }
@@ -111,7 +138,7 @@ final class ViewModelTests: XCTestCase {
 
         await detail.set(.graphicsBackend, to: .string("wined3d"))
         XCTAssertEqual(detail.lastSave, .ready(.object([:])))
-        XCTAssertTrue(try requests(for: "config.set")[0].contains("\"params\":{\"appid\":220,\"key\":\"graphics_backend\",\"value\":\"wined3d\"}"))
+        XCTAssertTrue(try request(for: "config.set").contains("\"params\":{\"appid\":220,\"key\":\"graphics_backend\",\"value\":\"wined3d\"}"))
         XCTAssertEqual(try requests(for: "config.get").count, 2, "a save reloads the config")
         await app.shutdown()
     }
@@ -124,14 +151,14 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(detail.importState.value?.applied, false)
         var imports = try requests(for: "config.import")
         XCTAssertEqual(imports.count, 1)
-        XCTAssertTrue(imports[0].contains("\"accept_launch_overrides\":false"))
+        XCTAssertTrue(try XCTUnwrap(imports.first).contains("\"accept_launch_overrides\":false"))
 
         await detail.confirmLaunchOverrides()
         XCTAssertTrue(detail.pendingConfirmation.isEmpty)
         XCTAssertEqual(detail.importState.value?.applied, true)
         imports = try requests(for: "config.import")
         XCTAssertEqual(imports.count, 2)
-        XCTAssertTrue(imports[1].contains("\"accept_launch_overrides\":true"))
+        XCTAssertTrue(try XCTUnwrap(imports.dropFirst().first).contains("\"accept_launch_overrides\":true"))
         XCTAssertEqual(try requests(for: "config.get").count, 1, "an applied import reloads the config")
 
         // Declining sends nothing and keeps the preview on screen.
@@ -161,7 +188,7 @@ final class ViewModelTests: XCTestCase {
         await detail.confirmLaunchOverrides()
         let imports = try requests(for: "config.import")
         XCTAssertEqual(imports.count, 3)
-        XCTAssertTrue(imports[2].contains("\"accept_launch_overrides\":true,\"appid\":220,\"path\":\"/tmp/B.preset.json\""), imports[2])
+        XCTAssertTrue(try XCTUnwrap(imports.dropFirst(2).first).contains("\"accept_launch_overrides\":true,\"appid\":220,\"path\":\"/tmp/B.preset.json\""), "\(imports)")
         await app.shutdown()
     }
 
@@ -207,7 +234,7 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(detail.importState.value?.applied, true)
         let imports = try requests(for: "config.import")
         XCTAssertEqual(imports.count, 2)
-        XCTAssertTrue(imports[1].contains("\"accept_launch_overrides\":true"), imports[1])
+        XCTAssertTrue(try XCTUnwrap(imports.dropFirst().first).contains("\"accept_launch_overrides\":true"), "\(imports)")
         XCTAssertEqual(try requests(for: "config.get").count, 1, "the applied import reloads the config")
 
         // The other order: a dismissal after the confirm took the plan is a no-op.
@@ -226,7 +253,7 @@ final class ViewModelTests: XCTestCase {
         let detail = GameDetailViewModel(app: app, appid: 220)
         await detail.run()
         XCTAssertEqual(detail.runState.value, AppRunResult(id: 41, logPath: log.path, jobId: 12))
-        XCTAssertTrue(try requests(for: "app.run")[0].contains("\"params\":{\"appid\":220,\"probe_direct\":false}"))
+        XCTAssertTrue(try request(for: "app.run").contains("\"params\":{\"appid\":220,\"probe_direct\":false}"))
         await app.shutdown()
 
         // Today's core: the flow reads as unavailable, not as a failure.
@@ -241,19 +268,515 @@ final class ViewModelTests: XCTestCase {
     }
 
     func testASecondRunWhileOneIsInFlightSendsNothing() async throws {
-        let app = makeApp(environment: ["FAKE_CORE_RUN_DELAY_MS": "300"])
-        let detail = GameDetailViewModel(app: app, appid: 220)
+        let app = makeApp(environment: ["FAKE_CORE_RUN_DELAY_MS": "300", "FAKE_CORE_RUN_OUTCOME": "exits"])
+        let detail = app.detail(for: 220)
+        XCTAssertTrue(detail === app.detail(for: 220), "one detail model per title")
         let first = Task { await detail.run() }
         try await waitUntil { detail.runState == .loading }
-        await detail.run()
+        await app.detail(for: 220).run()
         XCTAssertEqual(detail.runState, .loading, "the second Run returns at once and leaves the first in flight")
         await first.value
         XCTAssertNotNil(detail.runState.value)
         XCTAssertEqual(try requests(for: "app.run").count, 1)
 
-        // Once the first returned, Run works again.
+        // While the session is open, Run sends nothing; once it closed, Run works again.
+        try await waitUntil { detail.session.value != nil }
+        if detail.isRunning {
+            await detail.run()
+            XCTAssertEqual(try requests(for: "app.run").count, 1)
+        }
+        try await waitUntil { detail.session.value?.finished == true }
+        XCTAssertFalse(detail.isRunning)
         await detail.run()
         XCTAssertEqual(try requests(for: "app.run").count, 2)
+        await app.shutdown()
+    }
+
+    /// No view cancels the task around `run()`; if one did, the request
+    /// lives on the follow task, so the caller returns at the core's answer
+    /// and the run goes on to its end.
+    func testACancelledRunLeavesRunInATerminalState() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RUN_DELAY_MS": "200", "FAKE_CORE_RUN_OUTCOME": "exits"])
+        let detail = app.detail(for: 220)
+        let run = Task { await detail.run() }
+        try await waitUntil { detail.runState == .loading }
+        run.cancel()
+        await run.value
+        XCTAssertEqual(detail.runState.value?.id, 41, "the caller returns at the answer, not at the cancellation: \(detail.runState)")
+        try await waitUntil { detail.session.value?.finished == true }
+        XCTAssertFalse(detail.isRunning)
+        XCTAssertNil(detail.openSession, "the exited row is not an open one")
+        await detail.run()
+        XCTAssertEqual(try requests(for: "app.run").count, 2, "Run works again after the first run ended")
+        await app.shutdown()
+    }
+
+    // MARK: - Cancel
+
+    func testCancelEndsTheSessionThisShellStarted() async throws {
+        let app = makeApp()
+        let detail = app.detail(for: 220)
+        await detail.run()
+        XCTAssertEqual(detail.runState.value?.id, 41)
+        try await waitUntil { detail.session.value?.phase == "running" }
+        XCTAssertTrue(detail.isRunning)
+        XCTAssertTrue(detail.canCancel)
+        XCTAssertNil(detail.openSession, "the shell's own run is not another process's open row")
+
+        await detail.cancel()
+        XCTAssertEqual(detail.cancelState.value?.finished, true)
+        XCTAssertEqual(detail.cancelState.value?.phase, "cancelled")
+        XCTAssertTrue(try request(for: "app.cancel").contains("\"params\":{\"appid\":220,\"kill_prefix\":false}"))
+        try await waitUntil { detail.session.value?.finished == true }
+        XCTAssertFalse(detail.isRunning)
+        XCTAssertEqual(detail.session.value?.phase, "cancelled")
+        XCTAssertNil(detail.openSession, "the row the cancel closed is not offered again")
+        XCTAssertFalse(detail.canCancel)
+        await app.shutdown()
+    }
+
+    func testASecondStopWhileTheCancelJobRunsSendsNothing() async throws {
+        let app = makeApp()
+        let detail = app.detail(for: 220)
+        await detail.run()
+        try await waitUntil { detail.session.value?.phase == "running" }
+        let first = Task { await detail.cancel() }
+        try await waitUntil { detail.cancelState.value.map { !$0.finished } ?? false }
+        XCTAssertFalse(detail.canCancel, "Stop is not offered while its own job runs: \(detail.cancelState)")
+        await detail.cancel()
+        XCTAssertEqual(try requests(for: "app.cancel").count, 1, "the second press sends nothing")
+        await first.value
+        XCTAssertEqual(detail.cancelState.value?.finished, true)
+        await app.shutdown()
+    }
+
+    func testAListReadDuringASlowStartDoesNotOfferTheOwnRow() async throws {
+        // The core inserts the row before it answers `app.run`; the fake
+        // does the same.
+        let app = makeApp(environment: ["FAKE_CORE_RUN_DELAY_MS": "300"])
+        let detail = app.detail(for: 220)
+        let run = Task { await detail.run() }
+        try await waitUntil { detail.runState == .loading }
+        await detail.loadSessions()
+        XCTAssertNil(detail.openSession, "the row of the start in flight is the shell's own")
+        await run.value
+        XCTAssertEqual(detail.runState.value?.id, 41)
+        try await waitUntil { detail.isRunning }
+        await detail.loadSessions()
+        XCTAssertNil(detail.openSession)
+        XCTAssertTrue(detail.canCancel)
+        await detail.cancel()
+        try await waitUntil { detail.session.value?.finished == true }
+        XCTAssertNil(detail.openSession)
+        await app.shutdown()
+    }
+
+    func testCancelOffersAnOpenRowFromSessionListAndShowsARefusal() async throws {
+        // The fake lists an open session (id 1, running) for 220.
+        let app = makeApp()
+        let detail = app.detail(for: 220)
+        await detail.load()
+        XCTAssertEqual(detail.openSession?.id, 1)
+        XCTAssertFalse(detail.isRunning)
+        XCTAssertTrue(detail.canCancel)
+        await detail.cancel(killPrefix: true)
+        XCTAssertEqual(detail.cancelState.value?.finished, true)
+        XCTAssertTrue(try request(for: "app.cancel").contains("\"kill_prefix\":true"))
+        XCTAssertEqual(try requests(for: "session.list").count, 2, "a finished cancel reads the sessions again")
+        XCTAssertNil(detail.openSession, "the cancel closed the row")
+        XCTAssertFalse(detail.canCancel)
+        await app.shutdown()
+
+        let refusing = makeApp(environment: ["FAKE_CORE_CANCEL_REFUSED": "1"])
+        let other = refusing.detail(for: 220)
+        await other.cancel()
+        XCTAssertEqual(other.cancelState, .failed(.rpc(RpcError(code: RpcErrorCode.notRunning.rawValue, message: "app 220 has no open session"))))
+        await refusing.shutdown()
+    }
+
+    /// `SessionRow` (`sessions.rs`): `starting` at the claim, `running` once
+    /// the marker appears, `cancel_requested` from the cancel, and the end
+    /// state with `ended_at`; the fake's row moves the same way, so a shell
+    /// that reads `state` or `cancel_requested` learns what the core says.
+    func testTheSessionRowFollowsRunCancelAndExit() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RUN_DELAY_MS": "300"])
+        let logs = LogsViewModel(app: app)
+        func row() async throws -> SessionEntry {
+            await logs.load(appid: 220)
+            return try XCTUnwrap(logs.sessions.value?.sessions.first)
+        }
+        var seen = try await row()
+        XCTAssertEqual(seen.id, 1)
+        XCTAssertEqual(seen.state, .running)
+        XCTAssertFalse(seen.cancelRequested)
+
+        let detail = app.detail(for: 220)
+        let run = Task { await detail.run() }
+        try await waitUntil { detail.runState == .loading }
+        seen = try await row()
+        XCTAssertEqual(seen.id, 41)
+        XCTAssertEqual(seen.state, .starting, "claimed, not yet seen running")
+        XCTAssertNil(seen.endedAt)
+        XCTAssertFalse(seen.cancelRequested)
+        await run.value
+        try await waitUntil { detail.session.value?.phase == "running" }
+        seen = try await row()
+        XCTAssertEqual(seen.state, .running)
+        XCTAssertNil(seen.endedAt)
+
+        await detail.cancel()
+        try await waitUntil { detail.session.value?.finished == true }
+        seen = try await row()
+        XCTAssertEqual(seen.id, 41)
+        XCTAssertEqual(seen.state, .cancelled)
+        XCTAssertTrue(seen.cancelRequested, "the cancel flagged the row before its job closed it")
+        XCTAssertNotNil(seen.endedAt)
+        XCTAssertEqual(seen.exitCode, 143, "the owner was alive, so it closed the row with the status it reaped from the title the cancel ended, SIGTERM (`PlannedRun::close`); only a dead owner's row has none")
+        await app.shutdown()
+
+        let exiting = makeApp(environment: ["FAKE_CORE_RUN_OUTCOME": "exits"])
+        let other = exiting.detail(for: 220)
+        await other.run()
+        try await waitUntil { other.session.value?.finished == true }
+        let more = LogsViewModel(app: exiting)
+        await more.load(appid: 220)
+        let ended = try XCTUnwrap(more.sessions.value?.sessions.first)
+        XCTAssertEqual(ended.id, 41)
+        XCTAssertEqual(ended.state, .exited)
+        XCTAssertEqual(ended.exitCode, 0)
+        XCTAssertFalse(ended.cancelRequested)
+        XCTAssertNotNil(ended.endedAt)
+        await exiting.shutdown()
+    }
+
+    /// The core's owner closes a row by its flag (`PlannedRun::close`): a
+    /// cancel asked for before the title exited ends the row `cancelled`,
+    /// and the owner still records the exit it reaped. The fake's cancel job
+    /// is held past the exit, so the run job is the one that closes the row.
+    func testACancelBeforeTheExitEndsTheRowCancelled() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RUN_OUTCOME": "exits", "FAKE_CORE_CANCEL_CLOSE_MS": "500"])
+        let detail = app.detail(for: 220)
+        await detail.run()
+        await detail.cancel()
+        try await waitUntil { detail.session.value?.finished == true }
+        XCTAssertEqual(detail.session.value?.phase, "cancelled", "job 12 reports the end state the flag picked")
+        XCTAssertEqual(detail.cancelState.value?.finished, true)
+        let logs = LogsViewModel(app: app)
+        await logs.load(appid: 220)
+        let row = try XCTUnwrap(logs.sessions.value?.sessions.first)
+        XCTAssertEqual(row.id, 41)
+        XCTAssertEqual(row.state, .cancelled)
+        XCTAssertTrue(row.cancelRequested)
+        XCTAssertEqual(row.exitCode, 0, "the owner reaped the title, so the row carries its status whatever the state (`PlannedRun::close`)")
+        XCTAssertNotNil(row.endedAt)
+        await app.shutdown()
+    }
+
+    func testExportSendsThePathAndReportsWhereTheCoreWrote() async throws {
+        let app = makeApp()
+        let detail = app.detail(for: 220)
+        await detail.export(to: "/tmp/out/220.preset.json")
+        XCTAssertEqual(detail.exportState.value, ConfigExportResult(path: "/tmp/out/220.preset.json"))
+        XCTAssertTrue(try XCTUnwrap(requests(for: "config.export").first).contains("\"params\":{\"appid\":220,\"path\":\"/tmp/out/220.preset.json\"}"))
+        await app.shutdown()
+    }
+
+    // MARK: - Steam client runtime
+
+    func testRuntimeStatusAndEachActionFollowsItsJob() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RUNTIME_STATE": "absent"])
+        let runtime = SteamClientRuntimeViewModel(app: app)
+        await runtime.load()
+        let status = try XCTUnwrap(runtime.status.value)
+        XCTAssertEqual(status.state, .absent)
+        XCTAssertNil(status.buildId)
+        XCTAssertEqual(status.snapshots, 0)
+        XCTAssertEqual(status.detail, "no steam-client prefix")
+
+        let expected: [(SteamClientRuntimeViewModel.Action, String, String)] = [
+            (.install, "runtime.steam.install", "\"params\":{}"),
+            (.update, "runtime.steam.update", "\"params\":{}"),
+            (.repair, "runtime.steam.repair", "\"params\":{\"reinstall\":false}"),
+            (.reinstall, "runtime.steam.repair", "\"params\":{\"reinstall\":true}"),
+            (.stop, "runtime.steam.stop", "\"params\":{}"),
+        ]
+        for (index, (action, method, params)) in expected.enumerated() {
+            await runtime.perform(action)
+            XCTAssertEqual(runtime.action, action)
+            XCTAssertEqual(runtime.job.value?.finished, true, "\(action)")
+            XCTAssertEqual(runtime.progress.map(\.phase), ["prefix", "start", "status"], "\(action)")
+            let start = try XCTUnwrap(runtime.progress.first { $0.phase == "start" }, "\(action)")
+            XCTAssertTrue(start.message.contains("microphone"), start.message)
+            let sent = try requests(for: method)
+            XCTAssertTrue(try XCTUnwrap(sent.last).contains(params), "\(action): \(sent)")
+            XCTAssertEqual(try requests(for: "runtime.steam.status").count, index + 2, "\(action) reads the status again when it ends")
+        }
+        await app.shutdown()
+    }
+
+    func testARuntimeJobThatFailsKeepsItsStartLineAndTheCoreMessage() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RUNTIME_OUTCOME": "broken"])
+        let runtime = SteamClientRuntimeViewModel(app: app)
+        let busy = Task { await runtime.perform(.install) }
+        try await waitUntil { runtime.job.value != nil }
+        await runtime.perform(.update)
+        XCTAssertTrue(try requests(for: "runtime.steam.update").isEmpty, "one runtime job at a time")
+        await busy.value
+        XCTAssertEqual(
+            runtime.job,
+            .failed(.rpc(RpcError(code: RpcErrorCode.clientRuntimeBroken.rawValue, message: "the Steam client never reached the login window; run `applejack runtime steam repair`"))))
+        XCTAssertEqual(runtime.progress.map(\.phase), ["prefix", "start"])
+        XCTAssertTrue(try XCTUnwrap(runtime.progress.last).message.contains("Don't Allow is fine"))
+        XCTAssertEqual(try requests(for: "runtime.steam.status").count, 1)
+        await app.shutdown()
+    }
+
+    func testRuntimeButtonsFollowTheStatus() async throws {
+        typealias Action = SteamClientRuntimeViewModel.Action
+        let all: [Action] = [.install, .update, .repair, .reinstall, .stop]
+        // Stop follows `running`, not the state: a client left running by a
+        // signed-in account is `ready` with `running: true`.
+        let expected: [(String, String?, [Action])] = [
+            ("absent", nil, [.install]),
+            ("ready", nil, [.install, .update, .repair, .reinstall]),
+            ("ready", "1", all),
+            ("needs_login", nil, all),
+            ("needs_login", "0", [.install, .update, .repair, .reinstall]),
+            ("broken", nil, [.install, .update, .repair, .reinstall]),
+        ]
+        for (state, running, enabled) in expected {
+            var environment = ["FAKE_CORE_RUNTIME_STATE": state]
+            if let running { environment["FAKE_CORE_RUNTIME_RUNNING"] = running }
+            let app = makeApp(environment: environment)
+            let runtime = SteamClientRuntimeViewModel(app: app)
+            XCTAssertEqual(all.filter { runtime.canPerform($0) }, [.install], "before the status is read only Install is offered (\(state))")
+            await runtime.load()
+            XCTAssertEqual(all.filter { runtime.canPerform($0) }, enabled, state)
+            let busy = Task { await runtime.perform(.install) }
+            try await waitUntil { runtime.job.value != nil }
+            XCTAssertTrue(all.filter { runtime.canPerform($0) }.isEmpty, "nothing while a job runs (\(state))")
+            await busy.value
+            await app.shutdown()
+        }
+    }
+
+    func testACancelledJobStartLeavesNothingLoading() async throws {
+        // `AppModel.runJob` reports nothing on a cancellation, so the models
+        // fall back to idle themselves; a stuck `.loading` would disable
+        // every button for good.
+        let app = makeApp(environment: ["FAKE_CORE_JOB_DELAY_MS": "400"])
+        let runtime = SteamClientRuntimeViewModel(app: app)
+        let install = Task { await runtime.perform(.install) }
+        try await waitUntil { runtime.job == .loading }
+        install.cancel()
+        await install.value
+        XCTAssertEqual(runtime.job, .idle)
+        XCTAssertFalse(runtime.isBusy)
+
+        let snapshots = PrefixSnapshotsViewModel(app: app, prefix: "steam-client")
+        let reset = Task { await snapshots.resetPrefix(keepUserData: true) }
+        try await waitUntil { snapshots.reset == .loading }
+        reset.cancel()
+        await reset.value
+        XCTAssertEqual(snapshots.reset, .idle)
+        XCTAssertFalse(snapshots.isBusy)
+        await app.shutdown()
+    }
+
+    // MARK: - Snapshots
+
+    func testSnapshotRestoreAndResetOnThePrefix() async throws {
+        let app = makeApp()
+        let snapshots = PrefixSnapshotsViewModel(app: app, prefix: "steam-client")
+        await snapshots.takeSnapshot()
+        XCTAssertEqual(snapshots.snapshot.value?.timestamp, "20261103T120001Z")
+        XCTAssertEqual(snapshots.knownTimestamps, ["20261103T120001Z"])
+        XCTAssertTrue(try request(for: "prefix.snapshot").contains("\"params\":{\"prefix\":\"steam-client\"}"))
+
+        snapshots.restoreTimestamp = " 20261103T120001Z "
+        await snapshots.restoreSelected()
+        XCTAssertEqual(snapshots.restore.value?.timestamp, "20261103T130000Z", "the answer is the safety snapshot of the replaced state")
+        XCTAssertTrue(try request(for: "prefix.restore").contains("\"params\":{\"prefix\":\"steam-client\",\"timestamp\":\"20261103T120001Z\"}"))
+        XCTAssertEqual(snapshots.knownTimestamps, ["20261103T130000Z", "20261103T120001Z"])
+        snapshots.restoreTimestamp = ""
+        await snapshots.restoreSelected()
+        XCTAssertEqual(try requests(for: "prefix.restore").count, 1, "an empty timestamp sends nothing")
+        snapshots.restoreTimestamp = "garbage"
+        await snapshots.restoreSelected()
+        guard case .failed(.rpc(let refused)) = snapshots.restore else {
+            return XCTFail("a name the core never made is refused, got \(snapshots.restore)")
+        }
+        XCTAssertEqual(refused.message, "snapshot steam-client/garbage does not exist")
+        XCTAssertEqual(snapshots.knownTimestamps, ["20261103T130000Z", "20261103T120001Z"], "a refusal adds nothing")
+
+        await snapshots.resetPrefix(keepUserData: false)
+        XCTAssertEqual(snapshots.reset.value?.finished, true)
+        XCTAssertTrue(try request(for: "prefix.reset").contains("\"params\":{\"keep_user_data\":false,\"prefix\":\"steam-client\"}"))
+        XCTAssertEqual(snapshots.knownTimestamps.first, "20261103T140000Z", "the safety snapshot the reset reported")
+        XCTAssertNil(snapshots.resetFailureSnapshot)
+        await app.shutdown()
+    }
+
+    func testAFailedResetNamesTheSnapshotToRestore() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_RESET_OUTCOME": "failed"])
+        let detail = app.detail(for: 220)
+        XCTAssertEqual(detail.snapshots.prefix, "220")
+        await detail.snapshots.resetPrefix(keepUserData: true)
+        guard case .failed(.rpc(let error)) = detail.snapshots.reset else {
+            return XCTFail("expected the reset to fail, got \(detail.snapshots.reset)")
+        }
+        // `ResetFailed` carries its cause's code and text: a wineboot that
+        // fails inside the rebuild is `WineCommandFailed`, Internal (1003).
+        XCTAssertEqual(error.code, RpcErrorCode.internal.rawValue)
+        XCTAssertTrue(error.message.hasPrefix("resetting prefix 220 failed; `applejack prefix restore 220 20261103T140000Z` brings it back: `"), error.message)
+        XCTAssertTrue(error.message.hasSuffix("wineboot --init` failed (exit status: 1); log at `/data/logs/prefixes/220/wineboot.log`"), error.message)
+        XCTAssertEqual(detail.snapshots.resetFailureSnapshot, "20261103T140000Z")
+        XCTAssertEqual(detail.snapshots.knownTimestamps, ["20261103T140000Z"])
+        await detail.snapshots.restore(timestamp: "20261103T140000Z")
+        XCTAssertTrue(try request(for: "prefix.restore").contains("\"prefix\":\"220\",\"timestamp\":\"20261103T140000Z\""))
+        await app.shutdown()
+    }
+
+    /// The core names a second snapshot of one prefix in the same second
+    /// `<timestamp>-001` (`snapshot.rs`, `publish`); the shell must offer
+    /// that name, not the one three characters shorter.
+    func testASuffixedSnapshotNameIsReadWhole() async throws {
+        let failing = makeApp(environment: ["FAKE_CORE_RESET_OUTCOME": "failed", "FAKE_CORE_RESET_SNAPSHOT": "20261103T140000Z-001"])
+        let snapshots = PrefixSnapshotsViewModel(app: failing, prefix: "220")
+        await snapshots.resetPrefix(keepUserData: true)
+        XCTAssertEqual(snapshots.resetFailureSnapshot, "20261103T140000Z-001")
+        XCTAssertEqual(snapshots.knownTimestamps, ["20261103T140000Z-001"])
+        await snapshots.restore(timestamp: try XCTUnwrap(snapshots.resetFailureSnapshot))
+        XCTAssertTrue(try request(for: "prefix.restore").contains("\"timestamp\":\"20261103T140000Z-001\""))
+        await failing.shutdown()
+
+        let app = makeApp(environment: ["FAKE_CORE_RESET_SNAPSHOT": "20261103T140000Z-002"])
+        let reported = PrefixSnapshotsViewModel(app: app, prefix: "220")
+        await reported.resetPrefix(keepUserData: false)
+        XCTAssertEqual(reported.reset.value?.finished, true)
+        XCTAssertEqual(reported.knownTimestamps, ["20261103T140000Z-002"], "the progress line's safety snapshot, whole")
+        await app.shutdown()
+    }
+
+    // MARK: - QR polling
+
+    func testPollingStopsWhenTheViewGoesAwayAndOnAnError() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_POLLS": "100"])
+        let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(30))
+        await steam.startQrLogin()
+        try await waitUntil { (try? self.requests(for: "steam.login.complete").count) ?? 0 >= 2 }
+        steam.stopPolling()
+        XCTAssertFalse(steam.isPolling)
+        await fence(app)
+        let sent = try requests(for: "steam.login.complete").count
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(try requests(for: "steam.login.complete").count, sent, "a stopped loop sends nothing more")
+        guard case .ready(let pending) = steam.login, !pending.step.isDone else {
+            return XCTFail("the login stays for the view that comes back: \(steam.login)")
+        }
+        steam.startPolling()
+        try await waitUntil { (try? self.requests(for: "steam.login.complete").count) ?? 0 > sent }
+        steam.stopPolling()
+        await steam.waitForLogin()
+        await app.shutdown()
+
+        let failing = makeApp(environment: ["FAKE_CORE_LOGIN_FAIL": "1", "FAKE_CORE_REQUEST_LOG": secondRequestLog.path])
+        let other = SteamAccountViewModel(app: failing, pollDelay: .milliseconds(30))
+        await other.startQrLogin()
+        await other.waitForLogin()
+        XCTAssertEqual(other.login, .failed(.rpc(RpcError(code: RpcErrorCode.steamLoginFailed.rawValue, message: "the login is over; begin again"))))
+        XCTAssertFalse(other.isPolling)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(try requests(for: "steam.login.complete", in: secondRequestLog).count, 1, "an error ends the loop")
+        await failing.shutdown()
+    }
+
+    func testGuardCodeIsWantedUnlessTheFactorIsDeviceConfirmation() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_GUARD": "device_confirmation", "FAKE_CORE_LOGIN_POLLS": "100"])
+        let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(30))
+        await steam.startQrLogin()
+        XCTAssertFalse(steam.guardCodeWanted)
+        XCTAssertTrue(steam.isPolling, "approval in the mobile app ends the login, so the poll goes on")
+        steam.stopPolling()
+        await steam.waitForLogin()
+        await app.shutdown()
+
+        let typed = makeApp(environment: ["FAKE_CORE_LOGIN_GUARD": "email_code", "FAKE_CORE_LOGIN_POLLS": "100", "FAKE_CORE_REQUEST_LOG": secondRequestLog.path])
+        let other = SteamAccountViewModel(app: typed, pollDelay: .seconds(5))
+        await other.startQrLogin()
+        XCTAssertTrue(other.guardCodeWanted)
+        // The loop's first poll goes out without a code; the submit does not wait 5 s for its tick.
+        try await waitUntil { (try? self.requests(for: "steam.login.complete", in: self.secondRequestLog).contains { $0.contains("\"params\":{\"session_id\":\"login-session-fake\"}") }) ?? false }
+        other.guardCode = "ABCDE"
+        other.submitGuardCode()
+        try await waitUntil({ (try? self.requests(for: "steam.login.complete", in: self.secondRequestLog).contains { $0.contains("ABCDE") }) ?? false }, within: .seconds(2))
+        let sent = try requests(for: "steam.login.complete", in: secondRequestLog)
+        XCTAssertTrue(sent.contains { $0.contains("\"steam_guard_code\":\"ABCDE\"") }, "\(sent)")
+        try await waitUntil { other.guardCode.isEmpty }
+        other.stopPolling()
+        await other.waitForLogin()
+        await typed.shutdown()
+    }
+
+    func testAWrongGuardCodeKeepsTheLoginOpen() async throws {
+        // `docs/rpc-protocol.md`: a wrong code answers SteamGuardRejected and
+        // the login stays open; the fake rejects the first code it sees.
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_GUARD": "device_code", "FAKE_CORE_LOGIN_POLLS": "100", "FAKE_CORE_LOGIN_REJECT_ONCE": "1"])
+        let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(30))
+        await steam.startQrLogin()
+        XCTAssertTrue(steam.guardCodeWanted)
+        XCTAssertNil(steam.guardRejection)
+        steam.guardCode = "WRONG"
+        steam.submitGuardCode()
+        try await waitUntil { steam.guardRejection != nil }
+        XCTAssertEqual(steam.guardRejection, "Steam Guard code rejected", "AuthError::InvalidGuardCode's text, as the core sends it")
+        guard case .ready(let session) = steam.login, case .guardRequired(let factor) = session.step else {
+            return XCTFail("the login stays open for another code, got \(steam.login)")
+        }
+        XCTAssertEqual(factor, "device_code")
+        XCTAssertTrue(steam.guardCodeWanted, "the code field stays")
+        XCTAssertTrue(steam.isPolling, "the poll goes on")
+        XCTAssertTrue(steam.guardCode.isEmpty, "the rejected code is not sent again")
+        let before = try requests(for: "steam.login.complete").count
+        try await waitUntil { (try? self.requests(for: "steam.login.complete").count) ?? 0 > before }
+        XCTAssertEqual(try requests(for: "steam.login.complete").filter { $0.contains("WRONG") }.count, 1)
+
+        steam.guardCode = "RIGHT"
+        steam.submitGuardCode()
+        await steam.waitForLogin()
+        XCTAssertEqual(steam.signedInAccount, "fake-account")
+        XCTAssertNil(steam.guardRejection, "a code that went through clears the message")
+        XCTAssertFalse(steam.isPolling)
+        await app.shutdown()
+    }
+
+    func testGuardPromptsNameTheFactor() {
+        XCTAssertEqual(SteamAccountViewModel.guardPrompt(factor: "email_code"), "Steam Guard: type the code from your email.")
+        XCTAssertTrue(SteamAccountViewModel.guardPrompt(factor: "device_code").contains("or approve the sign-in there"))
+        XCTAssertFalse(SteamAccountViewModel.guardPrompt(factor: "email_code").contains("approve"), "only the mobile app can approve instead of a code")
+        XCTAssertEqual(SteamAccountViewModel.guardPrompt(factor: "device_confirmation"), "Steam Guard: approve the sign-in in the Steam mobile app.")
+        XCTAssertTrue(SteamAccountViewModel.guardPrompt(factor: "new_factor").contains("new_factor"))
+    }
+
+    func testADroppedAccountModelStopsPolling() async throws {
+        // Round-three review S3: the loop used to hold the model through
+        // its sleep, so a dropped model polled on until `done`.
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_POLLS": "100"])
+        weak var weakModel: SteamAccountViewModel?
+        do {
+            let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(30))
+            weakModel = steam
+            await steam.startQrLogin()
+            try await waitUntil { (try? self.requests(for: "steam.login.complete").count) ?? 0 >= 2 }
+        }
+        try await waitUntil { weakModel == nil }
+        // The model can only die in the loop's sleep (`tick` holds it), so the
+        // last poll is answered and logged; the fence guards the count against
+        // a fake that logs late, not against a poll in flight.
+        await fence(app)
+        let sent = try requests(for: "steam.login.complete").count
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(try requests(for: "steam.login.complete").count, sent, "a dropped model sends nothing more")
         await app.shutdown()
     }
 
@@ -287,8 +810,8 @@ final class ViewModelTests: XCTestCase {
     }
 
     func testCoreDeathDuringAJobFailsTheFlowAndShowsTheBanner() async throws {
-        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
-        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let pidFile = makePidFile()
+        defer { CoreClientTests.removePidFile(pidFile) }
         let app = makeApp(environment: ["FAKE_CORE_JOB_OUTCOME": "never", "FAKE_CORE_PID_FILE": pidFile.path])
         await app.start()
         let engines = EnginesViewModel(app: app)
@@ -309,7 +832,7 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(engines.engines.value?.engines.map(\.active), [true, false])
         await engines.use("rosetta-wine", version: "10.0.0")
         XCTAssertEqual(engines.use, .ready(.object([:])))
-        XCTAssertTrue(try requests(for: "engine.use")[0].contains("\"params\":{\"engine_id\":\"rosetta-wine\",\"version\":\"10.0.0\"}"))
+        XCTAssertTrue(try request(for: "engine.use").contains("\"params\":{\"engine_id\":\"rosetta-wine\",\"version\":\"10.0.0\"}"))
         await engines.runDoctor()
         XCTAssertEqual(engines.doctor.value?.runnable, true)
         XCTAssertEqual(engines.doctor.value?.findings.map(\.severity), [.info, .warning])
@@ -325,13 +848,15 @@ final class ViewModelTests: XCTestCase {
         let steam = SteamAccountViewModel(app: app)
         await steam.startQrLogin()
         XCTAssertEqual(steam.qrPayload, "https://s.team/q/1/fake-challenge")
-        XCTAssertTrue(try requests(for: "steam.login.start")[0].contains("\"params\":{\"mode\":{\"kind\":\"qr\"}}"))
+        XCTAssertTrue(try request(for: "steam.login.start").contains("\"params\":{\"mode\":{\"kind\":\"qr\"}}"))
         let image = try XCTUnwrap(QRCode.cgImage(for: try XCTUnwrap(steam.qrPayload)))
         XCTAssertGreaterThan(image.width, 0)
 
-        await steam.complete()
+        XCTAssertTrue(steam.isPolling, "polling starts with the challenge, not with a button")
+        await steam.waitForLogin()
         XCTAssertEqual(steam.signedInAccount, "fake-account")
-        XCTAssertTrue(try requests(for: "steam.login.complete")[0].contains("\"params\":{\"session_id\":\"login-session-fake\"}"), "no guard code means no member")
+        XCTAssertFalse(steam.isPolling)
+        XCTAssertTrue(try request(for: "steam.login.complete").contains("\"params\":{\"session_id\":\"login-session-fake\"}"), "no guard code means no member")
 
         await steam.signOut()
         XCTAssertEqual(steam.login, .idle)
@@ -342,50 +867,43 @@ final class ViewModelTests: XCTestCase {
     /// Red if the loop tests only for `.ready`: the tick after the sleep
     /// would send the old id for a login that has been replaced.
     func testANewLoginEndsThePollOfTheOldOne() async throws {
-        let app = makeApp(environment: ["FAKE_CORE_LOGIN_ROTATE": "1", "FAKE_CORE_LOGIN_POLLS": "100"])
-        let steam = SteamAccountViewModel(app: app)
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_ROTATE": "1", "FAKE_CORE_LOGIN_POLLS": "3"])
+        let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(20))
         await steam.startQrLogin()
-        let polling = Task { await steam.complete() }
         while try requests(for: "steam.login.complete").isEmpty {
             try await Task.sleep(for: .milliseconds(10))
         }
         await steam.startQrLogin()
-        await polling.value
+        await steam.waitForLogin()
 
         let sent = try requests()
         let restart = try XCTUnwrap(sent.lastIndex { $0.contains("\"method\":\"steam.login.start\"") })
         XCTAssertFalse(sent[restart...].contains { $0.contains("login-session-fake-1") }, "\(sent)")
         guard case .ready(let session) = steam.login else { return XCTFail("\(steam.login)") }
         XCTAssertEqual(session.sessionId, "login-session-fake-2")
-        XCTAssertNotNil(steam.qrPayload, "the new challenge stays up")
+        XCTAssertEqual(steam.signedInAccount, "fake-account")
         await app.shutdown()
     }
 
-    /// Red if `polling` is one flag: the old loop holds it through its sleep,
-    /// so Done on the new login returns with nothing sent, and the app polls
-    /// only after Done.
-    func testDoneOnANewLoginDuringTheOldLoopsSleepPolls() async throws {
+    /// Red if the new login waited for the old loop's sleep: the first poll
+    /// of the new session must go out at once.
+    func testANewLoginDuringTheOldLoopsSleepPollsAtOnce() async throws {
         let app = makeApp(environment: ["FAKE_CORE_LOGIN_ROTATE": "1", "FAKE_CORE_LOGIN_POLLS": "100"])
-        let steam = SteamAccountViewModel(app: app)
+        let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(1500))
         await steam.startQrLogin()
-        let old = Task { await steam.complete() }
         while try requests(for: "steam.login.complete").isEmpty {
             try await Task.sleep(for: .milliseconds(10))
         }
-        try await Task.sleep(for: .milliseconds(200))
         await steam.startQrLogin()
-        let new = Task { await steam.complete() }
-        let deadline = ContinuousClock.now + .milliseconds(1500)
+        let deadline = ContinuousClock.now + .milliseconds(500)
         while try !requests(for: "steam.login.complete").contains(where: { $0.contains("login-session-fake-2") }) {
             if ContinuousClock.now > deadline { break }
             try await Task.sleep(for: .milliseconds(10))
         }
         let sent = try requests(for: "steam.login.complete")
         XCTAssertTrue(sent.contains { $0.contains("login-session-fake-2") }, "\(sent)")
-        new.cancel()
-        old.cancel()
-        await new.value
-        await old.value
+        steam.stopPolling()
+        await steam.waitForLogin()
         await app.shutdown()
     }
 
@@ -393,9 +911,9 @@ final class ViewModelTests: XCTestCase {
         setenv("FAKE_CORE_LOGIN_POLLS", "1", 1)
         defer { unsetenv("FAKE_CORE_LOGIN_POLLS") }
         let app = makeApp()
-        let steam = SteamAccountViewModel(app: app)
+        let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(20))
         await steam.startQrLogin()
-        await steam.complete()
+        await steam.waitForLogin()
         XCTAssertEqual(steam.signedInAccount, "fake-account")
         XCTAssertEqual(try requests(for: "steam.login.complete").count, 2)
         await app.shutdown()
@@ -454,7 +972,7 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(model.importState, .ready(.object([:])))
         let imports = try requests(for: "engine.d3dmetal.import")
         XCTAssertEqual(imports.count, 1)
-        XCTAssertTrue(imports[0].contains("\"params\":{\"license_acknowledged\":true,\"path\":\"\(volume.path)\"}"), imports[0])
+        XCTAssertTrue(try XCTUnwrap(imports.first).contains("\"params\":{\"license_acknowledged\":true,\"path\":\"\(volume.path)\"}"), "\(imports)")
         XCTAssertEqual(model.licenseURL?.path, volume.appendingPathComponent("License.pdf").path)
         await app.shutdown()
     }
@@ -526,7 +1044,7 @@ final class ViewModelTests: XCTestCase {
         await logs.load(appid: 220)
         let session = try XCTUnwrap(logs.sessions.value?.sessions.first)
         XCTAssertEqual(session.logPath, log.path)
-        XCTAssertTrue(try requests(for: "session.list")[0].contains("\"params\":{\"appid\":220}"))
+        XCTAssertTrue(try request(for: "session.list").contains("\"params\":{\"appid\":220}"))
 
         // The file does not exist yet when the tail starts.
         logs.select(session)
@@ -712,7 +1230,13 @@ final class ViewModelTests: XCTestCase {
                 return XCTFail("\(knob): expected stopped, got \(app.coreStatus)")
             }
             switch (expectation, error) {
-            case ("malformedResponse", .malformedResponse), ("rpc", .rpc): break
+            case ("malformedResponse", .malformedResponse(let detail)):
+                // The banner names the binary and says what was wrong in one line.
+                XCTAssertTrue(detail.hasPrefix(CoreClientTests.fakeCore.path + ": "), detail)
+                XCTAssertFalse(detail.contains("DecodingError"), detail)
+                XCTAssertFalse(detail.contains("\n"), detail)
+                XCTAssertTrue(detail.contains("`protocol_version` is missing"), detail)
+            case ("rpc", .rpc): break
             default: XCTFail("\(knob): expected \(expectation), got \(error)")
             }
             await app.restart()
@@ -810,14 +1334,29 @@ final class ViewModelTests: XCTestCase {
     }
 
     func testAnIdleCoreExitReachesTheBannerThroughEvents() async throws {
-        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
-        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let pidFile = makePidFile()
+        defer { CoreClientTests.removePidFile(pidFile) }
         let app = makeApp(environment: ["FAKE_CORE_PID_FILE": pidFile.path])
         await app.start()
         let pid = try XCTUnwrap(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
         kill(pid, SIGKILL)
         try await waitUntil { app.coreStatus == .exited(9) }
         await app.shutdown()
+    }
+
+    /// Everything the shell wrote before this call is in the fake's log once
+    /// it answers: the fake reads its pipe in order and logs each line before
+    /// it acts on it. The log is the fake's view, behind the pipe, so a count
+    /// taken at the instant of a stop can miss the poll already written; a
+    /// count taken after the fence is exact, and a request the stop left
+    /// behind lands after it.
+    private func fence(_ app: AppModel, file: StaticString = #filePath, line: UInt = #line) async {
+        let answer = await app.run { try await $0.call("engine.list", params: EmptyParams()) as JSONValue }
+        XCTAssertNotNil(answer?.value, "the fence needs an answer from the fake, or it fenced nothing: \(String(describing: answer))", file: file, line: line)
+    }
+
+    private func makePidFile() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
     }
 
     private func waitUntil(_ condition: @MainActor () -> Bool, within limit: Duration = .seconds(5), file: StaticString = #filePath, line: UInt = #line) async throws {

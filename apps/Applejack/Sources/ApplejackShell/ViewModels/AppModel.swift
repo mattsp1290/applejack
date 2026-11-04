@@ -29,6 +29,10 @@ public final class AppModel {
     public let coreLocation: URL?
     public private(set) var coreStatus: CoreStatus
     private var exitObserver: Task<Void, Never>?
+    /// One detail model per title, for the app's lifetime: a detail view
+    /// rebuilt after a section switch finds its run and its session where it
+    /// left them, and two views of one title cannot each send `app.run`.
+    private var details: [UInt32: GameDetailViewModel] = [:]
 
     /// The observer holds `client` through `events()` until an event wakes
     /// it; a model dropped without `shutdown()` while the core idles would
@@ -78,15 +82,26 @@ public final class AppModel {
         await client?.shutdown()
     }
 
+    /// The detail model for `appid`, made on first use and kept.
+    public func detail(for appid: UInt32) -> GameDetailViewModel {
+        if let detail = details[appid] { return detail }
+        let detail = GameDetailViewModel(app: self, appid: appid)
+        details[appid] = detail
+        return detail
+    }
+
     private func greet(_ client: CoreClient) async {
         do {
             coreStatus = .running(try await client.hello())
         } catch is CancellationError {
         } catch let error as CoreClientError {
             switch error {
-            case .rpc, .malformedResponse:
+            case .malformedResponse(let detail):
                 // A `hello` the client could not read tore the core down;
-                // unlike a flow's rpc error, there is no core behind it.
+                // unlike a flow's rpc error, there is no core behind it. The
+                // banner names the binary, since that is what to fix.
+                coreStatus = .stopped(.malformedResponse("\(client.executable.path): the hello answer is not a handshake; \(detail)"))
+            case .rpc:
                 coreStatus = .stopped(error)
             default:
                 note(error)
@@ -131,24 +146,48 @@ public final class AppModel {
     public func runJob<Params: Encodable & Sendable>(
         _ method: String, params: Params, onChange: (FlowState<JobSnapshot>) -> Void
     ) async {
+        await runJob(
+            method, params: params, jobId: \JobStarted.jobId,
+            onStarted: { started in
+                // A `JobStarted` answer says nothing the first snapshot does
+                // not; its loading and failure states are the job's.
+                switch started {
+                case .ready: break
+                default: onChange(started.map { JobSnapshot(jobId: $0.jobId) })
+                }
+            },
+            onChange: onChange
+        )
+    }
+
+    /// `runJob` for a method whose result is more than `JobStarted`:
+    /// `onStarted` gets the answer (or the failure, in which case nothing
+    /// else is reported), then `onChange` follows the job `jobId` names.
+    /// Cancellation reports nothing, as `run` does.
+    public func runJob<Params: Encodable & Sendable, Result: Decodable & Equatable & Sendable>(
+        _ method: String, params: Params, jobId: @Sendable (Result) -> JobId,
+        onStarted: (FlowState<Result>) -> Void, onChange: (FlowState<JobSnapshot>) -> Void
+    ) async {
         guard let client else {
-            onChange(.failed(.launchFailed("no applejack-core binary")))
+            onStarted(.failed(.launchFailed("no applejack-core binary")))
             return
         }
-        onChange(.loading)
-        let handle: JobHandle
+        onStarted(.loading)
+        let result: Result
+        let events: AsyncThrowingStream<JobEvent, any Error>
         do {
-            handle = try await client.startJob(method, params: params)
+            (result, events) = try await client.startJob(method, params: params, jobId: jobId)
         } catch {
             if let error = error as? CoreClientError { note(error) }
-            if let outcome = FlowState<JobSnapshot>.outcome(of: error) { onChange(outcome) }
+            if let outcome = FlowState<Result>.outcome(of: error) { onStarted(outcome) }
             return
         }
         await noteHealthy(client)
-        var snapshot = JobSnapshot(jobId: handle.jobId)
+        onStarted(.ready(result))
+        var snapshot = JobSnapshot(jobId: jobId(result))
         onChange(.ready(snapshot))
         do {
-            for try await event in handle.events {
+            for try await event in events {
                 switch event {
                 case .progress(let progress):
                     snapshot.apply(progress)

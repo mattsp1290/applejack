@@ -52,4 +52,49 @@ final class CoreBinaryTests: XCTestCase {
         let restarts = await client.restarts
         XCTAssertEqual(restarts, 0)
     }
+
+    /// The real core on an empty data directory, with the network denied
+    /// (standing order 13: no harness reaches Steam): the client runtime
+    /// reads `absent` and there are no sessions. Nothing is installed.
+    func testCoreBinaryAnswersRuntimeStatusAndSessionsOffline() async throws {
+        let binary = try coreBinary()
+        let dataDir = FileManager.default.temporaryDirectory.appendingPathComponent("applejack-u16-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dataDir) }
+        let client = CoreClient(
+            executable: URL(fileURLWithPath: "/usr/bin/sandbox-exec"),
+            arguments: ["-p", "(version 1)(allow default)(deny network*)", binary, "serve", "--stdio"],
+            environment: ["APPLEJACK_DATA_DIR": dataDir.path]
+        )
+        let outcome = try await withTimeout(.seconds(20)) {
+            let hello = try await client.hello()
+            let status: ClientRuntimeStatus = try await client.call("runtime.steam.status", params: EmptyParams())
+            let sessions: SessionListResult = try await client.call("session.list", params: SessionListParams(appid: nil))
+            return (hello, status, sessions)
+        }
+        XCTAssertEqual(outcome.0.protocolVersion, 1)
+        XCTAssertEqual(outcome.1.state, .absent)
+        XCTAssertFalse(outcome.1.running)
+        XCTAssertNil(outcome.1.buildId)
+        XCTAssertEqual(outcome.1.snapshots, 0)
+        XCTAssertTrue(outcome.1.prefix.hasPrefix(dataDir.path) || outcome.1.prefix.hasPrefix("/private" + dataDir.path), outcome.1.prefix)
+        XCTAssertEqual(outcome.2.sessions, [])
+        await client.shutdown()
+        let contents = try FileManager.default.contentsOfDirectory(atPath: dataDir.path)
+        XCTAssertFalse(contents.contains("prefixes"), "a status read creates no prefix: \(contents)")
+    }
+
+    private struct TimedOut: Error {}
+
+    private func withTimeout<T: Sendable>(_ limit: Duration, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(for: limit)
+                throw TimedOut()
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
+    }
 }

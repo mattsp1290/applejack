@@ -26,11 +26,7 @@ public final class LogsViewModel {
 
     public func select(_ session: SessionEntry) {
         selected = session
-        if let path = session.logPath {
-            follow(path)
-        } else {
-            stop()
-        }
+        follow(session.logPath)
     }
 
     /// Follows `path` from its start; replaces any tail in progress.

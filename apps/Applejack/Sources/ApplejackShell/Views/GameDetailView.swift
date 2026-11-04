@@ -1,15 +1,17 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
 public struct GameDetailView: View {
     let models: ShellModels
-    @State private var model: GameDetailViewModel
+    let model: GameDetailViewModel
     @State private var choosingPreset = false
+    @State private var confirmingCancel = false
     @State private var isShown = false
 
     public init(models: ShellModels, appid: UInt32) {
         self.models = models
-        _model = State(initialValue: GameDetailViewModel(app: models.app, appid: appid))
+        model = models.app.detail(for: appid)
     }
 
     public var body: some View {
@@ -37,13 +39,29 @@ public struct GameDetailView: View {
             saveStatus
             importStatus
             runStatus
+            sessionStatus
+            exportStatus
+            PrefixSnapshotsView(model: model.snapshots)
         }
         .padding()
         .navigationTitle("App \(model.appid)")
         .toolbar {
             Button("Run") { Task { await runAndFollowLog() } }
-                .disabled(model.runState == .loading)
+                .disabled(model.runState == .loading || model.isRunning)
+            Button("Stop") { requestCancel() }
+                .disabled(!model.canCancel)
+                .accessibilityIdentifier("detail.cancel")
             Button("Import preset…") { choosingPreset = true }
+            Button("Export preset…") { exportPreset() }
+        }
+        .confirmationDialog(
+            "Stop the session another process started?", isPresented: $confirmingCancel, titleVisibility: .visible
+        ) {
+            Button("Stop session", role: .destructive) { Task { await model.cancel() } }
+        } message: {
+            if let open = model.openSession {
+                Text("Session \(open.id) (\(open.state.rawValue), started \(open.startedAt)) is still open. It will be ended.")
+            }
         }
         .onAppear { isShown = true }
         .onDisappear { isShown = false }
@@ -87,6 +105,48 @@ public struct GameDetailView: View {
         guard isShown, let path = model.runState.value?.logPath else { return }
         models.logs.follow(path)
         models.section = .logs
+    }
+
+    /// A session this shell started is stopped at once; one `session.list`
+    /// showed is confirmed first, since it is some other process's.
+    private func requestCancel() {
+        if model.isRunning {
+            Task { await model.cancel() }
+        } else if model.openSession != nil {
+            confirmingCancel = true
+        }
+    }
+
+    /// `config.export` through a save panel; the core writes the file.
+    private func exportPreset() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "\(model.appid).preset.json"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await model.export(to: url.path) }
+    }
+
+    @ViewBuilder
+    private var sessionStatus: some View {
+        FlowStateView(model.session, idle: "") { snapshot in
+            if snapshot.finished {
+                Text("Session closed.").foregroundStyle(.secondary)
+            } else {
+                Text("Session \(snapshot.phase)\(snapshot.message.isEmpty ? "" : ": \(snapshot.message)")").foregroundStyle(.secondary)
+            }
+        }
+        if let open = model.openSession {
+            Text("Session \(open.id) is open (\(open.state.rawValue)); Stop ends it.").foregroundStyle(.orange)
+        }
+        JobProgressView(model.cancelState, title: "Stop")
+    }
+
+    @ViewBuilder
+    private var exportStatus: some View {
+        FlowStateView(model.exportState, idle: "") { result in
+            Text("Preset exported to \(result.path).").foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder

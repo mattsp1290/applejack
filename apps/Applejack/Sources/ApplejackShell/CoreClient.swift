@@ -207,17 +207,28 @@ public actor CoreClient {
     /// request is written, so a `job.progress` the core emits right after
     /// answering is delivered even if it beats the response on the wire.
     public func startJob<Params: Encodable & Sendable>(_ method: String, params: Params) async throws -> JobHandle {
+        let (started, events) = try await startJob(method, params: params, jobId: \JobStarted.jobId)
+        return JobHandle(started: started, events: events)
+    }
+
+    /// `startJob` for a method whose result carries a job among other members
+    /// (`app.run`): `jobId` reads it, and the result comes back with the
+    /// stream of that job's notifications, subscribed before the request was
+    /// written.
+    public func startJob<Params: Encodable & Sendable, Result: Decodable & Sendable>(
+        _ method: String, params: Params, jobId: @Sendable (Result) -> JobId
+    ) async throws -> (result: Result, events: AsyncThrowingStream<JobEvent, any Error>) {
         _ = try await ensureRunning()
         let (all, allContinuation) = AsyncStream<CoreEvent>.makeStream()
         let ticket = addSubscriber(allContinuation)
-        let started: JobStarted
+        let result: Result
         do {
-            started = try await send(method, params: params)
+            result = try await send(method, params: params)
         } catch {
             removeSubscriber(ticket)
             throw error
         }
-        let jobId = started.jobId
+        let jobId = jobId(result)
         let (events, eventsContinuation) = AsyncThrowingStream<JobEvent, any Error>.makeStream()
         let forwarder = Task {
             for await event in all {
@@ -243,7 +254,7 @@ public actor CoreClient {
             guard let self else { return }
             Task { await self.removeSubscriber(ticket) }
         }
-        return JobHandle(started: started, events: events)
+        return (result, events)
     }
 
     /// Closes the core's stdin, which ends its loop with exit 0, and
@@ -650,7 +661,7 @@ public actor CoreClient {
         do {
             response = try RpcCoding.decoder().decode(RpcTypedResponse<Result>.self, from: line)
         } catch {
-            throw CoreClientError.malformedResponse(String(describing: error))
+            throw CoreClientError.malformedResponse(CoreClient.summarize(error))
         }
         if let error = response.error {
             throw CoreClientError.rpc(error)
@@ -659,6 +670,29 @@ public actor CoreClient {
             throw CoreClientError.malformedResponse("response has neither result nor error")
         }
         return result
+    }
+
+    /// One line for a decode failure: `String(describing:)` of a
+    /// `DecodingError` dumps the whole context, which no banner can show.
+    static func summarize(_ error: any Error) -> String {
+        func path(_ context: DecodingError.Context) -> String {
+            let keys = context.codingPath.map(\.stringValue).joined(separator: ".")
+            return keys.isEmpty ? "the result" : "`\(keys)`"
+        }
+        let line: String
+        switch error {
+        case DecodingError.keyNotFound(let key, let context):
+            line = "`\(key.stringValue)` is missing from \(path(context))"
+        case DecodingError.typeMismatch(_, let context):
+            line = "\(path(context)) has the wrong type: \(context.debugDescription)"
+        case DecodingError.valueNotFound(_, let context):
+            line = "\(path(context)) is null: \(context.debugDescription)"
+        case DecodingError.dataCorrupted(let context):
+            line = "\(path(context)) is not what was expected: \(context.debugDescription)"
+        default:
+            line = String(describing: error)
+        }
+        return line.split(whereSeparator: \.isNewline).joined(separator: " ")
     }
 
     private func writeFailed(generation: Int) {

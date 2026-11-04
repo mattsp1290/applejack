@@ -398,9 +398,10 @@ connects, and answers `{session_id, step}`. A blank `account_name` is
 `InvalidParams`, with no connection made. `steam.login.complete` takes
 `session_id` and an optional `steam_guard_code`, and answers the same shape after
 one submit, or one poll when there is no code. `step.kind` is below, with what a
-client does. The app today offers QR only, so it never sees `guard_required`, and
-it starts polling when the user presses Done, not when the QR appears; the CLI
-drives every row.
+client does. The app offers QR only, so it sees `guard_required` only when Steam
+asks for a second factor on that path; it polls from the moment the first step
+is answered, every two seconds, until `done`, an error, or the view goes away,
+and a typed code goes out at once. The CLI drives every row.
 
 | `kind` | Members | A client |
 |---|---|---|

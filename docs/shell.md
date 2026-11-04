@@ -47,7 +47,8 @@ are lazy and capped at three, and the model only reads the outcome:
 - `.exited(status)`: the core died, whether a request was in flight or not.
   The banner's "Restart" calls `hello()` again, which respawns under the cap.
 - `.stopped(error)`: `notRunning`, `launchFailed`, or `handshakeTimedOut`,
-  and a `hello` whose answer could not be read (`malformedResponse`, or an
+  and a `hello` whose answer could not be read (`malformedResponse`, shown
+  as the binary's path and one line saying which member was wrong, or an
   `rpc` error other than the protocol mismatch). No core is running and no
   exit status was seen; under the lazy restart policy the next call
   respawns it, so the banner offers the same "Restart".
@@ -153,12 +154,63 @@ Flows that need an answer before the core sends a request:
 
 Run with log tail: "Run" in the game detail sends `app.run` (`AppRunResult`:
 `id`, `log_path`, and the `job_id` that reports the session). The button is
-disabled only until the core answers, which it does before the title is on
-screen. If the user is still on the detail then, the shell switches
-to Logs and follows it; the library's navigation path lives in
-`ShellModels`, so returning to Library lands on the same detail. The core
-refuses a second launch of a running title with `AlreadyRunning`. The shell
-does not yet follow the job or offer `app.cancel`.
+disabled until the core answers, which it does before the title is on
+screen, and then while the session is open. If the user is still on the
+detail then, the shell switches to Logs and follows it; the library's
+navigation path lives in `ShellModels`, so returning to Library lands on the
+same detail. `AppModel.detail(for:)` keeps one `GameDetailViewModel` per
+title for the app's lifetime, so the rebuilt detail finds its run and its
+session, and two views of one title cannot each send `app.run`. The run's
+job is followed on a task of the model's own (`CoreClient.startJob(_:params:jobId:)`
+subscribes before the request is written, so an early phase is not lost):
+`session` shows the phases and `finished` once the row closed. A start the
+core refuses leaves `runState` failed; it never stays loading. Cancelling
+the task that called `run()` is not reachable from the view (a button's
+task is never cancelled), and since the request lives on the follow task,
+such a cancellation returns at the core's answer and the run goes on. The
+core inserts the `sessions` row before it answers, so `session.list` is
+left alone while the answer is pending and the row's id is kept from the
+answer; a list read during the start cannot offer the shell's own row as
+another process's. The core refuses a second launch of a running title with
+`AlreadyRunning`.
+
+Stop: "Stop" sends `app.cancel` for a session this model started, and,
+after a confirmation whose destructive choice is "Stop session", for an
+open row `session.list` showed that some other process owns
+(`openSession`). Its job is followed in `cancelState` (`cancel`,
+`cancelled`), and the sessions are read again when it ends. The button is
+disabled from the request until the job ends: the core accepts a second
+`app.cancel` for the same row, so the shell sends one. `NotRunning` and the
+other refusals show the core's message.
+
+Export: "Export preset…" opens a save panel and sends `config.export` with
+the chosen path; the core applies the export denylist and writes the file.
+
+Prefix snapshots (`PrefixSnapshotsViewModel`, shown on the game detail for
+the title's prefix and under the Steam client for `steam-client`): Snapshot
+shows the timestamp `prefix.snapshot` made; Restore takes a timestamp from a
+text field or from the picker of timestamps this model saw this session
+(there is no listing method; the follow-up is in `docs/rpc-protocol.md`,
+"Jobs"); Reset is a job whose safety snapshot is read from its progress
+line, and a failed reset's message names the snapshot to restore, which the
+view offers as a button. Both are read with the core's full name, including
+the `-NNN` suffix a second snapshot in the same second gets. Reset always
+takes that safety snapshot, removes the prefix, and recreates it with the
+active engine; "Keep user data" copies `drive_c/users/` back from the
+safety snapshot, and off, the new prefix has no user data. Nothing else of
+the old prefix survives either way.
+
+Steam client runtime (`SteamClientRuntimeViewModel`, under the account on
+the Steam view, since `needs_login` is a sign-in too): `runtime.steam.status`
+is read when the view appears and after every action; Install, Update,
+Repair, Reinstall (`repair` with `reinstall: true`) and Stop run one at a
+time as jobs. The buttons follow the status read last: Install is always
+offered (it resumes an interrupted install), Stop only while `running`,
+Update, Repair and Reinstall only once a prefix exists (`state` other than
+`absent`). Every `job.progress` line is listed, not only the latest,
+because the `start` phase carries the macOS microphone warning the user has
+about 15 s to act on. A `job.failed` (`ClientRuntimeBroken` and the other
+103x codes) shows the core's message verbatim; it names the remedy.
 
 Logs: `session.list` names each session's `log_path`; `LogsViewModel`
 follows it with `LogTailer` (a polling file reader, so a log that does not
@@ -170,7 +222,20 @@ to the new one. Controllers come from the GameController framework, not
 the core.
 
 Steam account: there is no `steam.status` method, so before any call the
-view says the sign-in state is unknown rather than "not signed in".
+view says the sign-in state is unknown rather than "not signed in". Once
+`steam.login.start` answers, the model polls `steam.login.complete` every
+two seconds on a task of its own, from the moment the challenge is up: an
+approval in the Steam mobile app ends the login without a button. The loop
+ends on `done`, on an error, when the view disappears (`stopPolling()`; it
+resumes when the view comes back), and when another login starts; a small
+progress indicator shows while the loop runs and clears the moment it ends. A
+`guard_required` step shows a code field unless the factor is
+`device_confirmation`, worded by factor (the code from the email, or from
+the mobile app, which can also approve instead); Submit restarts the loop
+so the code goes out at once. A wrong code answers `SteamGuardRejected`
+and the login stays open: the message is shown, the field stays, and the
+poll goes on; any other error ends the login. The shell logs nothing of
+these requests; the core redacts them.
 
 The `config.import` result the shell expects (`applied`, `accepted`,
 `rejected`, `confirmations`) is the shell's proposal for how
