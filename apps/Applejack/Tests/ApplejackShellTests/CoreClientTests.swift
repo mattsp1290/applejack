@@ -38,6 +38,17 @@ final class CoreClientTests: XCTestCase {
         FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
     }
 
+    /// Removes the pid file and, from the path the fake wrote beside it, the
+    /// lock directory a fake killed by pid (no EXIT trap) left behind.
+    static func removePidFile(_ pidFile: URL) {
+        let lockdirFile = URL(fileURLWithPath: pidFile.path + ".lockdir")
+        if let lockdir = try? String(contentsOf: lockdirFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !lockdir.isEmpty {
+            try? FileManager.default.removeItem(atPath: lockdir)
+        }
+        try? FileManager.default.removeItem(at: lockdirFile)
+        try? FileManager.default.removeItem(at: pidFile)
+    }
+
     func readPid(_ pidFile: URL) throws -> Int32 {
         let text = try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
         return try XCTUnwrap(Int32(text), text)
@@ -217,7 +228,7 @@ final class CoreClientTests: XCTestCase {
 
     func testShutdownTerminatesACoreThatIgnoresEof() async throws {
         let pidFile = makePidFile()
-        defer { try? FileManager.default.removeItem(at: pidFile) }
+        defer { Self.removePidFile(pidFile) }
         let client = makeClient(environment: ["FAKE_CORE_IGNORE_EOF": "1", "FAKE_CORE_PID_FILE": pidFile.path])
         _ = try await client.hello()
         let pid = try readPid(pidFile)
@@ -231,7 +242,7 @@ final class CoreClientTests: XCTestCase {
 
     func testHandshakeTimeoutTearsDownAMuteCoreAndReleasesTheClient() async throws {
         let pidFile = makePidFile()
-        defer { try? FileManager.default.removeItem(at: pidFile) }
+        defer { Self.removePidFile(pidFile) }
         var client: CoreClient? = makeClient(
             environment: ["FAKE_CORE_MUTE": "1", "FAKE_CORE_PID_FILE": pidFile.path],
             handshakeTimeout: .milliseconds(500)

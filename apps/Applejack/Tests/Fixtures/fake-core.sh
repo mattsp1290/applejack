@@ -111,6 +111,9 @@ trap 'rm -rf "$lockdir"' EXIT
 
 if [ -n "${FAKE_CORE_PID_FILE:-}" ]; then
   printf '%s\n' "$$" > "$FAKE_CORE_PID_FILE"
+  # A SIGKILL runs no EXIT trap; a test that kills by pid can sweep the lock
+  # directory itself.
+  printf '%s\n' "$lockdir" > "$FAKE_CORE_PID_FILE.lockdir"
 fi
 if [ "${FAKE_CORE_ORPHAN:-0}" = "1" ]; then
   sleep 5 &

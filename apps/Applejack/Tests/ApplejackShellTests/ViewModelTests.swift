@@ -770,6 +770,9 @@ final class ViewModelTests: XCTestCase {
             try await waitUntil { (try? self.requests(for: "steam.login.complete").count) ?? 0 >= 2 }
         }
         try await waitUntil { weakModel == nil }
+        // The model can only die in the loop's sleep (`tick` holds it), so the
+        // last poll is answered and logged; the fence guards the count against
+        // a fake that logs late, not against a poll in flight.
         await fence(app)
         let sent = try requests(for: "steam.login.complete").count
         try await Task.sleep(for: .milliseconds(200))
@@ -807,8 +810,8 @@ final class ViewModelTests: XCTestCase {
     }
 
     func testCoreDeathDuringAJobFailsTheFlowAndShowsTheBanner() async throws {
-        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
-        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let pidFile = makePidFile()
+        defer { CoreClientTests.removePidFile(pidFile) }
         let app = makeApp(environment: ["FAKE_CORE_JOB_OUTCOME": "never", "FAKE_CORE_PID_FILE": pidFile.path])
         await app.start()
         let engines = EnginesViewModel(app: app)
@@ -1331,8 +1334,8 @@ final class ViewModelTests: XCTestCase {
     }
 
     func testAnIdleCoreExitReachesTheBannerThroughEvents() async throws {
-        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
-        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let pidFile = makePidFile()
+        defer { CoreClientTests.removePidFile(pidFile) }
         let app = makeApp(environment: ["FAKE_CORE_PID_FILE": pidFile.path])
         await app.start()
         let pid = try XCTUnwrap(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
@@ -1347,8 +1350,13 @@ final class ViewModelTests: XCTestCase {
     /// taken at the instant of a stop can miss the poll already written; a
     /// count taken after the fence is exact, and a request the stop left
     /// behind lands after it.
-    private func fence(_ app: AppModel) async {
-        _ = await app.run { try await $0.call("engine.list", params: EmptyParams()) as JSONValue }
+    private func fence(_ app: AppModel, file: StaticString = #filePath, line: UInt = #line) async {
+        let answer = await app.run { try await $0.call("engine.list", params: EmptyParams()) as JSONValue }
+        XCTAssertNotNil(answer?.value, "the fence needs an answer from the fake, or it fenced nothing: \(String(describing: answer))", file: file, line: line)
+    }
+
+    private func makePidFile() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-\(UUID().uuidString).pid")
     }
 
     private func waitUntil(_ condition: @MainActor () -> Bool, within limit: Duration = .seconds(5), file: StaticString = #filePath, line: UInt = #line) async throws {
