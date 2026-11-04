@@ -9,29 +9,44 @@ import XCTest
 /// method is `NotImplemented`.
 @MainActor
 final class ViewModelTests: XCTestCase {
-    nonisolated let requestLog = FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-requests-\(UUID().uuidString).log")
+    nonisolated let requestLog = ViewModelTests.makeRequestLog()
+    /// For a test's second app. `shutdown` only closes the first fake's
+    /// stdin; a request already in the pipe is read and logged after
+    /// `shutdown` returns, so a count over one shared log would take the
+    /// first fake's last request for the second app's.
+    nonisolated let secondRequestLog = ViewModelTests.makeRequestLog()
+
+    nonisolated static func makeRequestLog() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("fake-core-requests-\(UUID().uuidString).log")
+    }
 
     override func tearDown() {
         try? FileManager.default.removeItem(at: requestLog)
+        try? FileManager.default.removeItem(at: secondRequestLog)
         super.tearDown()
     }
 
+    /// The fake logs its requests to `requestLog` unless `environment`
+    /// names another file.
     func makeApp(implemented: Bool = true, environment: [String: String] = [:]) -> AppModel {
         var env = environment
-        env["FAKE_CORE_REQUEST_LOG"] = requestLog.path
+        if env["FAKE_CORE_REQUEST_LOG"] == nil {
+            env["FAKE_CORE_REQUEST_LOG"] = requestLog.path
+        }
         if implemented {
             env["FAKE_CORE_IMPLEMENTED"] = "1"
         }
         return AppModel(client: CoreClient(executable: CoreClientTests.fakeCore, arguments: [], environment: env))
     }
 
-    func requests() throws -> [String] {
-        guard FileManager.default.fileExists(atPath: requestLog.path) else { return [] }
-        return try String(contentsOf: requestLog, encoding: .utf8).split(separator: "\n").map(String.init)
+    func requests(in log: URL? = nil) throws -> [String] {
+        let log = log ?? requestLog
+        guard FileManager.default.fileExists(atPath: log.path) else { return [] }
+        return try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map(String.init)
     }
 
-    func requests(for method: String) throws -> [String] {
-        try requests().filter { $0.contains("\"method\":\"\(method)\"") }
+    func requests(for method: String, in log: URL? = nil) throws -> [String] {
+        try requests(in: log).filter { $0.contains("\"method\":\"\(method)\"") }
     }
 
     /// The first request for `method`; a failure, not a crash, when none was sent.
@@ -634,15 +649,14 @@ final class ViewModelTests: XCTestCase {
         await steam.waitForLogin()
         await app.shutdown()
 
-        let before = try requests(for: "steam.login.complete").count
-        let failing = makeApp(environment: ["FAKE_CORE_LOGIN_FAIL": "1"])
+        let failing = makeApp(environment: ["FAKE_CORE_LOGIN_FAIL": "1", "FAKE_CORE_REQUEST_LOG": secondRequestLog.path])
         let other = SteamAccountViewModel(app: failing, pollDelay: .milliseconds(30))
         await other.startQrLogin()
         await other.waitForLogin()
         XCTAssertEqual(other.login, .failed(.rpc(RpcError(code: RpcErrorCode.steamLoginFailed.rawValue, message: "the login is over; begin again"))))
         XCTAssertFalse(other.isPolling)
         try await Task.sleep(for: .milliseconds(100))
-        XCTAssertEqual(try requests(for: "steam.login.complete").count, before + 1, "an error ends the loop")
+        XCTAssertEqual(try requests(for: "steam.login.complete", in: secondRequestLog).count, 1, "an error ends the loop")
         await failing.shutdown()
     }
 
@@ -656,16 +670,16 @@ final class ViewModelTests: XCTestCase {
         await steam.waitForLogin()
         await app.shutdown()
 
-        let typed = makeApp(environment: ["FAKE_CORE_LOGIN_GUARD": "email_code", "FAKE_CORE_LOGIN_POLLS": "100"])
+        let typed = makeApp(environment: ["FAKE_CORE_LOGIN_GUARD": "email_code", "FAKE_CORE_LOGIN_POLLS": "100", "FAKE_CORE_REQUEST_LOG": secondRequestLog.path])
         let other = SteamAccountViewModel(app: typed, pollDelay: .seconds(5))
         await other.startQrLogin()
         XCTAssertTrue(other.guardCodeWanted)
         // The loop's first poll goes out without a code; the submit does not wait 5 s for its tick.
-        try await waitUntil { (try? self.requests(for: "steam.login.complete").contains { $0.contains("\"params\":{\"session_id\":\"login-session-fake\"}") }) ?? false }
+        try await waitUntil { (try? self.requests(for: "steam.login.complete", in: self.secondRequestLog).contains { $0.contains("\"params\":{\"session_id\":\"login-session-fake\"}") }) ?? false }
         other.guardCode = "ABCDE"
         other.submitGuardCode()
-        try await waitUntil({ (try? self.requests(for: "steam.login.complete").contains { $0.contains("ABCDE") }) ?? false }, within: .seconds(2))
-        let sent = try requests(for: "steam.login.complete")
+        try await waitUntil({ (try? self.requests(for: "steam.login.complete", in: self.secondRequestLog).contains { $0.contains("ABCDE") }) ?? false }, within: .seconds(2))
+        let sent = try requests(for: "steam.login.complete", in: secondRequestLog)
         XCTAssertTrue(sent.contains { $0.contains("\"steam_guard_code\":\"ABCDE\"") }, "\(sent)")
         try await waitUntil { other.guardCode.isEmpty }
         other.stopPolling()
