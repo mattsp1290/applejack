@@ -1585,34 +1585,36 @@ fn cancel_ends_a_title_nobody_owns() {
     fixture.assert_lock_free();
 }
 
-/// Keeps starting helpers of the session on its own thread, the way a
-/// watchdog no list has seen yet would, until it is dropped or `for_how_long`
-/// has passed.
+/// Keeps a helper of the session running on its own thread, the way a
+/// watchdog no list has seen yet would: each time the helper is killed the
+/// next is started, `respawns` times, so the last kill pass leaves nothing
+/// and no spawn can land after it. Started only after the first helper is up.
 struct Respawner {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Respawner {
-    fn start(fixture: &Fixture, key: &str, for_how_long: Duration) -> Self {
+    fn start(fixture: &Fixture, key: &str, respawns: usize) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let prefix = fixture.prefix_dir();
         let key = key.to_owned();
+        let mut child = spawn_stub_title(&key, &prefix, "helper.exe");
         let thread = thread::spawn(move || {
-            let mut children: Vec<Child> = Vec::new();
-            let until = Instant::now() + for_how_long;
+            let mut left = respawns;
             while !stopping.load(Ordering::Relaxed) {
-                if Instant::now() < until {
-                    children.push(spawn_stub_title(&key, &prefix, "helper.exe"));
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    if left == 0 {
+                        return;
+                    }
+                    left -= 1;
+                    child = spawn_stub_title(&key, &prefix, "helper.exe");
                 }
-                children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(2));
             }
-            for child in &mut children {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            let _ = child.kill();
+            let _ = child.wait();
         });
         Self {
             stop,
@@ -1634,9 +1636,12 @@ impl Drop for Respawner {
 fn cancel_keeps_killing_until_the_session_is_empty() {
     let fixture = Fixture::new();
     let id = orphan_row(&fixture, "run-respawn-ends");
+    // A look comes `tick` after each kill pass: wide enough for the next
+    // helper to be up and seen, so every look until the last is non-empty.
     let mut tuning = SHORT_DRAIN;
     tuning.term_wait = Duration::from_secs(1);
-    let respawner = Respawner::start(&fixture, "run-respawn-ends", Duration::from_millis(1600));
+    tuning.tick = Duration::from_millis(100);
+    let respawner = Respawner::start(&fixture, "run-respawn-ends", 2);
     let row = fixture
         .core()
         .with_run_tuning(tuning)
@@ -1655,7 +1660,7 @@ fn cancel_keeps_killing_until_the_session_is_empty() {
 fn a_cancel_that_cannot_empty_the_session_leaves_the_row_open() {
     let fixture = Fixture::new();
     let id = orphan_row(&fixture, "run-respawn-stays");
-    let respawner = Respawner::start(&fixture, "run-respawn-stays", Duration::from_secs(60));
+    let respawner = Respawner::start(&fixture, "run-respawn-stays", usize::MAX);
     let error = fixture
         .core()
         .with_run_tuning(SHORT_DRAIN)
