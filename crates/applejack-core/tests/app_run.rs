@@ -1587,11 +1587,12 @@ fn cancel_ends_a_title_nobody_owns() {
 }
 
 /// Keeps a helper of the session running on its own thread, the way a
-/// watchdog no list has seen yet would: each time the helper is killed the
-/// next is started, `respawns` times (`respawns + 1` helpers in all), so the
-/// last kill pass leaves nothing and no spawn can run while a look is taking
-/// its process-table snapshot. `start` returns with the first helper
-/// spawned, not yet necessarily listed; `stop` says how each helper died.
+/// watchdog no list has seen yet would: each time the helper dies the next
+/// is started, `respawns` times (`respawns + 1` helpers in all), so the
+/// last kill pass leaves nothing and every spawn follows a death by a few
+/// ms, never a clock. `start` returns with the first helper spawned, not
+/// yet necessarily listed; `stop` says how each helper died and `drop`
+/// kills whichever is current.
 struct Respawner {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<Vec<ExitStatus>>>,
@@ -1618,8 +1619,13 @@ impl Respawner {
                 }
                 thread::sleep(Duration::from_millis(2));
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            // A death the loop had not polled yet is the core's, not ours.
+            if let Ok(Some(status)) = child.try_wait() {
+                deaths.push(status);
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             deaths
         });
         Self {
@@ -1655,10 +1661,12 @@ fn cancel_keeps_killing_until_the_session_is_empty() {
     let respawns = 2;
     // A look comes `tick` after each kill pass: wide enough for the next
     // helper, spawned a few ms after the kill, to precede the look's
-    // snapshot, so every look until the last is non-empty. The passes must
+    // snapshot, so every look until the last is non-empty (the respawner's
+    // 2 ms poll plus a spawn must stay well under `tick`). The passes must
     // also fit the second `term_wait` `end_stragglers` allows:
-    // (respawns + 2) * (tick + look) <= term_wait, about 1.5 s of the 2 s
-    // bound with a 30 ms look.
+    // (respawns + 2) * (tick + look) <= term_wait, about 0.5 s of the
+    // second 1 s with a 30 ms look, so the empty look lands near 1.5 s of
+    // the 2 s bound.
     let mut tuning = SHORT_DRAIN;
     tuning.term_wait = Duration::from_secs(1);
     tuning.tick = Duration::from_millis(100);
@@ -1672,16 +1680,22 @@ fn cancel_keeps_killing_until_the_session_is_empty() {
         .unwrap();
     assert_eq!(row.id, id);
     assert_eq!(row.state, SessionState::Cancelled);
-    assert_eq!(find_session("run-respawn-ends"), []);
+    // The look precedes the stop, which would kill the current helper.
+    let left = find_session("run-respawn-ends");
     let deaths = respawner.stop();
     assert_eq!(
         deaths.len(),
         respawns + 1,
-        "every helper was killed by the cancel: {deaths:?}"
+        "every helper was killed by the cancel: {deaths:?}; left {left:?}"
     );
     assert!(
         deaths.iter().all(|status| status.signal() == Some(9)),
         "each helper died of the cancel's SIGKILL: {deaths:?}"
+    );
+    assert_eq!(
+        left,
+        [],
+        "nothing of the session outlived the row: {deaths:?}"
     );
     fixture.assert_lock_free();
 }
