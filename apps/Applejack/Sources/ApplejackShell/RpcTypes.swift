@@ -278,9 +278,48 @@ extension ControllerKind {
         self == .dualshock4 || self == .dualsense
     }
 
-    /// The hidraw mode this pad alone, connected, would select: the
-    /// `hidraw default` column of `applejack doctor --controllers`.
+    /// The hidraw mode this pad, connected, would select
+    /// (`ControllerKind::hidraw_default`).
     public var hidrawDefaultEnabled: Bool { !hidrawRegresses }
+}
+
+extension ControllerFact {
+    /// The per-pad column of `applejack doctor --controllers`, word for
+    /// word (`render_controllers` in the CLI): what the rule does with this
+    /// pad as it is now, so the column never contradicts the rule's line.
+    /// Only a connected Sony pad disables hidraw; an away one says what it
+    /// would do if connected.
+    public var hidrawColumn: String {
+        switch (connected, kind.hidrawDefaultEnabled) {
+        case (true, false): "hidraw default disabled"
+        case (true, true): "hidraw default enabled"
+        case (false, false): "would disable hidraw if connected"
+        case (false, true): "would leave hidraw enabled if connected"
+        }
+    }
+}
+
+/// `applejack_core::host::Inventory`, as `host.doctor` carries it: the pads
+/// `system_profiler` listed and, when one of its reports failed to run,
+/// timed out, or did not parse, why. An unavailable inventory is never "no
+/// pads": the pads the other report listed are still here, but a run keeps
+/// the prefix's mode instead of deciding from them.
+public struct ControllerInventory: Equatable, Sendable {
+    public var pads: [ControllerFact]
+    public var unavailable: String?
+
+    public init(pads: [ControllerFact], unavailable: String? = nil) {
+        self.pads = pads
+        self.unavailable = unavailable
+    }
+
+    /// The line `doctor --controllers` prints instead of the decision line
+    /// when the inventory is unavailable; `nil` when it was read.
+    public var unavailableLine: String? {
+        unavailable.map { why in
+            "controller inventory unavailable (\(why)): a new prefix gets hidraw disabled, an existing prefix keeps its mode"
+        }
+    }
 }
 
 /// `HidrawDecision::from_controllers`: the hidraw mode a run applies to a
@@ -295,6 +334,13 @@ public struct HidrawDefault: Equatable, Sendable {
     public init(enabled: Bool, reason: String) {
         self.enabled = enabled
         self.reason = reason
+    }
+
+    /// The rule over an inventory that was read; `nil` when it is
+    /// unavailable, since the mode is then the prefix's own and only
+    /// `config.resolve` can say it.
+    public static func decide(_ inventory: ControllerInventory) -> HidrawDefault? {
+        inventory.unavailable == nil ? decide(inventory.pads) : nil
     }
 
     public static func decide(_ controllers: [ControllerFact]) -> HidrawDefault {
@@ -326,6 +372,11 @@ public struct HostFacts: Codable, Equatable, Sendable {
     /// Why the inventory could not be read; `nil` when it was. The Rust side
     /// leaves the key out when there is nothing to say.
     public var controllersUnavailable: String?
+
+    /// `controllers` and `controllersUnavailable` as one inventory.
+    public var controllerInventory: ControllerInventory {
+        ControllerInventory(pads: controllers, unavailable: controllersUnavailable)
+    }
 
     enum CodingKeys: String, CodingKey {
         case macosVersion = "macos_version"

@@ -80,14 +80,19 @@
 #   FAKE_CORE_CONTROLLERS=<shape>  host.doctor's `controllers`: `empty` (the
 #                                 default), `dualsense` (one connected over
 #                                 Bluetooth), `xbox` (one wired), `dualsense-away`
-#                                 (paired, not connected), `refuse` (host.doctor
-#                                 answers Internal 1003 instead), or a JSON
-#                                 array in the Rust shape, used as given
+#                                 (paired, not connected), `unavailable` (no
+#                                 pads and `controllers_unavailable` set, the
+#                                 shape of a profiler report that timed out),
+#                                 `refuse` (host.doctor answers Internal 1003
+#                                 instead), or a JSON array in the Rust shape,
+#                                 used as given
 #   FAKE_CORE_HIDRAW=<unset|true|false>  config.get's `hidraw_enabled` (default
 #                                 false); config.resolve answers the stored
 #                                 value from `config`, or with `unset` the
 #                                 rule FAKE_CORE_CONTROLLERS gives from
 #                                 `controllers`, as `HidrawDecision` does
+#                                 (`unavailable`: the prefix's mode, `false`
+#                                 for one not built yet, and the reason)
 #
 # session.list reflects what happened, as the core's `sessions` row does: the
 # canned open row 1 (running) until app.run, then the run's row 41, `starting`
@@ -398,12 +403,15 @@ cancel_job() {
 }
 
 # controllers_json: host.doctor's `controllers` per FAKE_CORE_CONTROLLERS,
-# in the shape `host.doctor.result.json` pins (ids lowercase `0x` hex).
+# in the shape `host.doctor.result.json` pins (ids lowercase `0x` hex). The
+# `unavailable` shape also carries the `controllers_unavailable` member the
+# core adds only when a report failed.
 controllers_json() {
   case "${FAKE_CORE_CONTROLLERS:-empty}" in
     empty) printf '%s' '[]' ;;
     dualsense) printf '%s' '[{"name":"DualSense Wireless Controller","transport":"bluetooth","vendor_id":"0x054c","product_id":"0x0ce6","connected":true,"kind":"dualsense"}]' ;;
     dualsense-away) printf '%s' '[{"name":"DualSense Wireless Controller","transport":"bluetooth","vendor_id":"0x054c","product_id":"0x0ce6","connected":false,"kind":"dualsense"}]' ;;
+    unavailable) printf '%s' '[],"controllers_unavailable":"SPBluetoothDataType timed out"' ;;
     xbox) printf '%s' '[{"name":"Xbox Wireless Controller","transport":"usb","vendor_id":"0x045e","product_id":"0x0b12","connected":true,"kind":"xbox"}]' ;;
     *) printf '%s' "$FAKE_CORE_CONTROLLERS" ;;
   esac
@@ -590,6 +598,7 @@ implemented() {
         unset)
           case "${FAKE_CORE_CONTROLLERS:-empty}" in
             dualsense) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"appid":220,"hidraw_enabled":false,"hidraw_reason":"DualSense connected","hidraw_source":"controllers"}}' ;;
+            unavailable) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"appid":220,"hidraw_enabled":false,"hidraw_reason":"controller inventory unavailable (SPBluetoothDataType timed out)","hidraw_source":"controllers"}}' ;;
             *) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"appid":220,"hidraw_enabled":true,"hidraw_reason":"no Sony pad connected","hidraw_source":"controllers"}}' ;;
           esac
           ;;

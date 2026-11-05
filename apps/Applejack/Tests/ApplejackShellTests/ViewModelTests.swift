@@ -1175,7 +1175,8 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(model.inventory, .idle)
         XCTAssertNil(model.hidrawDefault, "no rule before the inventory is read")
         await model.loadInventory()
-        XCTAssertEqual(model.inventory, .ready([]))
+        XCTAssertEqual(model.inventory, .ready(ControllerInventory(pads: [])))
+        XCTAssertNil(model.inventory.value?.unavailableLine)
         XCTAssertEqual(model.hidrawDefault, HidrawDefault(enabled: true, reason: "no Sony pad connected"))
         XCTAssertEqual(model.hidrawDefault?.summary, "hidraw enabled (no Sony pad connected)")
         await model.reload()
@@ -1187,7 +1188,7 @@ final class ViewModelTests: XCTestCase {
         let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "dualsense"])
         let model = ControllersViewModel(app: app, provider: { [] })
         await model.loadInventory()
-        let pads = try XCTUnwrap(model.inventory.value)
+        let pads = try XCTUnwrap(model.inventory.value?.pads)
         XCTAssertEqual(pads.count, 1)
         XCTAssertEqual(pads.first?.name, "DualSense Wireless Controller")
         XCTAssertEqual(pads.first?.transport, .bluetooth)
@@ -1195,7 +1196,8 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(pads.first?.productId, "0x0ce6")
         XCTAssertEqual(pads.first?.kind, .dualsense)
         XCTAssertEqual(pads.first?.connected, true)
-        XCTAssertEqual(pads.first?.kind.hidrawDefaultEnabled, false, "the row's hidraw default column")
+        XCTAssertEqual(pads.first?.kind.hidrawDefaultEnabled, false)
+        XCTAssertEqual(pads.first?.hidrawColumn, "hidraw default disabled", "the row's column, in the CLI's words")
         XCTAssertEqual(model.hidrawDefault?.summary, "hidraw disabled (DualSense connected)")
         await app.shutdown()
     }
@@ -1204,28 +1206,74 @@ final class ViewModelTests: XCTestCase {
         let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "xbox"])
         let model = ControllersViewModel(app: app, provider: { [] })
         await model.loadInventory()
-        let pad = try XCTUnwrap(model.inventory.value?.first)
+        let pad = try XCTUnwrap(model.inventory.value?.pads.first)
         XCTAssertEqual(pad.kind, .xbox)
         XCTAssertEqual(pad.transport, .usb)
         XCTAssertTrue(pad.connected)
         XCTAssertTrue(pad.kind.hidrawDefaultEnabled)
+        XCTAssertEqual(pad.hidrawColumn, "hidraw default enabled")
         XCTAssertEqual(model.hidrawDefault?.summary, "hidraw enabled (no Sony pad connected)")
         await app.shutdown()
     }
 
-    /// A paired pad that is away is listed with its kind's default, and
-    /// does not count toward the rule, as `HidrawDecision::from_controllers`
-    /// filters on `connected`.
+    /// A paired pad that is away is listed with what it would do if
+    /// connected, and does not count toward the rule, as
+    /// `HidrawDecision::from_controllers` filters on `connected`.
     func testASonyPadThatIsAwayIsListedAndDoesNotCount() async throws {
         let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "dualsense-away"])
         let model = ControllersViewModel(app: app, provider: { [] })
         await model.loadInventory()
-        let pad = try XCTUnwrap(model.inventory.value?.first)
+        let pad = try XCTUnwrap(model.inventory.value?.pads.first)
         XCTAssertEqual(pad.kind, .dualsense)
         XCTAssertFalse(pad.connected)
-        XCTAssertFalse(pad.kind.hidrawDefaultEnabled, "the column says what the pad would select once connected")
+        XCTAssertFalse(pad.kind.hidrawDefaultEnabled)
+        XCTAssertEqual(pad.hidrawColumn, "would disable hidraw if connected", "the column never contradicts the rule's line")
         XCTAssertEqual(model.hidrawDefault, HidrawDefault(enabled: true, reason: "no Sony pad connected"))
         await app.shutdown()
+    }
+
+    /// The per-pad column is `render_controllers`'s, word for word, over
+    /// the four states a pad can be in.
+    func testThePerPadColumnUsesTheCliWords() {
+        func pad(_ kind: ControllerKind, connected: Bool) -> ControllerFact {
+            ControllerFact(name: kind.rawValue, transport: .bluetooth, vendorId: "0x054c", productId: "", connected: connected, kind: kind)
+        }
+        XCTAssertEqual(pad(.dualsense, connected: true).hidrawColumn, "hidraw default disabled")
+        XCTAssertEqual(pad(.dualshock4, connected: true).hidrawColumn, "hidraw default disabled")
+        XCTAssertEqual(pad(.xbox, connected: true).hidrawColumn, "hidraw default enabled")
+        XCTAssertEqual(pad(.other, connected: true).hidrawColumn, "hidraw default enabled")
+        XCTAssertEqual(pad(.dualsense, connected: false).hidrawColumn, "would disable hidraw if connected")
+        XCTAssertEqual(pad(.dualshock4, connected: false).hidrawColumn, "would disable hidraw if connected")
+        XCTAssertEqual(pad(.xbox, connected: false).hidrawColumn, "would leave hidraw enabled if connected")
+        XCTAssertEqual(pad(.other, connected: false).hidrawColumn, "would leave hidraw enabled if connected")
+    }
+
+    /// `controllers_unavailable` is a read that failed, never "no pads": the
+    /// view gets the pads the other report listed (none here), no rule, and
+    /// the CLI's unavailable line with the core's reason.
+    func testAnUnavailableInventoryShowsItsReasonNotAnEmptyList() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "unavailable"])
+        let model = ControllersViewModel(app: app, provider: { [] })
+        await model.loadInventory()
+        let inventory = try XCTUnwrap(model.inventory.value)
+        XCTAssertEqual(inventory, ControllerInventory(pads: [], unavailable: "SPBluetoothDataType timed out"))
+        XCTAssertNotEqual(inventory, ControllerInventory(pads: []), "unavailable is not the empty inventory")
+        XCTAssertNil(model.hidrawDefault, "no rule: the mode is the prefix's own")
+        XCTAssertEqual(
+            inventory.unavailableLine,
+            "controller inventory unavailable (SPBluetoothDataType timed out): a new prefix gets hidraw disabled, an existing prefix keeps its mode")
+        await app.shutdown()
+    }
+
+    /// `HidrawDefault.decide` over an inventory: the rule when it was read,
+    /// nothing when it was not, whatever pads the other report listed.
+    func testTheHidrawRuleIsSilentOverAnUnavailableInventory() {
+        let dualsense = ControllerFact(name: "DualSense Wireless Controller", transport: .usb, vendorId: "0x054c", productId: "0x0ce6", connected: true, kind: .dualsense)
+        XCTAssertEqual(HidrawDefault.decide(ControllerInventory(pads: [dualsense])), HidrawDefault(enabled: false, reason: "DualSense connected"))
+        XCTAssertNil(HidrawDefault.decide(ControllerInventory(pads: [dualsense], unavailable: "SPBluetoothDataType timed out")))
+        XCTAssertNil(HidrawDefault.decide(ControllerInventory(pads: [], unavailable: "SPUSBDataType exited with exit status: 1")))
+        let facts = HostFacts(macosVersion: "26.0", arch: nil, rosettaPresent: nil, freeDiskBytes: nil, screenRecording: .unknown, developerIdIdentities: nil, controllers: [dualsense], controllersUnavailable: "why")
+        XCTAssertEqual(facts.controllerInventory, ControllerInventory(pads: [dualsense], unavailable: "why"))
     }
 
     /// A refusal is shown as the failure it is, with no rule and no empty
@@ -1270,6 +1318,22 @@ final class ViewModelTests: XCTestCase {
         await other.load()
         XCTAssertEqual(other.hidrawDefaultText, "Default: on, no Sony pad connected")
         await unplugged.shutdown()
+    }
+
+    /// An unavailable inventory reaches the toggle as the core says it: the
+    /// prefix's mode (`false` for one not built yet) and the reason verbatim.
+    func testAnUnsetHidrawToggleShowsTheUnavailableReason() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_HIDRAW": "unset", "FAKE_CORE_CONTROLLERS": "unavailable"])
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        await detail.load()
+        XCTAssertNil(detail.config.value?.hidrawEnabled)
+        XCTAssertEqual(
+            detail.hidrawDefault,
+            .ready(ConfigResolveResult(
+                appid: 220, hidrawEnabled: false, hidrawSource: .controllers,
+                hidrawReason: "controller inventory unavailable (SPBluetoothDataType timed out)")))
+        XCTAssertEqual(detail.hidrawDefaultText, "Default: off, controller inventory unavailable (SPBluetoothDataType timed out)")
+        await app.shutdown()
     }
 
     func testAStoredHidrawValueNeedsNoResolving() async throws {

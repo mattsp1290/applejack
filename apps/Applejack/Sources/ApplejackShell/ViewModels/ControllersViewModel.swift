@@ -29,9 +29,10 @@ public final class ControllersViewModel {
     public typealias Provider = @MainActor () -> [ControllerStatus]
 
     public private(set) var controllers: [ControllerStatus] = []
-    /// `host.doctor`'s `controllers`; a core that cannot be reached or
-    /// refuses leaves the failure here, never an empty list.
-    public private(set) var inventory: FlowState<[ControllerFact]> = .idle
+    /// `host.doctor`'s `controllers` and `controllers_unavailable`; a core
+    /// that cannot be reached or refuses leaves the failure here, never an
+    /// empty list.
+    public private(set) var inventory: FlowState<ControllerInventory> = .idle
     private let app: AppModel
     private let provider: Provider
     private var observers: [any NSObjectProtocol] = []
@@ -53,9 +54,11 @@ public final class ControllersViewModel {
         }
     }
 
-    /// The rule the inventory read last gives; `nil` until one is ready.
+    /// The rule the inventory read last gives; `nil` until one is ready,
+    /// and `nil` while the inventory is unavailable (the view shows
+    /// `inventory.unavailableLine` in its place).
     public var hidrawDefault: HidrawDefault? {
-        inventory.value.map(HidrawDefault.decide)
+        inventory.value.flatMap(HidrawDefault.decide)
     }
 
     /// The GameController list, now.
@@ -67,7 +70,7 @@ public final class ControllersViewModel {
     public func loadInventory() async {
         inventory = .loading
         if let next = await app.run({ try await $0.hostDoctor() }) {
-            inventory = next.map(\.controllers)
+            inventory = next.map(\.controllerInventory)
         }
     }
 

@@ -27,18 +27,20 @@ public struct ControllersView: View {
                 Text("Pads as the GameController framework reports them; input reaches the game through Wine.")
             }
             Section {
-                FlowStateView(model.inventory, idle: "Not read yet.", retry: { Task { await model.loadInventory() } }) { pads in
-                    if pads.isEmpty {
+                FlowStateView(model.inventory, idle: "Not read yet.", retry: { Task { await model.loadInventory() } }) { inventory in
+                    if inventory.pads.isEmpty, inventory.unavailable == nil {
                         Text("No pads paired or plugged in.").foregroundStyle(.secondary)
                     }
-                    ForEach(Array(pads.enumerated()), id: \.offset) { _, pad in
+                    ForEach(Array(inventory.pads.enumerated()), id: \.offset) { _, pad in
                         VStack(alignment: .leading) {
                             Text(pad.name)
-                            Text("\(pad.transport.rawValue) · \(pad.vendorId):\(pad.productId) · \(pad.kind.rawValue) · \(pad.connected ? "connected" : "not connected") · hidraw default \(pad.kind.hidrawDefaultEnabled ? "enabled" : "disabled")")
+                            Text("\(pad.transport.rawValue) · \(pad.vendorId):\(pad.productId) · \(pad.kind.rawValue) · \(pad.connected ? "connected" : "not connected") · \(pad.hidrawColumn)")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    if let rule = model.hidrawDefault {
+                    if let unavailable = inventory.unavailableLine {
+                        Text(unavailable).foregroundStyle(.secondary)
+                    } else if let rule = model.hidrawDefault {
                         Text(rule.summary)
                     }
                 }
