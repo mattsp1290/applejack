@@ -290,7 +290,11 @@ fn install_line(from: Option<&Path>) -> String {
 const LIST: &str = r#"{"jsonrpc":"2.0","id":6,"method":"engine.list","params":{}}"#;
 
 fn handler(dir: &TempDir, allow_unsigned: bool) -> CoreHandler {
-    CoreHandler::new(Core::new(dir.path().join("data")).with_unsigned_installs(allow_unsigned))
+    CoreHandler::new(
+        Core::new(dir.path().join("data"))
+            .with_controllers(Vec::new())
+            .with_unsigned_installs(allow_unsigned),
+    )
 }
 
 #[test]
@@ -431,7 +435,9 @@ fn prefix_reset_runs_as_a_job() {
     let dir = TempDir::new().unwrap();
     let tree = dir.path().join("tree");
     write_stub_bundle(&tree, "10.0.0");
-    let mut core = Core::new(dir.path().join("data")).with_unsigned_installs(true);
+    let mut core = Core::new(dir.path().join("data"))
+        .with_controllers(Vec::new())
+        .with_unsigned_installs(true);
     core.plan_install("rosetta-wine", Some(&tree))
         .unwrap()
         .run(&mut |_| {})

@@ -49,7 +49,7 @@ impl Handler for Echo {
 /// A handler over a throwaway data directory; tests never see the real one.
 fn core_handler() -> (TempDir, CoreHandler) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let handler = CoreHandler::new(Core::new(dir.path()));
+    let handler = CoreHandler::new(Core::new(dir.path()).with_controllers(Vec::new()));
     (dir, handler)
 }
 

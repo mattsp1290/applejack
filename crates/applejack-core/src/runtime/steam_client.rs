@@ -31,13 +31,14 @@ use applejack_engine::rosetta_wine::launch::new_session_id;
 use applejack_engine::rosetta_wine::process::{find_in_prefix, find_session, wineserver_running};
 use applejack_engine::rosetta_wine::snapshot::{self, PrefixLock};
 use applejack_engine::rosetta_wine::utc_now;
-use applejack_engine::{Engine, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec, Prefix};
+use applejack_engine::{Engine, GraphicsBackend, InstalledEngine, LaunchSpec, Prefix};
 use applejack_steam::acf::app_state;
 use applejack_steam::{AppManifest, Document, LibraryPaths, Node, Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::CoreError;
+use crate::host::HidrawDecision;
 use crate::prefixes::SnapshotResult;
 use crate::runtime::session::log_line;
 use crate::state::Core;
@@ -1733,6 +1734,11 @@ impl PlannedClientOp {
             let (_, prefix) = self.core.open_prefix(STEAM_CLIENT_PREFIX)?;
             return Ok(prefix);
         }
+        // The same rule a run applies, read once here, so the client starts
+        // with the inventory's default and the first run has nothing to flip
+        // while the client owns the prefix.
+        let hidraw = HidrawDecision::from_inventory(&self.core.controllers(), None);
+        report("prepare", hidraw.to_string());
         report("prefix", format!("creating prefix {STEAM_CLIENT_PREFIX}"));
         let library = self.core.library_dir()?;
         self.core.build_prefix(
@@ -1740,7 +1746,7 @@ impl PlannedClientOp {
             &self.installed,
             GraphicsBackend::Dxmt,
             None,
-            HidrawMode::Disabled,
+            hidraw.mode,
             library,
         )
     }

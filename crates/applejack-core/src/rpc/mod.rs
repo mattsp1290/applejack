@@ -11,7 +11,7 @@ use crate::config::DataDirError;
 use crate::engines::describe_progress;
 use crate::error::CoreError;
 use crate::game_config::config_value_text;
-use crate::host::HostFacts;
+use crate::host::{HostFacts, controllers};
 use crate::install::TitleInstall;
 use crate::runtime::steam_client::ClientOp;
 use crate::state::Core;
@@ -130,6 +130,16 @@ impl<H: SteamHost> CoreHandler<H> {
             steam: Arc::new(steam),
             login: None,
         }
+    }
+
+    /// The host with the core's controller inventory, so a pinned core never
+    /// reaches `system_profiler`; without a usable core, the host's own.
+    fn host_doctor(&self) -> HostFacts {
+        let inventory = self
+            .core
+            .as_ref()
+            .map_or_else(|_| controllers::inventory(), Core::controllers);
+        HostFacts::gather().with_controllers(inventory)
     }
 
     fn core(&mut self) -> Result<&mut Core, RpcError> {
@@ -376,7 +386,7 @@ impl<H: SteamHost> Handler for CoreHandler<H> {
                     core_version: env!("CARGO_PKG_VERSION").to_owned(),
                 })
             }
-            Method::HostDoctor(_) => to_result(&HostFacts::gather()),
+            Method::HostDoctor(_) => to_result(&self.host_doctor()),
             Method::EngineList(_) => to_result(&self.core()?.engine_list()?),
             Method::EngineInstall(params) => {
                 let install = self

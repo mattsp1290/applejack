@@ -10,16 +10,17 @@ use applejack_engine::{EngineLayout, RosettaWine};
 
 use crate::config::{self, ConfigDb, DataDirError};
 use crate::error::CoreError;
-use crate::host::controllers::{self, ControllerFact};
+use crate::host::controllers::{self, ControllerFact, Inventory};
 use crate::runtime::session::RunTuning;
 
 /// Where a run reads the controller inventory from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControllerSource {
-    /// `system_profiler`, on every read.
+    /// `system_profiler` on every read, or the `APPLEJACK_CONTROLLERS` knob
+    /// when it is set.
     System,
     /// A fixed inventory; tests pin the pads without the host's.
-    Fixed(Vec<ControllerFact>),
+    Fixed(Inventory),
 }
 
 /// Resolved directories, the engine, and the database handle.
@@ -85,16 +86,23 @@ impl Core {
     /// Pins the controller inventory instead of reading `system_profiler`.
     #[must_use]
     pub fn with_controllers(mut self, controllers: Vec<ControllerFact>) -> Self {
-        self.controllers = ControllerSource::Fixed(controllers);
+        self.controllers = ControllerSource::Fixed(Inventory::available(controllers));
         self
     }
 
-    /// The pads a run decides the hidraw default by, read now.
+    /// Pins the whole inventory, unavailable reads included.
     #[must_use]
-    pub fn controllers(&self) -> Vec<ControllerFact> {
+    pub fn with_controller_inventory(mut self, inventory: Inventory) -> Self {
+        self.controllers = ControllerSource::Fixed(inventory);
+        self
+    }
+
+    /// The inventory a run decides the hidraw default by, read now.
+    #[must_use]
+    pub fn controllers(&self) -> Inventory {
         match &self.controllers {
-            ControllerSource::System => controllers::gather(),
-            ControllerSource::Fixed(pads) => pads.clone(),
+            ControllerSource::System => controllers::inventory(),
+            ControllerSource::Fixed(inventory) => inventory.clone(),
         }
     }
 

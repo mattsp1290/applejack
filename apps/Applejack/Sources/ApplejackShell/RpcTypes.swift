@@ -271,6 +271,9 @@ public struct HostFacts: Codable, Equatable, Sendable {
     public var screenRecording: ScreenRecordingState
     public var developerIdIdentities: Int?
     public var controllers: [ControllerFact]
+    /// Why the inventory could not be read; `nil` when it was. The Rust side
+    /// leaves the key out when there is nothing to say.
+    public var controllersUnavailable: String?
 
     enum CodingKeys: String, CodingKey {
         case macosVersion = "macos_version"
@@ -280,6 +283,7 @@ public struct HostFacts: Codable, Equatable, Sendable {
         case screenRecording = "screen_recording"
         case developerIdIdentities = "developer_id_identities"
         case controllers
+        case controllersUnavailable = "controllers_unavailable"
     }
 
     public init(
@@ -289,7 +293,8 @@ public struct HostFacts: Codable, Equatable, Sendable {
         freeDiskBytes: UInt64?,
         screenRecording: ScreenRecordingState,
         developerIdIdentities: Int?,
-        controllers: [ControllerFact]
+        controllers: [ControllerFact],
+        controllersUnavailable: String? = nil
     ) {
         self.macosVersion = macosVersion
         self.arch = arch
@@ -298,6 +303,19 @@ public struct HostFacts: Codable, Equatable, Sendable {
         self.screenRecording = screenRecording
         self.developerIdIdentities = developerIdIdentities
         self.controllers = controllers
+        self.controllersUnavailable = controllersUnavailable
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(macosVersion, forKey: .macosVersion)
+        try container.encode(arch, forKey: .arch)
+        try container.encode(rosettaPresent, forKey: .rosettaPresent)
+        try container.encode(freeDiskBytes, forKey: .freeDiskBytes)
+        try container.encode(screenRecording, forKey: .screenRecording)
+        try container.encode(developerIdIdentities, forKey: .developerIdIdentities)
+        try container.encode(controllers, forKey: .controllers)
+        try container.encodeIfPresent(controllersUnavailable, forKey: .controllersUnavailable)
     }
 
     /// `controllers` reads as empty when absent, as the Rust side's
@@ -312,6 +330,7 @@ public struct HostFacts: Codable, Equatable, Sendable {
         screenRecording = try container.decode(ScreenRecordingState.self, forKey: .screenRecording)
         developerIdIdentities = try container.decodeIfPresent(Int.self, forKey: .developerIdIdentities)
         controllers = try container.decodeIfPresent([ControllerFact].self, forKey: .controllers) ?? []
+        controllersUnavailable = try container.decodeIfPresent(String.self, forKey: .controllersUnavailable)
     }
 }
 

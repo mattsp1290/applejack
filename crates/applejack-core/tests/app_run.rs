@@ -17,7 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use applejack_core::config::{ConfigDb, Drm, NewSession, SessionRow, SessionState};
-use applejack_core::host::{ControllerFact, ControllerKind, Transport};
+use applejack_core::host::{ControllerFact, ControllerKind, Inventory, Transport};
 use applejack_core::rpc::jobs::Notifier;
 use applejack_core::rpc::methods::{
     AppCancelParams, AppRunParams, HelloParams, Method, SessionListParams,
@@ -301,14 +301,8 @@ fn a_record_that_lands_after_the_first_look_refuses_the_run() {
             .unwrap()
             .success()
     );
-    let data = fixture.data();
-    let planner = thread::spawn(move || {
-        Core::new(data)
-            .with_unsigned_installs(true)
-            .with_run_tuning(FAST)
-            .plan_run(APP, false)
-            .map(|_plan| ())
-    });
+    let mut core = fixture.core();
+    let planner = thread::spawn(move || core.plan_run(APP, false).map(|_plan| ()));
     // This open returns once the first look has opened the FIFO to read.
     let mut writer = fs::OpenOptions::new().write(true).open(&acf).unwrap();
     let record = fixture
@@ -713,10 +707,14 @@ fn a_changed_setting_is_applied_before_the_launch() {
 /// A run with `pads` as the inventory, to its end; the lines are
 /// `phase: message`, as the CLI prints them.
 fn run_with_pads(fixture: &Fixture, pads: Vec<ControllerFact>) -> Vec<String> {
+    run_with_inventory(fixture, Inventory::available(pads))
+}
+
+fn run_with_inventory(fixture: &Fixture, inventory: Inventory) -> Vec<String> {
     let _ = fs::remove_file(fixture.prefix_dir().join("quit"));
     let plan = fixture
         .core()
-        .with_controllers(pads)
+        .with_controller_inventory(inventory)
         .plan_run(APP, false)
         .unwrap();
     let id = plan.session_id();
@@ -845,6 +843,53 @@ fn a_pad_appearing_between_two_runs_flips_the_prefix() {
     assert_eq!(lines[0], "prepare: hidraw enabled (no Sony pad connected)");
     assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Enabled));
     assert!(seeds(&fixture).contains(HIDRAW_ENABLED_SEED));
+}
+
+#[test]
+fn an_unavailable_inventory_disables_a_new_prefix_and_keeps_an_existing_one() {
+    const WHY: &str = "controller inventory unavailable (SPBluetoothDataType timed out)";
+    let fixture = Fixture::new();
+    let unavailable = Inventory::unavailable("SPBluetoothDataType timed out");
+    // Before the prefix exists, `config.resolve` says what the first run will do.
+    let resolved = fixture
+        .core()
+        .with_controller_inventory(unavailable.clone())
+        .config_resolve(APP)
+        .unwrap();
+    assert!(!resolved.hidraw_enabled);
+    assert_eq!(resolved.hidraw_reason, WHY);
+    let lines = run_with_inventory(&fixture, unavailable.clone());
+    assert_eq!(
+        lines[..3],
+        [
+            format!("prepare: hidraw disabled ({WHY})"),
+            "prefix: creating prefix 1234".to_owned(),
+            "starting: title.exe".to_owned(),
+        ],
+        "{lines:?}"
+    );
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Disabled));
+    assert!(seeds(&fixture).contains(HIDRAW_DISABLED_SEED));
+
+    run_with_pads(&fixture, Vec::new());
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Enabled));
+    let lines = run_with_inventory(&fixture, unavailable.clone());
+    assert_eq!(
+        lines[..2],
+        [
+            format!("prepare: hidraw enabled ({WHY})"),
+            "starting: title.exe".to_owned(),
+        ],
+        "an existing prefix keeps its mode and nothing is applied: {lines:?}"
+    );
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Enabled));
+    let resolved = fixture
+        .core()
+        .with_controller_inventory(unavailable)
+        .config_resolve(APP)
+        .unwrap();
+    assert!(resolved.hidraw_enabled);
+    assert_eq!(resolved.hidraw_reason, WHY);
 }
 
 #[test]
@@ -2050,7 +2095,7 @@ fn hello_on_a_fresh_data_directory_creates_nothing() {
     let dir = TempDir::new().unwrap();
     let data = dir.path().join("data");
     let (notifier, _lines) = Notifier::channel();
-    let mut handler = CoreHandler::new(Core::new(&data));
+    let mut handler = CoreHandler::new(Core::new(&data).with_controllers(Vec::new()));
     let hello = Method::Hello(HelloParams {
         protocol_version: PROTOCOL_VERSION,
     });

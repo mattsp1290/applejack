@@ -87,6 +87,7 @@ fn expected() -> BTreeMap<String, String> {
                 connected: true,
                 kind: ControllerKind::Dualsense,
             }],
+            controllers_unavailable: None,
         })
         .expect("encodes"),
     );

@@ -76,6 +76,9 @@ pub fn resolve(
         engine_version: pick!(engine_version),
         graphics_backend: pick!(graphics_backend).unwrap_or(GraphicsBackend::Dxmt),
         sync_mode: pick!(sync_mode).unwrap_or(SyncMode::Disabled),
+        // Not what a run applies: the run path leaves an unset `hidraw_enabled`
+        // to `applejack_core::host::HidrawDecision` (the connected pads decide).
+        // Whoever wires this resolver into the run must route it there too.
         hidraw_enabled: pick!(hidraw_enabled).unwrap_or(false),
         steam_input: pick!(steam_input).unwrap_or(false),
         steam_overlay: pick!(steam_overlay).unwrap_or(false),
