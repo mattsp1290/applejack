@@ -58,7 +58,9 @@ final class CoreBinaryTests: XCTestCase {
     /// the real binary through `APPLEJACK_CONTROLLERS` and its text is
     /// compared with the lines the Controllers view builds from the fake's
     /// `host.doctor` answer; the `unavailable` knob pins the unavailable
-    /// line's sentence.
+    /// line's sentence, and the `dualsense-unavailable` shape, fed as the
+    /// knob's inventory object, pins that a listed connected Sony pad
+    /// decides in place of that sentence.
     func testDoctorControllersAgreesWithTheSwiftMirror() async throws {
         let binary = try coreBinary()
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("applejack-u18d-\(UUID().uuidString)")
@@ -86,6 +88,30 @@ final class CoreBinaryTests: XCTestCase {
         let unavailable = ControllerInventory(pads: [], unavailable: "APPLEJACK_CONTROLLERS=unavailable")
         XCTAssertEqual(printed, doctorText(unavailable))
         XCTAssertEqual(printed.count, 1, "no decision line and no `no controllers` when the read failed: \(printed)")
+
+        let fake = CoreClient(executable: CoreClientTests.fakeCore, arguments: [], environment: ["FAKE_CORE_CONTROLLERS": "dualsense-unavailable"])
+        let facts = try await fake.hostDoctor()
+        await fake.shutdown()
+        XCTAssertEqual(facts.controllersUnavailable, "SPUSBDataType timed out")
+        XCTAssertEqual(facts.controllers.map(\.kind), [.dualsense])
+        let file = scratch.appendingPathComponent("dualsense-unavailable.json")
+        try JSONEncoder().encode(KnobInventory(controllers: facts.controllers, controllersUnavailable: facts.controllersUnavailable)).write(to: file)
+        let decided = try doctorControllers(binary, knob: file.path, dataDir: scratch)
+        XCTAssertEqual(decided, doctorText(facts.controllerInventory))
+        XCTAssertEqual(decided.count, 2, "the pad's row and the decision line: \(decided)")
+        XCTAssertEqual(decided.last, "hidraw disabled (DualSense connected; SPUSBDataType timed out)")
+    }
+
+    /// The `{"controllers": [...], "controllers_unavailable": ...}` shape
+    /// `APPLEJACK_CONTROLLERS` accepts.
+    private struct KnobInventory: Encodable {
+        var controllers: [ControllerFact]
+        var controllersUnavailable: String?
+
+        enum CodingKeys: String, CodingKey {
+            case controllers
+            case controllersUnavailable = "controllers_unavailable"
+        }
     }
 
     /// `render_controllers` rebuilt from the Swift words: one line per pad,

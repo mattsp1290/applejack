@@ -302,8 +302,10 @@ extension ControllerFact {
 /// `applejack_core::host::Inventory`, as `host.doctor` carries it: the pads
 /// `system_profiler` listed and, when one of its reports failed to run,
 /// timed out, or did not parse, why. An unavailable inventory is never "no
-/// pads": the pads the other report listed are still here, but a run keeps
-/// the prefix's mode instead of deciding from them.
+/// pads": the pads the other report listed are still here. A connected
+/// DualShock 4 or DualSense among them still decides (a failed report can
+/// only hide pads, never undo one that was listed); without one, a run
+/// keeps the prefix's mode instead of deciding from them.
 public struct ControllerInventory: Equatable, Sendable {
     public var pads: [ControllerFact]
     public var unavailable: String?
@@ -313,22 +315,31 @@ public struct ControllerInventory: Equatable, Sendable {
         self.unavailable = unavailable
     }
 
+    /// `Inventory::decides_hidraw`: whether the pads settle the hidraw
+    /// default, which an inventory that was read always does and an
+    /// unavailable one does only through a listed connected Sony pad.
+    public var decidesHidraw: Bool {
+        unavailable == nil || !HidrawDefault.decide(pads).enabled
+    }
+
     /// The line `doctor --controllers` prints instead of the decision line
-    /// when the inventory is unavailable; `nil` when it was read.
+    /// when the inventory is unavailable and no listed pad decides; `nil`
+    /// when it was read or a Sony pad decides.
     public var unavailableLine: String? {
-        unavailable.map { why in
-            "controller inventory unavailable (\(why)): a new prefix gets hidraw disabled, an existing prefix keeps its mode"
-        }
+        guard let why = unavailable, !decidesHidraw else { return nil }
+        return "controller inventory unavailable (\(why)): a new prefix gets hidraw disabled, an existing prefix keeps its mode"
     }
 }
 
-/// `HidrawDecision::from_controllers`: the hidraw mode a run applies to a
-/// title whose `hidraw_enabled` is unset, decided by the connected pads.
-/// Kept in step with the Rust rule so the Controllers view says what the
-/// next run will do before any `config.resolve` is asked.
+/// `HidrawDecision::from_controllers` and `from_inventory`: the hidraw mode
+/// a run applies to a title whose `hidraw_enabled` is unset, decided by the
+/// connected pads. Kept in step with the Rust rule so the Controllers view
+/// says what the next run will do before any `config.resolve` is asked.
 public struct HidrawDefault: Equatable, Sendable {
     public var enabled: Bool
-    /// `DualSense connected`, `DualShock 4 connected`, or `no Sony pad connected`.
+    /// `DualSense connected`, `DualShock 4 connected`, `no Sony pad
+    /// connected`, or `<kind> connected; <why>` when a listed Sony pad
+    /// decided over an unavailable inventory.
     public var reason: String
 
     public init(enabled: Bool, reason: String) {
@@ -336,11 +347,15 @@ public struct HidrawDefault: Equatable, Sendable {
         self.reason = reason
     }
 
-    /// The rule over an inventory that was read; `nil` when it is
-    /// unavailable, since the mode is then the prefix's own and only
-    /// `config.resolve` can say it.
+    /// The rule over an inventory that was read; over an unavailable one,
+    /// the `disabled` a listed connected Sony pad gives with the failure
+    /// after it, or `nil` when no such pad is listed, since the mode is
+    /// then the prefix's own and only `config.resolve` can say it.
     public static func decide(_ inventory: ControllerInventory) -> HidrawDefault? {
-        inventory.unavailable == nil ? decide(inventory.pads) : nil
+        let listed = decide(inventory.pads)
+        guard let why = inventory.unavailable else { return listed }
+        guard !listed.enabled else { return nil }
+        return HidrawDefault(enabled: false, reason: "\(listed.reason); \(why)")
     }
 
     public static func decide(_ controllers: [ControllerFact]) -> HidrawDefault {

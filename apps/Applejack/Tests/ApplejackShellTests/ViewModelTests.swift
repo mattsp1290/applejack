@@ -1265,13 +1265,54 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
-    /// `HidrawDefault.decide` over an inventory: the rule when it was read,
-    /// nothing when it was not, whatever pads the other report listed.
-    func testTheHidrawRuleIsSilentOverAnUnavailableInventory() {
+    /// A report that failed can only hide pads, never undo the DualSense the
+    /// other report listed: the view shows the decision line with both the
+    /// pad and the failure, as `doctor --controllers` does, not the
+    /// "keeps its mode" sentence.
+    func testAConnectedDualSenseDecidesEvenWhenTheInventoryIsUnavailable() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "dualsense-unavailable"])
+        let model = ControllersViewModel(app: app, provider: { [] })
+        await model.loadInventory()
+        let inventory = try XCTUnwrap(model.inventory.value)
+        XCTAssertEqual(inventory.pads.count, 1)
+        XCTAssertEqual(inventory.pads.first?.kind, .dualsense)
+        XCTAssertEqual(inventory.pads.first?.connected, true)
+        XCTAssertEqual(inventory.unavailable, "SPUSBDataType timed out")
+        XCTAssertTrue(inventory.decidesHidraw)
+        XCTAssertNil(inventory.unavailableLine, "the decision line replaces the sentence when a listed Sony pad decides")
+        XCTAssertEqual(model.hidrawDefault, HidrawDefault(enabled: false, reason: "DualSense connected; SPUSBDataType timed out"))
+        XCTAssertEqual(model.hidrawDefault?.summary, "hidraw disabled (DualSense connected; SPUSBDataType timed out)")
+        await app.shutdown()
+    }
+
+    /// `HidrawDefault.decide` over an inventory mirrors
+    /// `Inventory::decides_hidraw`: the rule when it was read; over an
+    /// unavailable one, a listed connected Sony pad still decides `disabled`
+    /// with `<kind> connected; <why>`, and only an inventory without such a
+    /// pad gives nothing (the mode is then the prefix's own).
+    func testTheHidrawRuleOverAnUnavailableInventoryDecidesOnlyForAListedSonyPad() {
         let dualsense = ControllerFact(name: "DualSense Wireless Controller", transport: .usb, vendorId: "0x054c", productId: "0x0ce6", connected: true, kind: .dualsense)
+        let ds4 = ControllerFact(name: "Wireless Controller", transport: .bluetooth, vendorId: "0x054c", productId: "0x09cc", connected: true, kind: .dualshock4)
+        let away = ControllerFact(name: "DualSense Wireless Controller", transport: .bluetooth, vendorId: "0x054c", productId: "0x0ce6", connected: false, kind: .dualsense)
+        let xbox = ControllerFact(name: "Xbox Wireless Controller", transport: .usb, vendorId: "0x045e", productId: "0x0b12", connected: true, kind: .xbox)
         XCTAssertEqual(HidrawDefault.decide(ControllerInventory(pads: [dualsense])), HidrawDefault(enabled: false, reason: "DualSense connected"))
-        XCTAssertNil(HidrawDefault.decide(ControllerInventory(pads: [dualsense], unavailable: "SPBluetoothDataType timed out")))
+        XCTAssertEqual(
+            HidrawDefault.decide(ControllerInventory(pads: [dualsense], unavailable: "SPBluetoothDataType timed out")),
+            HidrawDefault(enabled: false, reason: "DualSense connected; SPBluetoothDataType timed out"))
+        XCTAssertEqual(
+            HidrawDefault.decide(ControllerInventory(pads: [ds4, dualsense], unavailable: "SPUSBDataType exited with exit status: 1")),
+            HidrawDefault(enabled: false, reason: "DualSense connected; SPUSBDataType exited with exit status: 1"))
+        XCTAssertEqual(
+            HidrawDefault.decide(ControllerInventory(pads: [ds4], unavailable: "SPUSBDataType timed out")),
+            HidrawDefault(enabled: false, reason: "DualShock 4 connected; SPUSBDataType timed out"))
         XCTAssertNil(HidrawDefault.decide(ControllerInventory(pads: [], unavailable: "SPUSBDataType exited with exit status: 1")))
+        XCTAssertNil(HidrawDefault.decide(ControllerInventory(pads: [away], unavailable: "SPUSBDataType timed out")), "an away Sony pad does not count")
+        XCTAssertNil(HidrawDefault.decide(ControllerInventory(pads: [xbox], unavailable: "SPBluetoothDataType returned no report")), "an Xbox pad never decides")
+        XCTAssertTrue(ControllerInventory(pads: [xbox]).decidesHidraw, "a read inventory always decides")
+        XCTAssertTrue(ControllerInventory(pads: [ds4], unavailable: "why").decidesHidraw)
+        XCTAssertFalse(ControllerInventory(pads: [xbox], unavailable: "why").decidesHidraw)
+        XCTAssertNotNil(ControllerInventory(pads: [xbox], unavailable: "why").unavailableLine)
+        XCTAssertNil(ControllerInventory(pads: [ds4], unavailable: "why").unavailableLine)
         let facts = HostFacts(macosVersion: "26.0", arch: nil, rosettaPresent: nil, freeDiskBytes: nil, screenRecording: .unknown, developerIdIdentities: nil, controllers: [dualsense], controllersUnavailable: "why")
         XCTAssertEqual(facts.controllerInventory, ControllerInventory(pads: [dualsense], unavailable: "why"))
     }
@@ -1333,6 +1374,22 @@ final class ViewModelTests: XCTestCase {
                 appid: 220, hidrawEnabled: false, hidrawSource: .controllers,
                 hidrawReason: "controller inventory unavailable (SPBluetoothDataType timed out)")))
         XCTAssertEqual(detail.hidrawDefaultText, "Default: off, controller inventory unavailable (SPBluetoothDataType timed out)")
+        await app.shutdown()
+    }
+
+    /// A listed connected DualSense decides even when the other report
+    /// failed; the toggle reads the core's `<kind> connected; <why>` form.
+    func testAnUnsetHidrawToggleShowsTheDecidedReasonOverAnUnavailableInventory() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_HIDRAW": "unset", "FAKE_CORE_CONTROLLERS": "dualsense-unavailable"])
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        await detail.load()
+        XCTAssertNil(detail.config.value?.hidrawEnabled)
+        XCTAssertEqual(
+            detail.hidrawDefault,
+            .ready(ConfigResolveResult(
+                appid: 220, hidrawEnabled: false, hidrawSource: .controllers,
+                hidrawReason: "DualSense connected; SPUSBDataType timed out")))
+        XCTAssertEqual(detail.hidrawDefaultText, "Default: off, DualSense connected; SPUSBDataType timed out")
         await app.shutdown()
     }
 

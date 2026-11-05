@@ -55,8 +55,9 @@ public final class ControllersViewModel {
     }
 
     /// The rule the inventory read last gives; `nil` until one is ready,
-    /// and `nil` while the inventory is unavailable (the view shows
-    /// `inventory.unavailableLine` in its place).
+    /// and `nil` while the inventory is unavailable with no listed Sony pad
+    /// to decide it (the view shows `inventory.unavailableLine` in its
+    /// place).
     public var hidrawDefault: HidrawDefault? {
         inventory.value.flatMap(HidrawDefault.decide)
     }
