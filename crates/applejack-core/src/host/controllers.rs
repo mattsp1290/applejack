@@ -415,6 +415,8 @@ fn report(program: &Path, data_type: &str, timeout: Duration) -> Result<String, 
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         // Its own process group, so the kill reaches a helper the tool forked.
+        // That also takes it out of the terminal's foreground group: a Ctrl-C
+        // ends us, not it; it then exits on `SIGPIPE` or its own `-timeout`.
         .process_group(0)
         .spawn()
         .map_err(|error| format!("cannot run {}: {error}", program.display()))?;
@@ -713,11 +715,15 @@ fn hex_id(id: u16) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
     /// The program [`gather`] runs in place of [`SYSTEM_PROFILER`] while a
     /// test holds one installed; see [`install_profiler`].
     static PROFILER_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+    /// Held for as long as a [`ProfilerGuard`] lives, so two tests never
+    /// share the slot. Separate from the slot's own lock, which
+    /// [`profiler_override`] takes on the installing test's thread.
+    static INSTALLED: Mutex<()> = Mutex::new(());
 
     pub(crate) fn profiler_override() -> Option<PathBuf> {
         PROFILER_OVERRIDE
@@ -727,16 +733,20 @@ pub(crate) mod tests {
     }
 
     /// Makes `program` the reporter until the guard drops. One test at a
-    /// time: the guard holds the lock.
+    /// time: the guard holds [`INSTALLED`], and a second caller waits.
     pub(crate) fn install_profiler(program: &Path) -> ProfilerGuard {
-        let mut slot = PROFILER_OVERRIDE
+        let installed = INSTALLED.lock().unwrap_or_else(PoisonError::into_inner);
+        *PROFILER_OVERRIDE
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *slot = Some(program.to_path_buf());
-        ProfilerGuard
+            .unwrap_or_else(PoisonError::into_inner) = Some(program.to_path_buf());
+        ProfilerGuard {
+            _installed: installed,
+        }
     }
 
-    pub(crate) struct ProfilerGuard;
+    pub(crate) struct ProfilerGuard {
+        _installed: MutexGuard<'static, ()>,
+    }
 
     impl Drop for ProfilerGuard {
         fn drop(&mut self) {

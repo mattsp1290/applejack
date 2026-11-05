@@ -312,6 +312,8 @@ mod tests {
         let report = core.engine_doctor().expect("doctor without an engine");
         assert!(!report.runnable);
         assert!(!marker.exists(), "engine_doctor read the inventory");
+        let _host = crate::engines::engine_host();
+        assert!(!marker.exists(), "the engine paths read the inventory");
 
         // The control: the stand-in is reached by the path that does read.
         let inventory = controllers::gather();

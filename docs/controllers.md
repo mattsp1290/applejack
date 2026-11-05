@@ -217,8 +217,9 @@ failed, or the path of a JSON file holding either an array of pads in the
 output pins itself. The CLI suite sets it, and the core suites pin the
 inventory through `Core::with_controllers`, so no test runs
 `system_profiler`; the core's own lib test installs a recording stand-in
-for the tool and fails if `HostFacts::gather` or the engine doctor ever
-reach it. It is not a user setting and may change without notice.
+for the tool and fails if `HostFacts::gather` or the engine paths
+(`engine install` and `engine doctor`, through `engines::engine_host`)
+ever reach it. It is not a user setting and may change without notice.
 
 ## In the shell
 

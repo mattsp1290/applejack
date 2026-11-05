@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use applejack_engine::rosetta_wine::{self, CpuidProbe, d3dmetal};
 use applejack_engine::{
-    DoctorReport, Engine, EngineId, EngineLayout, Error as EngineError, Finding, InstallLock,
+    DoctorReport, Engine, EngineId, EngineLayout, Error as EngineError, Finding, Host, InstallLock,
     InstalledEngine, LocalBundle, Progress, RosettaWine, Severity, Version, embedded_manifest,
     versions,
 };
@@ -16,6 +16,15 @@ use crate::config::ConfigDb;
 use crate::error::CoreError;
 use crate::host::HostFacts;
 use crate::state::Core;
+
+/// The host the engine paths (`engine install`, `engine doctor`) hand the
+/// engine: never the controller inventory, since `HostFacts::gather` runs
+/// no `system_profiler`. The one `gather` in this file; both callers go
+/// through it, and `host::tests::gather_reads_no_controller_inventory`
+/// pins it.
+pub(crate) fn engine_host() -> Host {
+    HostFacts::gather().engine_host()
+}
 
 /// `meta` key holding the last [`CpuidProbe`], as JSON.
 pub const META_CPUID_PROBE: &str = "cpuid_probe";
@@ -111,7 +120,7 @@ impl EngineInstall {
         let lock = InstallLock::acquire(&self.layout, self.id)?;
         lock.sweep_packed(&self.from);
         let local = LocalBundle::prepare(&self.layout, self.id, &self.from, progress)?;
-        let host = HostFacts::gather().engine_host();
+        let host = engine_host();
         let installed = RosettaWine.install(&host, &self.layout, &local.request, progress)?;
         strip_quarantine(&installed.root);
         let db = ConfigDb::open(&self.layout.data_dir().join(crate::config::DB_FILE))?;
@@ -277,7 +286,7 @@ impl Core {
     /// Only when the fix itself cannot be worked out (an unreadable engine
     /// directory).
     pub fn engine_doctor(&mut self) -> Result<DoctorReport, CoreError> {
-        let host = HostFacts::gather().engine_host();
+        let host = engine_host();
         let (installed, opened) = match self.active_engine() {
             Ok(installed) => (installed, None),
             Err(error) => (None, Some(error)),
