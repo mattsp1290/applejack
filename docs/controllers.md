@@ -50,7 +50,8 @@ it is not the one in a user's prefix.
 | `true` | enabled | `config` |
 | `false` | disabled | `config` |
 | unset, inventory read | disabled with a connected DualShock 4 or DualSense, else enabled | `controllers` |
-| unset, inventory unavailable | the prefix's current mode; disabled for a prefix not built yet | `controllers` |
+| unset, one report unavailable, the other lists a connected DualShock 4 or DualSense | disabled | `controllers` |
+| unset, inventory unavailable, no connected Sony pad known | the prefix's current mode; disabled for a prefix not built yet | `controllers` |
 
 An explicit value always wins. When it is unset, every run reads the
 controller inventory (below) and decides again, so a prefix flips with the
@@ -67,25 +68,38 @@ prepare: hidraw enabled (config)
 prepare: hidraw disabled (config)
 prepare: hidraw disabled (controller inventory unavailable (SPBluetoothDataType timed out))
 prepare: hidraw enabled (controller inventory unavailable (SPBluetoothDataType timed out))
+prepare: hidraw disabled (DualSense connected; SPBluetoothDataType timed out)
 ```
 
 When both Sony pads are connected the DualSense is named. A pad that is
 paired but away does not count.
 
 An inventory is unavailable when one of the two `system_profiler` reports
-failed to run, timed out, or did not parse. That never reads as "no pads":
-the run keeps the prefix's current mode, applies nothing, and says why on
-the `prepare` line; a prefix that does not exist yet is built with hidraw
-disabled, the mode that is safe for a Sony pad. Pads the other report did
-list are still shown by `doctor`, but do not make the read trustworthy.
+failed to run, timed out, returned no report, or did not parse. That never
+reads as "no pads". A report that failed can only hide pads, never make a
+listed one false, so a connected DualShock 4 or DualSense the other report
+did list still disables hidraw, with both facts on the line (`DualSense
+connected; SPBluetoothDataType timed out`). With no connected Sony pad
+known, the run keeps the prefix's current mode, applies nothing, and says
+why on the `prepare` line; a prefix that does not exist yet is built with
+hidraw disabled, the mode that is safe for a Sony pad. Pads the other
+report did list are still shown by `doctor`, but an Xbox pad or an away
+Sony pad does not make the read trustworthy.
 
 The inventory is read only when `hidraw_enabled` is unset: `system_profiler`
 answers in about 0.2 s once warm and takes over a second on a cold start,
-and an explicit setting has nothing to ask it. Each report runs with
-`-timeout 5` (the tool's own default is 180 s; five seconds is several times
-the slowest report measured) and is killed if it has not returned within
-half as much again, so a wedged Bluetooth daemon costs a run at most a few
-seconds and an "unavailable" line, never a silent three-minute stall.
+and an explicit setting has nothing to ask it. The two reports run at once,
+and each is bounded at 7.5 s (`PROFILER_TIMEOUT`, five seconds, several
+times the slowest report measured, and half as much again): past that the
+tool and every process it started are killed, as one process group, and the
+report is `timed out`. The bound is on the read of the report, not on the
+tool's exit alone, so a helper that kept stdout open after the tool was
+gone cannot hold a run. The tool is told `-timeout 10` so its own give-up
+(default 180 s) never comes first; when a reporter does not answer it, the
+tool prints `{}` with exit 0, which reads as `returned no report`, never as
+"no pads". So a wedged Bluetooth daemon costs a run at most 7.5 s and an
+"unavailable" line, never a silent three-minute stall and never a false
+"no Sony pad connected".
 
 ### The Steam client prefix
 
@@ -120,9 +134,11 @@ hidraw_reason         = "DualSense connected"
 Over RPC the same answer is `config.resolve`
 (`{appid, hidraw_enabled, hidraw_source, hidraw_reason}`), with
 `hidraw_enabled` the effective value; see `docs/rpc-protocol.md`. When the
-inventory is unavailable, both report the mode of the prefix the run would
-use (the title's own, or `steam-client` for a title on the client path),
-and `false` when that prefix is not built yet.
+inventory is unavailable and no connected Sony pad is known, both report
+the mode of the prefix the run would use (the title's own, or
+`steam-client` for a title on the client path), and `false` when that
+prefix is not built yet; a prefix directory that exists but cannot be
+opened is the error the run would give, not "not built yet".
 
 Start with the default. If a DualShock 4's sticks do not click, or a pad is
 dead under D3DMetal, set `hidraw_enabled false`; if a game talks the pad's
@@ -148,7 +164,9 @@ pad as it is now: a connected pad reads `hidraw default disabled` or
 hidraw if connected` or `would leave hidraw enabled if connected`, since it
 does not count toward the last line. With nothing paired or plugged in it
 prints `no controllers` and `hidraw enabled (no Sony pad connected)`. When a
-report could not be read it prints the pads it did get and then, instead of
+report could not be read it prints the pads it did get and then, unless
+one of them is a connected Sony pad (then the decision line, `hidraw
+disabled (DualSense connected; SPBluetoothDataType timed out)`), instead of
 the decision line,
 
 ```text
@@ -173,7 +191,9 @@ SPUSBDataType -json` and `SPBluetoothDataType -json`
   under both lists is one pad, connected.
 - USB carries no device class, so a device is a pad when its ids name a
   known Sony pad, or when its name says `controller`, `gamepad`, or
-  `joystick`. A Microsoft mouse is not an Xbox pad; an Xbox pad is.
+  `joystick`. A Microsoft mouse is not an Xbox pad; an Xbox pad is. A hub
+  (a device with `_items`) is never a pad by its name, so a "USB 3.0 Hub
+  Controller" is left out. Two identical pads are two rows.
 - Kind by ids: Sony `0x054c` with DualShock 4 `0x05c4`, `0x09cc`, or the
   `0x0ba0` USB wireless adaptor, DualSense `0x0ce6` or Edge `0x0df2`;
   Microsoft `0x045e`, any product, is `xbox`; everything else is `other`.
@@ -181,16 +201,24 @@ SPUSBDataType -json` and `SPBluetoothDataType -json`
   hubs, and phones are left out.
 - Each device is read leniently: an id written as a number is still an id,
   and an odd or missing field blanks that field or drops that device, never
-  the report. A report that is not JSON, or not a report object (`[]`, the
-  shape of an empty report, lists nothing), is unavailable.
+  the report. The report's own array must be there: `{"SPUSBDataType": []}`
+  (the real empty report) is no pads; `{}` or a `null` array is `returned no
+  report`, and text that is not JSON, not a report object, or has the array
+  as something else `does not parse`. All three make the inventory
+  unavailable.
 
 ### Pinning the inventory (tests only)
 
 `APPLEJACK_CONTROLLERS` replaces the host's inventory for the `applejack`
 binary and the core: `none` for no pads, `unavailable` for a read that
-failed, or the path of a JSON array of pads in the `host.doctor` shape. The
-CLI and core test suites set it so no test runs `system_profiler`; it is
-not a user setting and may change without notice.
+failed, or the path of a JSON file holding either an array of pads in the
+`host.doctor` shape or the object `doctor --controllers --json` prints
+(`{"controllers": [...], "controllers_unavailable": "..."}`), so that
+output pins itself. The CLI suite sets it, and the core suites pin the
+inventory through `Core::with_controllers`, so no test runs
+`system_profiler`; the core's own lib test installs a recording stand-in
+for the tool and fails if `HostFacts::gather` or the engine doctor ever
+reach it. It is not a user setting and may change without notice.
 
 ## In the shell
 
