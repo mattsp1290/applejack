@@ -77,6 +77,17 @@
 #   FAKE_CORE_LOGIN_REJECT_ONCE=1  the first steam.login.complete carrying a
 #                                 steam_guard_code answers SteamGuardRejected
 #                                 (1022); the next one with a code answers done
+#   FAKE_CORE_CONTROLLERS=<shape>  host.doctor's `controllers`: `empty` (the
+#                                 default), `dualsense` (one connected over
+#                                 Bluetooth), `xbox` (one wired), `dualsense-away`
+#                                 (paired, not connected), `refuse` (host.doctor
+#                                 answers Internal 1003 instead), or a JSON
+#                                 array in the Rust shape, used as given
+#   FAKE_CORE_HIDRAW=<unset|true|false>  config.get's `hidraw_enabled` (default
+#                                 false); config.resolve answers the stored
+#                                 value from `config`, or with `unset` the
+#                                 rule FAKE_CORE_CONTROLLERS gives from
+#                                 `controllers`, as `HidrawDecision` does
 #
 # session.list reflects what happened, as the core's `sessions` row does: the
 # canned open row 1 (running) until app.run, then the run's row 41, `starting`
@@ -386,6 +397,27 @@ cancel_job() {
   ) &
 }
 
+# controllers_json: host.doctor's `controllers` per FAKE_CORE_CONTROLLERS,
+# in the shape `host.doctor.result.json` pins (ids lowercase `0x` hex).
+controllers_json() {
+  case "${FAKE_CORE_CONTROLLERS:-empty}" in
+    empty) printf '%s' '[]' ;;
+    dualsense) printf '%s' '[{"name":"DualSense Wireless Controller","transport":"bluetooth","vendor_id":"0x054c","product_id":"0x0ce6","connected":true,"kind":"dualsense"}]' ;;
+    dualsense-away) printf '%s' '[{"name":"DualSense Wireless Controller","transport":"bluetooth","vendor_id":"0x054c","product_id":"0x0ce6","connected":false,"kind":"dualsense"}]' ;;
+    xbox) printf '%s' '[{"name":"Xbox Wireless Controller","transport":"usb","vendor_id":"0x045e","product_id":"0x0b12","connected":true,"kind":"xbox"}]' ;;
+    *) printf '%s' "$FAKE_CORE_CONTROLLERS" ;;
+  esac
+}
+
+# hidraw_json: config.get's `hidraw_enabled` per FAKE_CORE_HIDRAW.
+hidraw_json() {
+  case "${FAKE_CORE_HIDRAW:-false}" in
+    unset) printf '%s' null ;;
+    true) printf '%s' true ;;
+    *) printf '%s' false ;;
+  esac
+}
+
 # implemented <id> <method> <line>: the canned answer for a view-model
 # method, or 1 when the method has none.
 implemented() {
@@ -550,8 +582,22 @@ implemented() {
           ;;
       esac
       ;;
+    config.resolve)
+      # `HidrawDecision::decide`: a stored value wins; unset, a connected
+      # Sony pad disables, else enabled. The named shapes carry one pad at
+      # most, so the DualSense is the only Sony culprit the fake can name.
+      case "${FAKE_CORE_HIDRAW:-false}" in
+        unset)
+          case "${FAKE_CORE_CONTROLLERS:-empty}" in
+            dualsense) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"appid":220,"hidraw_enabled":false,"hidraw_reason":"DualSense connected","hidraw_source":"controllers"}}' ;;
+            *) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"appid":220,"hidraw_enabled":true,"hidraw_reason":"no Sony pad connected","hidraw_source":"controllers"}}' ;;
+          esac
+          ;;
+        *) emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"appid":220,"hidraw_enabled":'"$(hidraw_json)"',"hidraw_reason":"config","hidraw_source":"config"}}' ;;
+      esac
+      ;;
     config.get)
-      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"engine_id":"rosetta-wine","engine_version":"10.0.1","graphics_backend":"dxmt","sync_mode":"esync","hidraw_enabled":false,"steam_input":null,"steam_overlay":true,"rosetta_advertise_avx":null,"extra_env":{"DXMT_LOG":"1"},"launch_mode":"client","launch_exe_override":null,"launch_args_override":null,"direct_verified_at":null,"isolated_prefix":false,"dx12_expectation":null,"notes":"fake"}}'
+      emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"engine_id":"rosetta-wine","engine_version":"10.0.1","graphics_backend":"dxmt","sync_mode":"esync","hidraw_enabled":'"$(hidraw_json)"',"steam_input":null,"steam_overlay":true,"rosetta_advertise_avx":null,"extra_env":{"DXMT_LOG":"1"},"launch_mode":"client","launch_exe_override":null,"launch_args_override":null,"direct_verified_at":null,"isolated_prefix":false,"dx12_expectation":null,"notes":"fake"}}'
       ;;
     config.import)
       # A path containing "foreign" is a preset exported for another title.
@@ -647,7 +693,11 @@ while IFS= read -r line; do
       fi
       ;;
     host.doctor)
-      emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"macos_version":"26.0","arch":"arm64","rosetta_present":true,"free_disk_bytes":123456789,"screen_recording":"unknown","developer_id_identities":0,"controllers":[]}}'
+      if [ "${FAKE_CORE_CONTROLLERS:-empty}" = "refuse" ]; then
+        emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":1003,"message":"system_profiler failed (fake core)"}}'
+        continue
+      fi
+      emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"macos_version":"26.0","arch":"arm64","rosetta_present":true,"free_disk_bytes":123456789,"screen_recording":"unknown","developer_id_identities":0,"controllers":'"$(controllers_json)"'}}'
       ;;
     fake.die)
       # Exits 3 without answering. The grandchild inherits stdout only (an

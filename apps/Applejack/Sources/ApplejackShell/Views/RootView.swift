@@ -32,7 +32,7 @@ public final class ShellModels {
         steam = SteamAccountViewModel(app: app)
         runtime = SteamClientRuntimeViewModel(app: app)
         logs = LogsViewModel(app: app)
-        controllers = ControllersViewModel()
+        controllers = ControllersViewModel(app: app)
         d3dmetal = D3DMetalImportViewModel(app: app)
     }
 
@@ -44,7 +44,7 @@ public final class ShellModels {
         case .engines: await engines.load()
         case .logs: await logs.load()
         case .host: await host.load()
-        case .controllers: controllers.refresh()
+        case .controllers: await controllers.reload()
         case .steam: await runtime.load()
         case .d3dmetal: break
         }

@@ -1159,12 +1159,147 @@ final class ViewModelTests: XCTestCase {
 
     func testControllersComeFromTheProvider() {
         let pad = ControllerStatus(id: "0:Sony", vendorName: "DualSense", productCategory: "DualSense", hasExtendedGamepad: true, isAttachedToDevice: false)
-        let model = ControllersViewModel(provider: { [pad] })
+        let model = ControllersViewModel(app: AppModel(client: nil), provider: { [pad] })
         XCTAssertTrue(model.controllers.isEmpty)
         model.refresh()
         XCTAssertEqual(model.controllers, [pad])
         // The real provider runs without a pad attached and lists nothing or whatever is connected.
         _ = ControllersViewModel.connectedControllers()
+    }
+
+    /// The core's inventory beside the GameController list; both read on
+    /// `reload()`, so Refresh re-reads `host.doctor`.
+    func testAnEmptyInventoryGivesTheEnabledDefault() async throws {
+        let app = makeApp()
+        let model = ControllersViewModel(app: app, provider: { [] })
+        XCTAssertEqual(model.inventory, .idle)
+        XCTAssertNil(model.hidrawDefault, "no rule before the inventory is read")
+        await model.loadInventory()
+        XCTAssertEqual(model.inventory, .ready([]))
+        XCTAssertEqual(model.hidrawDefault, HidrawDefault(enabled: true, reason: "no Sony pad connected"))
+        XCTAssertEqual(model.hidrawDefault?.summary, "hidraw enabled (no Sony pad connected)")
+        await model.reload()
+        XCTAssertEqual(try requests(for: "host.doctor").count, 2, "Refresh re-reads host.doctor")
+        await app.shutdown()
+    }
+
+    func testAConnectedDualSenseDisablesHidrawByDefault() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "dualsense"])
+        let model = ControllersViewModel(app: app, provider: { [] })
+        await model.loadInventory()
+        let pads = try XCTUnwrap(model.inventory.value)
+        XCTAssertEqual(pads.count, 1)
+        XCTAssertEqual(pads.first?.name, "DualSense Wireless Controller")
+        XCTAssertEqual(pads.first?.transport, .bluetooth)
+        XCTAssertEqual(pads.first?.vendorId, "0x054c")
+        XCTAssertEqual(pads.first?.productId, "0x0ce6")
+        XCTAssertEqual(pads.first?.kind, .dualsense)
+        XCTAssertEqual(pads.first?.connected, true)
+        XCTAssertEqual(pads.first?.kind.hidrawDefaultEnabled, false, "the row's hidraw default column")
+        XCTAssertEqual(model.hidrawDefault?.summary, "hidraw disabled (DualSense connected)")
+        await app.shutdown()
+    }
+
+    func testAWiredXboxPadKeepsHidrawEnabled() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "xbox"])
+        let model = ControllersViewModel(app: app, provider: { [] })
+        await model.loadInventory()
+        let pad = try XCTUnwrap(model.inventory.value?.first)
+        XCTAssertEqual(pad.kind, .xbox)
+        XCTAssertEqual(pad.transport, .usb)
+        XCTAssertTrue(pad.connected)
+        XCTAssertTrue(pad.kind.hidrawDefaultEnabled)
+        XCTAssertEqual(model.hidrawDefault?.summary, "hidraw enabled (no Sony pad connected)")
+        await app.shutdown()
+    }
+
+    /// A paired pad that is away is listed with its kind's default, and
+    /// does not count toward the rule, as `HidrawDecision::from_controllers`
+    /// filters on `connected`.
+    func testASonyPadThatIsAwayIsListedAndDoesNotCount() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "dualsense-away"])
+        let model = ControllersViewModel(app: app, provider: { [] })
+        await model.loadInventory()
+        let pad = try XCTUnwrap(model.inventory.value?.first)
+        XCTAssertEqual(pad.kind, .dualsense)
+        XCTAssertFalse(pad.connected)
+        XCTAssertFalse(pad.kind.hidrawDefaultEnabled, "the column says what the pad would select once connected")
+        XCTAssertEqual(model.hidrawDefault, HidrawDefault(enabled: true, reason: "no Sony pad connected"))
+        await app.shutdown()
+    }
+
+    /// A refusal is shown as the failure it is, with no rule and no empty
+    /// list; a dead core reads the same way through `AppModel.run`.
+    func testARefusedInventoryIsAFailureNotAnEmptyList() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_CONTROLLERS": "refuse"])
+        let model = ControllersViewModel(app: app, provider: { [] })
+        await model.loadInventory()
+        XCTAssertEqual(model.inventory, .failed(.rpc(RpcError(code: 1003, message: "system_profiler failed (fake core)"))))
+        XCTAssertNil(model.hidrawDefault)
+        XCTAssertEqual(app.coreStatus, .starting, "an rpc refusal belongs to the flow; the banner is left where the (ungreeted) core had it")
+        await app.shutdown()
+    }
+
+    /// The rule mirrors `HidrawDecision::from_controllers`: the DualSense is
+    /// named when both Sony pads are connected.
+    func testTheHidrawRuleNamesTheDualSenseFirst() {
+        func pad(_ kind: ControllerKind, connected: Bool = true) -> ControllerFact {
+            ControllerFact(name: kind.rawValue, transport: .usb, vendorId: "0x054c", productId: "0x0000", connected: connected, kind: kind)
+        }
+        XCTAssertEqual(HidrawDefault.decide([pad(.dualshock4), pad(.dualsense)]).reason, "DualSense connected")
+        XCTAssertEqual(HidrawDefault.decide([pad(.dualshock4)]), HidrawDefault(enabled: false, reason: "DualShock 4 connected"))
+        XCTAssertEqual(HidrawDefault.decide([pad(.dualshock4, connected: false), pad(.xbox), pad(.other)]).enabled, true)
+    }
+
+    // MARK: - The hidraw default in the game detail
+
+    func testAnUnsetHidrawToggleShowsTheDefaultFromConfigResolve() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_HIDRAW": "unset", "FAKE_CORE_CONTROLLERS": "dualsense"])
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        await detail.load()
+        XCTAssertNil(detail.config.value?.hidrawEnabled)
+        XCTAssertEqual(
+            detail.hidrawDefault,
+            .ready(ConfigResolveResult(appid: 220, hidrawEnabled: false, hidrawSource: .controllers, hidrawReason: "DualSense connected")))
+        XCTAssertEqual(detail.hidrawDefaultText, "Default: off, DualSense connected")
+        XCTAssertTrue(try request(for: "config.resolve").contains("\"params\":{\"appid\":220}"))
+        await app.shutdown()
+
+        let unplugged = makeApp(environment: ["FAKE_CORE_HIDRAW": "unset", "FAKE_CORE_REQUEST_LOG": secondRequestLog.path])
+        let other = GameDetailViewModel(app: unplugged, appid: 220)
+        await other.load()
+        XCTAssertEqual(other.hidrawDefaultText, "Default: on, no Sony pad connected")
+        await unplugged.shutdown()
+    }
+
+    func testAStoredHidrawValueNeedsNoResolving() async throws {
+        for (stored, expected) in [("true", true), ("false", false)] {
+            let log = logDir.appendingPathComponent("hidraw-\(stored).log")
+            let app = makeApp(environment: ["FAKE_CORE_HIDRAW": stored, "FAKE_CORE_REQUEST_LOG": log.path])
+            let detail = GameDetailViewModel(app: app, appid: 220)
+            await detail.load()
+            XCTAssertEqual(detail.config.value?.hidrawEnabled, expected)
+            XCTAssertEqual(detail.config.value?.value(.hidrawEnabled), .bool(expected))
+            XCTAssertEqual(detail.hidrawDefault, .idle, "a stored value is its own effective value")
+            XCTAssertNil(detail.hidrawDefaultText)
+            XCTAssertEqual(try requests(for: "config.resolve", in: log), [], "config.resolve is asked only while unset")
+            await app.shutdown()
+        }
+    }
+
+    func testASaveReReadsTheHidrawDefault() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_HIDRAW": "unset"])
+        let detail = GameDetailViewModel(app: app, appid: 220)
+        await detail.load()
+        XCTAssertEqual(try requests(for: "config.resolve").count, 1)
+        await detail.set(.notes, to: .string("saved"))
+        XCTAssertEqual(detail.lastSave, .ready(.object([:])))
+        XCTAssertEqual(try requests(for: "config.get").count, 2, "a save reloads the config")
+        XCTAssertEqual(try requests(for: "config.resolve").count, 2, "and the default with it")
+        XCTAssertEqual(detail.hidrawDefaultText, "Default: on, no Sony pad connected")
+        await detail.load()
+        XCTAssertEqual(try requests(for: "config.resolve").count, 3, "Refresh re-reads it too")
+        await app.shutdown()
     }
 
     // MARK: - Core lifecycle

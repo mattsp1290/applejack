@@ -159,6 +159,9 @@ final class GoldenTests: XCTestCase {
         XCTAssertEqual(snapshot.timestamp, "20261031T120000Z")
         let export = try typedResult("config.export.result.json", as: ConfigExportResult.self)
         XCTAssertEqual(export.path, "/tmp/220.preset.json")
+        let resolved = try typedResult("config.resolve.result.json", as: ConfigResolveResult.self)
+        XCTAssertEqual(resolved, ConfigResolveResult(appid: 220, hidrawEnabled: false, hidrawSource: .controllers, hidrawReason: "DualSense connected"))
+        XCTAssertEqual(resolved.defaultText, "Default: off, DualSense connected")
     }
 
     func testJobMirrorsDecodeTheNotificationGoldens() throws {
@@ -192,6 +195,7 @@ final class GoldenTests: XCTestCase {
         try check("app.run", AppRunParams.self)
         try check("app.cancel", AppCancelParams.self)
         try check("config.get", ConfigGetParams.self)
+        try check("config.resolve", ConfigResolveParams.self)
         try check("config.set", ConfigSetParams.self)
         try check("config.import", ConfigImportParams.self)
         try check("engine.install", EngineInstallParams.self)

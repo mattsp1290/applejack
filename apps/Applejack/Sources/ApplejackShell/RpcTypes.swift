@@ -260,6 +260,58 @@ public struct ControllerFact: Codable, Equatable, Sendable {
         case connected
         case kind
     }
+
+    public init(name: String, transport: ControllerTransport, vendorId: String, productId: String, connected: Bool, kind: ControllerKind) {
+        self.name = name
+        self.transport = transport
+        self.vendorId = vendorId
+        self.productId = productId
+        self.connected = connected
+        self.kind = kind
+    }
+}
+
+extension ControllerKind {
+    /// The pads Wine's hidraw path is known to break (`hidraw_regresses` in
+    /// `host/controllers.rs`).
+    public var hidrawRegresses: Bool {
+        self == .dualshock4 || self == .dualsense
+    }
+
+    /// The hidraw mode this pad alone, connected, would select: the
+    /// `hidraw default` column of `applejack doctor --controllers`.
+    public var hidrawDefaultEnabled: Bool { !hidrawRegresses }
+}
+
+/// `HidrawDecision::from_controllers`: the hidraw mode a run applies to a
+/// title whose `hidraw_enabled` is unset, decided by the connected pads.
+/// Kept in step with the Rust rule so the Controllers view says what the
+/// next run will do before any `config.resolve` is asked.
+public struct HidrawDefault: Equatable, Sendable {
+    public var enabled: Bool
+    /// `DualSense connected`, `DualShock 4 connected`, or `no Sony pad connected`.
+    public var reason: String
+
+    public init(enabled: Bool, reason: String) {
+        self.enabled = enabled
+        self.reason = reason
+    }
+
+    public static func decide(_ controllers: [ControllerFact]) -> HidrawDefault {
+        let culprits = controllers.filter { $0.connected && $0.kind.hidrawRegresses }.map(\.kind)
+        if culprits.contains(.dualsense) {
+            return HidrawDefault(enabled: false, reason: "DualSense connected")
+        }
+        if !culprits.isEmpty {
+            return HidrawDefault(enabled: false, reason: "DualShock 4 connected")
+        }
+        return HidrawDefault(enabled: true, reason: "no Sony pad connected")
+    }
+
+    /// The `hidraw enabled (no Sony pad connected)` form the CLI prints.
+    public var summary: String {
+        "hidraw \(enabled ? "enabled" : "disabled") (\(reason))"
+    }
 }
 
 /// `applejack_core::host::HostFacts`.
