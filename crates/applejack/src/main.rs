@@ -2,7 +2,8 @@
 
 mod cmd;
 
-use applejack_core::host::HostFacts;
+use applejack_core::host::{self, ControllerFact, HidrawDecision, HostFacts};
+use applejack_engine::HidrawMode;
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -45,13 +46,17 @@ enum Command {
         /// Print the facts as JSON
         #[arg(long)]
         json: bool,
+        /// Print only the controller inventory, one line per pad, and the
+        /// hidraw default it gives a game whose `hidraw_enabled` is unset
+        #[arg(long)]
+        controllers: bool,
     },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Doctor { json } => doctor(json),
+        Command::Doctor { json, controllers } => doctor(json, controllers),
         Command::Config(args) => cmd::config::run(args),
         Command::Engine(args) => cmd::engine::run(args),
         Command::Prefix(args) => cmd::prefix::run(args),
@@ -65,7 +70,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn doctor(json: bool) -> ExitCode {
+fn doctor(json: bool, controllers: bool) -> ExitCode {
+    if controllers && !json {
+        // Only the inventory: the other probes are not asked for.
+        return emit(&render_controllers(&host::controllers::gather()));
+    }
     let facts = HostFacts::gather();
     let text = if json {
         match serde_json::to_string_pretty(&facts) {
@@ -109,7 +118,8 @@ fn render_facts(facts: &HostFacts) -> String {
     let identities = facts
         .developer_id_identities
         .map_or_else(|| "unknown".to_owned(), |count| count.to_string());
-    let rows: [(&str, String); 6] = [
+    let connected = facts.controllers.iter().filter(|pad| pad.connected).count();
+    let rows: [(&str, String); 7] = [
         ("macOS version", facts.macos_version.clone()),
         (
             "architecture",
@@ -119,10 +129,39 @@ fn render_facts(facts: &HostFacts) -> String {
         ("free disk (data dir)", free_disk),
         ("screen recording", facts.screen_recording.to_string()),
         ("Developer ID identities", identities),
+        ("controllers", format!("{connected} connected")),
     ];
     let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
     rows.iter()
         .map(|(label, value)| format!("{label:<width$}  {value}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// One line per pad, then the default the whole inventory gives: the text a
+/// run's `prepare: hidraw` line carries.
+fn render_controllers(pads: &[ControllerFact]) -> String {
+    let mut lines: Vec<String> = pads
+        .iter()
+        .map(|pad| {
+            let state = if pad.connected {
+                "connected"
+            } else {
+                "not connected"
+            };
+            let default = match pad.kind.hidraw_default() {
+                HidrawMode::Enabled => "enabled",
+                HidrawMode::Disabled => "disabled",
+            };
+            format!(
+                "{}  {}  {}:{}  {}  {state}  hidraw default {default}",
+                pad.name, pad.transport, pad.vendor_id, pad.product_id, pad.kind
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push("no controllers".to_owned());
+    }
+    lines.push(HidrawDecision::from_controllers(pads).to_string());
+    lines.join("\n")
 }

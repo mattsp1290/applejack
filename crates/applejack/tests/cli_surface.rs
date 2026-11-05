@@ -5,13 +5,14 @@ const SUBCOMMANDS: [&str; 11] = [
     "doctor",
 ];
 
-const DOCTOR_KEYS: [&str; 6] = [
+const DOCTOR_KEYS: [&str; 7] = [
     "macos_version",
     "arch",
     "rosetta_present",
     "free_disk_bytes",
     "screen_recording",
     "developer_id_identities",
+    "controllers",
 ];
 
 fn applejack() -> Command {
@@ -297,10 +298,20 @@ fn config_show_on_empty_data_dir_prints_empty_config() {
         drm.is_some_and(|line| line.ends_with(" = \"unknown\"")),
         "{text}"
     );
+    // The three `hidraw_*` lines after the title's fields are the effective
+    // hidraw mode and its source, never stored values.
+    let effective = |name: &str| text.lines().any(|line| line.starts_with(name));
+    assert!(effective("hidraw_effective "), "{text}");
+    assert!(effective("hidraw_source "), "{text}");
+    assert!(effective("hidraw_reason "), "{text}");
     assert!(
-        !text
-            .lines()
-            .any(|line| !line.ends_with(" = (unset)") && !line.starts_with("drm ")),
+        !text.lines().any(|line| {
+            !line.ends_with(" = (unset)")
+                && !line.starts_with("drm ")
+                && !line.starts_with("hidraw_effective ")
+                && !line.starts_with("hidraw_source ")
+                && !line.starts_with("hidraw_reason ")
+        }),
         "{text}"
     );
 
