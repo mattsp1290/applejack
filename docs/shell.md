@@ -105,8 +105,9 @@ and `JobFailed` in `RpcTypes.swift`; no stringly state.
 One `@Observable @MainActor` class per flow (the Observation framework is
 macOS 14, the deployment target): `LibraryViewModel`,
 `GameDetailViewModel`, `EnginesViewModel`, `SteamAccountViewModel`,
-`LogsViewModel`, `ControllersViewModel`, `D3DMetalImportViewModel`, and
-`HostViewModel` for `host.doctor`. Each exposes its results as
+`LogsViewModel`, `ControllersViewModel` (the GameController list and
+`host.doctor`'s inventory), `D3DMetalImportViewModel`, and `HostViewModel`
+for `host.doctor`. Each exposes its results as
 
 ```swift
 enum FlowState<Value> { case idle, loading, ready(Value), unavailable(Unavailable), failed(CoreClientError) }
@@ -218,8 +219,34 @@ exist yet is picked up when the engine creates it, and one that shrank or
 changed inode was rotated and is read again from the start). Leaving the
 Logs view suspends the poll; coming back resumes it from the start of the
 file, and lines the old tail had buffered are dropped rather than appended
-to the new one. Controllers come from the GameController framework, not
-the core.
+to the new one.
+
+Controllers (`ControllersViewModel`): two lists. "What macOS sees" is the
+GameController framework's list of connected pads (vendor, product
+category, extended-gamepad profile, wired or wireless), refreshed on every
+connect and disconnect; it is display only, since input reaches the game
+through Wine. "What the core will act on" is `host.doctor`'s `controllers`
+(`docs/controllers.md`): one row per pad `system_profiler` lists, with its
+name, transport, vendor and product ids, kind, whether it is connected, and
+the hidraw default that pad alone would select (`hidraw default disabled`
+for a DualShock 4 or DualSense), followed by the rule's one line for the
+whole inventory, `hidraw enabled (no Sony pad connected)` or `hidraw
+disabled (DualSense connected)`, computed in the shell by `HidrawDefault`,
+a mirror of the core's `HidrawDecision::from_controllers`. Refresh re-reads
+both; so does a pad connecting or disconnecting, and a banner Restart. When
+the core is unreachable or refuses `host.doctor`, the section shows that
+failure with a Retry, never an empty list; the GameController list stays.
+
+Game detail, `hidraw_enabled`: while the row leaves it unset, the toggle
+takes the position `config.resolve` reports and reads "Default: off,
+DualSense connected" or "Default: on, no Sony pad connected" beside it
+(`ConfigResolveResult.defaultText`); a stored `true` or `false` shows as
+itself and sends no `config.resolve`, since a stored value is its own
+effective value and the read costs a `system_profiler` run. Every `load()`
+(the first show, a save, Refresh, a banner Restart) re-reads it. Flipping
+the toggle stores an explicit value; clearing one is `applejack config
+<appid> set hidraw_enabled ""` for now, since the toggle has no third
+position.
 
 Steam account: there is no `steam.status` method, so before any call the
 view says the sign-in state is unknown rather than "not signed in". Once

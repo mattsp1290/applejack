@@ -138,13 +138,17 @@ SPUSBDataType -json` and `SPBluetoothDataType -json`
 A report that fails or does not parse lists nothing: the inventory is a
 default, never a refusal.
 
-## What the shell shows
+## In the shell
 
-The shell's Controllers view (plan 06 and unit U18b) reads `host.doctor` for
-the inventory and `config.resolve` for a title's effective hidraw mode, so it
-can say "off (DualSense connected)" beside the per-game toggle. Until U18b
-lands, the GameController-framework list is display only and the CLI above
-is the way to see the inventory.
+The Controllers view shows two lists: the pads macOS sees through the
+GameController framework (display only) and, beside them, this inventory
+from `host.doctor`, one row per pad with the columns above and the rule's
+line under them (`hidraw disabled (DualSense connected)`); Refresh re-reads
+both, and a core that cannot be reached shows its failure, not an empty
+list. The game detail's `hidraw_enabled` toggle, while unset, takes the
+position `config.resolve` reports and says why: "Default: off, DualSense
+connected" or "Default: on, no Sony pad connected", re-read after every save
+and Refresh. See `docs/shell.md`.
 
 ## Steam Input and the overlay
 
