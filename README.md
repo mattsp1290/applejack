@@ -33,8 +33,10 @@ cargo xtask check
 `doctor` reports host facts without network access: macOS version, chip
 architecture, Rosetta presence, free disk under
 `~/Library/Application Support/applejack`, Screen Recording permission state
-(reported as `unknown` for now), and the number of Developer ID Application
-identities.
+(reported as `unknown` for now), the number of Developer ID Application
+identities, and how many controllers are connected. `doctor --controllers`
+lists the pads and the hidraw default they give a game; see
+[`docs/controllers.md`](docs/controllers.md).
 
 ## Verification
 
