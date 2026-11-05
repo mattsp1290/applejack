@@ -11,13 +11,14 @@ DirectInput and an XInput device; nothing of applejack's sits in that path.
 CodeWeavers tests Xbox One, Xbox Series, DualShock 4, and DualSense pads
 this way, and a game has to support XInput to see one
 ([Using controllers in CrossOver](https://support.codeweavers.com/using-controllers-in-crossover)).
-The shell's own controller list (plan 06, `Controllers.swift`) uses the
-GameController framework and is display only: the game never sees it.
+The shell's own controller list
+(`apps/Applejack/Sources/ApplejackShell/ViewModels/ControllersViewModel.swift`,
+`Views/ControllersView.swift`) uses the GameController framework and is
+display only: the game never sees it.
 
 `hidraw` is Wine's second path: with it enabled, a game can open the pad as
-a raw HID device and talk its own protocol, which is what Steam Input and
-the DualSense's adaptive triggers want. On macOS it is also where the known
-failures are:
+a raw HID device and talk the pad's own protocol instead of going through
+DirectInput or XInput. On macOS it is also where the known failures are:
 
 - DualShock 4 L3 and R3 do nothing under Wine 9.6 with hidraw enabled;
   disabling hidraw in the prefix registry fixes it
@@ -33,9 +34,12 @@ failures are:
 
 The engine writes the toggle as a registry value at the bundle's
 `[registry] hidraw_key` (for the Rosetta engine
-`HKLM\System\CurrentControlSet\Services\winebus\Parameters\DisableHidraw`,
-`1` for disabled, `0` for enabled) in the `seeds.reg` it imports when a
-prefix is created and again whenever a setting changes between runs.
+`HKLM\System\CurrentControlSet\Services\WineBus\DisableHidraw`, per
+`build/bundle-spec.toml` and `docs/engines/payload-build.md`; `1` for
+disabled, `0` for enabled) in the `seeds.reg` it imports when a prefix is
+created and again whenever a setting changes between runs. The test stub
+engine under `crates/applejack-engine/tests/fixtures/` uses a different key;
+it is not the one in a user's prefix.
 
 ## The hidraw default
 
@@ -45,7 +49,8 @@ prefix is created and again whenever a setting changes between runs.
 |---|---|---|
 | `true` | enabled | `config` |
 | `false` | disabled | `config` |
-| unset | disabled with a connected DualShock 4 or DualSense, else enabled | `controllers` |
+| unset, inventory read | disabled with a connected DualShock 4 or DualSense, else enabled | `controllers` |
+| unset, inventory unavailable | the prefix's current mode; disabled for a prefix not built yet | `controllers` |
 
 An explicit value always wins. When it is unset, every run reads the
 controller inventory (below) and decides again, so a prefix flips with the
@@ -60,17 +65,38 @@ prepare: hidraw disabled (DualShock 4 connected)
 prepare: hidraw enabled (no Sony pad connected)
 prepare: hidraw enabled (config)
 prepare: hidraw disabled (config)
+prepare: hidraw disabled (controller inventory unavailable (SPBluetoothDataType timed out))
+prepare: hidraw enabled (controller inventory unavailable (SPBluetoothDataType timed out))
 ```
 
 When both Sony pads are connected the DualSense is named. A pad that is
-paired but away does not count. A run of a title through the Steam client
-prints the line only when it builds or may change the client prefix; while
-the client is up and owns the prefix, settings wait for a stop, as every
-other prefix setting does.
+paired but away does not count.
+
+An inventory is unavailable when one of the two `system_profiler` reports
+failed to run, timed out, or did not parse. That never reads as "no pads":
+the run keeps the prefix's current mode, applies nothing, and says why on
+the `prepare` line; a prefix that does not exist yet is built with hidraw
+disabled, the mode that is safe for a Sony pad. Pads the other report did
+list are still shown by `doctor`, but do not make the read trustworthy.
 
 The inventory is read only when `hidraw_enabled` is unset: `system_profiler`
-answers in about 0.2 s once warm but takes over a second on a cold start, and
-an explicit setting has nothing to ask it.
+answers in about 0.2 s once warm and takes over a second on a cold start,
+and an explicit setting has nothing to ask it. Each report runs with
+`-timeout 5` (the tool's own default is 180 s; five seconds is several times
+the slowest report measured) and is killed if it has not returned within
+half as much again, so a wedged Bluetooth daemon costs a run at most a few
+seconds and an "unavailable" line, never a silent three-minute stall.
+
+### The Steam client prefix
+
+`applejack runtime steam install` builds the shared `steam-client` prefix
+with the same rule, read once at install, and prints the same `prepare:`
+line before `prefix: creating prefix steam-client`. The client then starts
+with the inventory's default, so the first title run through it has nothing
+to flip. A run of a title through the client prints the `prepare` line only
+while the client is down; while the client is up and owns the prefix, the
+mode it was started with stays until `applejack runtime steam stop`, as
+every other prefix setting does.
 
 ### Overriding it per game
 
@@ -85,20 +111,22 @@ applejack config <appid> show
 `set`, and adds what a run would apply now:
 
 ```text
-hidraw_enabled   = (unset)
-hidraw_effective = "false"
-hidraw_source    = "controllers"
-hidraw_reason    = "DualSense connected"
+hidraw_enabled        = (unset)
+hidraw_effective      = "false"
+hidraw_source         = "controllers"
+hidraw_reason         = "DualSense connected"
 ```
 
 Over RPC the same answer is `config.resolve`
 (`{appid, hidraw_enabled, hidraw_source, hidraw_reason}`), with
-`hidraw_enabled` the effective value; see `docs/rpc-protocol.md`.
+`hidraw_enabled` the effective value; see `docs/rpc-protocol.md`. When the
+inventory is unavailable, both report the mode of the prefix the run would
+use (the title's own, or `steam-client` for a title on the client path),
+and `false` when that prefix is not built yet.
 
 Start with the default. If a DualShock 4's sticks do not click, or a pad is
-dead under D3DMetal, set `hidraw_enabled false`; if a game needs raw HID
-access to the pad (adaptive triggers, a native DualSense mode) and the pad
-works, set it `true`.
+dead under D3DMetal, set `hidraw_enabled false`; if a game talks the pad's
+own HID protocol and the pad works, set it `true`.
 
 ## `applejack doctor --controllers`
 
@@ -106,18 +134,32 @@ Prints one line per pad `system_profiler` lists and the default the whole
 inventory gives, the text of a run's `prepare` line:
 
 ```text
-DualSense Wireless Controller  bluetooth  0x054c:0x0ce6  dualsense  connected  hidraw default disabled
+DualSense Wireless Controller  usb  0x054c:0x0ce6  dualsense  connected  hidraw default disabled
 Xbox Wireless Controller  usb  0x045e:0x0b12  xbox  connected  hidraw default enabled
+DualSense Wireless Controller  bluetooth  0x054c:0x0ce6  dualsense  not connected  would disable hidraw if connected
 hidraw disabled (DualSense connected)
 ```
 
 The columns are name, transport (`usb` or `bluetooth`), vendor and product
-id, kind (`dualshock4`, `dualsense`, `xbox`, `other`), whether it is
-connected, and the mode that pad alone would select. With nothing paired or
-plugged in it prints `no controllers` and `hidraw enabled (no Sony pad
-connected)`. Plain `applejack doctor` adds a `controllers  <n> connected`
-row; `applejack doctor --json` carries the inventory as `controllers`, the
-same field `host.doctor` returns.
+id (blank when the report has none), kind (`dualshock4`, `dualsense`,
+`xbox`, `other`), whether it is connected, and what the rule does with that
+pad as it is now: a connected pad reads `hidraw default disabled` or
+`hidraw default enabled`; a pad that is paired but away reads `would disable
+hidraw if connected` or `would leave hidraw enabled if connected`, since it
+does not count toward the last line. With nothing paired or plugged in it
+prints `no controllers` and `hidraw enabled (no Sony pad connected)`. When a
+report could not be read it prints the pads it did get and then, instead of
+the decision line,
+
+```text
+controller inventory unavailable (SPBluetoothDataType timed out): a new prefix gets hidraw disabled, an existing prefix keeps its mode
+```
+
+Plain `applejack doctor` adds a `controllers  <n> connected` row, or
+`controllers  unavailable (<why>)`. `applejack doctor --json` carries the
+inventory as `controllers` and, only when a report failed,
+`controllers_unavailable`, the same members `host.doctor` returns;
+`doctor --controllers --json` prints those members alone.
 
 The inventory comes from two pure parsers over `system_profiler
 SPUSBDataType -json` and `SPBluetoothDataType -json`
@@ -125,26 +167,38 @@ SPUSBDataType -json` and `SPBluetoothDataType -json`
 `crates/applejack-core/tests/fixtures/system_profiler/`):
 
 - Bluetooth lists every paired device under `device_connected` or
-  `device_not_connected`; a pad is one with the `Gamepad` minor type, or a
-  known Sony pad's vendor and product ids.
+  `device_not_connected`; a pad is one with the `Gamepad` minor type, a
+  known Sony pad's vendor and product ids, or a name that says `controller`,
+  `gamepad`, or `joystick` (an Xbox pad reporting no minor type). A device
+  under both lists is one pad, connected.
 - USB carries no device class, so a device is a pad when its ids name a
   known Sony pad, or when its name says `controller`, `gamepad`, or
   `joystick`. A Microsoft mouse is not an Xbox pad; an Xbox pad is.
-- Kind by ids: Sony `0x054c` with DualShock 4 `0x05c4` or `0x09cc`, DualSense
-  `0x0ce6` or Edge `0x0df2`; Microsoft `0x045e`, any product, is `xbox`;
-  everything else is `other`. Headphones, mice, hubs, and phones are left
-  out.
+- Kind by ids: Sony `0x054c` with DualShock 4 `0x05c4`, `0x09cc`, or the
+  `0x0ba0` USB wireless adaptor, DualSense `0x0ce6` or Edge `0x0df2`;
+  Microsoft `0x045e`, any product, is `xbox`; everything else is `other`.
+  A pad with an id missing is `other` with that id blank. Headphones, mice,
+  hubs, and phones are left out.
+- Each device is read leniently: an id written as a number is still an id,
+  and an odd or missing field blanks that field or drops that device, never
+  the report. A report that is not JSON, or not a report object (`[]`, the
+  shape of an empty report, lists nothing), is unavailable.
 
-A report that fails or does not parse lists nothing: the inventory is a
-default, never a refusal.
+### Pinning the inventory (tests only)
+
+`APPLEJACK_CONTROLLERS` replaces the host's inventory for the `applejack`
+binary and the core: `none` for no pads, `unavailable` for a read that
+failed, or the path of a JSON array of pads in the `host.doctor` shape. The
+CLI and core test suites set it so no test runs `system_profiler`; it is
+not a user setting and may change without notice.
 
 ## What the shell shows
 
-The shell's Controllers view (plan 06 and unit U18b) reads `host.doctor` for
-the inventory and `config.resolve` for a title's effective hidraw mode, so it
-can say "off (DualSense connected)" beside the per-game toggle. Until U18b
-lands, the GameController-framework list is display only and the CLI above
-is the way to see the inventory.
+The shell's Controllers view (`docs/shell.md`) reads `host.doctor` for the
+inventory and `config.resolve` for a title's effective hidraw mode, so it
+can say "off (DualSense connected)" beside the per-game toggle. Until that
+view reads them, the GameController-framework list is display only and the
+CLI above is the way to see the inventory.
 
 ## Steam Input and the overlay
 
@@ -153,4 +207,10 @@ nothing reads them yet: the client keeps both per game in
 `userdata/<id>/config/localconfig.vdf`, and the key names are unverified
 (`docs/steam-runtime.md`). Until that lands, turn Steam Input off in the
 Steam client's own controller settings for a title that misbehaves under
-D3DMetal.
+D3DMetal. This follow-up is tracked here; the repository has no issue
+tracker project for it.
+
+`applejack_config::resolve` (`crates/applejack-config/src/resolve.rs`)
+still reads an unset `hidraw_enabled` as `false`; the run path does not use
+that resolver, and whoever wires it in must route the unset case through
+`applejack_core::host::HidrawDecision`.

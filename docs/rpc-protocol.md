@@ -146,7 +146,10 @@ method has an example request in `crates/applejack-core/tests/rpc_golden/`.
 --json`. Its `controllers` member is the pad inventory
 (`[{name, transport, vendor_id, product_id, connected, kind}]`, `transport`
 `usb` or `bluetooth`, `kind` one of `dualshock4`, `dualsense`, `xbox`,
-`other`); see `docs/controllers.md`.
+`other`; an id the report lacks is `""`). When a `system_profiler` report
+failed to run, timed out, or did not parse, `controllers_unavailable` carries
+the reason and `controllers` is not to be read as "no pads"; the key is
+absent otherwise. See `docs/controllers.md`.
 
 The table between the markers is rendered from the method table by
 `docs_method_table_matches_the_types` in `tests/rpc_golden.rs`; edit
@@ -223,7 +226,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `prefix.restore` | The same shape, naming the safety snapshot of the replaced state, or the restored snapshot when the prefix was gone and there was nothing to replace |
 | `prefix.reset` | `JobStarted`. A `job.progress` message names the safety snapshot |
 | `config.get` | `GameConfig`; every member `null` for an appid with no row |
-| `config.resolve` | `{appid, hidraw_enabled, hidraw_source, hidraw_reason}`: the hidraw mode a run would apply now. `hidraw_source` is `config` when the row sets `hidraw_enabled`, else `controllers`, and `hidraw_reason` is the text of the run's `prepare: hidraw` line (`config`, `DualSense connected`, `DualShock 4 connected`, `no Sony pad connected`); see `docs/controllers.md` |
+| `config.resolve` | `{appid, hidraw_enabled, hidraw_source, hidraw_reason}`: the hidraw mode a run would apply now. `hidraw_source` is `config` when the row sets `hidraw_enabled`, else `controllers`, and `hidraw_reason` is the text of the run's `prepare: hidraw` line (`config`, `DualSense connected`, `DualShock 4 connected`, `no Sony pad connected`, or `controller inventory unavailable (<why>)`, in which case `hidraw_enabled` is the mode of the prefix the run would use, or `false` when that prefix is not built yet); see `docs/controllers.md` |
 | `config.set` | `{}`. `value` is a string, a boolean, a number, an object for `extra_env`, or `null` to clear. `direct_verified_at` is refused: only a direct probe records it. Key `drm` sets the title's `drm` in the `apps` row, and is how a title becomes client-free; `TitleNotInstalled` when it has no row |
 | `config.export` | `{path}` |
 | `config.import` | `{applied, preset_appid, accepted, rejected, confirmations}` |
@@ -385,8 +388,8 @@ starts the client to its login window, which the user signs in to; the core
 never sees credentials.
 
 A client session is a `sessions` row with `prefix = "steam-client"`. Its job
-reports `prepare` (the hidraw decision when the client prefix is built or
-the client is down, then the `.acf` backup and `libraryfolders.vdf`), `shim` when
+reports `prepare` (the hidraw decision when the client is down, then the
+`.acf` backup and `libraryfolders.vdf`), `shim` when
 the run starts the client (the web helper shim check), `starting`,
 `running` when the client's `RunningAppID` equals the appid, and the end
 state. `exit_code` is null: the title's status is the client's. The client
