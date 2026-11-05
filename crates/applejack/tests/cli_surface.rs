@@ -5,17 +5,23 @@ const SUBCOMMANDS: [&str; 11] = [
     "doctor",
 ];
 
-const DOCTOR_KEYS: [&str; 6] = [
+const DOCTOR_KEYS: [&str; 7] = [
     "macos_version",
     "arch",
     "rosetta_present",
     "free_disk_bytes",
     "screen_recording",
     "developer_id_identities",
+    "controllers",
 ];
 
+/// The binary with its controller inventory pinned empty, so no test here
+/// reads the host's pads through `system_profiler`; a test that wants pads
+/// sets `APPLEJACK_CONTROLLERS` again to a fixture path.
 fn applejack() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_applejack"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_applejack"));
+    command.env("APPLEJACK_CONTROLLERS", "none");
+    command
 }
 
 #[test]
@@ -297,10 +303,20 @@ fn config_show_on_empty_data_dir_prints_empty_config() {
         drm.is_some_and(|line| line.ends_with(" = \"unknown\"")),
         "{text}"
     );
+    // The three `hidraw_*` lines after the title's fields are the effective
+    // hidraw mode and its source, never stored values.
+    let effective = |name: &str| text.lines().any(|line| line.starts_with(name));
+    assert!(effective("hidraw_effective "), "{text}");
+    assert!(effective("hidraw_source "), "{text}");
+    assert!(effective("hidraw_reason "), "{text}");
     assert!(
-        !text
-            .lines()
-            .any(|line| !line.ends_with(" = (unset)") && !line.starts_with("drm ")),
+        !text.lines().any(|line| {
+            !line.ends_with(" = (unset)")
+                && !line.starts_with("drm ")
+                && !line.starts_with("hidraw_effective ")
+                && !line.starts_with("hidraw_source ")
+                && !line.starts_with("hidraw_reason ")
+        }),
         "{text}"
     );
 
@@ -682,6 +698,59 @@ fn doctor_json_has_expected_keys() {
         "unexpected keys in {facts}"
     );
     assert_eq!(facts["screen_recording"], "unknown");
+}
+
+#[test]
+fn doctor_controllers_reads_the_knob_and_prints_one_line_per_pad() {
+    let data_dir = TempDataDir::new("doctor-controllers");
+    std::fs::create_dir_all(&data_dir.path).expect("creates");
+    let pads = data_dir.path.join("pads.json");
+    std::fs::write(
+        &pads,
+        r#"[{"name":"DualSense Wireless Controller","transport":"bluetooth","vendor_id":"0x054c","product_id":"0x0ce6","connected":false,"kind":"dualsense"}]"#,
+    )
+    .expect("writes");
+    let output = applejack()
+        .env("APPLEJACK_CONTROLLERS", &pads)
+        .args(["doctor", "--controllers"])
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "DualSense Wireless Controller  bluetooth  0x054c:0x0ce6  dualsense  not connected  ",
+            "would disable hidraw if connected\n",
+            "hidraw enabled (no Sony pad connected)\n",
+        )
+    );
+
+    let output = applejack()
+        .env("APPLEJACK_CONTROLLERS", &pads)
+        .args(["doctor", "--controllers", "--json"])
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(
+        json.as_object()
+            .map(|object| object.keys().cloned().collect::<Vec<_>>()),
+        Some(vec!["controllers".to_owned()]),
+        "{json}"
+    );
+    assert_eq!(json["controllers"][0]["kind"], "dualsense");
+
+    let output = applejack()
+        .env("APPLEJACK_CONTROLLERS", "unavailable")
+        .args(["doctor", "--controllers"])
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "controller inventory unavailable (APPLEJACK_CONTROLLERS=unavailable): a new prefix \
+         gets hidraw disabled, an existing prefix keeps its mode\n"
+    );
 }
 
 const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":1}}"#;

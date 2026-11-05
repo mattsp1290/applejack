@@ -105,8 +105,9 @@ and `JobFailed` in `RpcTypes.swift`; no stringly state.
 One `@Observable @MainActor` class per flow (the Observation framework is
 macOS 14, the deployment target): `LibraryViewModel`,
 `GameDetailViewModel`, `EnginesViewModel`, `SteamAccountViewModel`,
-`LogsViewModel`, `ControllersViewModel`, `D3DMetalImportViewModel`, and
-`HostViewModel` for `host.doctor`. Each exposes its results as
+`LogsViewModel`, `ControllersViewModel` (the GameController list and
+`host.doctor`'s inventory), `D3DMetalImportViewModel`, and `HostViewModel`
+for `host.doctor`. Each exposes its results as
 
 ```swift
 enum FlowState<Value> { case idle, loading, ready(Value), unavailable(Unavailable), failed(CoreClientError) }
@@ -218,8 +219,58 @@ exist yet is picked up when the engine creates it, and one that shrank or
 changed inode was rotated and is read again from the start). Leaving the
 Logs view suspends the poll; coming back resumes it from the start of the
 file, and lines the old tail had buffered are dropped rather than appended
-to the new one. Controllers come from the GameController framework, not
-the core.
+to the new one.
+
+Controllers (`ControllersViewModel`): two lists. "What macOS sees" is the
+GameController framework's list of connected pads (vendor, product
+category, extended-gamepad profile, wired or wireless), refreshed on every
+connect and disconnect; it is display only, since input reaches the game
+through Wine. "What the core will act on" is `host.doctor`'s `controllers`
+(`docs/controllers.md`): one row per pad `system_profiler` lists, with its
+name, transport, vendor and product ids, kind, whether it is connected, and
+the same last column `applejack doctor --controllers` prints
+(`ControllerFact.hidrawColumn`): a connected pad reads `hidraw default
+disabled` or `hidraw default enabled`; a pad that is paired but away reads
+`would disable hidraw if connected` or `would leave hidraw enabled if
+connected`, since it does not count. Under the rows is the rule's one line
+for the whole inventory, `hidraw enabled (no Sony pad connected)` or
+`hidraw disabled (DualSense connected)`, computed in the shell by
+`HidrawDefault`, a mirror of the core's `HidrawDecision`. When `host.doctor`
+carries `controllers_unavailable` (a profiler report failed to run, timed
+out, or did not parse), the section lists the pads the other report gave.
+If one of them is a connected DualShock 4 or DualSense it still decides,
+as in the core (`Inventory::decides_hidraw`: a failed report can only hide
+pads, never undo one that was listed), and the rule's line reads `hidraw
+disabled (DualSense connected; SPUSBDataType timed out)`, the pad first
+and the failure after it (`ControllerInventory.decidesHidraw`). Without
+such a pad the section shows, in place of the rule's line and of "No pads
+paired or plugged in", the CLI's own sentence: `controller inventory
+unavailable (<why>): a new prefix gets hidraw disabled, an existing prefix
+keeps its mode` (`ControllerInventory.unavailableLine`, `nil` whenever the
+inventory decides). Refresh re-reads both lists; so does a pad connecting
+or disconnecting, and a banner Restart. When the core is unreachable or
+refuses `host.doctor`, the section shows that failure with a Retry, never
+an empty list; the GameController list stays. `CoreBinaryTests` pins that
+the real binary's `doctor --controllers` and these Swift words agree for
+the fake core's four pad shapes, for an unavailable inventory, and for the
+`dualsense-unavailable` shape (a connected DualSense beside a USB report
+that timed out), fed to the binary as the knob's inventory object.
+
+Game detail, `hidraw_enabled`: while the row leaves it unset, the toggle
+takes the position `config.resolve` reports and reads "Default: off,
+DualSense connected" or "Default: on, no Sony pad connected" beside it
+(`ConfigResolveResult.defaultText`, the core's `hidraw_reason` verbatim, so
+an unavailable inventory reads "Default: off, controller inventory
+unavailable (SPBluetoothDataType timed out)", the mode of the prefix the
+run would use, and one a listed connected Sony pad decided reads "Default:
+off, DualSense connected; SPUSBDataType timed out"); a stored `true` or
+`false` shows as
+itself and sends no `config.resolve`, since a stored value is its own
+effective value and the read costs a `system_profiler` run. Every `load()`
+(the first show, a save, Refresh, a banner Restart) re-reads it. Flipping
+the toggle stores an explicit value; clearing one is `applejack config
+<appid> set hidraw_enabled ""` for now, since the toggle has no third
+position.
 
 Steam account: there is no `steam.status` method, so before any call the
 view says the sign-in state is unknown rather than "not signed in". Once

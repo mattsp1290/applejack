@@ -231,6 +231,150 @@ public enum ScreenRecordingState: String, Codable, Sendable {
     case unknown
 }
 
+public enum ControllerTransport: String, Codable, Sendable {
+    case usb
+    case bluetooth
+}
+
+public enum ControllerKind: String, Codable, Sendable {
+    case dualshock4
+    case dualsense
+    case xbox
+    case other
+}
+
+/// `applejack_core::host::ControllerFact`: one pad `system_profiler` lists.
+public struct ControllerFact: Codable, Equatable, Sendable {
+    public var name: String
+    public var transport: ControllerTransport
+    public var vendorId: String
+    public var productId: String
+    public var connected: Bool
+    public var kind: ControllerKind
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case transport
+        case vendorId = "vendor_id"
+        case productId = "product_id"
+        case connected
+        case kind
+    }
+
+    public init(name: String, transport: ControllerTransport, vendorId: String, productId: String, connected: Bool, kind: ControllerKind) {
+        self.name = name
+        self.transport = transport
+        self.vendorId = vendorId
+        self.productId = productId
+        self.connected = connected
+        self.kind = kind
+    }
+}
+
+extension ControllerKind {
+    /// The pads Wine's hidraw path is known to break (`hidraw_regresses` in
+    /// `host/controllers.rs`).
+    public var hidrawRegresses: Bool {
+        self == .dualshock4 || self == .dualsense
+    }
+
+    /// The hidraw mode this pad, connected, would select
+    /// (`ControllerKind::hidraw_default`).
+    public var hidrawDefaultEnabled: Bool { !hidrawRegresses }
+}
+
+extension ControllerFact {
+    /// The per-pad column of `applejack doctor --controllers`, word for
+    /// word (`render_controllers` in the CLI): what the rule does with this
+    /// pad as it is now, so the column never contradicts the rule's line.
+    /// Only a connected Sony pad disables hidraw; an away one says what it
+    /// would do if connected.
+    public var hidrawColumn: String {
+        switch (connected, kind.hidrawDefaultEnabled) {
+        case (true, false): "hidraw default disabled"
+        case (true, true): "hidraw default enabled"
+        case (false, false): "would disable hidraw if connected"
+        case (false, true): "would leave hidraw enabled if connected"
+        }
+    }
+}
+
+/// `applejack_core::host::Inventory`, as `host.doctor` carries it: the pads
+/// `system_profiler` listed and, when one of its reports failed to run,
+/// timed out, or did not parse, why. An unavailable inventory is never "no
+/// pads": the pads the other report listed are still here. A connected
+/// DualShock 4 or DualSense among them still decides (a failed report can
+/// only hide pads, never undo one that was listed); without one, a run
+/// keeps the prefix's mode instead of deciding from them.
+public struct ControllerInventory: Equatable, Sendable {
+    public var pads: [ControllerFact]
+    public var unavailable: String?
+
+    public init(pads: [ControllerFact], unavailable: String? = nil) {
+        self.pads = pads
+        self.unavailable = unavailable
+    }
+
+    /// `Inventory::decides_hidraw`: whether the pads settle the hidraw
+    /// default, which an inventory that was read always does and an
+    /// unavailable one does only through a listed connected Sony pad.
+    public var decidesHidraw: Bool {
+        unavailable == nil || !HidrawDefault.decide(pads).enabled
+    }
+
+    /// The line `doctor --controllers` prints instead of the decision line
+    /// when the inventory is unavailable and no listed pad decides; `nil`
+    /// when it was read or a Sony pad decides.
+    public var unavailableLine: String? {
+        guard let why = unavailable, !decidesHidraw else { return nil }
+        return "controller inventory unavailable (\(why)): a new prefix gets hidraw disabled, an existing prefix keeps its mode"
+    }
+}
+
+/// `HidrawDecision::from_controllers` and `from_inventory`: the hidraw mode
+/// a run applies to a title whose `hidraw_enabled` is unset, decided by the
+/// connected pads. Kept in step with the Rust rule so the Controllers view
+/// says what the next run will do before any `config.resolve` is asked.
+public struct HidrawDefault: Equatable, Sendable {
+    public var enabled: Bool
+    /// `DualSense connected`, `DualShock 4 connected`, `no Sony pad
+    /// connected`, or `<kind> connected; <why>` when a listed Sony pad
+    /// decided over an unavailable inventory.
+    public var reason: String
+
+    public init(enabled: Bool, reason: String) {
+        self.enabled = enabled
+        self.reason = reason
+    }
+
+    /// The rule over an inventory that was read; over an unavailable one,
+    /// the `disabled` a listed connected Sony pad gives with the failure
+    /// after it, or `nil` when no such pad is listed, since the mode is
+    /// then the prefix's own and only `config.resolve` can say it.
+    public static func decide(_ inventory: ControllerInventory) -> HidrawDefault? {
+        let listed = decide(inventory.pads)
+        guard let why = inventory.unavailable else { return listed }
+        guard !listed.enabled else { return nil }
+        return HidrawDefault(enabled: false, reason: "\(listed.reason); \(why)")
+    }
+
+    public static func decide(_ controllers: [ControllerFact]) -> HidrawDefault {
+        let culprits = controllers.filter { $0.connected && $0.kind.hidrawRegresses }.map(\.kind)
+        if culprits.contains(.dualsense) {
+            return HidrawDefault(enabled: false, reason: "DualSense connected")
+        }
+        if !culprits.isEmpty {
+            return HidrawDefault(enabled: false, reason: "DualShock 4 connected")
+        }
+        return HidrawDefault(enabled: true, reason: "no Sony pad connected")
+    }
+
+    /// The `hidraw enabled (no Sony pad connected)` form the CLI prints.
+    public var summary: String {
+        "hidraw \(enabled ? "enabled" : "disabled") (\(reason))"
+    }
+}
+
 /// `applejack_core::host::HostFacts`.
 public struct HostFacts: Codable, Equatable, Sendable {
     public var macosVersion: String
@@ -239,6 +383,15 @@ public struct HostFacts: Codable, Equatable, Sendable {
     public var freeDiskBytes: UInt64?
     public var screenRecording: ScreenRecordingState
     public var developerIdIdentities: Int?
+    public var controllers: [ControllerFact]
+    /// Why the inventory could not be read; `nil` when it was. The Rust side
+    /// leaves the key out when there is nothing to say.
+    public var controllersUnavailable: String?
+
+    /// `controllers` and `controllersUnavailable` as one inventory.
+    public var controllerInventory: ControllerInventory {
+        ControllerInventory(pads: controllers, unavailable: controllersUnavailable)
+    }
 
     enum CodingKeys: String, CodingKey {
         case macosVersion = "macos_version"
@@ -247,6 +400,55 @@ public struct HostFacts: Codable, Equatable, Sendable {
         case freeDiskBytes = "free_disk_bytes"
         case screenRecording = "screen_recording"
         case developerIdIdentities = "developer_id_identities"
+        case controllers
+        case controllersUnavailable = "controllers_unavailable"
+    }
+
+    public init(
+        macosVersion: String,
+        arch: String?,
+        rosettaPresent: Bool?,
+        freeDiskBytes: UInt64?,
+        screenRecording: ScreenRecordingState,
+        developerIdIdentities: Int?,
+        controllers: [ControllerFact],
+        controllersUnavailable: String? = nil
+    ) {
+        self.macosVersion = macosVersion
+        self.arch = arch
+        self.rosettaPresent = rosettaPresent
+        self.freeDiskBytes = freeDiskBytes
+        self.screenRecording = screenRecording
+        self.developerIdIdentities = developerIdIdentities
+        self.controllers = controllers
+        self.controllersUnavailable = controllersUnavailable
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(macosVersion, forKey: .macosVersion)
+        try container.encode(arch, forKey: .arch)
+        try container.encode(rosettaPresent, forKey: .rosettaPresent)
+        try container.encode(freeDiskBytes, forKey: .freeDiskBytes)
+        try container.encode(screenRecording, forKey: .screenRecording)
+        try container.encode(developerIdIdentities, forKey: .developerIdIdentities)
+        try container.encode(controllers, forKey: .controllers)
+        try container.encodeIfPresent(controllersUnavailable, forKey: .controllersUnavailable)
+    }
+
+    /// `controllers` reads as empty when absent, as the Rust side's
+    /// `#[serde(default)]` does, so a core from before the inventory still
+    /// decodes.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        macosVersion = try container.decode(String.self, forKey: .macosVersion)
+        arch = try container.decodeIfPresent(String.self, forKey: .arch)
+        rosettaPresent = try container.decodeIfPresent(Bool.self, forKey: .rosettaPresent)
+        freeDiskBytes = try container.decodeIfPresent(UInt64.self, forKey: .freeDiskBytes)
+        screenRecording = try container.decode(ScreenRecordingState.self, forKey: .screenRecording)
+        developerIdIdentities = try container.decodeIfPresent(Int.self, forKey: .developerIdIdentities)
+        controllers = try container.decodeIfPresent([ControllerFact].self, forKey: .controllers) ?? []
+        controllersUnavailable = try container.decodeIfPresent(String.self, forKey: .controllersUnavailable)
     }
 }
 

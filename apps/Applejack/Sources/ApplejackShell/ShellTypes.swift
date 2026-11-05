@@ -152,6 +152,12 @@ public struct ConfigGetParams: Codable, Equatable, Sendable {
     public init(appid: UInt32) { self.appid = appid }
 }
 
+public struct ConfigResolveParams: Codable, Equatable, Sendable {
+    public var appid: UInt32
+
+    public init(appid: UInt32) { self.appid = appid }
+}
+
 public struct ConfigSetParams: Codable, Equatable, Sendable {
     public var appid: UInt32
     public var key: String
@@ -553,6 +559,44 @@ public struct GameConfig: Codable, Equatable, Sendable {
 
     public init() {
         extraEnv = [:]
+    }
+}
+
+/// `HidrawSource` in `applejack_core::host`: where the effective
+/// `hidraw_enabled` came from.
+public enum HidrawSource: String, Codable, Sendable {
+    case config
+    case controllers
+}
+
+/// The result of `config.resolve` (`ConfigResolveResult` in
+/// `applejack-core`): the hidraw mode a run would apply now. `hidrawEnabled`
+/// is the effective value, not the stored one; `hidrawReason` is the text of
+/// the run's `prepare: hidraw` line.
+public struct ConfigResolveResult: Codable, Equatable, Sendable {
+    public var appid: UInt32
+    public var hidrawEnabled: Bool
+    public var hidrawSource: HidrawSource
+    public var hidrawReason: String
+
+    enum CodingKeys: String, CodingKey {
+        case appid
+        case hidrawEnabled = "hidraw_enabled"
+        case hidrawSource = "hidraw_source"
+        case hidrawReason = "hidraw_reason"
+    }
+
+    public init(appid: UInt32, hidrawEnabled: Bool, hidrawSource: HidrawSource, hidrawReason: String) {
+        self.appid = appid
+        self.hidrawEnabled = hidrawEnabled
+        self.hidrawSource = hidrawSource
+        self.hidrawReason = hidrawReason
+    }
+
+    /// The line the game detail shows under an unset toggle:
+    /// `Default: off, DualSense connected`.
+    public var defaultText: String {
+        "Default: \(hidrawEnabled ? "on" : "off"), \(hidrawReason)"
     }
 }
 

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use applejack_core::config::{AppRow, DataDirError, Field, GameConfig};
-use applejack_core::game_config::ConfigImportResult;
+use applejack_core::game_config::{ConfigImportResult, ConfigResolveResult};
 use applejack_core::{Core, CoreError};
 use clap::{Args, Subcommand};
 
@@ -92,11 +92,12 @@ fn execute(args: ConfigArgs) -> Result<String, Failure> {
         Action::Show { json } => {
             let config = core.config_get(appid)?;
             let title = core.title(appid)?.unwrap_or_default();
+            let resolved = core.config_resolve(appid)?;
             if json {
-                return as_json(&config, &title)
+                return as_json(&config, &title, &resolved)
                     .map_err(|error| Failure::Message(format!("cannot encode config: {error}")));
             }
-            Ok(render(&config, &title))
+            Ok(render(&config, &title, &resolved))
         }
         Action::Set { key, value } => {
             core.config_set(appid, &key, &value)?;
@@ -117,8 +118,11 @@ fn execute(args: ConfigArgs) -> Result<String, Failure> {
 /// import report uses, so a `show` line pastes into `set`. Values are
 /// Debug-quoted: control and bidirectional formatting characters come out
 /// escaped, so a stored value cannot move the cursor, reverse a line, or
-/// forge a `show` line. `--json` gives the exact form.
-fn render(config: &GameConfig, title: &AppRow) -> String {
+/// forge a `show` line. `--json` gives the exact form. The three
+/// `hidraw_*` lines after the title's fields are what a run applies now and
+/// why, not stored values: `hidraw_enabled` stays the stored one so the line
+/// still pastes into `set`.
+fn render(config: &GameConfig, title: &AppRow, resolved: &ConfigResolveResult) -> String {
     let width = Field::names()
         .iter()
         .map(|name| name.len())
@@ -131,20 +135,48 @@ fn render(config: &GameConfig, title: &AppRow) -> String {
         .iter()
         .map(|field| (field.name(), config.get(*field)));
     let drm = Some(title.drm.as_str().to_owned());
+    let source = serde_json::to_value(resolved.hidraw_source)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned));
     fields
-        .chain([("drm", drm), ("launch_exe", title.launch_exe.clone())])
+        .chain([
+            ("drm", drm),
+            ("launch_exe", title.launch_exe.clone()),
+            (
+                "hidraw_effective",
+                Some(resolved.hidraw_enabled.to_string()),
+            ),
+            ("hidraw_source", source),
+            ("hidraw_reason", Some(resolved.hidraw_reason.clone())),
+        ])
         .map(|(name, value)| format!("{name:<width$} = {}", quoted(value)))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// The stored configuration and the two fields of the title that `show`
-/// lists with it.
-fn as_json(config: &GameConfig, title: &AppRow) -> Result<String, serde_json::Error> {
+/// The stored configuration, the two fields of the title that `show` lists
+/// with it, and the effective hidraw mode with its source.
+fn as_json(
+    config: &GameConfig,
+    title: &AppRow,
+    resolved: &ConfigResolveResult,
+) -> Result<String, serde_json::Error> {
     let mut shown = serde_json::to_value(config)?;
     if let Some(fields) = shown.as_object_mut() {
         fields.insert("drm".to_owned(), title.drm.as_str().into());
         fields.insert("launch_exe".to_owned(), title.launch_exe.clone().into());
+        fields.insert(
+            "hidraw_effective".to_owned(),
+            resolved.hidraw_enabled.into(),
+        );
+        fields.insert(
+            "hidraw_source".to_owned(),
+            serde_json::to_value(resolved.hidraw_source)?,
+        );
+        fields.insert(
+            "hidraw_reason".to_owned(),
+            resolved.hidraw_reason.clone().into(),
+        );
     }
     serde_json::to_string_pretty(&shown)
 }
@@ -224,7 +256,13 @@ mod tests {
             extra_env: std::collections::BTreeMap::from([("A".to_owned(), "1".to_owned())]),
             ..GameConfig::default()
         };
-        let text = render(&config, &AppRow::default());
+        let resolved = ConfigResolveResult {
+            appid: 1,
+            hidraw_enabled: true,
+            hidraw_source: applejack_core::host::HidrawSource::Controllers,
+            hidraw_reason: "no Sony pad connected".to_owned(),
+        };
+        let text = render(&config, &AppRow::default(), &resolved);
         let line = |name: &str| {
             text.lines()
                 .find(|line| line.starts_with(name))
@@ -247,6 +285,13 @@ mod tests {
                 .filter(|line| line.starts_with("launch_exe_override"))
                 .count(),
             1
+        );
+        assert!(line("hidraw_enabled").ends_with("(unset)"), "{text}");
+        assert!(line("hidraw_effective").ends_with("\"true\""), "{text}");
+        assert!(line("hidraw_source").ends_with("\"controllers\""), "{text}");
+        assert!(
+            line("hidraw_reason").ends_with("\"no Sony pad connected\""),
+            "{text}"
         );
     }
 }

@@ -10,7 +10,18 @@ use applejack_engine::{EngineLayout, RosettaWine};
 
 use crate::config::{self, ConfigDb, DataDirError};
 use crate::error::CoreError;
+use crate::host::controllers::{self, Inventory};
 use crate::runtime::session::RunTuning;
+
+/// Where a run reads the controller inventory from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControllerSource {
+    /// `system_profiler` on every read, or the `APPLEJACK_CONTROLLERS` knob
+    /// when it is set.
+    System,
+    /// A fixed inventory; tests pin the pads without the host's.
+    Fixed(Inventory),
+}
 
 /// Resolved directories, the engine, and the database handle.
 #[derive(Debug)]
@@ -22,6 +33,7 @@ pub struct Core {
     pub(crate) engine: RosettaWine,
     allow_unsigned: bool,
     pub(crate) tuning: RunTuning,
+    controllers: ControllerSource,
     db: Option<ConfigDb>,
 }
 
@@ -38,6 +50,7 @@ impl Core {
             engine: RosettaWine,
             allow_unsigned: false,
             tuning: RunTuning::default(),
+            controllers: ControllerSource::System,
             db: None,
         }
     }
@@ -68,6 +81,31 @@ impl Core {
     pub fn with_run_tuning(mut self, tuning: RunTuning) -> Self {
         self.tuning = tuning;
         self
+    }
+
+    /// Pins the controller inventory instead of reading `system_profiler`:
+    /// a list of pads is a complete read, an [`Inventory`] may be
+    /// unavailable.
+    #[must_use]
+    pub fn with_controllers(mut self, controllers: impl Into<Inventory>) -> Self {
+        self.controllers = ControllerSource::Fixed(controllers.into());
+        self
+    }
+
+    /// Pins the whole inventory, unavailable reads included.
+    #[must_use]
+    pub fn with_controller_inventory(mut self, inventory: Inventory) -> Self {
+        self.controllers = ControllerSource::Fixed(inventory);
+        self
+    }
+
+    /// The inventory a run decides the hidraw default by, read now.
+    #[must_use]
+    pub fn controllers(&self) -> Inventory {
+        match &self.controllers {
+            ControllerSource::System => controllers::inventory(),
+            ControllerSource::Fixed(inventory) => inventory.clone(),
+        }
     }
 
     #[must_use]
@@ -106,6 +144,7 @@ impl Core {
             engine: self.engine,
             allow_unsigned: self.allow_unsigned,
             tuning: self.tuning,
+            controllers: self.controllers.clone(),
             db: None,
         }
     }

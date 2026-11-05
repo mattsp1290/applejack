@@ -356,7 +356,7 @@ impl Fixture {
     }
 
     fn core(&self) -> Core {
-        Core::new(self.data())
+        Core::new(self.data()).with_controllers(Vec::new())
     }
 
     fn signed_in(&self) {
@@ -398,6 +398,7 @@ fn request() -> TitleInstall {
 
 fn install_in(data: &Path, host: &FakeHost) -> Result<applejack_core::config::AppRow, CoreError> {
     Core::new(data)
+        .with_controllers(Vec::new())
         .plan_title_install(request())?
         .run(host, &|_, _, _, _| {})
 }

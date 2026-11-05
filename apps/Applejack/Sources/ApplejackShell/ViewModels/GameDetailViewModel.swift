@@ -26,6 +26,10 @@ public final class GameDetailViewModel {
 
     public let appid: UInt32
     public private(set) var config: FlowState<GameConfig> = .idle
+    /// `config.resolve` while `hidraw_enabled` is unset: the value a run
+    /// would apply and why. `idle` once the row stores one, whose stored
+    /// value is its effective value.
+    public private(set) var hidrawDefault: FlowState<ConfigResolveResult> = .idle
     public private(set) var lastSave: FlowState<JSONValue> = .idle
     public private(set) var importState: FlowState<ConfigImportResult> = .idle
     /// Set while a preset's launch overrides wait for confirmation.
@@ -82,7 +86,28 @@ public final class GameDetailViewModel {
         if let next = await app.run({ try await $0.call("config.get", params: ConfigGetParams(appid: appid)) as GameConfig }) {
             config = next
         }
+        await loadHidrawDefault()
         await loadSessions()
+    }
+
+    /// The text under an unset `hidraw_enabled` toggle, once `config.resolve`
+    /// answered: `Default: off, DualSense connected`.
+    public var hidrawDefaultText: String? {
+        hidrawDefault.value?.defaultText
+    }
+
+    /// `config.resolve` is asked only while the row leaves `hidraw_enabled`
+    /// unset: a stored value needs no resolving, and the read costs a
+    /// `system_profiler` run in the core.
+    private func loadHidrawDefault() async {
+        guard let stored = config.value, stored.hidrawEnabled == nil else {
+            hidrawDefault = .idle
+            return
+        }
+        hidrawDefault = .loading
+        if let next = await app.run({ try await $0.call("config.resolve", params: ConfigResolveParams(appid: appid)) as ConfigResolveResult }) {
+            hidrawDefault = next
+        }
     }
 
     /// `session.list` for this title; an open row that is not this model's

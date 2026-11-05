@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "appid": 220,
+    "hidraw_enabled": false,
+    "hidraw_reason": "DualSense connected",
+    "hidraw_source": "controllers"
+  }
+}

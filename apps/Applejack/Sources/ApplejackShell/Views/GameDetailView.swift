@@ -20,7 +20,7 @@ public struct GameDetailView: View {
                 Form {
                     Section("Configuration") {
                         ForEach(ConfigKey.allCases, id: \.rawValue) { key in
-                            ConfigFieldRow(key: key, value: config.value(key)) { value in
+                            ConfigFieldRow(key: key, value: config.value(key), unsetDefault: key == .hidrawEnabled ? hidrawDefault : nil) { value in
                                 Task { await model.set(key, to: value) }
                             }
                         }
@@ -46,6 +46,7 @@ public struct GameDetailView: View {
         .padding()
         .navigationTitle("App \(model.appid)")
         .toolbar {
+            Button("Refresh") { Task { await model.load() } }
             Button("Run") { Task { await runAndFollowLog() } }
                 .disabled(model.runState == .loading || model.isRunning)
             Button("Stop") { requestCancel() }
@@ -79,6 +80,18 @@ public struct GameDetailView: View {
             Text(planSummary(pending))
         }
         .task { await model.load() }
+    }
+
+    /// What the unset `hidraw_enabled` toggle shows: the effective value and
+    /// its reason from `config.resolve`, or the read's own state.
+    private var hidrawDefault: ConfigFieldRow.UnsetDefault {
+        switch model.hidrawDefault {
+        case .idle: .init(value: nil, detail: "unset")
+        case .loading: .init(value: nil, detail: "resolving…")
+        case .ready(let resolved): .init(value: resolved.hidrawEnabled, detail: resolved.defaultText)
+        case .unavailable(let reason): .init(value: nil, detail: "unset; \(reason.message)")
+        case .failed(let error): .init(value: nil, detail: "unset; \(describe(error))")
+        }
     }
 
     private var confirmationShown: Binding<Bool> {
@@ -193,8 +206,16 @@ public struct GameDetailView: View {
 
 /// One editable `config.set` key, rendered by its kind.
 struct ConfigFieldRow: View {
+    /// What an unset toggle shows: the position it takes (`nil` reads as
+    /// off) and the text beside it.
+    struct UnsetDefault {
+        var value: Bool?
+        var detail: String
+    }
+
     let key: ConfigKey
     let value: JSONValue
+    var unsetDefault: UnsetDefault? = nil
     let onSet: (JSONValue) -> Void
     @State private var text = ""
     @FocusState private var focused: Bool
@@ -203,9 +224,9 @@ struct ConfigFieldRow: View {
         switch key.kind {
         case .toggle:
             HStack {
-                Toggle(key.rawValue, isOn: Binding(get: { value.boolValue ?? false }, set: { onSet(.bool($0)) }))
+                Toggle(key.rawValue, isOn: Binding(get: { value.boolValue ?? unsetDefault?.value ?? false }, set: { onSet(.bool($0)) }))
                 if value == .null {
-                    Text("unset").foregroundStyle(.secondary)
+                    Text(unsetDefault?.detail ?? "unset").foregroundStyle(.secondary)
                 }
             }
         case .choice(let options):

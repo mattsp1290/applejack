@@ -1,0 +1,52 @@
+{
+  "SPBluetoothDataType" : [
+    {
+      "controller_properties" : {
+        "controller_address" : "00:00:00:00:00:00",
+        "controller_chipset" : "BCM_4388C2",
+        "controller_discoverable" : "attrib_off",
+        "controller_firmwareVersion" : "23.5.224.1468",
+        "controller_productID" : "0x4A3A",
+        "controller_state" : "attrib_on",
+        "controller_supportedServices" : "0x392039 < HFP AVRCP A2DP HID Braille LEA AACP GATT SerialPort >",
+        "controller_transport" : "PCIe",
+        "controller_vendorID" : "0x004C (Apple)"
+      },
+      "device_connected" : [
+        {
+          "DualSense Wireless Controller" : {
+            "device_address" : "00:00:00:00:00:01",
+            "device_firmwareVersion" : "1.0.0",
+            "device_minorType" : "Gamepad",
+            "device_productID" : "0x0CE6",
+            "device_vendorID" : "0x054C"
+          }
+        },
+        {
+          "Example Mouse" : {
+            "device_address" : "00:00:00:00:00:02",
+            "device_minorType" : "Mouse"
+          }
+        }
+      ],
+      "device_not_connected" : [
+        {
+          "Example Headphones" : {
+            "device_address" : "00:00:00:00:00:03",
+            "device_caseVersion" : "8B39",
+            "device_firmwareVersion" : "8B39",
+            "device_minorType" : "Headphones",
+            "device_productID" : "0x2014",
+            "device_serialNumber" : "0000000000",
+            "device_vendorID" : "0x004C"
+          }
+        },
+        {
+          "Example Phone" : {
+            "device_address" : "00:00:00:00:00:04"
+          }
+        }
+      ]
+    }
+  ]
+}

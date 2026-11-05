@@ -6,7 +6,7 @@ use super::jobs::JobId;
 use super::wire::{ErrorCode, RpcError};
 use crate::config::SessionRow;
 pub use crate::engines::{CpuidProbeResult, D3dmetalImportResult, EngineEntry, EngineListResult};
-pub use crate::game_config::ConfigImportResult;
+pub use crate::game_config::{ConfigImportResult, ConfigResolveResult};
 use crate::host::HostFacts;
 pub use crate::prefixes::SnapshotResult;
 pub use crate::runtime::steam_client::{ClientRuntimeState, ClientRuntimeStatus};
@@ -77,6 +77,7 @@ methods! {
     RuntimeSteamStop = "runtime.steam.stop": RuntimeSteamStopParams => IMPLEMENTED;
     RuntimeSteamStatus = "runtime.steam.status": RuntimeSteamStatusParams => IMPLEMENTED;
     ConfigGet = "config.get": ConfigGetParams => IMPLEMENTED;
+    ConfigResolve = "config.resolve": ConfigResolveParams => IMPLEMENTED;
     ConfigSet = "config.set": ConfigSetParams => IMPLEMENTED;
     ConfigExport = "config.export": ConfigExportParams => IMPLEMENTED;
     ConfigImport = "config.import": ConfigImportParams => IMPLEMENTED;
@@ -178,6 +179,7 @@ impl Method {
             Self::RuntimeSteamStop(RuntimeSteamStopParams {}),
             Self::RuntimeSteamStatus(RuntimeSteamStatusParams {}),
             Self::ConfigGet(ConfigGetParams { appid: 220 }),
+            Self::ConfigResolve(ConfigResolveParams { appid: 220 }),
             Self::ConfigSet(ConfigSetParams {
                 appid: 220,
                 key: "graphics_backend".into(),
@@ -434,6 +436,12 @@ pub struct RuntimeSteamStatusParams {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigGetParams {
+    pub appid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigResolveParams {
     pub appid: u32,
 }
 
