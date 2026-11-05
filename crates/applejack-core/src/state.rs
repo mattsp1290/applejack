@@ -10,7 +10,7 @@ use applejack_engine::{EngineLayout, RosettaWine};
 
 use crate::config::{self, ConfigDb, DataDirError};
 use crate::error::CoreError;
-use crate::host::controllers::{self, ControllerFact, Inventory};
+use crate::host::controllers::{self, Inventory};
 use crate::runtime::session::RunTuning;
 
 /// Where a run reads the controller inventory from.
@@ -83,10 +83,12 @@ impl Core {
         self
     }
 
-    /// Pins the controller inventory instead of reading `system_profiler`.
+    /// Pins the controller inventory instead of reading `system_profiler`:
+    /// a list of pads is a complete read, an [`Inventory`] may be
+    /// unavailable.
     #[must_use]
-    pub fn with_controllers(mut self, controllers: Vec<ControllerFact>) -> Self {
-        self.controllers = ControllerSource::Fixed(Inventory::available(controllers));
+    pub fn with_controllers(mut self, controllers: impl Into<Inventory>) -> Self {
+        self.controllers = ControllerSource::Fixed(controllers.into());
         self
     }
 

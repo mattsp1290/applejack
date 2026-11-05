@@ -112,10 +112,12 @@ impl Core {
             Some(app) if !takes_direct_path(&app, config, false) => STEAM_CLIENT_PREFIX.to_owned(),
             _ => appid.to_string(),
         };
-        Ok(self
-            .open_prefix(&name)
-            .ok()
-            .map(|(_, prefix)| prefix.hidraw))
+        // A directory that exists but does not open is the run's refusal,
+        // not "not built yet".
+        if !self.prefix_dir(&name)?.is_dir() {
+            return Ok(None);
+        }
+        Ok(Some(self.open_prefix(&name)?.1.hidraw))
     }
 
     /// The title's `apps` row, for the fields that live there.

@@ -8,8 +8,10 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use applejack_engine::HidrawMode;
@@ -27,16 +29,21 @@ const DUALSENSE: [u16; 2] = [0x0ce6, 0x0df2];
 /// The reporter the inventory is read from.
 pub const SYSTEM_PROFILER: &str = "/usr/sbin/system_profiler";
 
-/// The bound passed to `system_profiler -timeout`, whose own default is
-/// 180 s. A warm report takes 0.1 to 0.3 s and a cold one about 1.3 s on
-/// the measured host, so five seconds is several times the slowest
-/// observed report and still shorter than a stall a user reads as a hang.
+/// The bound on one report: the tool and every helper it started are
+/// killed, and the report is unavailable, once half as much again has
+/// passed (7.5 s). A warm report takes 0.1 to 0.3 s and a cold one about
+/// 1.3 s on the measured host, so five seconds is several times the
+/// slowest observed report and still shorter than a stall a user reads as
+/// a hang. The tool's own `-timeout` (default 180 s) is set to twice this
+/// so it never fires first: when it does fire it prints `{}` with exit 0,
+/// which reads as `returned no report`, never as "no pads".
 pub const PROFILER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The environment knob that replaces the host's inventory: `none` for no
 /// pads, `unavailable` for a report that could not be read, or the path of
-/// a JSON array of [`ControllerFact`]. Test suites set it so the binary
-/// never runs `system_profiler`.
+/// a JSON file holding an array of [`ControllerFact`] or an [`Inventory`]
+/// object as `doctor --controllers --json` prints it. The CLI test suite
+/// sets it so the binary never runs `system_profiler`.
 pub const CONTROLLERS_ENV: &str = "APPLEJACK_CONTROLLERS";
 
 /// One pad `system_profiler` lists, over USB or Bluetooth.
@@ -171,6 +178,23 @@ impl Inventory {
     pub const fn is_available(&self) -> bool {
         self.unavailable.is_none()
     }
+
+    /// Whether the pads decide the hidraw default on their own: a complete
+    /// read does, and so does a connected `DualShock` 4 or `DualSense` the
+    /// one report that answered did list, since the report that failed can
+    /// only hide pads, never make a listed one false. Otherwise the prefix's
+    /// mode holds.
+    #[must_use]
+    pub fn decides_hidraw(&self) -> bool {
+        self.is_available()
+            || HidrawDecision::from_controllers(&self.pads).mode == HidrawMode::Disabled
+    }
+}
+
+impl From<Vec<ControllerFact>> for Inventory {
+    fn from(pads: Vec<ControllerFact>) -> Self {
+        Self::available(pads)
+    }
 }
 
 /// Where the effective `hidraw_enabled` came from.
@@ -196,8 +220,10 @@ pub struct HidrawDecision {
 impl HidrawDecision {
     /// An explicit configuration always wins; otherwise the inventory
     /// decides: disabled with a connected `DualShock` 4 or `DualSense`,
-    /// enabled with none. An inventory that could not be read keeps
-    /// `current`, the prefix's mode, and gives a new prefix `Disabled`.
+    /// enabled with none. An inventory with a report missing still
+    /// disables for a connected Sony pad the other report listed; with no
+    /// such pad it keeps `current`, the prefix's mode, and gives a new
+    /// prefix `Disabled`.
     #[must_use]
     pub fn decide(
         config: Option<bool>,
@@ -217,13 +243,18 @@ impl HidrawDecision {
     /// The default with nothing configured; see [`Self::decide`].
     #[must_use]
     pub fn from_inventory(inventory: &Inventory, current: Option<HidrawMode>) -> Self {
+        let listed = Self::from_controllers(&inventory.pads);
         match &inventory.unavailable {
+            Some(why) if listed.mode == HidrawMode::Disabled => Self {
+                reason: format!("{}; {why}", listed.reason),
+                ..listed
+            },
             Some(why) => Self {
                 mode: current.unwrap_or(HidrawMode::Disabled),
                 source: HidrawSource::Controllers,
                 reason: format!("controller inventory unavailable ({why})"),
             },
-            None => Self::from_controllers(&inventory.pads),
+            None => listed,
         }
     }
 
@@ -281,6 +312,14 @@ pub fn inventory() -> Inventory {
     std::env::var_os(CONTROLLERS_ENV).map_or_else(gather, |knob| inventory_from_knob(&knob))
 }
 
+/// The two shapes a [`CONTROLLERS_ENV`] file may take.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KnobFile {
+    Pads(Vec<ControllerFact>),
+    Inventory(Inventory),
+}
+
 /// The inventory a [`CONTROLLERS_ENV`] value stands for.
 #[must_use]
 pub fn inventory_from_knob(knob: &OsStr) -> Inventory {
@@ -291,109 +330,200 @@ pub fn inventory_from_knob(knob: &OsStr) -> Inventory {
         return Inventory::unavailable(format!("{CONTROLLERS_ENV}=unavailable"));
     }
     let path = Path::new(knob);
-    let pads = fs::read_to_string(path)
+    let file = fs::read_to_string(path)
         .map_err(|error| error.to_string())
         .and_then(|text| {
-            serde_json::from_str::<Vec<ControllerFact>>(&text).map_err(|error| error.to_string())
+            serde_json::from_str::<KnobFile>(&text).map_err(|error| error.to_string())
         });
-    match pads {
-        Ok(pads) => Inventory::available(pads),
+    match file {
+        Ok(KnobFile::Pads(pads)) => Inventory::available(pads),
+        Ok(KnobFile::Inventory(inventory)) => inventory,
         Err(why) => Inventory::unavailable(format!("{CONTROLLERS_ENV} {}: {why}", path.display())),
     }
 }
 
-/// Runs both `system_profiler` reports, each bounded by
+/// Runs both `system_profiler` reports at once, each bounded by
 /// [`PROFILER_TIMEOUT`], and lists the pads in them, USB first. A report
-/// that fails to run, times out, or does not parse makes the inventory
-/// unavailable with the reason; the pads of the other report are still
-/// listed.
+/// that fails to run, times out, returns no report, or does not parse makes
+/// the inventory unavailable with the reason; the pads of the other report
+/// are still listed.
 #[must_use]
 pub fn gather() -> Inventory {
-    gather_from(Path::new(SYSTEM_PROFILER), PROFILER_TIMEOUT)
+    gather_from(&profiler(), PROFILER_TIMEOUT)
 }
 
-type Parser = fn(&str) -> Result<Vec<ControllerFact>, serde_json::Error>;
+/// The reporter [`gather`] runs: [`SYSTEM_PROFILER`], or the program a
+/// test installed in its place.
+fn profiler() -> PathBuf {
+    #[cfg(test)]
+    if let Some(program) = tests::profiler_override() {
+        return program;
+    }
+    PathBuf::from(SYSTEM_PROFILER)
+}
+
+type Parser = fn(&str) -> Result<Vec<ControllerFact>, ReportError>;
 
 /// [`gather`] with the reporter and its bound chosen; tests point it at a
 /// shim.
 #[must_use]
 pub fn gather_from(program: &Path, timeout: Duration) -> Inventory {
-    let mut inventory = Inventory::default();
-    let mut failures = Vec::new();
     let reports: [(&str, Parser); 2] = [
         ("SPUSBDataType", parse_usb),
         ("SPBluetoothDataType", parse_bluetooth),
     ];
-    for (data_type, parse) in reports {
-        let pads = report(program, data_type, timeout)
-            .and_then(|text| parse(&text).map_err(|error| format!("does not parse: {error}")));
-        match pads {
+    // Both at once: two stalled reports cost one bound, not two.
+    let results = std::thread::scope(|scope| {
+        let handles = reports.map(|(data_type, parse)| {
+            scope.spawn(move || {
+                report(program, data_type, timeout)
+                    .and_then(|text| parse(&text).map_err(|error| error.to_string()))
+            })
+        });
+        handles.map(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|_| Err("the report thread panicked".to_owned()))
+        })
+    });
+    let mut inventory = Inventory::default();
+    let mut failures = Vec::new();
+    for ((data_type, _), result) in reports.into_iter().zip(results) {
+        match result {
             Ok(pads) => inventory.pads.extend(pads),
             Err(why) => failures.push(format!("{data_type} {why}")),
         }
     }
-    dedupe(&mut inventory.pads);
     if !failures.is_empty() {
         inventory.unavailable = Some(failures.join("; "));
     }
     inventory
 }
 
-/// One report's JSON. The tool is told the bound and the wait allows it
-/// half as much again to print; past that it is killed and the report is
-/// a failure, never a hang.
+/// One report's JSON, read within `timeout` and half as much again: past
+/// that the tool and every process it started are killed and the report is
+/// a failure, never a hang. The read, not only the child's exit, is what
+/// the bound covers, since a helper that inherited stdout would otherwise
+/// hold the pipe open after the tool is gone.
 fn report(program: &Path, data_type: &str, timeout: Duration) -> Result<String, String> {
-    let seconds = timeout.as_secs().max(1).to_string();
+    // The tool's own give-up prints `{}` with exit 0; told twice our bound
+    // it never comes first, so a stall reads as `timed out`.
+    let tool_timeout = (timeout * 2).as_secs().max(1).to_string();
     let mut child = Command::new(program)
-        .args([data_type, "-json", "-timeout", &seconds])
+        .args([data_type, "-json", "-timeout", &tool_timeout])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        // Its own process group, so the kill reaches a helper the tool forked.
+        .process_group(0)
         .spawn()
         .map_err(|error| format!("cannot run {}: {error}", program.display()))?;
     let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| "no stdout pipe".to_owned())?;
-    // Drained on its own thread so a long report cannot fill the pipe and
-    // wait on us while we wait on it.
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut text = Vec::new();
-        stdout.read_to_end(&mut text).map(|_| text)
+        let _ = sender.send(stdout.read_to_end(&mut text).map(|_| text));
     });
     let deadline = Instant::now() + timeout + timeout / 2;
+    let read = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(read) => read,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            end(&mut child);
+            return Err("timed out".to_owned());
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            end(&mut child);
+            return Err("the reader thread panicked".to_owned());
+        }
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                end(&mut child);
                 return Err("timed out".to_owned());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(format!("cannot wait for the report: {error}")),
+            Err(error) => {
+                end(&mut child);
+                return Err(format!("cannot wait for the report: {error}"));
+            }
         }
     };
-    let text = reader
-        .join()
-        .map_err(|_| "the reader thread panicked".to_owned())?
-        .map_err(|error| format!("cannot read the report: {error}"))?;
+    let text = read.map_err(|error| format!("cannot read the report: {error}"))?;
     if !status.success() {
         return Err(format!("exited with {status}"));
     }
     Ok(String::from_utf8_lossy(&text).into_owned())
 }
 
-/// The report as an object. `[]` is what an empty report would be and
-/// lists nothing; any other non-object is not a report.
-fn report_object(text: &str) -> Result<Option<serde_json::Map<String, Value>>, serde_json::Error> {
-    match serde_json::from_str::<Value>(text)? {
-        Value::Object(map) => Ok(Some(map)),
-        Value::Array(items) if items.is_empty() => Ok(None),
-        other => Err(serde::de::Error::custom(format!(
-            "expected a report object, found {}",
+/// Kills the tool's whole process group (its pid, by `process_group(0)`)
+/// and reaps the tool. `/bin/kill` carries the group signal because the
+/// crate forbids unsafe code and takes no `libc`.
+fn end(child: &mut Child) {
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Why a report's text lists no pads.
+#[derive(Debug)]
+pub enum ReportError {
+    /// The report lacks its own data type's array, or has it `null`: the
+    /// `{}` that `system_profiler -timeout` prints when the reporter did
+    /// not answer in time. Only a present, empty array is "no pads".
+    NoReport,
+    /// Not JSON, not a report object, or the data type is not an array.
+    Malformed(serde_json::Error),
+}
+
+impl fmt::Display for ReportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoReport => f.write_str("returned no report"),
+            Self::Malformed(error) => write!(f, "does not parse: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ReportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NoReport => None,
+            Self::Malformed(error) => Some(error),
+        }
+    }
+}
+
+impl From<serde_json::Error> for ReportError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Malformed(error)
+    }
+}
+
+/// The `data_type` array of a report.
+fn report_items(text: &str, data_type: &str) -> Result<Vec<Value>, ReportError> {
+    let Value::Object(mut report) = serde_json::from_str::<Value>(text)? else {
+        let found = json_kind(&serde_json::from_str::<Value>(text)?);
+        return Err(ReportError::Malformed(serde::de::Error::custom(format!(
+            "expected a report object, found {found}"
+        ))));
+    };
+    match report.remove(data_type) {
+        None | Some(Value::Null) => Err(ReportError::NoReport),
+        Some(Value::Array(items)) => Ok(items),
+        Some(other) => Err(ReportError::Malformed(serde::de::Error::custom(format!(
+            "{data_type} is {}, not an array",
             json_kind(&other)
-        ))),
+        )))),
     }
 }
 
@@ -429,21 +559,20 @@ fn id_of(value: &Value) -> Option<u16> {
 /// The pads in `system_profiler SPUSBDataType -json`: every device under a
 /// bus or hub whose vendor and product name a known pad, or whose name says
 /// it is one. The USB report carries no device class, so a Microsoft mouse
-/// is told from an Xbox pad by its name. Each device is read leniently: an
-/// odd or missing field drops or blanks that field, never the report.
+/// is told from an Xbox pad by its name; a hub (a device with `_items`) is
+/// never a pad by its name. Each device is read leniently: an odd or
+/// missing field drops or blanks that field, never the report. Two
+/// identical pads are two rows.
 ///
 /// # Errors
 ///
-/// The text is not JSON, or not a report object.
-pub fn parse_usb(text: &str) -> Result<Vec<ControllerFact>, serde_json::Error> {
-    let Some(report) = report_object(text)? else {
-        return Ok(Vec::new());
-    };
+/// The text is not JSON or not a report object, or the report has no
+/// `SPUSBDataType` array.
+pub fn parse_usb(text: &str) -> Result<Vec<ControllerFact>, ReportError> {
     let mut pads = Vec::new();
-    for bus in array_of(report.get("SPUSBDataType")) {
+    for bus in &report_items(text, "SPUSBDataType")? {
         collect_usb(bus, &mut pads);
     }
-    dedupe(&mut pads);
     Ok(pads)
 }
 
@@ -453,14 +582,18 @@ fn collect_usb(item: &Value, pads: &mut Vec<ControllerFact>) {
     };
     let vendor = item.get("vendor_id").and_then(id_of);
     let product = item.get("product_id").and_then(id_of);
-    pads.extend(pad_of(
-        text_of(item.get("_name")),
-        Transport::Usb,
-        vendor,
-        product,
-        false,
-        true,
-    ));
+    let hub = item.contains_key("_items");
+    pads.extend(
+        pad_of(
+            text_of(item.get("_name")),
+            Transport::Usb,
+            vendor,
+            product,
+            false,
+            true,
+        )
+        .filter(|pad| !hub || pad.kind.hidraw_regresses()),
+    );
     for child in array_of(item.get("_items")) {
         collect_usb(child, pads);
     }
@@ -481,13 +614,11 @@ fn names_a_pad(name: &str) -> bool {
 ///
 /// # Errors
 ///
-/// The text is not JSON, or not a report object.
-pub fn parse_bluetooth(text: &str) -> Result<Vec<ControllerFact>, serde_json::Error> {
-    let Some(report) = report_object(text)? else {
-        return Ok(Vec::new());
-    };
+/// The text is not JSON or not a report object, or the report has no
+/// `SPBluetoothDataType` array.
+pub fn parse_bluetooth(text: &str) -> Result<Vec<ControllerFact>, ReportError> {
     let mut pads = Vec::new();
-    for entry in array_of(report.get("SPBluetoothDataType")) {
+    for entry in &report_items(text, "SPBluetoothDataType")? {
         let Some(entry) = entry.as_object() else {
             continue;
         };
@@ -545,8 +676,8 @@ fn pad_of(
     })
 }
 
-/// One row per pad: the same name and ids over the same transport, listed
-/// twice, is one pad, connected if either listing says so.
+/// One row per Bluetooth pad: the same name and ids listed under both the
+/// connected and the not-connected list is one pad, connected.
 fn dedupe(pads: &mut Vec<ControllerFact>) {
     let mut kept: Vec<ControllerFact> = Vec::with_capacity(pads.len());
     for pad in pads.drain(..) {
@@ -580,8 +711,40 @@ fn hex_id(id: u16) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    /// The program [`gather`] runs in place of [`SYSTEM_PROFILER`] while a
+    /// test holds one installed; see [`install_profiler`].
+    static PROFILER_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    pub(crate) fn profiler_override() -> Option<PathBuf> {
+        PROFILER_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Makes `program` the reporter until the guard drops. One test at a
+    /// time: the guard holds the lock.
+    pub(crate) fn install_profiler(program: &Path) -> ProfilerGuard {
+        let mut slot = PROFILER_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *slot = Some(program.to_path_buf());
+        ProfilerGuard
+    }
+
+    pub(crate) struct ProfilerGuard;
+
+    impl Drop for ProfilerGuard {
+        fn drop(&mut self) {
+            *PROFILER_OVERRIDE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
 
     const BLUETOOTH_CONNECTED: &str =
         include_str!("../../tests/fixtures/system_profiler/bluetooth-dualsense-connected.json");
@@ -669,17 +832,73 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_malformed_reports() {
+    fn an_empty_report_lists_no_pads_only_with_its_array_present() {
+        // The U18a capture of a host with nothing plugged in.
         assert_eq!(parse_usb(USB_EMPTY).unwrap(), []);
-        assert_eq!(parse_bluetooth("{}").unwrap(), []);
-        // `[]` is the shape an empty report would take, so it lists nothing
-        // rather than failing.
-        assert_eq!(parse_bluetooth("[]").unwrap(), []);
-        assert_eq!(parse_usb("[]").unwrap(), []);
+        assert_eq!(
+            parse_bluetooth(r#"{"SPBluetoothDataType": []}"#).unwrap(),
+            []
+        );
+        // What `system_profiler -timeout` prints when a reporter gave up
+        // (measured: `{\n\n}`, 4 bytes, exit 0), and its null twin.
+        for text in ["{}", "{\n\n}", r#"{"SPBluetoothDataType": null}"#] {
+            let error = parse_bluetooth(text).unwrap_err();
+            assert!(matches!(error, ReportError::NoReport), "{text}: {error:?}");
+            assert_eq!(error.to_string(), "returned no report");
+        }
+        for text in [
+            "{}",
+            r#"{"SPUSBDataType": null}"#,
+            r#"{"SPUSBDataType_v2": []}"#,
+        ] {
+            assert!(
+                matches!(parse_usb(text), Err(ReportError::NoReport)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_reports_do_not_parse() {
+        let error = parse_usb(r#"{"SPUSBDataType": {}}"#).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "does not parse: SPUSBDataType is an object, not an array"
+        );
+        let error = parse_bluetooth("[]").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "does not parse: expected a report object, found an array"
+        );
         assert!(parse_usb("not json").is_err());
         assert!(parse_bluetooth("\"text\"").is_err());
         assert!(parse_usb("[1]").is_err());
         assert!(parse_bluetooth("null").is_err());
+    }
+
+    #[test]
+    fn a_hub_whose_name_says_controller_is_not_a_pad_and_two_identical_pads_are_two() {
+        let dualsense = serde_json::json!({
+            "_name": "DualSense Wireless Controller",
+            "vendor_id": "0x054c  (Sony Corporation)",
+            "product_id": "0x0ce6",
+            "location_id": "0x01100000",
+        });
+        let mut twin = dualsense.clone();
+        twin["location_id"] = serde_json::json!("0x01200000");
+        let text = serde_json::json!({"SPUSBDataType": [{
+            "_name": "USB31Bus",
+            "_items": [{
+                "_name": "USB 3.0 Hub Controller",
+                "vendor_id": "0x2109",
+                "product_id": "0x0817",
+                "_items": [dualsense, twin],
+            }],
+        }]})
+        .to_string();
+        let pads = parse_usb(&text).unwrap();
+        assert_eq!(pads.len(), 2, "{pads:?}");
+        assert!(pads.iter().all(|pad| pad.kind == ControllerKind::Dualsense));
     }
 
     #[test]
@@ -871,14 +1090,68 @@ mod tests {
         );
         let kept = HidrawDecision::decide(None, &unavailable, Some(HidrawMode::Disabled));
         assert_eq!(kept.mode, HidrawMode::Disabled);
-        // Pads the other report did list do not make the read trustworthy.
+        // An Xbox pad the other report did list does not make the read
+        // trustworthy: the report that failed could hide a Sony pad.
         let partial = Inventory {
             pads: vec![pad(ControllerKind::Xbox, true)],
             unavailable: Some("SPBluetoothDataType exited with exit status: 1".to_owned()),
         };
+        assert!(!partial.decides_hidraw());
         assert_eq!(
             HidrawDecision::decide(None, &partial, Some(HidrawMode::Disabled)).mode,
             HidrawMode::Disabled
+        );
+        let kept = HidrawDecision::decide(None, &partial, Some(HidrawMode::Enabled));
+        assert_eq!(
+            kept.to_string(),
+            "hidraw enabled (controller inventory unavailable (SPBluetoothDataType exited with exit status: 1))"
+        );
+        assert_eq!(
+            HidrawDecision::decide(None, &partial, None).to_string(),
+            "hidraw disabled (controller inventory unavailable (SPBluetoothDataType exited with exit status: 1))"
+        );
+    }
+
+    #[test]
+    fn a_connected_sony_pad_decides_even_when_the_other_report_is_unavailable() {
+        // The report that failed can only hide pads; it never undoes the
+        // DualSense the USB report did list.
+        let partial = Inventory {
+            pads: vec![pad(ControllerKind::Dualsense, true)],
+            unavailable: Some("SPBluetoothDataType exited with exit status: 1".to_owned()),
+        };
+        assert!(partial.decides_hidraw());
+        for current in [None, Some(HidrawMode::Enabled), Some(HidrawMode::Disabled)] {
+            let decision = HidrawDecision::decide(None, &partial, current);
+            assert_eq!(decision.mode, HidrawMode::Disabled, "{current:?}");
+            assert_eq!(decision.source, HidrawSource::Controllers);
+            assert_eq!(
+                decision.to_string(),
+                "hidraw disabled (DualSense connected; SPBluetoothDataType exited with exit status: 1)"
+            );
+        }
+        let ds4 = Inventory {
+            pads: vec![pad(ControllerKind::Dualshock4, true)],
+            unavailable: Some("SPUSBDataType timed out".to_owned()),
+        };
+        assert_eq!(
+            HidrawDecision::decide(None, &ds4, Some(HidrawMode::Enabled)).to_string(),
+            "hidraw disabled (DualShock 4 connected; SPUSBDataType timed out)"
+        );
+        // An away Sony pad does not count, so the prefix's mode holds.
+        let away = Inventory {
+            pads: vec![pad(ControllerKind::Dualsense, false)],
+            unavailable: Some("SPUSBDataType timed out".to_owned()),
+        };
+        assert!(!away.decides_hidraw());
+        assert_eq!(
+            HidrawDecision::decide(None, &away, Some(HidrawMode::Enabled)).mode,
+            HidrawMode::Enabled
+        );
+        // The configuration still wins.
+        assert_eq!(
+            HidrawDecision::decide(Some(true), &partial, None).to_string(),
+            "hidraw enabled (config)"
         );
     }
 
@@ -901,18 +1174,59 @@ mod tests {
         script
     }
 
+    /// The bound the shim tests hand `gather_from`: the report that must
+    /// succeed (a `cat` through `sh`) has three seconds under a loaded
+    /// host, and the stalled one costs the test those three seconds.
+    const SHIM_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Well past the 3 s deadline, well short of any shim's sleep.
+    const SHIM_BOUND: Duration = Duration::from_secs(10);
+
+    /// Whether any process of the group `pgid` is still alive, polled for
+    /// up to two seconds so a kill that has landed but not yet been reaped
+    /// does not read as a survivor.
+    fn group_alive(pgid: &str) -> bool {
+        let started = Instant::now();
+        loop {
+            let listed = Command::new("/usr/bin/pgrep")
+                .args(["-g", pgid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !listed {
+                return false;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn pid_alive(pid: &str) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn pid_in(dir: &Path, name: &str) -> String {
+        fs::read_to_string(dir.join(name))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
     #[test]
     fn a_report_that_times_out_is_unavailable_and_the_other_pads_still_list() {
         let dir = tempfile::tempdir().unwrap();
-        // `exec` so the kill lands on the sleeper, not a shell in front of it.
+        // The sleeper is the tool itself.
         let tool = shim(dir.path(), USB_PADS, "exec sleep 30");
         let started = Instant::now();
-        let inventory = gather_from(&tool, Duration::from_millis(400));
+        let inventory = gather_from(&tool, SHIM_TIMEOUT);
         let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "the wait is bounded: {elapsed:?}"
-        );
+        assert!(elapsed < SHIM_BOUND, "the wait is bounded: {elapsed:?}");
         assert_eq!(
             inventory.unavailable.as_deref(),
             Some("SPBluetoothDataType timed out")
@@ -920,7 +1234,86 @@ mod tests {
         assert_eq!(inventory.pads.len(), 2, "{inventory:?}");
         assert_eq!(
             HidrawDecision::from_inventory(&inventory, None).to_string(),
+            "hidraw disabled (DualSense connected; SPBluetoothDataType timed out)"
+        );
+        let xbox_only: Vec<_> = inventory
+            .pads
+            .into_iter()
+            .filter(|pad| pad.kind == ControllerKind::Xbox)
+            .collect();
+        let inventory = Inventory {
+            pads: xbox_only,
+            unavailable: Some("SPBluetoothDataType timed out".to_owned()),
+        };
+        assert_eq!(
+            HidrawDecision::from_inventory(&inventory, None).to_string(),
             "hidraw disabled (controller inventory unavailable (SPBluetoothDataType timed out))"
+        );
+    }
+
+    #[test]
+    fn a_shell_in_front_of_the_sleeper_leaves_no_survivor() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `exec`: the sleeper is the shell's child, in the tool's group.
+        let snippet = format!(
+            "echo $$ > '{}'; sleep 31; echo '{{}}'",
+            dir.path().join("pgid").display()
+        );
+        let tool = shim(dir.path(), USB_EMPTY, &snippet);
+        let started = Instant::now();
+        let inventory = gather_from(&tool, SHIM_TIMEOUT);
+        let elapsed = started.elapsed();
+        assert!(elapsed < SHIM_BOUND, "the wait is bounded: {elapsed:?}");
+        assert_eq!(
+            inventory.unavailable.as_deref(),
+            Some("SPBluetoothDataType timed out")
+        );
+        let pgid = pid_in(dir.path(), "pgid");
+        assert!(!group_alive(&pgid), "the group {pgid} survived the kill");
+    }
+
+    #[test]
+    fn a_helper_that_holds_stdout_after_the_tool_exits_does_not_hold_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        // The tool exits 0 at once; its helper keeps the pipe's write end.
+        let snippet = format!(
+            "echo $$ > '{}'; sleep 12 & echo $! > '{}'; echo '{{\"SPBluetoothDataType\": []}}'; exit 0",
+            dir.path().join("pgid").display(),
+            dir.path().join("helper").display()
+        );
+        let tool = shim(dir.path(), USB_EMPTY, &snippet);
+        let started = Instant::now();
+        let inventory = gather_from(&tool, SHIM_TIMEOUT);
+        let elapsed = started.elapsed();
+        assert!(elapsed < SHIM_BOUND, "the wait is bounded: {elapsed:?}");
+        assert_eq!(
+            inventory.unavailable.as_deref(),
+            Some("SPBluetoothDataType timed out"),
+            "a report whose pipe never closed is not trusted"
+        );
+        let pgid = pid_in(dir.path(), "pgid");
+        assert!(!group_alive(&pgid), "the group {pgid} survived the kill");
+        let helper = pid_in(dir.path(), "helper");
+        assert!(!pid_alive(&helper), "the helper {helper} survived the kill");
+    }
+
+    #[test]
+    fn two_stalled_reports_cost_one_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both reports stall: the shim is replaced by a script that sleeps
+        // whatever it is asked (the mode set by `shim` stays).
+        let tool = shim(dir.path(), USB_EMPTY, "exec sleep 30");
+        fs::write(&tool, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let started = Instant::now();
+        let inventory = gather_from(&tool, SHIM_TIMEOUT);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SHIM_TIMEOUT * 2 + SHIM_TIMEOUT / 2,
+            "both reports share one bound: {elapsed:?}"
+        );
+        assert_eq!(
+            inventory.unavailable.as_deref(),
+            Some("SPUSBDataType timed out; SPBluetoothDataType timed out")
         );
     }
 
@@ -935,10 +1328,15 @@ mod tests {
         );
         assert_eq!(inventory.pads, []);
 
-        let tool = shim(dir.path(), "not json", "echo '[]'");
+        let tool = shim(
+            dir.path(),
+            "not json",
+            r#"echo '{"SPBluetoothDataType": []}'"#,
+        );
         let inventory = gather_from(&tool, Duration::from_secs(5));
         let why = inventory.unavailable.as_deref().unwrap();
         assert!(why.starts_with("SPUSBDataType does not parse: "), "{why}");
+        assert!(!why.contains("SPBluetoothDataType"), "{why}");
 
         let missing = dir.path().join("no-such-tool");
         let inventory = gather_from(&missing, Duration::from_secs(5));
@@ -950,10 +1348,53 @@ mod tests {
     #[test]
     fn a_shim_that_answers_both_reports_is_a_complete_inventory() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = shim(dir.path(), USB_EMPTY, "echo '{}'");
+        let tool = shim(
+            dir.path(),
+            USB_EMPTY,
+            r#"echo '{"SPBluetoothDataType": []}'"#,
+        );
         let inventory = gather_from(&tool, Duration::from_secs(5));
         assert_eq!(inventory, Inventory::default());
         assert!(inventory.is_available());
+    }
+
+    #[test]
+    fn the_tools_own_partial_report_is_unavailable_not_no_pads() {
+        let dir = tempfile::tempdir().unwrap();
+        // `system_profiler -timeout` gives up with exit 0 and `{}`.
+        let tool = shim(dir.path(), USB_PADS, "printf '{\\n\\n}'");
+        let inventory = gather_from(&tool, Duration::from_secs(5));
+        assert_eq!(
+            inventory.unavailable.as_deref(),
+            Some("SPBluetoothDataType returned no report")
+        );
+        assert_eq!(inventory.pads.len(), 2, "{inventory:?}");
+        assert!(
+            inventory
+                .pads
+                .iter()
+                .all(|pad| pad.transport == Transport::Usb),
+            "{inventory:?}"
+        );
+    }
+
+    #[test]
+    fn the_tool_is_told_twice_the_bound_so_its_own_give_up_never_comes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = dir.path().join("args");
+        let tool = shim(
+            dir.path(),
+            USB_EMPTY,
+            &format!(
+                "echo \"$@\" > '{}'; echo '{{\"SPBluetoothDataType\": []}}'",
+                args.display()
+            ),
+        );
+        let _ = gather_from(&tool, Duration::from_secs(5));
+        assert_eq!(
+            fs::read_to_string(&args).unwrap().trim(),
+            "SPBluetoothDataType -json -timeout 10"
+        );
     }
 
     #[test]
@@ -976,6 +1417,17 @@ mod tests {
         .unwrap();
         let fixed = inventory_from_knob(file.as_os_str());
         assert_eq!(fixed, pads(&[pad(ControllerKind::Dualsense, true)]));
+        // `doctor --controllers --json`'s own shape round-trips, the
+        // unavailable member included.
+        let object = dir.path().join("inventory.json");
+        let partial = Inventory {
+            pads: vec![pad(ControllerKind::Xbox, true)],
+            unavailable: Some("SPBluetoothDataType timed out".to_owned()),
+        };
+        fs::write(&object, serde_json::to_string(&partial).unwrap()).unwrap();
+        assert_eq!(inventory_from_knob(object.as_os_str()), partial);
+        fs::write(&object, serde_json::to_string(&fixed).unwrap()).unwrap();
+        assert_eq!(inventory_from_knob(object.as_os_str()), fixed);
         let missing = inventory_from_knob(dir.path().join("missing.json").as_os_str());
         assert!(
             missing

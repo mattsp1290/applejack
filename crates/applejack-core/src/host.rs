@@ -276,11 +276,60 @@ mod tests {
         assert_eq!(count_developer_id_identities(SECURITY_EMPTY_SAMPLE), 0);
     }
 
+    /// A `system_profiler` stand-in that records every invocation and
+    /// answers nothing, so any path that reads the inventory leaves a
+    /// marker on every host, pads or none.
+    fn recording_profiler(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let marker = dir.join("invocations");
+        let script = dir.join("system_profiler");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$1\" >> '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, marker)
+    }
+
     #[test]
     fn gather_reads_no_controller_inventory() {
+        assert!(
+            std::env::var_os(controllers::CONTROLLERS_ENV).is_none(),
+            "{} is set; this pin needs the host's own path",
+            controllers::CONTROLLERS_ENV
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (script, marker) = recording_profiler(dir.path());
+        let _installed = controllers::tests::install_profiler(&script);
+
         let facts = HostFacts::gather();
+        assert!(!marker.exists(), "HostFacts::gather() read the inventory");
         assert_eq!(facts.controllers, []);
         assert_eq!(facts.controllers_unavailable, None);
+
+        let mut core = crate::Core::new(dir.path().join("data"));
+        let report = core.engine_doctor().expect("doctor without an engine");
+        assert!(!report.runnable);
+        assert!(!marker.exists(), "engine_doctor read the inventory");
+
+        // The control: the stand-in is reached by the path that does read.
+        let inventory = controllers::gather();
+        let mut invoked: Vec<String> = std::fs::read_to_string(&marker)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        // The two reports run at once, in either order.
+        invoked.sort_unstable();
+        assert_eq!(invoked, ["SPBluetoothDataType", "SPUSBDataType"]);
+        assert_eq!(
+            inventory.unavailable.as_deref(),
+            Some(
+                "SPUSBDataType exited with exit status: 1; SPBluetoothDataType exited with exit status: 1"
+            )
+        );
+
         let unavailable = facts.with_controllers(Inventory::unavailable("why"));
         assert_eq!(unavailable.controllers_unavailable.as_deref(), Some("why"));
         let json = serde_json::to_value(&unavailable).expect("serializes");

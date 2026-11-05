@@ -181,16 +181,17 @@ fn render_controllers(inventory: &Inventory) -> String {
             )
         })
         .collect();
-    if let Some(why) = &inventory.unavailable {
-        lines.push(format!(
+    match &inventory.unavailable {
+        Some(why) if !inventory.decides_hidraw() => lines.push(format!(
             "controller inventory unavailable ({why}): a new prefix gets hidraw disabled, \
              an existing prefix keeps its mode"
-        ));
-    } else {
-        if lines.is_empty() {
-            lines.push("no controllers".to_owned());
+        )),
+        _ => {
+            if lines.is_empty() {
+                lines.push("no controllers".to_owned());
+            }
+            lines.push(HidrawDecision::from_inventory(inventory, None).to_string());
         }
-        lines.push(HidrawDecision::from_inventory(inventory, None).to_string());
     }
     lines.join("\n")
 }
@@ -267,6 +268,36 @@ mod tests {
             text,
             "controller inventory unavailable (SPBluetoothDataType timed out): a new prefix gets \
              hidraw disabled, an existing prefix keeps its mode"
+        );
+    }
+
+    #[test]
+    fn a_connected_sony_pad_in_a_partial_inventory_prints_the_decision_not_the_sentence() {
+        let mut pads = host::controllers::parse_usb(USB_PADS).unwrap();
+        let inventory = Inventory {
+            pads: pads.clone(),
+            unavailable: Some("SPBluetoothDataType timed out".to_owned()),
+        };
+        let text = render_controllers(&inventory);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(
+            lines[2],
+            "hidraw disabled (DualSense connected; SPBluetoothDataType timed out)"
+        );
+        // The Xbox pad alone does not decide: the sentence stands.
+        pads.retain(|pad| pad.kind == ControllerKind::Xbox);
+        let inventory = Inventory {
+            pads,
+            unavailable: Some("SPBluetoothDataType timed out".to_owned()),
+        };
+        let text = render_controllers(&inventory);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[1]
+                .starts_with("controller inventory unavailable (SPBluetoothDataType timed out): "),
+            "{text}"
         );
     }
 
