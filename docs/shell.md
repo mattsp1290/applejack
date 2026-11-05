@@ -237,16 +237,24 @@ for the whole inventory, `hidraw enabled (no Sony pad connected)` or
 `hidraw disabled (DualSense connected)`, computed in the shell by
 `HidrawDefault`, a mirror of the core's `HidrawDecision`. When `host.doctor`
 carries `controllers_unavailable` (a profiler report failed to run, timed
-out, or did not parse), the section lists the pads the other report gave
-and, in place of the rule's line and of "No pads paired or plugged in",
-the CLI's own sentence: `controller inventory unavailable (<why>): a new
-prefix gets hidraw disabled, an existing prefix keeps its mode`. Refresh
-re-reads both lists; so does a pad connecting or disconnecting, and a
-banner Restart. When the core is unreachable or refuses `host.doctor`, the
-section shows that failure with a Retry, never an empty list; the
-GameController list stays. `CoreBinaryTests` pins that the real binary's
-`doctor --controllers` and these Swift words agree for the fake core's four
-pad shapes and for an unavailable inventory.
+out, or did not parse), the section lists the pads the other report gave.
+If one of them is a connected DualShock 4 or DualSense it still decides,
+as in the core (`Inventory::decides_hidraw`: a failed report can only hide
+pads, never undo one that was listed), and the rule's line reads `hidraw
+disabled (DualSense connected; SPUSBDataType timed out)`, the pad first
+and the failure after it (`ControllerInventory.decidesHidraw`). Without
+such a pad the section shows, in place of the rule's line and of "No pads
+paired or plugged in", the CLI's own sentence: `controller inventory
+unavailable (<why>): a new prefix gets hidraw disabled, an existing prefix
+keeps its mode` (`ControllerInventory.unavailableLine`, `nil` whenever the
+inventory decides). Refresh re-reads both lists; so does a pad connecting
+or disconnecting, and a banner Restart. When the core is unreachable or
+refuses `host.doctor`, the section shows that failure with a Retry, never
+an empty list; the GameController list stays. `CoreBinaryTests` pins that
+the real binary's `doctor --controllers` and these Swift words agree for
+the fake core's four pad shapes, for an unavailable inventory, and for the
+`dualsense-unavailable` shape (a connected DualSense beside a USB report
+that timed out), fed to the binary as the knob's inventory object.
 
 Game detail, `hidraw_enabled`: while the row leaves it unset, the toggle
 takes the position `config.resolve` reports and reads "Default: off,
@@ -254,7 +262,9 @@ DualSense connected" or "Default: on, no Sony pad connected" beside it
 (`ConfigResolveResult.defaultText`, the core's `hidraw_reason` verbatim, so
 an unavailable inventory reads "Default: off, controller inventory
 unavailable (SPBluetoothDataType timed out)", the mode of the prefix the
-run would use); a stored `true` or `false` shows as
+run would use, and one a listed connected Sony pad decided reads "Default:
+off, DualSense connected; SPUSBDataType timed out"); a stored `true` or
+`false` shows as
 itself and sends no `config.resolve`, since a stored value is its own
 effective value and the read costs a `system_profiler` run. Every `load()`
 (the first show, a save, Refresh, a banner Restart) re-reads it. Flipping

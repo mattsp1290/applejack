@@ -228,15 +228,21 @@ from `host.doctor`, one row per pad with the columns above in the same
 words (`hidraw default disabled` for a connected Sony pad, `would disable
 hidraw if connected` for one that is away) and the rule's line under them
 (`hidraw disabled (DualSense connected)`). When `controllers_unavailable`
-is set the view lists what the other report gave and shows the
-`controller inventory unavailable (<why>): ...` sentence above in place of
-the rule's line, never "no pads". Refresh re-reads both, and a core that
-cannot be reached shows its failure, not an empty list. The game detail's
-`hidraw_enabled` toggle, while unset, takes the position `config.resolve`
-reports and says why with `hidraw_reason` as the core gives it: "Default:
-off, DualSense connected", "Default: on, no Sony pad connected", or
-"Default: off, controller inventory unavailable (SPBluetoothDataType timed
-out)", re-read after every save and Refresh. See `docs/shell.md`.
+is set the view lists what the other report gave; a connected DualShock 4
+or DualSense among them still decides, and the rule's line carries the
+failure after the pad (`hidraw disabled (DualSense connected; SPUSBDataType
+timed out)`), the same rule as `Inventory::decides_hidraw` above, mirrored
+in Swift by `HidrawDefault.decide(_ inventory:)`. Without such a pad the
+view shows the `controller inventory unavailable (<why>): ...` sentence
+above in place of the rule's line, never "no pads". Refresh re-reads both,
+and a core that cannot be reached shows its failure, not an empty list.
+The game detail's `hidraw_enabled` toggle, while unset, takes the position
+`config.resolve` reports and says why with `hidraw_reason` as the core
+gives it: "Default: off, DualSense connected", "Default: on, no Sony pad
+connected", "Default: off, controller inventory unavailable
+(SPBluetoothDataType timed out)", or "Default: off, DualSense connected;
+SPUSBDataType timed out", re-read after every save and Refresh. See
+`docs/shell.md`.
 
 ## Steam Input and the overlay
 
