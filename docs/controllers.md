@@ -196,13 +196,19 @@ not a user setting and may change without notice.
 
 The Controllers view shows two lists: the pads macOS sees through the
 GameController framework (display only) and, beside them, this inventory
-from `host.doctor`, one row per pad with the columns above and the rule's
-line under them (`hidraw disabled (DualSense connected)`); Refresh re-reads
-both, and a core that cannot be reached shows its failure, not an empty
-list. The game detail's `hidraw_enabled` toggle, while unset, takes the
-position `config.resolve` reports and says why: "Default: off, DualSense
-connected" or "Default: on, no Sony pad connected", re-read after every save
-and Refresh. See `docs/shell.md`.
+from `host.doctor`, one row per pad with the columns above in the same
+words (`hidraw default disabled` for a connected Sony pad, `would disable
+hidraw if connected` for one that is away) and the rule's line under them
+(`hidraw disabled (DualSense connected)`). When `controllers_unavailable`
+is set the view lists what the other report gave and shows the
+`controller inventory unavailable (<why>): ...` sentence above in place of
+the rule's line, never "no pads". Refresh re-reads both, and a core that
+cannot be reached shows its failure, not an empty list. The game detail's
+`hidraw_enabled` toggle, while unset, takes the position `config.resolve`
+reports and says why with `hidraw_reason` as the core gives it: "Default:
+off, DualSense connected", "Default: on, no Sony pad connected", or
+"Default: off, controller inventory unavailable (SPBluetoothDataType timed
+out)", re-read after every save and Refresh. See `docs/shell.md`.
 
 ## Steam Input and the overlay
 
