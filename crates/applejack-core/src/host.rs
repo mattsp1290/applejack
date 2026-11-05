@@ -9,7 +9,9 @@ use std::fmt;
 use std::path::Path;
 use std::process::Command;
 
-pub use controllers::{ControllerFact, ControllerKind, HidrawDecision, HidrawSource, Transport};
+pub use controllers::{
+    ControllerFact, ControllerKind, HidrawDecision, HidrawSource, Inventory, Transport,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFacts {
@@ -19,9 +21,14 @@ pub struct HostFacts {
     pub free_disk_bytes: Option<u64>,
     pub screen_recording: ScreenRecordingState,
     pub developer_id_identities: Option<usize>,
-    /// The pads `system_profiler` lists; see [`controllers`].
+    /// The pads `system_profiler` lists; see [`controllers`]. Empty from
+    /// [`HostFacts::gather`]; [`HostFacts::with_controllers`] fills it.
     #[serde(default)]
     pub controllers: Vec<ControllerFact>,
+    /// Why the inventory could not be read, when it could not; the pads are
+    /// then not to be trusted as "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controllers_unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +46,8 @@ impl fmt::Display for ScreenRecordingState {
 }
 
 impl HostFacts {
+    /// The host without its controller inventory: no `system_profiler`
+    /// runs. The engine paths and `hello` want only this.
     #[must_use]
     pub fn gather() -> Self {
         Self {
@@ -63,7 +72,33 @@ impl HostFacts {
             )
             .filter(|captured| captured.success)
             .map(|captured| count_developer_id_identities(&captured.stdout)),
-            controllers: controllers::gather(),
+            controllers: Vec::new(),
+            controllers_unavailable: None,
+        }
+    }
+
+    /// The facts with `inventory` as their controller inventory.
+    #[must_use]
+    pub fn with_controllers(mut self, inventory: Inventory) -> Self {
+        self.controllers = inventory.pads;
+        self.controllers_unavailable = inventory.unavailable;
+        self
+    }
+
+    /// [`Self::gather`] with the inventory the doctor paths add:
+    /// [`controllers::inventory`], so the `APPLEJACK_CONTROLLERS` knob is
+    /// honoured.
+    #[must_use]
+    pub fn gather_with_controllers() -> Self {
+        Self::gather().with_controllers(controllers::inventory())
+    }
+
+    /// The inventory these facts carry.
+    #[must_use]
+    pub fn inventory(&self) -> Inventory {
+        Inventory {
+            pads: self.controllers.clone(),
+            unavailable: self.controllers_unavailable.clone(),
         }
     }
 }
@@ -242,6 +277,18 @@ mod tests {
     }
 
     #[test]
+    fn gather_reads_no_controller_inventory() {
+        let facts = HostFacts::gather();
+        assert_eq!(facts.controllers, []);
+        assert_eq!(facts.controllers_unavailable, None);
+        let unavailable = facts.with_controllers(Inventory::unavailable("why"));
+        assert_eq!(unavailable.controllers_unavailable.as_deref(), Some("why"));
+        let json = serde_json::to_value(&unavailable).expect("serializes");
+        assert_eq!(json["controllers_unavailable"], "why");
+        assert_eq!(unavailable.inventory(), Inventory::unavailable("why"));
+    }
+
+    #[test]
     fn screen_recording_serializes_as_unknown() {
         let facts = HostFacts {
             macos_version: "26.6.2".to_owned(),
@@ -251,10 +298,12 @@ mod tests {
             screen_recording: ScreenRecordingState::Unknown,
             developer_id_identities: None,
             controllers: Vec::new(),
+            controllers_unavailable: None,
         };
         let json = serde_json::to_value(&facts).expect("serializes");
         assert_eq!(json["screen_recording"], "unknown");
         assert_eq!(json["controllers"], serde_json::json!([]));
+        assert!(json.get("controllers_unavailable").is_none(), "{json}");
         assert!(json["arch"].is_null());
         assert!(json["free_disk_bytes"].is_null());
         assert!(json["rosetta_present"].is_null());

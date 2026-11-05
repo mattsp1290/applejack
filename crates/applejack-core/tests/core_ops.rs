@@ -13,7 +13,9 @@ use serde_json::json;
 use tempfile::TempDir;
 
 fn core(dir: &TempDir) -> Core {
-    Core::new(dir.path().join("data")).with_unsigned_installs(true)
+    Core::new(dir.path().join("data"))
+        .with_controllers(Vec::new())
+        .with_unsigned_installs(true)
 }
 
 /// A core with the stub bundle installed and active.
@@ -131,6 +133,7 @@ fn install_refusals_name_the_way_out() {
     assert!(message.contains("--from"), "{message}");
 
     let refused = Core::new(dir.path())
+        .with_controllers(Vec::new())
         .plan_install("rosetta-wine", Some(Path::new("/nowhere")))
         .unwrap_err();
     assert!(matches!(refused, CoreError::UnsignedRefused));

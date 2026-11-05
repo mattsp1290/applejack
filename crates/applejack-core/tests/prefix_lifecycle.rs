@@ -41,7 +41,9 @@ fn parse(output: &[u8]) -> Vec<Value> {
 fn installed(dir: &TempDir) -> Core {
     let tree = dir.path().join("tree");
     write_stub_bundle(&tree, "10.0.0");
-    let mut core = Core::new(dir.path().join("data")).with_unsigned_installs(true);
+    let mut core = Core::new(dir.path().join("data"))
+        .with_controllers(Vec::new())
+        .with_unsigned_installs(true);
     core.plan_install("rosetta-wine", Some(&tree))
         .unwrap()
         .run(&mut |_| {})
@@ -87,7 +89,7 @@ fn double_reset() {
     script(&wine, &slow);
     let data = core.data_dir().to_path_buf();
     fs::write(save_file(&data), "only copy").unwrap();
-    let check = Core::new(&data);
+    let check = Core::new(&data).with_controllers(Vec::new());
 
     let input = format!("{HELLO}\n{}\n{}\n", reset_line(2), reset_line(3));
     let mut output = Vec::new();
@@ -231,7 +233,9 @@ fn an_install_finishes_under_a_dead_reader_and_leaves_no_archive() {
     let tree = dir.path().join("tree");
     write_stub_bundle(&tree, "10.0.0");
     let data = dir.path().join("data");
-    let core = Core::new(&data).with_unsigned_installs(true);
+    let core = Core::new(&data)
+        .with_controllers(Vec::new())
+        .with_unsigned_installs(true);
     let line = json!({
         "jsonrpc": "2.0", "id": 2, "method": "engine.install",
         "params": {"engine_id": "rosetta-wine", "from": tree}
@@ -254,7 +258,9 @@ fn the_next_install_clears_the_archive_a_killed_one_left() {
     fs::write(root.join("9.0.0.local.tar.zst"), "left by a killed install").unwrap();
     let tree = dir.path().join("tree");
     write_stub_bundle(&tree, "10.0.0");
-    let core = Core::new(&data).with_unsigned_installs(true);
+    let core = Core::new(&data)
+        .with_controllers(Vec::new())
+        .with_unsigned_installs(true);
     core.plan_install("rosetta-wine", Some(&tree))
         .unwrap()
         .run(&mut |_| {})
@@ -268,7 +274,9 @@ fn left_by_a_killed_install(dir: &TempDir) -> (Core, PathBuf, PathBuf) {
     let data = dir.path().join("data");
     let tree = dir.path().join("tree");
     write_stub_bundle(&tree, "10.0.0");
-    let core = Core::new(&data).with_unsigned_installs(true);
+    let core = Core::new(&data)
+        .with_controllers(Vec::new())
+        .with_unsigned_installs(true);
     let archive = data.join("engines/rosetta-wine/10.0.0.local.tar.zst");
     let kept = dir.path().join("kept.tar.zst");
     let packed =
@@ -679,7 +687,7 @@ fn a_failed_reset_over_rpc_names_its_snapshot_in_job_failed() {
     let dir = TempDir::new().unwrap();
     let core = installed(&dir);
     script(&stub_wine(&dir), "#!/bin/sh\nexit 3\n");
-    let check = Core::new(core.data_dir());
+    let check = Core::new(core.data_dir()).with_controllers(Vec::new());
     let input = format!("{HELLO}\n{}\n", reset_line(2));
     let mut output = Vec::new();
     rpc::serve(input.as_bytes(), &mut output, &mut CoreHandler::new(core)).unwrap();
@@ -712,7 +720,7 @@ fn await_job_end(lines: &Receiver<String>) -> Value {
 fn the_lock_is_free_when_job_done_arrives() {
     let dir = TempDir::new().unwrap();
     let core = installed(&dir);
-    let check = Core::new(core.data_dir());
+    let check = Core::new(core.data_dir()).with_controllers(Vec::new());
     let mut handler = CoreHandler::new(core);
     let (notifier, lines) = Notifier::channel();
     for round in 0..10 {
@@ -733,7 +741,9 @@ fn a_from_directory_and_an_archive_report_the_same_code_for_no_descriptor() {
     let dir = TempDir::new().unwrap();
     let empty = dir.path().join("empty");
     fs::create_dir(&empty).unwrap();
-    let core = Core::new(dir.path().join("data")).with_unsigned_installs(true);
+    let core = Core::new(dir.path().join("data"))
+        .with_controllers(Vec::new())
+        .with_unsigned_installs(true);
     let error = core
         .plan_install("rosetta-wine", Some(&empty))
         .unwrap()

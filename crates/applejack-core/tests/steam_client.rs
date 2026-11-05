@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use applejack_core::config::{ConfigDb, Drm, NewSession, SessionRow, SessionState};
+use applejack_core::host::{ControllerFact, ControllerKind, Transport};
 use applejack_core::rpc::wire::ErrorCode;
 use applejack_core::run::{AppRegistration, PlannedRun};
 use applejack_core::runtime::session::{NOTE_CLIENT, NOTE_LOST, RunTuning};
@@ -159,22 +160,40 @@ impl Fixture {
         content: &str,
         hook: &mut dyn FnMut(&str),
     ) -> (Result<ClientRuntimeState, CoreError>, Vec<String>) {
+        Self::install_on(self.core(), content, hook)
+    }
+
+    /// [`Fixture::install_reporting`] with `pads` as the inventory the
+    /// install reads.
+    fn install_with_pads(
+        &self,
+        pads: Vec<ControllerFact>,
+    ) -> (Result<ClientRuntimeState, CoreError>, Vec<String>) {
+        Self::install_on(
+            self.core().with_controllers(pads),
+            "VALVE-SIGNED",
+            &mut |_| {},
+        )
+    }
+
+    fn install_on(
+        mut core: Core,
+        content: &str,
+        hook: &mut dyn FnMut(&str),
+    ) -> (Result<ClientRuntimeState, CoreError>, Vec<String>) {
         let fetch = |_url: &str, dest: &Path, progress: &mut dyn FnMut(u64, Option<u64>)| {
             fs::write(dest, content).map_err(|error| CoreError::Message(error.to_string()))?;
             progress(content.len() as u64, Some(content.len() as u64));
             Ok(())
         };
         let mut lines = Vec::new();
-        let outcome = self
-            .core()
-            .plan_client_op(ClientOp::Install)
-            .and_then(|plan| {
-                plan.run_with(&fetch, &mut |phase, message| {
-                    let line = format!("{phase}: {message}");
-                    hook(&line);
-                    lines.push(line);
-                })
-            });
+        let outcome = core.plan_client_op(ClientOp::Install).and_then(|plan| {
+            plan.run_with(&fetch, &mut |phase, message| {
+                let line = format!("{phase}: {message}");
+                hook(&line);
+                lines.push(line);
+            })
+        });
         (outcome.map(|status| status.state), lines)
     }
 
@@ -646,9 +665,7 @@ fn a_client_session_runs_from_the_marker_to_its_clearing_and_the_client_stays() 
     assert!(row.ended_at.is_some());
     assert_eq!(
         phases,
-        [
-            "prepare", "prefix", "prepare", "starting", "running", "exited"
-        ]
+        ["prepare", "prepare", "starting", "running", "exited"]
     );
     assert!(fixture.client_up(), "the client outlives the title");
     assert_eq!(
@@ -728,9 +745,7 @@ fn another_titles_marker_falls_through_to_the_exe() {
     assert_eq!(outcome.unwrap().state, SessionState::Exited);
     assert_eq!(
         phases,
-        [
-            "prepare", "prefix", "prepare", "starting", "running", "exited"
-        ]
+        ["prepare", "prepare", "starting", "running", "exited"]
     );
 }
 
@@ -1308,6 +1323,68 @@ fn a_dead_owners_client_row_closes_once_the_title_is_gone() {
     assert_eq!(running.finish().0.unwrap().state, SessionState::Exited);
 }
 
+/// The hidraw mode of the client prefix's record.
+fn client_prefix_hidraw(fixture: &Fixture) -> Option<HidrawMode> {
+    fixture
+        .core()
+        .prefix_list()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == STEAM_CLIENT_PREFIX)
+        .unwrap()
+        .hidraw
+}
+
+fn dualsense() -> ControllerFact {
+    ControllerFact {
+        name: "DualSense Wireless Controller".to_owned(),
+        transport: Transport::Usb,
+        vendor_id: "0x054c".to_owned(),
+        product_id: "0x0ce6".to_owned(),
+        connected: true,
+        kind: ControllerKind::Dualsense,
+    }
+}
+
+#[test]
+fn install_decides_the_client_prefixs_hidraw_by_the_pads_connected_then() {
+    let fixture = Fixture::new();
+    let (state, lines) = fixture.install_with_pads(vec![dualsense()]);
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin);
+    assert_eq!(
+        lines[..2],
+        [
+            "prepare: hidraw disabled (DualSense connected)",
+            "prefix: creating prefix steam-client",
+        ],
+        "{lines:?}"
+    );
+    assert_eq!(client_prefix_hidraw(&fixture), Some(HidrawMode::Disabled));
+
+    let fixture = Fixture::new();
+    let (state, lines) = fixture.install_with_pads(Vec::new());
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin);
+    assert_eq!(
+        lines[..2],
+        [
+            "prepare: hidraw enabled (no Sony pad connected)",
+            "prefix: creating prefix steam-client",
+        ],
+        "{lines:?}"
+    );
+    assert_eq!(client_prefix_hidraw(&fixture), Some(HidrawMode::Enabled));
+    // The first title run finds the rule's mode already in place.
+    fixture.sign_in();
+    let running = fixture.start();
+    fixture.quit_game(0);
+    let (outcome, phases) = running.finish();
+    assert_eq!(outcome.unwrap().state, SessionState::Exited);
+    assert!(
+        !phases.iter().any(|phase| phase == "prefix"),
+        "nothing to flip after the install: {phases:?}"
+    );
+}
+
 #[test]
 fn the_client_prefix_keeps_its_settings_while_the_client_runs() {
     let fixture = Fixture::new();
@@ -1316,6 +1393,10 @@ fn the_client_prefix_keeps_its_settings_while_the_client_runs() {
     fixture
         .core()
         .config_set(APP, "graphics_backend", "wined3d")
+        .unwrap();
+    fixture
+        .core()
+        .config_set(APP, "hidraw_enabled", "false")
         .unwrap();
     let server = spawn_stub_server("server", &fixture.prefix_dir());
     let running = fixture.start();
@@ -1334,7 +1415,11 @@ fn the_client_prefix_keeps_its_settings_while_the_client_runs() {
         Some(GraphicsBackend::Dxmt),
         "not reapplied under a running client"
     );
-    assert_eq!(prefix.hidraw, Some(HidrawMode::Disabled));
+    assert_eq!(
+        prefix.hidraw,
+        Some(HidrawMode::Enabled),
+        "the install's mode stays while the client owns the prefix"
+    );
     drop(server);
 }
 

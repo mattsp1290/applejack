@@ -14,7 +14,10 @@ use crate::config::{
 };
 use crate::error::CoreError;
 use crate::host::{HidrawDecision, HidrawSource};
+use crate::runtime::direct::takes_direct_path;
+use crate::runtime::steam_client::STEAM_CLIENT_PREFIX;
 use crate::state::Core;
+use applejack_engine::HidrawMode;
 
 /// Largest preset file `import` reads. A preset is a few hundred bytes of
 /// settings; anything bigger is read into memory, written into the database,
@@ -73,21 +76,46 @@ impl Core {
     }
 
     /// The hidraw mode a run of `appid` would apply now, and why: the stored
-    /// row when it sets `hidraw_enabled`, else the connected pads.
+    /// row when it sets `hidraw_enabled`, else the connected pads. When the
+    /// inventory cannot be read, the prefix the run would use keeps its mode
+    /// and a prefix not yet built gets `Disabled`, as the run does.
     ///
     /// # Errors
     ///
     /// Returns the database failure.
     pub fn config_resolve(&mut self, appid: u32) -> Result<ConfigResolveResult, CoreError> {
         let config = self.config_get(appid)?;
-        let decision =
-            HidrawDecision::decide(config.hidraw_enabled, &self.controllers_for(&config));
+        let inventory = self.controllers_for(&config);
+        let current = if config.hidraw_enabled.is_none() && !inventory.is_available() {
+            self.current_hidraw(appid, &config)?
+        } else {
+            None
+        };
+        let decision = HidrawDecision::decide(config.hidraw_enabled, &inventory, current);
         Ok(ConfigResolveResult {
             appid,
             hidraw_enabled: decision.enabled(),
             hidraw_source: decision.source,
-            hidraw_reason: decision.reason.to_owned(),
+            hidraw_reason: decision.reason,
         })
+    }
+
+    /// The hidraw mode of the prefix a run of `appid` would use, when that
+    /// prefix exists: the client's for a title on the client path, else the
+    /// title's own.
+    fn current_hidraw(
+        &mut self,
+        appid: u32,
+        config: &GameConfig,
+    ) -> Result<Option<HidrawMode>, CoreError> {
+        let name = match self.title(appid)? {
+            Some(app) if !takes_direct_path(&app, config, false) => STEAM_CLIENT_PREFIX.to_owned(),
+            _ => appid.to_string(),
+        };
+        Ok(self
+            .open_prefix(&name)
+            .ok()
+            .map(|(_, prefix)| prefix.hidraw))
     }
 
     /// The title's `apps` row, for the fields that live there.
