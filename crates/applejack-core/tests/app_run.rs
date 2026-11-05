@@ -17,6 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use applejack_core::config::{ConfigDb, Drm, NewSession, SessionRow, SessionState};
+use applejack_core::host::{ControllerFact, ControllerKind, Transport};
 use applejack_core::rpc::jobs::Notifier;
 use applejack_core::rpc::methods::{
     AppCancelParams, AppRunParams, HelloParams, Method, SessionListParams,
@@ -97,6 +98,7 @@ impl Fixture {
     fn core(&self) -> Core {
         Core::new(self.data())
             .with_unsigned_installs(true)
+            .with_controllers(Vec::new())
             .with_run_tuning(FAST)
     }
 
@@ -632,7 +634,10 @@ fn a_session_runs_in_order_and_records_its_end() {
     assert_eq!(end.state, SessionState::Exited);
     assert_eq!(end.exit_code, Some(3));
     assert!(end.ended_at.is_some());
-    assert_eq!(phases, ["prefix", "starting", "running", "exited"]);
+    assert_eq!(
+        phases,
+        ["prepare", "prefix", "starting", "running", "exited"]
+    );
     assert_eq!(find_session(&end.session_key), []);
     fixture.assert_lock_free();
 }
@@ -684,7 +689,7 @@ fn a_new_prefix_maps_the_titles_library_and_is_reused() {
     let running = fixture.start();
     fixture.quit(0);
     let (_, phases) = running.finish();
-    assert_eq!(phases, ["starting", "running", "exited"]);
+    assert_eq!(phases, ["prepare", "starting", "running", "exited"]);
 }
 
 #[test]
@@ -703,6 +708,143 @@ fn a_changed_setting_is_applied_before_the_launch() {
     running.finish();
     let list = fixture.core().prefix_list().unwrap();
     assert_eq!(list[0].hidraw, Some(HidrawMode::Enabled));
+}
+
+/// A run with `pads` as the inventory, to its end; the lines are
+/// `phase: message`, as the CLI prints them.
+fn run_with_pads(fixture: &Fixture, pads: Vec<ControllerFact>) -> Vec<String> {
+    let _ = fs::remove_file(fixture.prefix_dir().join("quit"));
+    let plan = fixture
+        .core()
+        .with_controllers(pads)
+        .plan_run(APP, false)
+        .unwrap();
+    let id = plan.session_id();
+    let thread = thread::spawn(move || {
+        let mut lines = Vec::new();
+        let outcome = plan.run(&mut |phase, message| lines.push(format!("{phase}: {message}")));
+        (outcome, lines)
+    });
+    fixture.wait_for(id, SessionState::Running);
+    fixture.quit(0);
+    let (outcome, lines) = thread.join().unwrap();
+    outcome.unwrap();
+    lines
+}
+
+/// The newest `seeds.reg` the engine imported for the title's prefix: a
+/// create leaves it in the session's log directory, an apply in the prefix's
+/// `applejack/` state directory.
+fn seeds(fixture: &Fixture) -> String {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.file_name().is_some_and(|name| name == "seeds.reg") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&fixture.data(), &mut found);
+    let newest = found
+        .into_iter()
+        .max_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok())
+        .expect("a seeds.reg was written");
+    fs::read_to_string(newest).unwrap()
+}
+
+fn prefix_hidraw(fixture: &Fixture) -> Option<HidrawMode> {
+    fixture.core().prefix_list().unwrap()[0].hidraw
+}
+
+fn dualsense(connected: bool) -> ControllerFact {
+    ControllerFact {
+        name: "DualSense Wireless Controller".to_owned(),
+        transport: Transport::Bluetooth,
+        vendor_id: "0x054c".to_owned(),
+        product_id: "0x0ce6".to_owned(),
+        connected,
+        kind: ControllerKind::Dualsense,
+    }
+}
+
+/// The value the fixture bundle's `hidraw_key` names, as the seed writes it.
+const HIDRAW_DISABLED_SEED: &str = "\"DisableHidraw\"=dword:00000001";
+const HIDRAW_ENABLED_SEED: &str = "\"DisableHidraw\"=dword:00000000";
+
+#[test]
+fn an_unset_hidraw_with_a_connected_dualsense_is_disabled_in_the_prefix() {
+    let fixture = Fixture::new();
+    let lines = run_with_pads(&fixture, vec![dualsense(true)]);
+    assert!(
+        lines.contains(&"prepare: hidraw disabled (DualSense connected)".to_owned()),
+        "{lines:?}"
+    );
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Disabled));
+    assert!(seeds(&fixture).contains(HIDRAW_DISABLED_SEED));
+}
+
+#[test]
+fn an_unset_hidraw_with_no_connected_sony_pad_is_enabled() {
+    let fixture = Fixture::new();
+    let lines = run_with_pads(&fixture, vec![dualsense(false)]);
+    assert!(
+        lines.contains(&"prepare: hidraw enabled (no Sony pad connected)".to_owned()),
+        "{lines:?}"
+    );
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Enabled));
+    assert!(seeds(&fixture).contains(HIDRAW_ENABLED_SEED));
+}
+
+#[test]
+fn an_explicit_hidraw_setting_wins_over_the_pads() {
+    let fixture = Fixture::new();
+    fixture
+        .core()
+        .config_set(APP, "hidraw_enabled", "false")
+        .unwrap();
+    let lines = run_with_pads(&fixture, Vec::new());
+    assert!(
+        lines.contains(&"prepare: hidraw disabled (config)".to_owned()),
+        "{lines:?}"
+    );
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Disabled));
+    fixture
+        .core()
+        .config_set(APP, "hidraw_enabled", "true")
+        .unwrap();
+    let lines = run_with_pads(&fixture, vec![dualsense(true)]);
+    assert!(
+        lines.contains(&"prepare: hidraw enabled (config)".to_owned()),
+        "{lines:?}"
+    );
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Enabled));
+    assert!(seeds(&fixture).contains(HIDRAW_ENABLED_SEED));
+}
+
+#[test]
+fn a_pad_appearing_between_two_runs_flips_the_prefix() {
+    let fixture = Fixture::new();
+    run_with_pads(&fixture, Vec::new());
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Enabled));
+    let lines = run_with_pads(&fixture, vec![dualsense(true)]);
+    assert_eq!(
+        lines[..3],
+        [
+            "prepare: hidraw disabled (DualSense connected)",
+            "prefix: applying settings to prefix 1234",
+            "starting: title.exe",
+        ],
+        "{lines:?}"
+    );
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Disabled));
+    assert!(seeds(&fixture).contains(HIDRAW_DISABLED_SEED));
+    let lines = run_with_pads(&fixture, Vec::new());
+    assert_eq!(lines[0], "prepare: hidraw enabled (no Sony pad connected)");
+    assert_eq!(prefix_hidraw(&fixture), Some(HidrawMode::Enabled));
+    assert!(seeds(&fixture).contains(HIDRAW_ENABLED_SEED));
 }
 
 #[test]
@@ -1243,7 +1385,10 @@ fn a_busy_database_at_the_marker_does_not_abandon_the_title() {
     let (end, phases) = running.finish();
     assert_eq!(end.state, SessionState::Exited);
     assert_eq!(end.exit_code, Some(4));
-    assert_eq!(phases, ["prefix", "starting", "running", "exited"]);
+    assert_eq!(
+        phases,
+        ["prepare", "prefix", "starting", "running", "exited"]
+    );
     fixture.assert_lock_free();
 }
 
@@ -1826,7 +1971,10 @@ fn over_rpc_a_run_answers_at_once_and_reports_on_its_job() {
         .iter()
         .filter_map(|message| message["params"]["phase"].as_str())
         .collect();
-    assert_eq!(phases, ["prefix", "starting", "running", "cancelled"]);
+    assert_eq!(
+        phases,
+        ["prepare", "prefix", "starting", "running", "cancelled"]
+    );
     assert_eq!(run.last().unwrap()["method"], json!("job.done"));
     drop(job_lines(&lines, &cancel_job));
     let row = fixture.db().session(id).unwrap().unwrap();

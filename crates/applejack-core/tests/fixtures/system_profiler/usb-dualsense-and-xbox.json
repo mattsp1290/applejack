@@ -1,0 +1,62 @@
+{
+  "SPUSBDataType" : [
+    {
+      "_items" : [
+        {
+          "_name" : "DualSense Wireless Controller",
+          "bcd_device" : "1.00",
+          "bus_power" : "500",
+          "bus_power_used" : "500",
+          "device_speed" : "full_speed",
+          "extra_current_used" : "0",
+          "location_id" : "0x01100000 / 1",
+          "manufacturer" : "Sony Interactive Entertainment",
+          "product_id" : "0x0ce6",
+          "serial_num" : "0000000000000000",
+          "vendor_id" : "0x054c  (Sony Corporation)"
+        },
+        {
+          "_items" : [
+            {
+              "_name" : "Xbox Wireless Controller",
+              "bcd_device" : "5.17",
+              "bus_power" : "500",
+              "bus_power_used" : "500",
+              "device_speed" : "full_speed",
+              "extra_current_used" : "0",
+              "location_id" : "0x01210000 / 3",
+              "manufacturer" : "Microsoft",
+              "product_id" : "0x0b12",
+              "serial_num" : "0000000000000000",
+              "vendor_id" : "0x045e  (Microsoft Corporation)"
+            },
+            {
+              "_name" : "Example Keyboard",
+              "bcd_device" : "1.00",
+              "bus_power" : "500",
+              "bus_power_used" : "100",
+              "device_speed" : "full_speed",
+              "extra_current_used" : "0",
+              "location_id" : "0x01220000 / 4",
+              "manufacturer" : "Example",
+              "product_id" : "0x0001",
+              "vendor_id" : "0x05ac  (Apple Inc.)"
+            }
+          ],
+          "_name" : "USB3.0 Hub",
+          "bcd_device" : "1.00",
+          "bus_power" : "500",
+          "bus_power_used" : "0",
+          "device_speed" : "super_speed",
+          "extra_current_used" : "0",
+          "location_id" : "0x01200000 / 2",
+          "manufacturer" : "Example",
+          "product_id" : "0x0817",
+          "vendor_id" : "0x2109  (VIA Labs, Inc.)"
+        }
+      ],
+      "_name" : "USB31Bus",
+      "host_controller" : "AppleT8132USBXHCI"
+    }
+  ]
+}

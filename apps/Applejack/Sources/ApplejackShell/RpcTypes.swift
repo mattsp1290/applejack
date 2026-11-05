@@ -231,6 +231,37 @@ public enum ScreenRecordingState: String, Codable, Sendable {
     case unknown
 }
 
+public enum ControllerTransport: String, Codable, Sendable {
+    case usb
+    case bluetooth
+}
+
+public enum ControllerKind: String, Codable, Sendable {
+    case dualshock4
+    case dualsense
+    case xbox
+    case other
+}
+
+/// `applejack_core::host::ControllerFact`: one pad `system_profiler` lists.
+public struct ControllerFact: Codable, Equatable, Sendable {
+    public var name: String
+    public var transport: ControllerTransport
+    public var vendorId: String
+    public var productId: String
+    public var connected: Bool
+    public var kind: ControllerKind
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case transport
+        case vendorId = "vendor_id"
+        case productId = "product_id"
+        case connected
+        case kind
+    }
+}
+
 /// `applejack_core::host::HostFacts`.
 public struct HostFacts: Codable, Equatable, Sendable {
     public var macosVersion: String
@@ -239,6 +270,7 @@ public struct HostFacts: Codable, Equatable, Sendable {
     public var freeDiskBytes: UInt64?
     public var screenRecording: ScreenRecordingState
     public var developerIdIdentities: Int?
+    public var controllers: [ControllerFact]
 
     enum CodingKeys: String, CodingKey {
         case macosVersion = "macos_version"
@@ -247,6 +279,39 @@ public struct HostFacts: Codable, Equatable, Sendable {
         case freeDiskBytes = "free_disk_bytes"
         case screenRecording = "screen_recording"
         case developerIdIdentities = "developer_id_identities"
+        case controllers
+    }
+
+    public init(
+        macosVersion: String,
+        arch: String?,
+        rosettaPresent: Bool?,
+        freeDiskBytes: UInt64?,
+        screenRecording: ScreenRecordingState,
+        developerIdIdentities: Int?,
+        controllers: [ControllerFact]
+    ) {
+        self.macosVersion = macosVersion
+        self.arch = arch
+        self.rosettaPresent = rosettaPresent
+        self.freeDiskBytes = freeDiskBytes
+        self.screenRecording = screenRecording
+        self.developerIdIdentities = developerIdIdentities
+        self.controllers = controllers
+    }
+
+    /// `controllers` reads as empty when absent, as the Rust side's
+    /// `#[serde(default)]` does, so a core from before the inventory still
+    /// decodes.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        macosVersion = try container.decode(String.self, forKey: .macosVersion)
+        arch = try container.decodeIfPresent(String.self, forKey: .arch)
+        rosettaPresent = try container.decodeIfPresent(Bool.self, forKey: .rosettaPresent)
+        freeDiskBytes = try container.decodeIfPresent(UInt64.self, forKey: .freeDiskBytes)
+        screenRecording = try container.decode(ScreenRecordingState.self, forKey: .screenRecording)
+        developerIdIdentities = try container.decodeIfPresent(Int.self, forKey: .developerIdIdentities)
+        controllers = try container.decodeIfPresent([ControllerFact].self, forKey: .controllers) ?? []
     }
 }
 

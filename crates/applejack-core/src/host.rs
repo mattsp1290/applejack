@@ -1,11 +1,15 @@
 //! Host facts behind `applejack doctor`.
 
+pub mod controllers;
+
 use applejack_engine::{Arch, Host};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
 use std::process::Command;
+
+pub use controllers::{ControllerFact, ControllerKind, HidrawDecision, HidrawSource, Transport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFacts {
@@ -15,6 +19,9 @@ pub struct HostFacts {
     pub free_disk_bytes: Option<u64>,
     pub screen_recording: ScreenRecordingState,
     pub developer_id_identities: Option<usize>,
+    /// The pads `system_profiler` lists; see [`controllers`].
+    #[serde(default)]
+    pub controllers: Vec<ControllerFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +63,7 @@ impl HostFacts {
             )
             .filter(|captured| captured.success)
             .map(|captured| count_developer_id_identities(&captured.stdout)),
+            controllers: controllers::gather(),
         }
     }
 }
@@ -242,9 +250,11 @@ mod tests {
             free_disk_bytes: None,
             screen_recording: ScreenRecordingState::Unknown,
             developer_id_identities: None,
+            controllers: Vec::new(),
         };
         let json = serde_json::to_value(&facts).expect("serializes");
         assert_eq!(json["screen_recording"], "unknown");
+        assert_eq!(json["controllers"], serde_json::json!([]));
         assert!(json["arch"].is_null());
         assert!(json["free_disk_bytes"].is_null());
         assert!(json["rosetta_present"].is_null());

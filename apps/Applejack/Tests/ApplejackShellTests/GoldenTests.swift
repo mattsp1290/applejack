@@ -47,7 +47,7 @@ final class GoldenTests: XCTestCase {
             [
                 "app.cancel.result.json", "app.install.result.json", "app.run.result.json",
                 "config.export.result.json", "config.get.result.json", "config.import.result.json",
-                "empty.result.json", "engine.d3dmetal.import.result.json", "engine.doctor.result.json",
+                "config.resolve.result.json", "empty.result.json", "engine.d3dmetal.import.result.json", "engine.doctor.result.json",
                 "engine.install.result.json", "engine.list.result.json", "engine.probe_cpuid.result.json",
                 "hello.result.json", "host.doctor.result.json", "prefix.snapshot.result.json",
                 "runtime.steam.install.result.json", "runtime.steam.status.result.json",

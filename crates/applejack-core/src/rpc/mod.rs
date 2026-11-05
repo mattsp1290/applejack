@@ -413,6 +413,7 @@ impl<H: SteamHost> Handler for CoreHandler<H> {
                 to_result(&EmptyResult {})
             }
             Method::ConfigGet(params) => to_result(&self.core()?.config_get(params.appid)?),
+            Method::ConfigResolve(params) => to_result(&self.core()?.config_resolve(params.appid)?),
             Method::ConfigSet(params) => {
                 let value = config_value_text(&params.value);
                 self.core()?.config_set(params.appid, &params.key, &value)?;

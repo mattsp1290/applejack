@@ -647,7 +647,7 @@ while IFS= read -r line; do
       fi
       ;;
     host.doctor)
-      emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"macos_version":"26.0","arch":"arm64","rosetta_present":true,"free_disk_bytes":123456789,"screen_recording":"unknown","developer_id_identities":0}}'
+      emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"macos_version":"26.0","arch":"arm64","rosetta_present":true,"free_disk_bytes":123456789,"screen_recording":"unknown","developer_id_identities":0,"controllers":[]}}'
       ;;
     fake.die)
       # Exits 3 without answering. The grandchild inherits stdout only (an

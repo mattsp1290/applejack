@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": 23,
+  "method": "config.resolve",
+  "params": {
+    "appid": 220
+  }
+}

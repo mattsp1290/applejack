@@ -143,7 +143,10 @@ codes as an error response.
 Parameter types are in `crates/applejack-core/src/rpc/methods.rs`. Each
 method has an example request in `crates/applejack-core/tests/rpc_golden/`.
 `host.doctor` returns `HostFacts`, the same shape as `applejack doctor
---json`.
+--json`. Its `controllers` member is the pad inventory
+(`[{name, transport, vendor_id, product_id, connected, kind}]`, `transport`
+`usb` or `bluetooth`, `kind` one of `dualshock4`, `dualsense`, `xbox`,
+`other`); see `docs/controllers.md`.
 
 The table between the markers is rendered from the method table by
 `docs_method_table_matches_the_types` in `tests/rpc_golden.rs`; edit
@@ -175,6 +178,7 @@ by hand.
 | `runtime.steam.stop` | implemented |
 | `runtime.steam.status` | implemented |
 | `config.get` | implemented |
+| `config.resolve` | implemented |
 | `config.set` | implemented |
 | `config.export` | implemented |
 | `config.import` | implemented |
@@ -219,6 +223,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `prefix.restore` | The same shape, naming the safety snapshot of the replaced state, or the restored snapshot when the prefix was gone and there was nothing to replace |
 | `prefix.reset` | `JobStarted`. A `job.progress` message names the safety snapshot |
 | `config.get` | `GameConfig`; every member `null` for an appid with no row |
+| `config.resolve` | `{appid, hidraw_enabled, hidraw_source, hidraw_reason}`: the hidraw mode a run would apply now. `hidraw_source` is `config` when the row sets `hidraw_enabled`, else `controllers`, and `hidraw_reason` is the text of the run's `prepare: hidraw` line (`config`, `DualSense connected`, `DualShock 4 connected`, `no Sony pad connected`); see `docs/controllers.md` |
 | `config.set` | `{}`. `value` is a string, a boolean, a number, an object for `extra_env`, or `null` to clear. `direct_verified_at` is refused: only a direct probe records it. Key `drm` sets the title's `drm` in the `apps` row, and is how a title becomes client-free; `TitleNotInstalled` when it has no row |
 | `config.export` | `{path}` |
 | `config.import` | `{applied, preset_appid, accepted, rejected, confirmations}` |
@@ -254,6 +259,8 @@ a prefix nor a snapshot is an unknown prefix.
 
 `app.run` claims a session and answers at once with the `sessions` row id, the
 log path, and a job. The job's `job.progress` phases are the session's steps:
+`prepare` with the hidraw decision (`hidraw disabled (DualSense connected)`,
+see `docs/controllers.md`; not while a running client owns the prefix),
 `prefix` (only when it builds or changes the prefix), `starting`, `running`,
 `lingering` (only when the session goes on after the launch exe), then the state
 it ended in. The job ends with the session, so a `job.done` means the session is
@@ -378,7 +385,8 @@ starts the client to its login window, which the user signs in to; the core
 never sees credentials.
 
 A client session is a `sessions` row with `prefix = "steam-client"`. Its job
-reports `prepare` (the `.acf` backup and `libraryfolders.vdf`), `shim` when
+reports `prepare` (the hidraw decision when the client prefix is built or
+the client is down, then the `.acf` backup and `libraryfolders.vdf`), `shim` when
 the run starts the client (the web helper shim check), `starting`,
 `running` when the client's `RunningAppID` equals the appid, and the end
 state. `exit_code` is null: the title's status is the client's. The client

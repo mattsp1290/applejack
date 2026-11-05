@@ -13,6 +13,7 @@ use crate::config::{
     ImportOptions, Preset, Rejected,
 };
 use crate::error::CoreError;
+use crate::host::{HidrawDecision, HidrawSource};
 use crate::state::Core;
 
 /// Largest preset file `import` reads. A preset is a few hundred bytes of
@@ -37,6 +38,19 @@ pub struct ConfigImportResult {
     pub confirmations: Vec<Confirmation>,
 }
 
+/// The result of `config.resolve`: the settings a run would apply now that
+/// the stored row does not state outright. `hidraw_enabled` is the stored
+/// value when there is one, else what the connected pads decide (plan 06);
+/// `hidraw_reason` is the text a `prepare: hidraw` line carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigResolveResult {
+    pub appid: u32,
+    pub hidraw_enabled: bool,
+    pub hidraw_source: HidrawSource,
+    pub hidraw_reason: String,
+}
+
 /// The text `set_field` takes for a JSON value: `null` clears, a string is
 /// itself, anything else is its JSON (`extra_env` takes an object).
 #[must_use]
@@ -56,6 +70,24 @@ impl Core {
     /// Returns the database failure.
     pub fn config_get(&mut self, appid: u32) -> Result<GameConfig, CoreError> {
         self.reading(|db| Ok(db.game_config(appid)?.unwrap_or_default()))
+    }
+
+    /// The hidraw mode a run of `appid` would apply now, and why: the stored
+    /// row when it sets `hidraw_enabled`, else the connected pads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database failure.
+    pub fn config_resolve(&mut self, appid: u32) -> Result<ConfigResolveResult, CoreError> {
+        let config = self.config_get(appid)?;
+        let decision =
+            HidrawDecision::decide(config.hidraw_enabled, &self.controllers_for(&config));
+        Ok(ConfigResolveResult {
+            appid,
+            hidraw_enabled: decision.enabled(),
+            hidraw_source: decision.source,
+            hidraw_reason: decision.reason.to_owned(),
+        })
     }
 
     /// The title's `apps` row, for the fields that live there.

@@ -3,6 +3,16 @@
   "id": 2,
   "result": {
     "arch": "arm64",
+    "controllers": [
+      {
+        "connected": true,
+        "kind": "dualsense",
+        "name": "DualSense Wireless Controller",
+        "product_id": "0x0ce6",
+        "transport": "bluetooth",
+        "vendor_id": "0x054c"
+      }
+    ],
     "developer_id_identities": 1,
     "free_disk_bytes": 1168608788480,
     "macos_version": "26.0.1",

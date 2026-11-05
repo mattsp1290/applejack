@@ -5,14 +5,16 @@
 use applejack_core::config::{
     Drm, GameConfig, GraphicsBackend, SessionRow, SessionState, SyncMode,
 };
-use applejack_core::host::{HostFacts, ScreenRecordingState};
+use applejack_core::host::{
+    ControllerFact, ControllerKind, HidrawSource, HostFacts, ScreenRecordingState, Transport,
+};
 use applejack_core::rpc::PROTOCOL_VERSION;
 use applejack_core::rpc::jobs::{JobDone, JobFailed, JobId, JobProgress, JobStarted};
 use applejack_core::rpc::methods::{
     AppRunResult, ClientRuntimeState, ClientRuntimeStatus, ConfigExportResult, ConfigImportResult,
-    CpuidProbeResult, D3dmetalImportResult, EmptyResult, EngineEntry, EngineListResult,
-    GuardFactorWire, HelloResult, InstallState, LibraryEntry, LoginSession, LoginStepWire, Method,
-    MethodStatus, SessionListResult, SnapshotResult, SteamLibraryResult,
+    ConfigResolveResult, CpuidProbeResult, D3dmetalImportResult, EmptyResult, EngineEntry,
+    EngineListResult, GuardFactorWire, HelloResult, InstallState, LibraryEntry, LoginSession,
+    LoginStepWire, Method, MethodStatus, SessionListResult, SnapshotResult, SteamLibraryResult,
 };
 use applejack_core::rpc::wire::{ErrorCode, Id, Notification, Request, Response};
 use applejack_engine::rosetta_wine::{CpuidFeatures, CpuidProbe};
@@ -77,6 +79,14 @@ fn expected() -> BTreeMap<String, String> {
             free_disk_bytes: Some(1_168_608_788_480),
             screen_recording: ScreenRecordingState::Unknown,
             developer_id_identities: Some(1),
+            controllers: vec![ControllerFact {
+                name: "DualSense Wireless Controller".to_owned(),
+                transport: Transport::Bluetooth,
+                vendor_id: "0x054c".to_owned(),
+                product_id: "0x0ce6".to_owned(),
+                connected: true,
+                kind: ControllerKind::Dualsense,
+            }],
         })
         .expect("encodes"),
     );
@@ -87,6 +97,7 @@ fn expected() -> BTreeMap<String, String> {
     );
     files.insert("empty.result.json".to_owned(), pretty(&empty));
     results(&mut files);
+    config_results(&mut files);
     session_results(&mut files);
     notifications(&mut files);
     let codes: BTreeMap<&str, i64> = ErrorCode::ALL
@@ -168,6 +179,13 @@ fn results(files: &mut BTreeMap<String, String>) {
             dir: PathBuf::from("/data/prefixes/.snapshots/220/20261031T120000Z"),
         }),
     );
+}
+
+/// The config results, apart so neither function outgrows the lint.
+fn config_results(files: &mut BTreeMap<String, String>) {
+    let mut add = |name: &str, response: &Response| {
+        files.insert(format!("{name}.result.json"), pretty(response));
+    };
     add(
         "config.get",
         &result_response(&GameConfig {
@@ -175,6 +193,15 @@ fn results(files: &mut BTreeMap<String, String>) {
             sync_mode: Some(SyncMode::Disabled),
             hidraw_enabled: Some(true),
             ..GameConfig::default()
+        }),
+    );
+    add(
+        "config.resolve",
+        &result_response(&ConfigResolveResult {
+            appid: 220,
+            hidraw_enabled: false,
+            hidraw_source: HidrawSource::Controllers,
+            hidraw_reason: "DualSense connected".to_owned(),
         }),
     );
     add(
@@ -502,6 +529,7 @@ fn result_goldens_decode_into_their_types() {
     };
     let facts: HostFacts = serde_json::from_value(value).unwrap();
     assert_eq!(facts.screen_recording, ScreenRecordingState::Unknown);
+    assert_eq!(facts.controllers[0].kind, ControllerKind::Dualsense);
 
     let empty: Response =
         serde_json::from_str(&fs::read_to_string(dir.join("empty.result.json")).unwrap()).unwrap();
@@ -535,6 +563,9 @@ fn result_goldens_for_engine_and_config_methods_decode() {
         serde_json::from_value(result_value("engine.d3dmetal.import")).unwrap();
     let _: SnapshotResult = serde_json::from_value(result_value("prefix.snapshot")).unwrap();
     let _: GameConfig = serde_json::from_value(result_value("config.get")).unwrap();
+    let resolved: ConfigResolveResult =
+        serde_json::from_value(result_value("config.resolve")).unwrap();
+    assert_eq!(resolved.hidraw_source, HidrawSource::Controllers);
     let _: ConfigExportResult = serde_json::from_value(result_value("config.export")).unwrap();
     let import: ConfigImportResult = serde_json::from_value(result_value("config.import")).unwrap();
     assert!(!import.applied);

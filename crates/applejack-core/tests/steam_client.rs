@@ -114,6 +114,7 @@ impl Fixture {
     fn core(&self) -> Core {
         Core::new(self.data())
             .with_unsigned_installs(true)
+            .with_controllers(Vec::new())
             .with_run_tuning(self.tuning)
     }
 
@@ -643,7 +644,12 @@ fn a_client_session_runs_from_the_marker_to_its_clearing_and_the_client_stays() 
     assert_eq!(row.exit_code, None);
     assert_eq!(row.note.as_deref(), Some(NOTE_CLIENT));
     assert!(row.ended_at.is_some());
-    assert_eq!(phases, ["prepare", "starting", "running", "exited"]);
+    assert_eq!(
+        phases,
+        [
+            "prepare", "prefix", "prepare", "starting", "running", "exited"
+        ]
+    );
     assert!(fixture.client_up(), "the client outlives the title");
     assert_eq!(
         fs::read(fixture.acf()).unwrap(),
@@ -720,7 +726,12 @@ fn another_titles_marker_falls_through_to_the_exe() {
     fixture.quit_game(0);
     let (outcome, phases) = running.finish();
     assert_eq!(outcome.unwrap().state, SessionState::Exited);
-    assert_eq!(phases, ["prepare", "starting", "running", "exited"]);
+    assert_eq!(
+        phases,
+        [
+            "prepare", "prefix", "prepare", "starting", "running", "exited"
+        ]
+    );
 }
 
 /// A title in a library the running client has never seen: the folder is

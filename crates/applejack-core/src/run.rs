@@ -17,8 +17,7 @@ use applejack_engine::rosetta_wine::process::{find_session, wineserver_running};
 use applejack_engine::rosetta_wine::snapshot::{self, PrefixLock};
 use applejack_engine::rosetta_wine::{CpuidProbe, utc_now};
 use applejack_engine::{
-    Engine, GraphicsBackend, HidrawMode, InstalledEngine, LaunchSpec, Prefix, Session, SyncMode,
-    Version,
+    Engine, GraphicsBackend, InstalledEngine, LaunchSpec, Prefix, Session, SyncMode, Version,
 };
 use applejack_steam::{AppManifest, InstallPlan, LaunchEntry, LibraryPaths};
 
@@ -28,6 +27,7 @@ use crate::config::{
 };
 use crate::engines::META_CPUID_PROBE;
 use crate::error::CoreError;
+use crate::host::{ControllerFact, HidrawDecision};
 use crate::prefixes::pick_sync;
 use crate::runtime::direct::{DirectLaunch, resolve_launch, takes_direct_path};
 use crate::runtime::session::{
@@ -62,16 +62,18 @@ pub struct AppRegistration {
     pub library: Option<PathBuf>,
 }
 
-/// What a run wants of the prefix; `None` keeps what it has.
+/// What a run wants of the prefix; `None` keeps what it has. The hidraw
+/// mode is always decided: by the configuration, else by the pads connected
+/// at this run (plan 06), so a prefix flips with the pad.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrefixWish {
     backend: Option<GraphicsBackend>,
     sync_mode: Option<SyncMode>,
-    hidraw: Option<HidrawMode>,
+    hidraw: HidrawDecision,
 }
 
 impl PrefixWish {
-    fn of(config: &GameConfig) -> Result<Self, CoreError> {
+    fn of(config: &GameConfig, controllers: &[ControllerFact]) -> Result<Self, CoreError> {
         Ok(Self {
             backend: config
                 .graphics_backend
@@ -81,13 +83,7 @@ impl PrefixWish {
                 .sync_mode
                 .map(|mode| mode.as_str().parse::<SyncMode>())
                 .transpose()?,
-            hidraw: config.hidraw_enabled.map(|enabled| {
-                if enabled {
-                    HidrawMode::Enabled
-                } else {
-                    HidrawMode::Disabled
-                }
-            }),
+            hidraw: HidrawDecision::decide(config.hidraw_enabled, controllers),
         })
     }
 }
@@ -485,13 +481,14 @@ impl PlannedRun {
         let wish = self.wish;
         let installed = &self.installed;
         if !dir.is_dir() {
+            report("prepare", wish.hidraw.to_string());
             report("prefix", format!("creating prefix {name}"));
             return self.core.build_prefix(
                 name,
                 installed,
                 wish.backend.unwrap_or(DEFAULT_BACKEND),
                 wish.sync_mode,
-                wish.hidraw.unwrap_or(HidrawMode::Disabled),
+                wish.hidraw.mode,
                 self.library.clone(),
             );
         }
@@ -503,8 +500,9 @@ impl PlannedRun {
         }
         Core::settle(&dir)?;
         let (_, prefix) = self.core.open_prefix(name)?;
+        report("prepare", wish.hidraw.to_string());
         let backend = wish.backend.unwrap_or(prefix.backend);
-        let hidraw = wish.hidraw.unwrap_or(prefix.hidraw);
+        let hidraw = wish.hidraw.mode;
         let sync_mode = pick_sync(installed, Some(wish.sync_mode.unwrap_or(prefix.sync_mode)))?;
         let engine_changes = prefix.engine_version != installed.version;
         if !engine_changes
@@ -561,7 +559,7 @@ impl Core {
             )?)
         };
         let installed = self.run_engine(&config)?;
-        let wish = PrefixWish::of(&config)?;
+        let wish = PrefixWish::of(&config, &self.controllers_for(&config))?;
         let title = appid.to_string();
         let (name, lock, title_lock) = if client {
             let title_lock = self.claim_idle_title(appid, &title, false)?;
@@ -621,6 +619,16 @@ impl Core {
                 installdir: app.installdir.clone().unwrap_or_default(),
             }),
         })
+    }
+
+    /// The inventory only when the hidraw default needs it: `system_profiler`
+    /// takes over a second on a cold start, and an explicit setting never
+    /// reads it.
+    pub(crate) fn controllers_for(&self, config: &GameConfig) -> Vec<ControllerFact> {
+        if config.hidraw_enabled.is_some() {
+            return Vec::new();
+        }
+        self.controllers()
     }
 
     /// The client path needs a signed-in client; anything else is a refusal
