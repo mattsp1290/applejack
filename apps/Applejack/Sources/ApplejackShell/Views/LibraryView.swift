@@ -36,15 +36,16 @@ public struct LibraryView: View {
     @ViewBuilder
     private var titles: some View {
         let apps = model.filteredApps
+        let count = model.matchCount
         VStack(spacing: 0) {
-            if apps.isEmpty, model.matchCount != nil {
-                ContentUnavailableView.search(text: model.query)
+            if apps.isEmpty, count != nil {
+                ContentUnavailableView.search(text: model.trimmedQuery)
             } else {
                 List(apps, selection: $model.selection) { entry in
                     row(entry)
                 }
             }
-            if let count = model.matchCount {
+            if let count {
                 Divider()
                 Text(count)
                     .font(.caption)

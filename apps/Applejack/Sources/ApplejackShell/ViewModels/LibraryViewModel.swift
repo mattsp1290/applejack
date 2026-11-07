@@ -7,33 +7,37 @@ import Observation
 /// name, and a query narrows them.
 @Observable @MainActor
 public final class LibraryViewModel {
-    public private(set) var library: FlowState<SteamLibraryResult> = .idle
-    public private(set) var installs: [UInt32: FlowState<JobSnapshot>] = [:]
-    /// The search field's text. Whitespace alone is no query.
-    public var query: String = "" {
+    public private(set) var library: FlowState<SteamLibraryResult> = .idle {
         didSet {
-            if let selection, !filteredApps.contains(where: { $0.appid == selection }) {
-                self.selection = nil
+            sortedApps = Self.ordered(library.value?.apps ?? [])
+            // `.loading` lists nothing; the highlight waits for the rows.
+            if library.value != nil {
+                dropHiddenSelection()
             }
         }
     }
-    /// The highlighted row's appid; cleared when a query hides that title.
+    public private(set) var installs: [UInt32: FlowState<JobSnapshot>] = [:]
+    /// The search field's text. Whitespace alone is no query.
+    public var query: String = "" {
+        didSet { dropHiddenSelection() }
+    }
+    /// The highlighted row's appid; cleared when a query hides that title or
+    /// a reload no longer lists it.
     public var selection: UInt32?
+    /// Every title: `installed` and `update_available` first, then the rest,
+    /// each group in Finder's order (without regard to case or diacritics,
+    /// `Trials 2` before `Trials 10`) and by appid for two titles of one
+    /// name. Sorted once per library, not on every read.
+    public private(set) var sortedApps: [LibraryEntry] = []
     private let app: AppModel
 
     public init(app: AppModel) {
         self.app = app
     }
 
-    /// Every title: `installed` and `update_available` first, then the rest,
-    /// each group by name without regard to case and by appid for two titles
-    /// of one name.
-    public var sortedApps: [LibraryEntry] {
-        Self.ordered(library.value?.apps ?? [])
-    }
-
-    /// `sortedApps` narrowed to the query: a case-insensitive substring of
-    /// the name, or a prefix of the appid's digits.
+    /// `sortedApps` narrowed to the query: a substring of the shown name (the
+    /// name, or `App <appid>` without one) without regard to case or
+    /// diacritics, or a prefix of the appid's digits.
     public var filteredApps: [LibraryEntry] {
         let query = trimmedQuery
         guard !query.isEmpty else { return sortedApps }
@@ -46,8 +50,15 @@ public final class LibraryViewModel {
         return "Showing \(filteredApps.count) of \(sortedApps.count) titles"
     }
 
-    private var trimmedQuery: String {
+    /// The query as matched: without surrounding whitespace.
+    public var trimmedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func dropHiddenSelection() {
+        if let selection, !filteredApps.contains(where: { $0.appid == selection }) {
+            self.selection = nil
+        }
     }
 
     public static func ordered(_ apps: [LibraryEntry]) -> [LibraryEntry] {
@@ -55,7 +66,7 @@ public final class LibraryViewModel {
             if lhs.installState.isOnDisk != rhs.installState.isOnDisk {
                 return lhs.installState.isOnDisk
             }
-            switch lhs.title.compare(rhs.title, options: [.caseInsensitive]) {
+            switch lhs.title.localizedStandardCompare(rhs.title) {
             case .orderedAscending: return true
             case .orderedDescending: return false
             case .orderedSame: return lhs.appid < rhs.appid
@@ -64,7 +75,7 @@ public final class LibraryViewModel {
     }
 
     public static func matches(_ entry: LibraryEntry, query: String) -> Bool {
-        entry.title.range(of: query, options: [.caseInsensitive]) != nil
+        entry.title.localizedStandardRange(of: query) != nil
             || String(entry.appid).hasPrefix(query)
     }
 

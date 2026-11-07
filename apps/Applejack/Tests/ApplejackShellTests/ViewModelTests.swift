@@ -123,19 +123,22 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
-    /// `FAKE_CORE_LIBRARY=mixed` answers eleven titles in the core's order.
-    /// The view shows the installed and updating ones first, each group by
-    /// name without regard to case, two titles of one name by appid, and a
-    /// title with no name under the "App <appid>" it is shown as.
+    /// `FAKE_CORE_LIBRARY=mixed` answers fifteen titles in the core's order.
+    /// The view shows the installed and updating ones first, each group in
+    /// Finder's order (`half-life` with `Half-Life 2`, `Éclair` among the
+    /// E's, `Trials 2` before `Trials 10`), two titles of one name by appid,
+    /// and a title with no name, or an empty one, under the "App <appid>" it
+    /// is shown as.
     func testTheLibraryListsInstalledTitlesFirstThenByName() async throws {
         let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
         let library = LibraryViewModel(app: app)
         XCTAssertEqual(library.sortedApps, [], "nothing loaded is an empty list, not a crash")
         await library.load()
         let raw = try XCTUnwrap(library.library.value?.apps)
-        XCTAssertEqual(raw.map(\.appid), [440, 1000, 220, 2200, 999, 400, 123456, 620, 1296610, 70, 570], "the fake's rows are the core's order")
-        XCTAssertEqual(library.sortedApps.map(\.appid), [570, 70, 220, 620, 123456, 999, 1000, 1296610, 400, 2200, 440])
+        XCTAssertEqual(raw.map(\.appid), [440, 1000, 220, 2200, 999, 400, 123456, 620, 1296610, 70, 570, 3200, 3000, 7, 3100], "the fake's rows are the core's order")
+        XCTAssertEqual(library.sortedApps.map(\.appid), [570, 70, 220, 620, 7, 123456, 999, 1000, 3000, 1296610, 400, 2200, 440, 3100, 3200])
         XCTAssertEqual(library.sortedApps.prefix(4).map(\.installState), [.updateAvailable, .installed, .installed, .installed])
+        XCTAssertEqual(library.sortedApps[4].title, "App 7", "an empty name is shown, and sorted, as the appid")
         XCTAssertEqual(library.filteredApps, library.sortedApps, "no query shows every title, in order")
         XCTAssertNil(library.matchCount, "no count line without a query")
         await app.shutdown()
@@ -148,14 +151,20 @@ final class ViewModelTests: XCTestCase {
 
         library.query = "portal"
         XCTAssertEqual(library.filteredApps.map(\.appid), [620, 400], "a name substring, case-insensitive, installed first")
-        XCTAssertEqual(library.matchCount, "Showing 2 of 11 titles")
+        XCTAssertEqual(library.matchCount, "Showing 2 of 15 titles")
 
         library.query = "PEG"
         XCTAssertEqual(library.filteredApps.map(\.appid), [1296610])
-        XCTAssertEqual(library.matchCount, "Showing 1 of 11 titles")
+        XCTAssertEqual(library.matchCount, "Showing 1 of 15 titles")
+
+        library.query = "eclair"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [3000], "a name substring without regard to diacritics")
 
         library.query = "22"
-        XCTAssertEqual(library.filteredApps.map(\.appid), [220, 2200], "an appid prefix; 1296610 and 123456 do not start with 22")
+        XCTAssertEqual(library.filteredApps.map(\.appid), [220, 2200], "an appid prefix: 220 and 2200 start with 22")
+
+        library.query = "61"
+        XCTAssertEqual(library.filteredApps, [], "an appid prefix, not a substring: 1296610 contains 61 but does not start with it")
 
         library.query = "123456"
         XCTAssertEqual(library.filteredApps.map(\.appid), [123456], "a title with no name is found by its appid")
@@ -165,14 +174,14 @@ final class ViewModelTests: XCTestCase {
 
         library.query = "no such title"
         XCTAssertEqual(library.filteredApps, [])
-        XCTAssertEqual(library.matchCount, "Showing 0 of 11 titles")
+        XCTAssertEqual(library.matchCount, "Showing 0 of 15 titles")
 
         library.query = "   "
         XCTAssertEqual(library.filteredApps, library.sortedApps, "whitespace alone is no query")
         XCTAssertNil(library.matchCount)
 
         library.query = ""
-        XCTAssertEqual(library.filteredApps.count, 11, "clearing the query restores the full list")
+        XCTAssertEqual(library.filteredApps.count, 15, "clearing the query restores the full list")
         XCTAssertNil(library.matchCount)
         await app.shutdown()
     }
@@ -193,6 +202,24 @@ final class ViewModelTests: XCTestCase {
         library.selection = 440
         library.query = ""
         XCTAssertEqual(library.selection, 440, "no query hides nothing")
+        await app.shutdown()
+    }
+
+    /// `FAKE_CORE_LIBRARY=mixed-then-pair` answers the mixed list once and
+    /// the two-title pair, in reverse order, to every later read.
+    func testAReloadReSortsAndDropsASelectionItNoLongerLists() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed-then-pair"])
+        let library = LibraryViewModel(app: app)
+        await library.load()
+        XCTAssertEqual(library.sortedApps.count, 15)
+        library.selection = 1296610
+        await library.load()
+        XCTAssertEqual(try XCTUnwrap(library.library.value?.apps).map(\.appid), [440, 220], "the fake's second answer is the pair, scrambled")
+        XCTAssertEqual(library.sortedApps.map(\.appid), [220, 440], "a reload replacing the list re-sorts it")
+        XCTAssertNil(library.selection, "a reload that drops the highlighted title clears the highlight")
+        library.selection = 220
+        await library.load()
+        XCTAssertEqual(library.selection, 220, "a reload that keeps the title keeps the highlight through `.loading`")
         await app.shutdown()
     }
 

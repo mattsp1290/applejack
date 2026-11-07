@@ -326,7 +326,11 @@ public struct LibraryEntry: Codable, Equatable, Sendable, Identifiable {
     }
 
     public var id: UInt32 { appid }
-    public var title: String { name ?? "App \(appid)" }
+    /// The shown name; a `null` or empty name shows the appid.
+    public var title: String {
+        if let name, !name.isEmpty { return name }
+        return "App \(appid)"
+    }
 }
 
 public struct SteamLibraryResult: Codable, Equatable, Sendable {
