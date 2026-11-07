@@ -243,6 +243,7 @@ pub struct LoginFlow<H: SteamHost> {
     connection: H::Connection,
     state: LoginState,
     step: LoginStep,
+    started_at: Instant,
     polled_at: Instant,
     waiting_since: Option<Instant>,
     wait_limit: Duration,
@@ -286,6 +287,7 @@ impl<H: SteamHost> LoginFlow<H> {
             connection,
             state,
             step,
+            started_at: Instant::now(),
             polled_at: Instant::now(),
             waiting_since,
             wait_limit: LOGIN_WAIT_LIMIT,
@@ -348,7 +350,19 @@ impl<H: SteamHost> LoginFlow<H> {
         });
         self.state = auth.state();
         self.polled_at = Instant::now();
-        let step = outcome?;
+        let step = match outcome {
+            Ok(step) => step,
+            // The CM hangs up an auth connection that has not logged on after
+            // about two minutes, which is what ends a challenge nobody scanned.
+            Err(SteamError::Auth(AuthError::Disconnected))
+                if matches!(self.step, LoginStep::QrReady { .. }) =>
+            {
+                return Err(CoreError::SteamQrExpired {
+                    seconds: self.started_at.elapsed().as_secs(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         let keeps_prompt = matches!(
             self.step,
             LoginStep::QrReady { .. }

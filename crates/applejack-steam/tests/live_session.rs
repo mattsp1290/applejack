@@ -600,7 +600,9 @@ async fn a_lost_connection_fails_the_waiter() {
     let call = tokio::spawn(async move { caller.depot_key(100, 1).await });
     cm.recv_past_heartbeats().await;
     drop(cm);
-    assert!(matches!(call.await.unwrap(), Err(AuthError::Connection(_))));
+    let error = call.await.unwrap().unwrap_err();
+    assert!(matches!(error, AuthError::Disconnected), "{error}");
+    assert_eq!(error.to_string(), "connection: Steam closed the connection");
 }
 
 #[tokio::test]

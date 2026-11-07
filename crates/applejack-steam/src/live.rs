@@ -439,6 +439,7 @@ fn map_steamroom_error(error: steamroom::Error) -> AuthError {
         steamroom::Error::Connection(
             ConnectionError::LogonFailed(result) | ConnectionError::ServiceMethodFailed(result),
         ) => map_eresult(result),
+        steamroom::Error::Connection(ConnectionError::Disconnected) => AuthError::Disconnected,
         other => AuthError::Connection(other.to_string()),
     }
 }
@@ -553,6 +554,18 @@ mod tests {
         assert!(is_wrong_code(EResultError::from_code(65)));
         assert!(is_wrong_code(EResultError::from_code(71)));
         assert!(!is_wrong_code(EResultError::DuplicateRequest));
+    }
+
+    #[test]
+    fn a_closed_socket_is_typed_apart_from_other_connection_failures() {
+        let closed = map_steamroom_error(ConnectionError::Disconnected.into());
+        assert!(matches!(closed, AuthError::Disconnected));
+        assert_eq!(
+            closed.to_string(),
+            "connection: Steam closed the connection"
+        );
+        let other = map_steamroom_error(ConnectionError::MissingField("x").into());
+        assert!(matches!(other, AuthError::Connection(_)));
     }
 
     #[test]

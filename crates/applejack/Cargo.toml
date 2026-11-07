@@ -8,6 +8,7 @@ license.workspace = true
 applejack-core = { workspace = true }
 applejack-engine = { workspace = true }
 clap = { workspace = true }
+qrcode = { workspace = true }
 rpassword = { workspace = true }
 rustix = { workspace = true }
 serde_json = { workspace = true }
