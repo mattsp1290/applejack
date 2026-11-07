@@ -10,7 +10,9 @@ structs.
 Gate G2 status: **green** (2026-10-30, `steamroom` and `steamroom-client`
 0.3.0, macOS 26.6.2, `--credentials` with a Steam Guard device code). Login,
 refresh logon, and the license list all worked against live Steam, and the CM
-asked for a 9 s heartbeat. The Rust path stays primary. QR mode was not run.
+asked for a 9 s heartbeat. The Rust path stays primary. QR mode ran live on
+2026-11-06: the challenge rotated about every 30 s, and one nobody scanned ended
+after about two minutes when the CM closed the connection.
 
 Approving the mobile prompt and then typing a code answered EResult
 `DuplicateRequest` at G2. SteamKit treats that as success because the next
@@ -44,8 +46,13 @@ the only implementations that open a socket.
 - **QR login.** `begin(AuthMode::Qr)` calls `BeginAuthSessionViaQR` and returns
   `LoginStep::QrReady { payload }`; the shell renders the payload as a QR code.
   Polling follows `new_client_id` and `new_challenge_url`, which `steamroom`'s
-  own `poll_auth_session` drops, so a rotated challenge reaches the user. QR
-  mode has not run against live Steam.
+  own `poll_auth_session` drops, so a rotated challenge reaches the user. A
+  challenge nobody scans ends when the CM hangs up: `steamroom` reads the closed
+  socket as `ConnectionError::Disconnected`, which the live connection types as
+  `AuthError::Disconnected`, and `LoginFlow` turns that into
+  `CoreError::SteamQrExpired` while the step is `QrReady` (code
+  `SteamLoginFailed`). Anywhere else a hang-up keeps its own text, `connection:
+  Steam closed the connection`, as do the other connection failures.
 - **Credentials login.** `begin(AuthMode::Credentials, Some(credentials))`
   fetches the account's RSA key, sends the encrypted password to
   `BeginAuthSessionViaCredentials`, and returns either `Waiting` (no second
@@ -306,7 +313,15 @@ built with `CoreHandler::new`, so a test that walks the method table cannot
 touch an account or the Keychain.
 
 `applejack steam login` asks for the account name, then the password through
-`rpassword`, with echo off. `--qr` prints the payload instead. A code prompt
+`rpassword`, with echo off. `--qr` draws the challenge as a QR code in the
+terminal: Unicode half blocks, two modules per character cell with a one-module
+quiet zone, dark modules in the foreground colour, and the `https://s.team/q/...`
+URL under it for a terminal that cannot draw blocks. The encoder is the `qrcode`
+crate without its `image` feature. When Steam rotates the challenge, about every
+30 s, the CLI prints `The challenge rotated; scan this one instead:` and the new
+code and URL. An unscanned challenge ends with exit 1 and ``the QR challenge
+expired after <n> s without a scan; run `applejack steam login --qr` again``,
+where `<n>` counts from the first challenge. A code prompt
 keeps polling, so typing the code and approving in the mobile app both finish
 it. Codes are read with echo on: the reader thread is left blocked when the
 login ends first, and a process that exits mid-read with echo off leaves the

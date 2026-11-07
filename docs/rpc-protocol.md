@@ -427,7 +427,9 @@ does. A poll sooner than Steam's interval answers the current step without
 reaching Steam. A code that arrives once none is wanted is dropped. A wrong code
 answers `SteamGuardRejected` and the login stays open; any other error ends it,
 and a later `complete` answers `SteamLoginFailed`. So does two minutes at
-`waiting`, which ends the login too. A `session_id` that is not the pending one
+`waiting`, which ends the login too, and so does a `qr_ready` challenge nobody
+scanned: the CM closes the connection after about two minutes, and the error says
+the challenge expired and after how many seconds. A `session_id` that is not the pending one
 answers `SteamLoginFailed` and leaves that login alone. One login is pending at a
 time: `steam.login.start` drops the last. These requests block the loop for one Steam
 call, bounded at 30 s, or longer while `start` tries up to three CMs. Their params
