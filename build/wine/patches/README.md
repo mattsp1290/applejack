@@ -32,6 +32,7 @@ whether one applied.
 | Patch | Touches | Source |
 | --- | --- | --- |
 | `0001-dxmt-macdrv-abi.patch` | `dlls/winemac.drv/{cocoa_window.m,macdrv.h,macdrv_cocoa.h,window.c}` | Adapted to Wine 11.0 from <https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3> by cyy, the Wine 11.9 reference in <https://github.com/3Shain/dxmt/issues/170>. LGPL-2.1-or-later, as Wine. |
+| `0002-nsiproxy-macos-route-table.patch` | `dlls/nsiproxy.sys/{ip.c,ndis.c}` | applejack (U22a, 2026-11-06). LGPL-2.1-or-later, as Wine. |
 
 `0001-dxmt-macdrv-abi.patch` gives DXMT 0.80 what it needs from Wine 11.0: an
 exported `macdrv_functions` table and a `get_win_data` that returns DXMT's layout
@@ -44,6 +45,21 @@ win data lock instead of one shared static, so two windows cannot overwrite each
 other's. And the table's Metal view slots count their users, because every swap
 chain on a window shares one view and DXMT holds its layer unretained. See "DXMT
 under Wine 11.0" in `docs/engines/rosetta-wine.md` for the limits.
+
+`0002-nsiproxy-macos-route-table.patch` makes the IPv4 route table and the
+adapter list that `nsiproxy.sys` builds on macOS match what the same file
+builds on Linux, which is what Windows programs expect: interface-scoped
+routes (`RTF_IFSCOPE`, a VPN tunnel's own default route) and the ARP cache
+(`RTF_WASCLONED`, `RTF_LLINFO`) are not routes, host routes are /32, only
+gateway routes carry a next hop, loopback routes are marked, point-to-point
+tunnels are `MIB_IF_TYPE_PPP`, and a netmask is read by its address's family
+(the kernel leaves the netmask's own family unset). Without it, with Tailscale
+up, `GetIpForwardTable` held three default routes, `GetAdaptersAddresses` gave
+the tunnels and the loopback adapter gateways equal to their own addresses and
+`en0` a hundred of them, one tunnel address had prefix length 0, and the Steam
+client scheduled its CM connection every 50 ms without ever connecting. The
+evidence is in the patch header; `crates/applejack-engine/probes/netprobe/`
+prints what a Windows program sees and is how to re-measure it.
 
 Wine is LGPL: this directory is the source of the changes the bundle's `wine/`
 carries. `THIRD_PARTY_NOTICES.md` in the bundle links it at the commit that last

@@ -1,0 +1,119 @@
+Origin: applejack
+Date: 2026-11-06
+Reason: On macOS the route table nsiproxy.sys builds from the PF_ROUTE sysctl
+ dump includes interface-scoped routes (RTF_IFSCOPE: a VPN tunnel's own
+ default route, and the scoped copy of the real one), the ARP and ND cache
+ (RTF_WASCLONED, RTF_LLINFO: about a hundred host routes on a laptop),
+ host routes with prefix length 0 (no RTA_NETMASK, and the previous route's
+ length or garbage was kept), and a next hop on every direct route (the
+ interface's own address, which macOS puts in RTA_GATEWAY). With Tailscale
+ up, GetIpForwardTable showed three default routes (en0 twice, utun6 once),
+ GetBestRoute matched a zero-length host route, and GetAdaptersAddresses
+ listed 102 gateways on en0 and a gateway equal to the tunnel's own address
+ on utun6 and utun100; the loopback adapter carried gateway 127.0.0.1. The
+ unicast table reported the NetBird tunnel's address with prefix length 0
+ because the kernel's netmask sockaddr has no family; and every utun
+ reported IF_TYPE_OTHER. The Steam client, which reads the adapter list,
+ the gateways and GetBestInterfaceEx before it connects, scheduled its CM
+ connection every 50 ms and never connected (connection_log.txt: ~1,900
+ `EConnect called` lines, no `Connecting to`). Measured with
+ crates/applejack-engine/probes/netprobe on 2026-11-06, see
+ .agents/orchestrate/macos-windows-steam-runner/reports/U22a.md.
+ After the patch the table matches what the Linux code in the same file
+ reports from /proc/net/route: one default route, host routes /32, next
+ hops only on gateway routes, loopback marked, point-to-point tunnels as
+ MIB_IF_TYPE_PPP (as Linux tun devices), and netmasks read by the address's
+ family.
+Drop-when: upstream wine's dlls/nsiproxy.sys/ip.c skips RTF_IFSCOPE and
+ cloned routes in ipv4_forward_enumerate_all and resets prefix_len and
+ next_hop per route; check each Wine bump.
+
+--- a/dlls/nsiproxy.sys/ip.c
++++ b/dlls/nsiproxy.sys/ip.c
+@@ -1033,9 +1033,11 @@
+             rw->prefix_origin = IpPrefixOriginManual;
+             rw->suffix_origin = IpSuffixOriginManual;
+         }
+-        if (entry->ifa_netmask && entry->ifa_netmask->sa_family == AF_INET)
++        /* BSD kernels leave the netmask's sa_family unset (0 or 0xff) on
++         * some interfaces; the address's family is the one that counts. */
++        if (entry->ifa_netmask && entry->ifa_addr->sa_family == AF_INET)
+             rw->on_link_prefix = mask_v4_to_prefix( &((struct sockaddr_in *)entry->ifa_netmask)->sin_addr );
+-        else if (entry->ifa_netmask && entry->ifa_netmask->sa_family == AF_INET6)
++        else if (entry->ifa_netmask && entry->ifa_addr->sa_family == AF_INET6)
+             rw->on_link_prefix = mask_v6_to_prefix( &((struct sockaddr_in6 *)entry->ifa_netmask)->sin6_addr );
+         else rw->on_link_prefix = 0;
+         rw->unk[0] = 0;
+@@ -1612,11 +1614,28 @@
+ 
+             /* Ignore gateway routes which are multicast */
+             if ((rtm->rtm_flags & RTF_GATEWAY) && (rtm->rtm_flags & RTF_MULTICAST)) continue;
++#ifdef RTF_IFSCOPE
++            /* An interface-scoped route is consulted only for sockets bound
++             * to that interface. VPN clients install a scoped default route
++             * for their tunnel; to an unbound socket, and so to a Windows
++             * route table, it is not a route. */
++            if (rtm->rtm_flags & RTF_IFSCOPE) continue;
++#endif
++#ifdef RTF_WASCLONED
++            /* Cloned host routes and link-layer entries are the ARP cache,
++             * which Windows does not report as routes. */
++            if (rtm->rtm_flags & (RTF_WASCLONED | RTF_LLINFO)) continue;
++#endif
+ 
+             entry.if_index = rtm->rtm_index;
+             if (!convert_index_to_luid( entry.if_index, &entry.luid )) continue;
+             entry.protocol = (rtm->rtm_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
+             entry.metric = rtm->rtm_rmx.rmx_hopcount;
++            /* A host route carries no RTA_NETMASK; without this the previous
++             * route's prefix length (or garbage) would be reported. */
++            entry.prefix_len = (rtm->rtm_flags & RTF_HOST) ? 32 : 0;
++            entry.next_hop.s_addr = 0;
++            entry.loopback = 0;
+ 
+             addr_ptr = (char *)(rtm + 1);
+ 
+@@ -1672,8 +1691,13 @@
+                 case RTA_DST:
+                     entry.prefix = addr;
+                     dst_family = sa->sa_family;
++                    entry.loopback = (addr.s_addr & 0xff) == 127;
+                     break;
+-                case RTA_GATEWAY: entry.next_hop = addr; break;
++                case RTA_GATEWAY:
++                    /* For a direct route the kernel names the interface's own
++                     * address here; Windows reports no next hop for those. */
++                    if (entry.protocol == MIB_IPPROTO_NETMGMT) entry.next_hop = addr;
++                    break;
+                 case RTA_NETMASK: entry.prefix_len = mask_v4_to_prefix( &addr ); break;
+                 default:
+                     WARN( "Unexpected address type 0x%x\n", i );
+--- a/dlls/nsiproxy.sys/ndis.c
++++ b/dlls/nsiproxy.sys/ndis.c
+@@ -259,6 +259,26 @@
+     }
+ 
+     free( buf );
++
++    /* utun and gif tunnels report IFT_OTHER; a point-to-point link is a PPP
++     * interface, as the Linux code above reports tun devices. */
++    if (*type == MIB_IF_TYPE_OTHER)
++    {
++        struct ifreq ifr;
++        int fd = socket( PF_INET, SOCK_DGRAM, 0 );
++
++        if (fd != -1)
++        {
++            memset( &ifr, 0, sizeof(ifr) );
++            if (strlen( name ) < sizeof(ifr.ifr_name))
++            {
++                memcpy( ifr.ifr_name, name, strlen( name ) + 1 );
++                if (!ioctl( fd, SIOCGIFFLAGS, &ifr ) && (ifr.ifr_flags & IFF_POINTOPOINT))
++                    *type = MIB_IF_TYPE_PPP;
++            }
++            close( fd );
++        }
++    }
+     return STATUS_SUCCESS;
+ }
+ #endif
