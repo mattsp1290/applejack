@@ -1842,10 +1842,12 @@ fn a_steam_error_keeps_its_code_through_a_job() {
 }
 
 /// What `applejack steam login --qr` saw live on 2026-11-06: four challenges
-/// about 30 s apart, then the CM closed the socket. The flow names the expiry
-/// and the command, not the socket.
+/// about 30 s apart, then the CM closed the socket. The flow names the expiry,
+/// not the socket, and no command: the CLI adds its own, and the shell shows
+/// this text beside its Retry button. (`live.rs` pins that the closed socket
+/// arrives here as `AuthError::Disconnected`; the stub injects it directly.)
 #[test]
-fn an_unscanned_qr_challenge_ends_as_expired_and_names_the_command() {
+fn an_unscanned_qr_challenge_ends_as_expired_and_names_no_command() {
     let fixture = Fixture::new();
     let host = FakeHost::new(
         Script {
@@ -1871,10 +1873,8 @@ fn an_unscanned_qr_challenge_ends_as_expired_and_names_the_command() {
         text.starts_with("the QR challenge expired after "),
         "{text}"
     );
-    assert!(
-        text.ends_with(" s without a scan; run `applejack steam login --qr` again"),
-        "{text}"
-    );
+    assert!(text.ends_with(" s without a scan"), "{text}");
+    assert!(!text.contains("applejack"), "{text}");
     assert_eq!(stored_token(&host), None);
     assert_eq!(fixture.db().meta_get(META_ACCOUNT).unwrap(), None);
 }

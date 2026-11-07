@@ -34,10 +34,9 @@ pub enum CoreError {
     #[error("Steam issued no token within {seconds} seconds of the sign-in; begin again")]
     SteamLoginStalled { seconds: u64 },
     /// Nobody scanned the QR challenge before Steam closed the connection
-    /// that held it.
-    #[error(
-        "the QR challenge expired after {seconds} s without a scan; run `applejack steam login --qr` again"
-    )]
+    /// that held it. The message names no command: the shell shows it beside
+    /// its Retry button, and the CLI adds its own command when it prints it.
+    #[error("the QR challenge expired after {seconds} s without a scan")]
     SteamQrExpired { seconds: u64 },
     /// `steam.login.complete` for a login that is not the pending one.
     #[error("no such Steam login in progress; begin again")]

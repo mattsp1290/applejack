@@ -74,6 +74,9 @@
 #                                 with that factor instead of qr_ready
 #   FAKE_CORE_LOGIN_FAIL=1        steam.login.complete answers
 #                                 SteamLoginFailed (1021)
+#   FAKE_CORE_LOGIN_EXPIRE=1      steam.login.complete answers
+#                                 SteamLoginFailed (1021) with the core's
+#                                 text for a QR challenge nobody scanned
 #   FAKE_CORE_LOGIN_REJECT_ONCE=1  the first steam.login.complete carrying a
 #                                 steam_guard_code answers SteamGuardRejected
 #                                 (1022); the next one with a code answers done
@@ -551,6 +554,10 @@ implemented() {
     steam.login.complete)
       if [ "${FAKE_CORE_LOGIN_FAIL:-0}" = "1" ]; then
         emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1021,"message":"the login is over; begin again"}}'
+        return 0
+      fi
+      if [ "${FAKE_CORE_LOGIN_EXPIRE:-0}" = "1" ]; then
+        emit '{"jsonrpc":"2.0","id":'"$1"',"error":{"code":1021,"message":"the QR challenge expired after 125 s without a scan"}}'
         return 0
       fi
       if [ "${FAKE_CORE_LOGIN_REJECT_ONCE:-0}" = "1" ]; then
