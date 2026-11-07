@@ -2,14 +2,70 @@ import Foundation
 import Observation
 
 /// `steam.library` with install state per title, and `app.install` as a job.
+/// The rows are shown in the shell's order, not the core's: a library runs to
+/// a thousand titles, so the installed ones come first and each group is by
+/// name, and a query narrows them.
 @Observable @MainActor
 public final class LibraryViewModel {
     public private(set) var library: FlowState<SteamLibraryResult> = .idle
     public private(set) var installs: [UInt32: FlowState<JobSnapshot>] = [:]
+    /// The search field's text. Whitespace alone is no query.
+    public var query: String = "" {
+        didSet {
+            if let selection, !filteredApps.contains(where: { $0.appid == selection }) {
+                self.selection = nil
+            }
+        }
+    }
+    /// The highlighted row's appid; cleared when a query hides that title.
+    public var selection: UInt32?
     private let app: AppModel
 
     public init(app: AppModel) {
         self.app = app
+    }
+
+    /// Every title: `installed` and `update_available` first, then the rest,
+    /// each group by name without regard to case and by appid for two titles
+    /// of one name.
+    public var sortedApps: [LibraryEntry] {
+        Self.ordered(library.value?.apps ?? [])
+    }
+
+    /// `sortedApps` narrowed to the query: a case-insensitive substring of
+    /// the name, or a prefix of the appid's digits.
+    public var filteredApps: [LibraryEntry] {
+        let query = trimmedQuery
+        guard !query.isEmpty else { return sortedApps }
+        return sortedApps.filter { Self.matches($0, query: query) }
+    }
+
+    /// The count line shown while a query is active; `nil` without one.
+    public var matchCount: String? {
+        guard !trimmedQuery.isEmpty else { return nil }
+        return "Showing \(filteredApps.count) of \(sortedApps.count) titles"
+    }
+
+    private var trimmedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public static func ordered(_ apps: [LibraryEntry]) -> [LibraryEntry] {
+        apps.sorted { lhs, rhs in
+            if lhs.installState.isOnDisk != rhs.installState.isOnDisk {
+                return lhs.installState.isOnDisk
+            }
+            switch lhs.title.compare(rhs.title, options: [.caseInsensitive]) {
+            case .orderedAscending: return true
+            case .orderedDescending: return false
+            case .orderedSame: return lhs.appid < rhs.appid
+            }
+        }
+    }
+
+    public static func matches(_ entry: LibraryEntry, query: String) -> Bool {
+        entry.title.range(of: query, options: [.caseInsensitive]) != nil
+            || String(entry.appid).hasPrefix(query)
     }
 
     /// A refresh is a job, since reading a library can outlast a request; the
@@ -41,6 +97,17 @@ public final class LibraryViewModel {
         if case .ready(let snapshot) = installs[appid], snapshot.finished {
             installs[appid] = nil
             await load()
+        }
+    }
+}
+
+extension InstallState {
+    /// Installed titles and those with an update waiting both have files on
+    /// disk; the library lists them ahead of the rest.
+    var isOnDisk: Bool {
+        switch self {
+        case .installed, .updateAvailable: true
+        case .notInstalled: false
         }
     }
 }

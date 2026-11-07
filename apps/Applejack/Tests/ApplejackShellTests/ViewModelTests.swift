@@ -123,6 +123,79 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
+    /// `FAKE_CORE_LIBRARY=mixed` answers eleven titles in the core's order.
+    /// The view shows the installed and updating ones first, each group by
+    /// name without regard to case, two titles of one name by appid, and a
+    /// title with no name under the "App <appid>" it is shown as.
+    func testTheLibraryListsInstalledTitlesFirstThenByName() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
+        let library = LibraryViewModel(app: app)
+        XCTAssertEqual(library.sortedApps, [], "nothing loaded is an empty list, not a crash")
+        await library.load()
+        let raw = try XCTUnwrap(library.library.value?.apps)
+        XCTAssertEqual(raw.map(\.appid), [440, 1000, 220, 2200, 999, 400, 123456, 620, 1296610, 70, 570], "the fake's rows are the core's order")
+        XCTAssertEqual(library.sortedApps.map(\.appid), [570, 70, 220, 620, 123456, 999, 1000, 1296610, 400, 2200, 440])
+        XCTAssertEqual(library.sortedApps.prefix(4).map(\.installState), [.updateAvailable, .installed, .installed, .installed])
+        XCTAssertEqual(library.filteredApps, library.sortedApps, "no query shows every title, in order")
+        XCTAssertNil(library.matchCount, "no count line without a query")
+        await app.shutdown()
+    }
+
+    func testSearchMatchesNamesAndAppidPrefixes() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
+        let library = LibraryViewModel(app: app)
+        await library.load()
+
+        library.query = "portal"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [620, 400], "a name substring, case-insensitive, installed first")
+        XCTAssertEqual(library.matchCount, "Showing 2 of 11 titles")
+
+        library.query = "PEG"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [1296610])
+        XCTAssertEqual(library.matchCount, "Showing 1 of 11 titles")
+
+        library.query = "22"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [220, 2200], "an appid prefix; 1296610 and 123456 do not start with 22")
+
+        library.query = "123456"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [123456], "a title with no name is found by its appid")
+
+        library.query = "life 2"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [220], "a substring with a space; `half-life` alone does not contain it")
+
+        library.query = "no such title"
+        XCTAssertEqual(library.filteredApps, [])
+        XCTAssertEqual(library.matchCount, "Showing 0 of 11 titles")
+
+        library.query = "   "
+        XCTAssertEqual(library.filteredApps, library.sortedApps, "whitespace alone is no query")
+        XCTAssertNil(library.matchCount)
+
+        library.query = ""
+        XCTAssertEqual(library.filteredApps.count, 11, "clearing the query restores the full list")
+        XCTAssertNil(library.matchCount)
+        await app.shutdown()
+    }
+
+    func testTheSelectionSurvivesAQueryTheTitleStillMatches() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
+        let library = LibraryViewModel(app: app)
+        await library.load()
+        library.selection = 620
+        library.query = "portal"
+        XCTAssertEqual(library.selection, 620, "Portal 2 matches `portal`")
+        library.query = "62"
+        XCTAssertEqual(library.selection, 620, "and its appid prefix")
+        library.query = "dota"
+        XCTAssertNil(library.selection, "a title the query hides is no longer selected")
+        library.query = ""
+        XCTAssertNil(library.selection, "clearing the query does not bring a selection back")
+        library.selection = 440
+        library.query = ""
+        XCTAssertEqual(library.selection, 440, "no query hides nothing")
+        await app.shutdown()
+    }
+
     func testConfigEditorLoadsAndSets() async throws {
         let app = makeApp()
         let detail = GameDetailViewModel(app: app, appid: 220)

@@ -131,6 +131,21 @@ is set and runs `engine.install`, `app.install`, and a `steam.library` refresh a
 jobs. The result mirrors in `ShellTypes.swift` are pinned to the result goldens
 and the params mirrors to the request goldens by `GoldenTests`.
 
+Library order and search: the core answers `steam.library` in its own order,
+and a library runs to a thousand titles, so `LibraryViewModel.sortedApps`
+puts the titles with files on disk first (`installed` and `update_available`
+count alike), then the rest, each group by name without regard to case and
+by appid for two titles of one name; the sort is the view model's, tested
+against `FAKE_CORE_LIBRARY=mixed` (eleven titles, scrambled), never the
+view's. The search field (`.searchable`, "Name or appid") writes `query`;
+`filteredApps` keeps a title whose name contains the query without regard to
+case or whose appid starts with it, whitespace alone is no query, and
+`matchCount` ("Showing 2 of 11 titles") is shown under the list only while a
+query is active, with `ContentUnavailableView.search` in place of an empty
+list. The highlighted row (`selection`) stays through a query its title still
+matches and is cleared by one that hides it; clearing the query restores the
+full list and brings no selection back.
+
 Flows that need an answer before the core sends a request:
 
 - D3DMetal import: `requestImport()` opens the license sheet unless it was
