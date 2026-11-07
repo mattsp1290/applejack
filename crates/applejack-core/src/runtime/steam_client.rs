@@ -127,8 +127,8 @@ const SHIM_MAX_LEN: u64 = 1 << 20;
 /// Growth under a title's install directory that counts as a re-download.
 pub const REDOWNLOAD_GROWTH: u64 = 64 << 20;
 
-/// How many times one `install` or `update` stops and restarts the client
-/// because a start left a `cef.win*` helper in front without the shim (the
+/// How many times one `install`, `update` or `repair` stops and restarts
+/// the client because a start left a `cef.win*` helper in front without the shim (the
 /// first self-update, a client update, or a directory the client made at
 /// that start, as `cef.win64` beside the two `cef.win7*` live). Past it the
 /// op ends `broken` naming the directory instead of looping.
@@ -137,7 +137,8 @@ pub const RESHIM_ROUNDS: u32 = 2;
 /// The bootstrap log's line for the client ending on its own. A start that
 /// logs it with no download line since the start (seen twice live:
 /// `Verification skipped`, `Shutdown` 16 s later, nothing else) is started
-/// once more, once per `install` or `update`, before the exit is an error.
+/// once more, once per `install`, `update` or `repair`, before the exit is an
+/// error.
 const SHUTDOWN_MARK: &str = "Shutdown";
 
 const INSTALL_MARKER: &str = "applejack/client-install.json";
@@ -1824,6 +1825,15 @@ impl PlannedClientOp {
         self.core.client_is_up().unwrap_or(true)
     }
 
+    /// Whether the client is up to wait on: a `wineserver` runs for the
+    /// prefix. A `steam.exe` the record still names with no server behind
+    /// it is a client that died (live, every Wine process goes with the
+    /// server; the stub's linger), and a wait on it ends at a window that
+    /// cannot come, so it is stopped and started instead.
+    fn client_up_with_server(&self) -> bool {
+        wineserver_running(&self.paths.prefix_dir).unwrap_or(true)
+    }
+
     fn stop(&mut self, report: &mut dyn FnMut(&str, String)) -> Result<(), CoreError> {
         if !self.client_running() {
             report("stop", "the client is not running".to_owned());
@@ -1884,7 +1894,7 @@ impl PlannedClientOp {
             );
             fs::remove_file(&marker).map_err(|error| CoreError::io(&marker, error))?;
         }
-        if self.client_running() && !reinstall {
+        if self.client_up_with_server() && !reinstall {
             // The window the user signs in to is up; a second steam.exe
             // would only hand off to it. A payload fault is reported when
             // the client next starts, not here.
@@ -2042,7 +2052,7 @@ impl PlannedClientOp {
         prefix: &Prefix,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
-        if self.client_running() {
+        if self.client_up_with_server() {
             self.wait_window(None, None, false, report)?;
             return self.finish(report);
         }
@@ -2223,7 +2233,10 @@ impl PlannedClientOp {
     /// The first-run timeout passed without the window: the client is
     /// stopped and its files kept. A file-check start that was to lay a
     /// missing helper down and did not is `broken`, with `repair
-    /// --reinstall` as the way out; nothing is updating there.
+    /// --reinstall` as the way out; nothing is updating there. So is a
+    /// start that left the client's own helper in front of the shim (the
+    /// helper died at once, so not even the fallback signal came): the
+    /// error names it as `status` does.
     fn window_timed_out(
         &mut self,
         helper_missing: bool,
@@ -2231,19 +2244,22 @@ impl PlannedClientOp {
     ) -> CoreError {
         let _ = self.stop(report);
         let secs = self.core.tuning.first_run_timeout.as_secs();
-        match self.helper_still_missing(helper_missing) {
-            Some(dir) => BrokenReason::HelperNotLaidDown {
+        if let Some(dir) = self.helper_still_missing(helper_missing) {
+            return BrokenReason::HelperNotLaidDown {
                 dir,
                 waited: Some(secs),
             }
-            .into_error(),
-            None => CoreError::ClientRuntimeBroken {
-                state: ClientRuntimeState::Updating,
-                detail: format!(
-                    "the client did not reach the login window within {secs} seconds; it was \
-                     stopped and its files kept"
-                ),
-            },
+            .into_error();
+        }
+        if let Some(exposed) = exposed_helper(&self.paths).ok().flatten() {
+            return exposed.reason().into_error();
+        }
+        CoreError::ClientRuntimeBroken {
+            state: ClientRuntimeState::Updating,
+            detail: format!(
+                "the client did not reach the login window within {secs} seconds; it was \
+                 stopped and its files kept"
+            ),
         }
     }
 
@@ -2412,7 +2428,11 @@ impl PlannedClientOp {
     /// client worth keeping (its sign-in, its `userdata/`) must go through
     /// `prefix restore`, which keeps a safety copy. A dead install's marker
     /// is cleared first; with the client intact after that, nothing is
-    /// restored. Otherwise the newest usable snapshot is restored: one whose
+    /// restored. A client whose only break is its own web helper in front
+    /// of the shim (its record opens, `steam.exe` is there, no marker) is
+    /// fixed in place: stopped, the helper stashed and the shim put in
+    /// front by the next start's pass, and started to its window; nothing
+    /// is restored. Otherwise the newest usable snapshot is restored: one whose
     /// prefix record opens and which holds `steam.exe`. Each newer snapshot
     /// is reported as skipped with its reason, and with no usable one the
     /// op refuses with `ClientRuntimeBroken`. The safety copy the restore
@@ -2448,23 +2468,15 @@ impl PlannedClientOp {
                 ),
             );
         }
-        if let Some(exposed) = exposed_helper(&self.paths)? {
-            // The shim pass fixes this in place and downloads nothing; a
-            // snapshot restore would roll the client back for no reason.
-            report(
-                "repair",
-                format!(
-                    "{}: the client's own web helper is in front ({}); nothing to restore: \
-                     stopping the client if it runs, stashing the helper, putting the shim in \
-                     front of it and starting the client to its window",
-                    exposed.dir.display(),
-                    exposed.shape()
-                ),
-            );
-            self.stop(report)?;
-            Core::settle(&self.paths.prefix_dir)?;
-            let prefix = self.ensure_prefix(report)?;
-            return self.first_run(&prefix, report);
+        // `runtime_state` reads the record, `steam.exe` and the marker before
+        // any `cef.win*`, so with those intact the exposed helper is the
+        // runtime's one break; a record that does not open or a missing
+        // `steam.exe` is the restore's, whatever `bin/cef` holds beside it.
+        let intact = had_steam_exe
+            && !marker.exists()
+            && self.core.engine.open_prefix(&self.paths.prefix_dir).is_ok();
+        if intact && let Some(exposed) = exposed_helper(&self.paths)? {
+            return self.reshim_in_place(&exposed, report);
         }
         let newest = self.usable_snapshot(report)?;
         self.stop(report)?;
@@ -2516,6 +2528,39 @@ impl PlannedClientOp {
                 detail,
             }
             .into_error());
+        }
+        Ok(())
+    }
+
+    /// `repair`'s fix for a client whose one break is `exposed`: the shim
+    /// pass puts the shim in front and downloads nothing, where a snapshot
+    /// restore would roll the client back for no reason. `Ok` only when the
+    /// runtime no longer reads `broken`, as the restore path promises.
+    fn reshim_in_place(
+        &mut self,
+        exposed: &ExposedHelper,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<(), CoreError> {
+        report(
+            "repair",
+            format!(
+                "{}: the client's own web helper is in front ({}); nothing to restore: \
+                 stopping the client if it runs, stashing the helper, putting the shim in \
+                 front of it and starting the client to its window",
+                exposed.dir.display(),
+                exposed.shape()
+            ),
+        );
+        self.stop(report)?;
+        Core::settle(&self.paths.prefix_dir)?;
+        let prefix = self.ensure_prefix(report)?;
+        self.first_run(&prefix, report)?;
+        let (state, detail) = self.core.runtime_state(true)?;
+        if state == ClientRuntimeState::Broken {
+            return Err(CoreError::ClientRuntimeBroken {
+                state,
+                detail: shown_detail(detail, true),
+            });
         }
         Ok(())
     }

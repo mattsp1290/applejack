@@ -2221,6 +2221,10 @@ fn a_missing_helper_in_front_of_the_stash_gets_the_shim_back() {
 fn install_with_the_client_up_refuses_when_the_helper_was_written_back_over_the_shim() {
     let fixture = Fixture::new();
     fixture.install();
+    // A server, so the client counts as up; without one it died and the
+    // pass runs (the test below).
+    let server = spawn_stub_server("server", &fixture.prefix_dir());
+    fixture.servers.borrow_mut().push(server);
     fs::write(fixture.cef_dir().join(WEBHELPER_EXE), b"REAL-HELPER-2").unwrap();
     let cef = fixture.cef_dir().display().to_string();
     let (state, detail) = fixture.core().client_runtime_state().unwrap();
@@ -2778,6 +2782,187 @@ fn repair_puts_the_shim_in_front_of_an_unshimmed_helper_instead_of_restoring() {
     );
     assert_eq!(status.snapshots, 1);
     fixture.stop_client();
+}
+
+/// `repair` reads the whole runtime before it chooses: an exposed helper
+/// beside a `Steam/` without `steam.exe` is the restore's, never the
+/// in-place pass (which would stash the helper on a client that cannot
+/// start and skip the restore that fixes it).
+#[test]
+fn repair_restores_a_client_without_steam_exe_even_with_an_exposed_helper_beside_it() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.stop_client();
+    let win64 = fixture.cef_dir_named("cef.win64");
+    fs::create_dir_all(&win64).unwrap();
+    fs::write(win64.join(WEBHELPER_EXE), b"REAL-HELPER-64").unwrap();
+    fs::remove_file(fixture.steam_dir().join("steam.exe")).unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    assert!(detail.contains("has no steam.exe"), "{detail}");
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with(&format!("repair: restoring {STEAM_CLIENT_PREFIX} from "))),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| {
+            line.contains("nothing to restore")
+                || line.starts_with("shim:")
+                || line.starts_with("start:")
+        }),
+        "the restore path, not the in-place pass: {lines:?}"
+    );
+    assert!(
+        fixture.steam_dir().join("steam.exe").is_file(),
+        "back from the snapshot"
+    );
+    assert!(!win64.exists(), "the snapshot predates the directory");
+    assert_eq!(
+        status.snapshots, 1,
+        "the safety copy of a state with no steam.exe is discarded"
+    );
+}
+
+/// A client the record names whose `wineserver` is gone died (under the
+/// stub its processes linger with no server): `repair` and `install` do
+/// not wait on it for a window that cannot come and return `Ok` on a
+/// `broken` runtime; the client counts as stopped, the pass runs and the
+/// client starts.
+#[test]
+fn repair_and_install_on_a_client_whose_server_is_gone_run_the_pass_instead_of_waiting() {
+    let fixture = Fixture::new();
+    fixture.install();
+    assert!(
+        fixture.client_up(),
+        "the stub client is up under its key, with no server"
+    );
+    let win64 = fixture.cef_dir_named("cef.win64");
+    fs::create_dir_all(&win64).unwrap();
+    fs::write(win64.join(WEBHELPER_EXE), b"REAL-HELPER-64").unwrap();
+    let first_key = fixture.client_key();
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert_in_order(
+        &lines,
+        &[
+            &format!(
+                "repair: {}: the client's own web helper is in front",
+                win64.display()
+            ),
+            "stop: stopping the Steam client",
+            &format!(
+                "shim: {}: stashed the web helper as steamwebhelper_real.exe and put the shim in \
+                 front of it",
+                win64.display()
+            ),
+            "start: starting steam.exe",
+            "client: window: ",
+            "needs_login: ",
+        ],
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("broken:")),
+        "{lines:?}"
+    );
+    assert_ne!(fixture.client_key(), first_key, "a new client was started");
+    assert!(fixture.every_populated_cef_dir_is_shimmed());
+
+    // `install` on the same shape, with the helper written back over the shim.
+    fs::write(fixture.cef_dir().join(WEBHELPER_EXE), b"REAL-HELPER-2").unwrap();
+    let second_key = fixture.client_key();
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert_in_order(
+        &lines,
+        &[
+            &format!(
+                "shim: {}: a client update replaced the web helper; stashed the new one and put \
+                 the shim back",
+                fixture.cef_dir().display()
+            ),
+            "start: starting steam.exe",
+            "client: window: ",
+            "needs_login: ",
+        ],
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("the web helper running is the client's own")),
+        "no refusal for a client that is gone: {lines:?}"
+    );
+    assert_ne!(fixture.client_key(), second_key, "a new client was started");
+    assert_eq!(fixture.helper(), fixture.shim());
+    assert_eq!(
+        fixture.real_helper().as_deref(),
+        Some(&b"REAL-HELPER-2"[..])
+    );
+    fixture.stop_client();
+}
+
+/// A start at which the client writes its helper over the shim and the
+/// helper dies at once (no window line, no helper process) times out; the
+/// error names the exposed helper, as `status` does, not an update to wait
+/// for.
+#[test]
+fn a_window_timeout_with_an_exposed_helper_names_the_helper_not_an_update() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::write(fixture.prefix_dir().join("self-update"), "").unwrap();
+    fs::write(fixture.prefix_dir().join("no-window"), "").unwrap();
+    fixture.tuning = SHORT_WINDOW;
+    let cef = fixture.cef_dir().display().to_string();
+    // The server for the timeout's stop goes up once the client is being
+    // started; up before, `install` would read it as a running client.
+    let (outcome, lines) = fixture.install_hooked(
+        "VALVE-SIGNED",
+        &mut fixture.server_at("start: starting steam.exe"),
+    );
+    let error = outcome.unwrap_err();
+    assert_eq!(
+        error.code(),
+        ErrorCode::ClientRuntimeBroken,
+        "{error}\n{lines:?}"
+    );
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Broken,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "{cef}/steamwebhelper.exe is the client's own web helper with steamwebhelper_real.exe \
+             stashed beside it"
+        )),
+        "{message}"
+    );
+    assert!(
+        !message.contains("did not reach the login window"),
+        "{message}"
+    );
+    assert!(
+        lines.contains(&"stop: stopping the Steam client".to_owned()),
+        "{lines:?}"
+    );
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    assert!(message.contains(&detail), "{message}\n{detail}");
+    assert_eq!(fixture.helper(), b"REAL-HELPER-2");
+    wait_gone("the client", || fixture.client_up());
 }
 
 /// A run's client start is never restarted (that would end the game); a

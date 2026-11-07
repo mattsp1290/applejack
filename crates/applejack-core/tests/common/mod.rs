@@ -53,7 +53,9 @@ const BUNDLE_FILES: &[&str] = &[
 /// at every start `n`; `$WINEPREFIX/early-shutdown` (one-shot) and
 /// `early-shutdown-always` make a start write `Verification skipped` and
 /// `Shutdown` to `logs/bootstrap_log.txt` and exit with no window, as the
-/// live first start did twice. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`
+/// live first start did twice; `$WINEPREFIX/no-window` makes every start
+/// write no window line and run no `steamwebhelper.exe`, a helper that dies
+/// at once. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`
 /// when a helper file exists to run; without one no window line is written)
 /// that stays until `$WINEPREFIX/client-quit`; its arguments append to
 /// `$WINEPREFIX/client-args`; with
@@ -198,7 +200,7 @@ if [ "$name" = steam.exe ]; then
   sleep 0.1
   rm -f "$WINEPREFIX/client-quit"
   : > "$WINEPREFIX/client-up"
-  if [ -f "$cef/steamwebhelper.exe" ]; then
+  if [ -f "$cef/steamwebhelper.exe" ] && [ ! -e "$WINEPREFIX/no-window" ]; then
     echo 'SP DesktopLoginWindow_uid0: Created window: size: 700,440 pos: 0,0 mode: System window: 0000000000030106' >> "$steam/logs/webhelper.txt"
     "@HELPER@" common::stub_title --exact --ignored --nocapture steamwebhelper.exe &
   fi
