@@ -1,6 +1,7 @@
 //! Command-line entry point for applejack.
 
 mod cmd;
+mod qr;
 
 use applejack_core::host::{self, HidrawDecision, HostFacts, Inventory};
 use applejack_engine::HidrawMode;

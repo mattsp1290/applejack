@@ -146,12 +146,20 @@ fn read_codes() -> Receiver<String> {
     codes
 }
 
-fn show(step: &LoginStep) {
+/// `first_challenge` is false once a QR challenge has been on screen: Steam
+/// rotates it about every 30 s, and the user should know the old one is dead.
+fn show(step: &LoginStep, first_challenge: bool) {
     match step {
         LoginStep::QrReady { payload } => {
-            say(&format!(
-                "Scan this as a QR code with the Steam mobile app:\n{payload}"
-            ));
+            let intro = if first_challenge {
+                "Scan this QR code with the Steam mobile app:"
+            } else {
+                "The challenge rotated; scan this one instead:"
+            };
+            match crate::qr::half_blocks(payload) {
+                Some(drawing) => say(&format!("{intro}\n{drawing}\n{payload}")),
+                None => say(&format!("{intro}\n{payload}")),
+            }
         }
         LoginStep::GuardRequired {
             factor: GuardFactor::DeviceConfirmation,
@@ -185,7 +193,10 @@ fn login(qr: bool) -> Result<String, CoreError> {
             return Ok(format!("signed in as {account_name}"));
         }
         if shown.as_ref() != Some(&step) {
-            show(&step);
+            let first_challenge = shown
+                .as_ref()
+                .is_none_or(|previous| !matches!(previous, LoginStep::QrReady { .. }));
+            show(&step, first_challenge);
             shown = Some(step);
         }
         let interval = flow.poll_interval();
