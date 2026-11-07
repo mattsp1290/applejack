@@ -36,7 +36,7 @@ from disk every time; nothing caches it.
 |---|---|
 | `absent` | no `prefixes/steam-client/drive_c/Program Files (x86)/Steam/steam.exe` |
 | `installing` | `applejack/client-install.json` in the prefix while another process holds the prefix lock (probed without taking it, so a status read neither locks nor settles anything) |
-| `broken` | the prefix record does not open, `Steam/` exists without `steam.exe`, the install marker is there and nobody holds the lock (an install died), a `bin/cef/cef.win*/steamwebhelper.exe` is the [web helper shim](#the-web-helper-shim) (by its marker) with no `steamwebhelper_real.exe` beside it, or with one that is itself a shim, or (read after the `updating` reads below, so a self-update still filling the tree is not taken for it) a `cef.win*` directory holds neither `steamwebhelper.exe` nor `steamwebhelper_real.exe`, or the installed client has no `cef.win*` directory at all; a helper file that does not read is `broken` with the io error, never a failed `status` |
+| `broken` | the prefix record does not open, `Steam/` exists without `steam.exe`, the install marker is there and nobody holds the lock (an install died), a `bin/cef/cef.win*/steamwebhelper.exe` is the [web helper shim](#the-web-helper-shim) (by its marker) with no `steamwebhelper_real.exe` beside it, or with one that is itself a shim, or (read after the `updating` reads below, so a self-update still filling the tree is not taken for it) a `cef.win*` directory holds neither `steamwebhelper.exe` nor `steamwebhelper_real.exe`, or the installed client has no `cef.win*` directory at all, or a populated `cef.win*` directory holds the client's own `steamwebhelper.exe` with no `steamwebhelper_real.exe` beside it (the helper runs without the shim and draws no window, running client or not; `applejack runtime steam stop`, then `install`, put the shim in front of it without a download); a helper file that does not read is `broken` with the io error, never a failed `status` |
 | `updating` | `Steam/package/steam_client_win64.manifest` (the 2024 bootstrapper installs the 64-bit client; an older one writes `steam_client_win32.manifest`) is missing (the first self-update has not finished), or `Steam/package/tmp/` exists while the client runs |
 | `needs_login` | `Steam/config/loginusers.vdf` is missing or names no account with `RememberPassword "1"` (and `AllowAutoLogin` not `"0"`) |
 | `ready` | it names one |
@@ -57,7 +57,7 @@ process the client starts carries, games included; and
 
 | Command | RPC | Does |
 |---|---|---|
-| `runtime steam install` | `runtime.steam.install` (job) | Clears the marker of an install that died, builds the prefix if needed, downloads `SteamSetup.exe`, verifies it, runs it silently, lists the shared library in `libraryfolders.vdf`, puts the web helper shim in place, starts the client (`steam.exe -noverifyfiles`) for its self-update, and leaves it at the login window; a self-update that laid the client's helper down in place of (or over) the shim gets the client restarted once with the helper stashed and the shim in front (**unverified** live: stub only; the user's first install is the first live run). A shim with no helper beside it is removed first and that one start runs without `-noverifyfiles`, so the client's file check lays the helper down (**unverified** live); when that start ends without the helper laid down, the error is `ClientRuntimeBroken { broken }` naming `repair --reinstall`, not an update to wait for. With the client installed and up, only the wait for the window: it is the way to open the window for a sign-in; a helper that is not the shim under a running client (one started outside applejack, or a self-update while it ran, wrote its own back) gets a `shim:` warning naming `stop`, then `install`, and so does a running client whose directory holds the orphan shim or no helper at all |
+| `runtime steam install` | `runtime.steam.install` (job) | Clears the marker of an install that died, builds the prefix if needed, downloads `SteamSetup.exe`, verifies it, runs it silently, lists the shared library in `libraryfolders.vdf`, puts the web helper shim in place, starts the client (`steam.exe -noverifyfiles`) for its self-update, and leaves it at the login window; after every client start, window or not, the `cef.win*` directories are scanned again, and a helper laid down without the shim in front (the first self-update, a client update, or a directory the client made at that start: build 1792618285 made `cef.win64` beside `cef.win7` and `cef.win7x64` at its second start live) gets the client stopped and started once more with the helper stashed and the shim in front, at most twice per `install` or `update`; a third finding ends the op `broken` naming the directory. A first start that shuts down on its own with nothing in `logs/bootstrap_log.txt` since the start but the shutdown (no download line; seen twice live) is started once more before the exit is an error. A shim with no helper beside it is removed first and that one start runs without `-noverifyfiles`, so the client's file check lays the helper down (**unverified** live); when that start ends without the helper laid down, the error is `ClientRuntimeBroken { broken }` naming `repair --reinstall`, not an update to wait for. With the client installed and up, only the wait for the window: it is the way to open the window for a sign-in; a helper that is not the shim under a running client (one started outside applejack, or a self-update while it ran, wrote its own back) gets a `shim:` warning naming `stop`, then `install`, and so does a running client whose directory holds the orphan shim or no helper at all |
 | `runtime steam status [--json]` | `runtime.steam.status` | The table above |
 | `runtime steam update` | `runtime.steam.update` (job) | Stops the client, snapshots the prefix, starts the client so it updates itself, records the build |
 | `runtime steam repair` | `runtime.steam.repair` (job) | Refuses with `ClientRuntimeBroken` unless the runtime is `broken`. A dead install's marker is cleared first; with the client intact after that, nothing is restored. Otherwise stops the client and restores the newest usable snapshot (its prefix record opens, it holds `steam.exe`, and every `cef.win*` directory holds a web helper that is not an orphan shim), reporting each newer snapshot it skips and why; with no usable snapshot it refuses and names `--reinstall`. The safety copy the restore takes of the state repaired away is discarded when that state had no `steam.exe`, and kept, named in the report, when it had one. Succeeds only when the runtime no longer reads `broken`. `applejack prefix restore steam-client <timestamp>` is the deliberate rollback that keeps a safety copy |
@@ -104,7 +104,9 @@ folder again and restarts the client, below).
 Every client start, `install`, `update`, and a `run` that finds no client
 up, first puts the [web helper shim](#the-web-helper-shim) in front of
 `steamwebhelper.exe` (on a fresh install there is no `bin/cef/` yet, and
-the `shim:` line says the self-update brings it), then prints that macOS
+the `shim:` line says the self-update brings it); `install` and `update`
+scan the `cef.win*` directories again after every start (below). Each
+start then prints that macOS
 may ask whether "applejack" may use the microphone within about 15 s of the
 start (the client's audio init under `winecoreaudio`, labelled with the
 launcher's name; Don't Allow is fine, and macOS stores the answer). Left
@@ -117,7 +119,14 @@ in it dies with `fatal stalled cross-thread pipe`. A client that exits
 during the wait with that evidence written since the start is reported as
 `ClientRuntimeBroken` naming the prompt (for a dump alone, as the usual
 cause); one that exits without it, as `broken` pointing at
-`logs/bootstrap_log.txt`.
+`logs/bootstrap_log.txt`, except once: when the lines `bootstrap_log.txt`
+gained since the start carry `Shutdown` and no download line (the client
+ended on its own before its version check; the live first start did so
+twice, `Verification skipped`, `Shutdown` 16 s later, nothing else, and
+the next start was fine), the client is started once more (`client: the
+client shut down on its own with nothing but the shutdown in
+logs/bootstrap_log.txt (no download line); starting it once more`), and
+only a second such exit is the error.
 
 `steam.exe -noverifyfiles` is started under a session key of its own,
 recorded in `meta.steam_client_session`. `-noverifyfiles` skips the client's
@@ -155,11 +164,22 @@ exists (logs/webhelper.txt)`). On a fresh install the self-update lays the
 client's helper down under no shim (the first window is the real helper's,
 presumably black as the real helper's window was in unit U15b, and closes
 by itself); after a client update it writes its helper over the shim.
-Either way, when the window is up and the helper is not the shim, the
-client is stopped (`stop:`), the helper stashed (`shim:`), and the client
-started once more, so the window that is left on screen is one that draws
-(**unverified** live: exercised against the stub only; the user's first
-install is the first live run). Ten minutes without the window stops the
+Either way, once the wait returns (window or not), every populated
+`cef.win*` directory is scanned again, and when one holds a
+`steamwebhelper.exe` that is not the shim, the client is stopped (`client:
+the client laid its web helper down without the shim in front of it
+(<dir>); restarting the client with the shim in front of it (restart 1 of
+2)`, `stop:`), the next start's shim pass stashes it (`shim:`), and the
+client starts once more, so the window that is left on screen is one that
+draws. The scan is not only for the helper the pass covered: the client
+makes directories as it pleases, and build 1792618285 made `cef.win64`
+beside `cef.win7` and `cef.win7x64` at its second start, after the pass had
+shimmed the two, so that restart ran the new helper unshimmed with no window
+(the live finding of 2026-11-06). At most two such restarts per `install`
+or `update`; a third finding prints `client: <dir>/steamwebhelper.exe is
+still not the shim after 2 restarts; giving up` and the op ends
+`ClientRuntimeBroken { broken }` naming the directory, the client left
+running for `stop`, then `install`. Ten minutes without the window stops the
 client with `ClientRuntimeBroken { state: updating }`, or, on `install`
 with the client's manifest present, after a start without `-noverifyfiles`
 that left its directory without a helper, with `ClientRuntimeBroken {
@@ -186,9 +206,12 @@ helper.
 
 The payload ships `probes/steamwebhelper-shim.exe` (x86-64 PE, built by
 `crates/applejack-engine/probes/steamwebhelper-shim/build.sh` with the
-pinned llvm-mingw). Before every client start, for every
-`bin/cef/cef.win*/` directory under the client's `Steam/` that holds a
-`steamwebhelper.exe`:
+pinned llvm-mingw). Before every client start, and again after every start
+`install` and `update` make (the client's own tree decides which
+`cef.win*` directories exist: `cef.win7`, `cef.win7x64` and, since build
+1792618285 at the second start, `cef.win64`, the one the 64-bit client
+runs), for every `bin/cef/cef.win*/` directory under the client's `Steam/`
+that holds a `steamwebhelper.exe`:
 
 - if the helper is neither the payload's shim by SHA-256 nor any build's
   shim by its marker (every build of the shim carries the bytes
@@ -230,6 +253,17 @@ pinned llvm-mingw). Before every client start, for every
   game run never starts a client in that state, and one whose shim pass
   finds it (the directory emptied after `plan_run` answered) fails with the
   same reason;
+- a populated `cef.win*` directory holding the client's own helper (not a
+  shim by its marker) with no `steamwebhelper_real.exe` beside it is
+  `broken` for `status`, running client or not (`<dir>/steamwebhelper.exe
+  is the client's own web helper with no steamwebhelper_real.exe beside
+  it, ...`): that helper was never stashed, so it runs without the shim and
+  draws no window. `install` with the client stopped is the recovery (the
+  pass stashes it, `Applied`; nothing is downloaded); `install` with the
+  client running says so under `shim:` and refuses with the same reason
+  instead of waiting for a window that cannot come. A client that replaced
+  the helper over the shim with the stash still beside it is not read this
+  way (`status` stays `needs_login`; the next start's pass `Reapplied`s);
 - a stash with no `steamwebhelper.exe` in front of it gets the shim
   written back (`Rewritten`), with no file check;
 - a payload without the shim refuses with `ClientRuntimeBroken` before the
@@ -427,7 +461,10 @@ criterion 5 may be rewritten so the in-prefix client keeps its own copy.
 | The client died about 3 minutes in with `BMainLoop appears to have stalled` in the session's `wine.log`, `logs/console_log.txt` or `logs/bootstrap_log.txt`, or with a fresh `assert_steam.exe_*.dmp` under `dumps/` | `ClientRuntimeBroken { broken }` | The macOS microphone prompt for "applejack" was left unanswered (with a dump alone, the usual cause); answer it (Don't Allow is fine; the answer is stored) and `install` again. `status` does not show this one: the client is simply gone |
 | `steamwebhelper.exe` is the shim and `steamwebhelper_real.exe` is missing beside it (or is a shim too) | `ClientRuntimeBroken { broken }`, and `status` reads `broken` | `install` removes the orphan shim, starts the client once with its file check on so it lays the helper down, and restarts it with the helper stashed and the shim in front (**unverified** live: stub only); `repair` restores a snapshot holding helper and stash when one exists; `repair --reinstall` also recovers, through the full self-update (**unverified** live) |
 | Payload without `probes/steamwebhelper-shim.exe` | `ClientRuntimeBroken` | Install a payload that ships the shim; without it the login window does not draw. Refused before the bootstrapper download; `status` does not show it |
-| The window is on screen but black and stays after `install` returns | none | The helper ran without the shim: check `shim:` lines in the `install` output and `logs/webhelper.txt` for `steamwebhelper_real.exe` in the `webhelper launched` line, and `cef_log.txt` for `EGL_BAD_ALLOC`. A black window that closes by itself during a fresh install is the real helper's, before the restart with the shim |
+| A populated `cef.win*` directory holds the client's own `steamwebhelper.exe` with no `steamwebhelper_real.exe` beside it | `ClientRuntimeBroken { broken }`, and `status` reads `broken` naming the directory | The helper runs unshimmed and draws no window (live: `cef.win64` made at the client's second start, `EGL_BAD_ALLOC` in `cef_log.txt`, `running yes` and no window). `applejack runtime steam stop`, then `install`: the pass stashes the helper and puts the shim in front, with no download. `install` under the running client says so under `shim:` and refuses with this reason |
+| `install` or `update` found a helper without the shim after each of its two restarts | `ClientRuntimeBroken { broken }` naming the directory, after `client: <dir>/steamwebhelper.exe is still not the shim after 2 restarts; giving up` | The client lays an unshimmed helper down at every start; the client is left running. `stop`, then `install`, shims what is there; if the same directory keeps coming back, report it with the `shim:` and `client:` lines |
+| The first start shut down on its own (`Verification skipped`, `Shutdown`, no download line in `logs/bootstrap_log.txt`) | none on the first time (`client: the client shut down on its own ...; starting it once more`), `ClientRuntimeBroken { broken }` (the early exit) on the second | Seen twice live on a fresh prefix, the next start fine both times; cause unknown. After the error, `install` again |
+| The window is on screen but black and stays after `install` returns, or no window is on screen with `status` reading `running yes` | none, or `broken` when `status` reads the unshimmed helper | The helper ran without the shim: check `shim:` lines in the `install` output and `logs/webhelper.txt` for `steamwebhelper_real.exe` in the `webhelper launched` line (a `webhelper launched` line naming `steamwebhelper.exe` under a directory no `shim:` line named is the unshimmed case), and `cef_log.txt` for `EGL_BAD_ALLOC`. A black window that closes by itself during a fresh install is the real helper's, before the restart with the shim |
 | An install died and left its marker | `ClientRuntimeBroken { broken }` | `install` again: it holds the lock, so the marker is a dead install's and is cleared first. `repair` clears the marker and, with the client intact, stops there |
 | `repair` found no usable snapshot | `ClientRuntimeBroken { broken }` | None listed, or every one skipped: a prefix record that does not open, no `steam.exe`, no web helper beside the shim, or a helper that does not read (each is reported as skipped with its reason; `status` shows the count, not which are usable); `repair --reinstall` reruns the bootstrapper |
 | Run with no client | `ClientRuntimeUnavailable { absent }` | `applejack runtime steam install` |

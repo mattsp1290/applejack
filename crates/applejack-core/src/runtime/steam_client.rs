@@ -127,6 +127,19 @@ const SHIM_MAX_LEN: u64 = 1 << 20;
 /// Growth under a title's install directory that counts as a re-download.
 pub const REDOWNLOAD_GROWTH: u64 = 64 << 20;
 
+/// How many times one `install` or `update` stops and restarts the client
+/// because a start left a `cef.win*` helper in front without the shim (the
+/// first self-update, a client update, or a directory the client made at
+/// that start, as `cef.win64` beside the two `cef.win7*` live). Past it the
+/// op ends `broken` naming the directory instead of looping.
+pub const RESHIM_ROUNDS: u32 = 2;
+
+/// The bootstrap log's line for the client ending on its own. A first start
+/// that logs it with no download line since the start (seen twice live:
+/// `Verification skipped`, `Shutdown` 16 s later, nothing else) is started
+/// once more before the exit is an error.
+const SHUTDOWN_MARK: &str = "Shutdown";
+
 const INSTALL_MARKER: &str = "applejack/client-install.json";
 
 const BOOTSTRAPPER_FILE: &str = "applejack/SteamSetup.exe";
@@ -252,6 +265,11 @@ pub(crate) enum BrokenReason {
     /// `steamwebhelper_real.exe` (or an installed client has no such
     /// directory at all): nothing there can draw the window.
     NoWebHelper(PathBuf),
+    /// A populated `cef.win*` directory holds the client's own helper as
+    /// `steamwebhelper.exe` with no `steamwebhelper_real.exe` beside it: the
+    /// helper runs without the shim (the client made the directory after
+    /// the shim pass, or wrote its helper back) and draws no window.
+    HelperUnshimmed(PathBuf),
     /// The start without `-noverifyfiles`, with the client's manifest in
     /// place, ended with the directory still without a helper: the window
     /// never came within the seconds waited, or the client exited first
@@ -340,6 +358,14 @@ impl BrokenReason {
                  fetches its web helper again",
                 dir.display()
             ),
+            Self::HelperUnshimmed(dir) => format!(
+                "{}/{WEBHELPER_EXE} is the client's own web helper with no {WEBHELPER_REAL} \
+                 beside it, so it runs without the shim and its window does not draw on this \
+                 engine (the client made the directory after the shim pass, or wrote its helper \
+                 back); `applejack runtime steam stop` if the client is running, then `applejack \
+                 runtime steam install`, put the shim in front of it without downloading anything",
+                dir.display()
+            ),
             Self::HelperNotLaidDown { dir, waited } => helper_not_laid_down(dir, *waited),
             Self::HelperUnreadable(error) => {
                 format!("a web helper file does not read: {error}; {REPAIR_RESTORES}")
@@ -397,6 +423,7 @@ impl BrokenReason {
             | Self::NoSteamExe(_)
             | Self::ShimWithoutReal(_)
             | Self::NoWebHelper(_)
+            | Self::HelperUnshimmed(_)
             | Self::HelperNotLaidDown { .. }
             | Self::HelperUnreadable(_)
             | Self::NoSnapshot
@@ -831,17 +858,48 @@ pub(crate) fn ensure_webhelper_shim(
     Ok(pass)
 }
 
-/// Whether any `cef.win*` helper is not the payload's shim: a client
-/// self-update wrote its helper over it since the last check.
-fn helper_replaced(engine_root: &Path, paths: &ClientPaths) -> Result<bool, CoreError> {
+/// The first populated `cef.win*` directory whose `steamwebhelper.exe` is
+/// not a shim (the payload's by hash, any build's by marker): a client
+/// start wrote its helper over the shim, or made the directory, since the
+/// last shim pass. Read after every start, since the client lays
+/// directories down as it pleases (`cef.win64` appeared at a second start
+/// live, after the pass had covered `cef.win7` and `cef.win7x64`).
+fn unshimmed_helper(engine_root: &Path, paths: &ClientPaths) -> Result<Option<PathBuf>, CoreError> {
     let (_, shim_hash) = read_shim(engine_root)?;
-    for dir in cef_dirs(paths)? {
-        let helper = dir.join(WEBHELPER_EXE);
-        if helper.is_file() && hash_and_marker(&helper)?.0 != shim_hash {
-            return Ok(true);
+    let (dirs, _) = populated_cef_dirs(paths)?;
+    for dir in dirs {
+        if shim_file(&dir.join(WEBHELPER_EXE), Some(&shim_hash))? == Some(false) {
+            return Ok(Some(dir));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// The first populated `cef.win*` directory with the client's own helper in
+/// front (not a shim by its marker) and no `steamwebhelper_real.exe` beside
+/// it: the helper was never stashed, so it runs unshimmed and draws no
+/// window, running client or not. Needs no payload, so `status`, `install`
+/// and the post-start scan read the same thing.
+fn exposed_helper(paths: &ClientPaths) -> Result<Option<PathBuf>, CoreError> {
+    let (dirs, _) = populated_cef_dirs(paths)?;
+    for dir in dirs {
+        if shim_file(&dir.join(WEBHELPER_EXE), None)? == Some(false)
+            && !dir.join(WEBHELPER_REAL).is_file()
+        {
+            return Ok(Some(dir));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the lines `path` gained past `offset` are the client ending on
+/// its own with nothing done: a [`SHUTDOWN_MARK`] line and no download
+/// line (a normal start logs `Download skipped` or the update it fetches).
+fn clean_shutdown(path: &Path, offset: u64) -> bool {
+    log_has_since(path, offset, |line| line.contains(SHUTDOWN_MARK))
+        && !log_has_since(path, offset, |line| {
+            line.to_ascii_lowercase().contains("download")
+        })
 }
 
 /// The file's length, as the offset later reads start from; 0 when absent.
@@ -891,6 +949,17 @@ impl WindowSignal {
             Self::Helper => ": a steamwebhelper.exe is up; no window line in logs/webhelper.txt",
         }
     }
+}
+
+/// How a window wait ended without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowWait {
+    /// The window (or its fallback signal) is there.
+    Window,
+    /// The client this call started is gone with a clean shutdown in
+    /// `logs/bootstrap_log.txt` and no download line, no stall, and no
+    /// helper left missing.
+    ShutDown,
 }
 
 /// What one look at a starting client found.
@@ -1580,6 +1649,11 @@ impl Core {
             Ok(None) => {}
             Err(error) => return broken(BrokenReason::HelperUnreadable(error.to_string())),
         }
+        match exposed_helper(&paths) {
+            Ok(Some(dir)) => return broken(BrokenReason::HelperUnshimmed(dir)),
+            Ok(None) => {}
+            Err(error) => return broken(BrokenReason::HelperUnreadable(error.to_string())),
+        }
         let login = fs::read_to_string(paths.loginusers())
             .ok()
             .and_then(|text| remembered_login(&text));
@@ -1781,7 +1855,25 @@ impl PlannedClientOp {
             // The window the user signs in to is up; a second steam.exe
             // would only hand off to it. A payload fault is reported when
             // the client next starts, not here.
-            if helper_replaced(&self.installed.root, &self.paths).unwrap_or(false) {
+            if let Some(dir) = exposed_helper(&self.paths).ok().flatten() {
+                // No window to wait for: the helper in front was never
+                // stashed, so it runs without the shim.
+                report(
+                    "shim",
+                    format!(
+                        "{}: the web helper running is the client's own with no {WEBHELPER_REAL} \
+                         beside it (the client made the directory after the shim pass), so the \
+                         window cannot draw",
+                        dir.display()
+                    ),
+                );
+                return Err(BrokenReason::HelperUnshimmed(dir).into_error());
+            }
+            if unshimmed_helper(&self.installed.root, &self.paths)
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 report(
                     "shim",
                     "the web helper running is not the shim (a client started outside \
@@ -1914,12 +2006,15 @@ impl PlannedClientOp {
     }
 
     /// Starts `steam.exe` and waits for its self-update and the login
-    /// window. The client stays up for the user. A helper the client laid
-    /// down over (or in place of) the shim during the wait, by its first
-    /// self-update or by the file check after an orphan shim was removed,
-    /// is caught after the wait: the client is stopped, the new helper
-    /// stashed, and the client started once more, so an `install` ends with
-    /// a window that draws.
+    /// window. The client stays up for the user. After every start, window
+    /// or not, the `cef.win*` directories are scanned again: a helper the
+    /// client laid down without the shim in front (its first self-update,
+    /// the file check after an orphan shim was removed, a client update, or
+    /// a directory the client made at that start) stops the client, and the
+    /// next start's shim pass stashes it, at most [`RESHIM_ROUNDS`] times;
+    /// past that the op ends `broken` naming the directory. A first start
+    /// that shuts down on its own with nothing in its bootstrap log but the
+    /// shutdown is started once more before the exit is an error.
     fn first_run(
         &mut self,
         prefix: &Prefix,
@@ -1939,21 +2034,55 @@ impl PlannedClientOp {
                 format!("listing {windows_path} in libraryfolders.vdf before the client starts"),
             );
         }
-        let mut restarted = false;
+        let mut restarts = 0;
+        let mut retried = false;
         loop {
-            self.start_client(prefix, report)?;
-            if restarted || !helper_replaced(&self.installed.root, &self.paths)? {
-                break;
+            match self.start_client(prefix, report)? {
+                WindowWait::Window => {}
+                WindowWait::ShutDown if !retried => {
+                    retried = true;
+                    report(
+                        "client",
+                        "the client shut down on its own with nothing but the shutdown in \
+                         logs/bootstrap_log.txt (no download line); starting it once more"
+                            .to_owned(),
+                    );
+                    Core::settle(&self.paths.prefix_dir)?;
+                    continue;
+                }
+                WindowWait::ShutDown => {
+                    return Err(BrokenReason::ClientExitedEarly(
+                        self.paths.steam_dir().join(STALL_LOGS[1]),
+                    )
+                    .into_error());
+                }
             }
+            let Some(dir) = unshimmed_helper(&self.installed.root, &self.paths)? else {
+                break;
+            };
+            if restarts == RESHIM_ROUNDS {
+                report(
+                    "client",
+                    format!(
+                        "{}/{WEBHELPER_EXE} is still not the shim after {RESHIM_ROUNDS} restarts; \
+                         giving up",
+                        dir.display()
+                    ),
+                );
+                return Err(BrokenReason::HelperUnshimmed(dir).into_error());
+            }
+            restarts += 1;
             report(
                 "client",
-                "the self-update replaced the web helper; restarting the client with the shim in \
-                 front of it"
-                    .to_owned(),
+                format!(
+                    "the client laid its web helper down without the shim in front of it ({}); \
+                     restarting the client with the shim in front of it (restart {restarts} of \
+                     {RESHIM_ROUNDS})",
+                    dir.display()
+                ),
             );
             self.stop(report)?;
             Core::settle(&self.paths.prefix_dir)?;
-            restarted = true;
         }
         self.finish(report)
     }
@@ -1964,7 +2093,7 @@ impl PlannedClientOp {
         &mut self,
         prefix: &Prefix,
         report: &mut dyn FnMut(&str, String),
-    ) -> Result<(), CoreError> {
+    ) -> Result<WindowWait, CoreError> {
         let pass = ensure_webhelper_shim(&self.installed.root, &self.paths, report)?;
         report(
             "start",
@@ -2028,6 +2157,29 @@ impl PlannedClientOp {
             return None;
         }
         missing_web_helper(&self.paths).ok().flatten()
+    }
+
+    /// The client is gone during the wait. One this call started
+    /// (`own_start`), with no stall and no helper left missing, whose
+    /// bootstrap log gained a clean shutdown and no download line since the
+    /// start (`bootstrap` is the log and its offset then) is
+    /// [`WindowWait::ShutDown`] for the caller to retry once; anything else
+    /// is [`PlannedClientOp::client_gone`]'s error.
+    fn client_gone_or_shut_down(
+        &self,
+        own_start: bool,
+        stalled: Option<PathBuf>,
+        helper_missing: bool,
+        bootstrap: (&Path, u64),
+    ) -> Result<WindowWait, CoreError> {
+        if own_start
+            && stalled.is_none()
+            && self.helper_still_missing(helper_missing).is_none()
+            && clean_shutdown(bootstrap.0, bootstrap.1)
+        {
+            return Ok(WindowWait::ShutDown);
+        }
+        Err(self.client_gone(stalled, helper_missing))
     }
 
     /// The client exited during the wait: the stall when one was seen, the
@@ -2105,14 +2257,17 @@ impl PlannedClientOp {
     /// longer counts: the client dies about 3 minutes in unless the prompt
     /// is answered, and that death is reported as the prompt.
     /// `helper_missing` is the shim pass's: a wait that ends without the
-    /// window names the helper the start did not lay down.
+    /// window names the helper the start did not lay down. A client this
+    /// call started that is gone with a clean shutdown in its bootstrap log
+    /// and nothing else to name is [`WindowWait::ShutDown`], the caller's to
+    /// retry once; any other exit is the error.
     fn wait_window(
         &mut self,
         key: Option<&str>,
         session_log: Option<&Path>,
         helper_missing: bool,
         report: &mut dyn FnMut(&str, String),
-    ) -> Result<(), CoreError> {
+    ) -> Result<WindowWait, CoreError> {
         let key = match key {
             Some(key) => Some(key.to_owned()),
             None => self.core.client_session_key()?,
@@ -2123,6 +2278,8 @@ impl PlannedClientOp {
         let steam = self.paths.steam_dir();
         let helper_log = self.paths.webhelper_log();
         let helper_log_before = log_offset(&helper_log);
+        let bootstrap_log = steam.join(STALL_LOGS[1]);
+        let bootstrap_before = log_offset(&bootstrap_log);
         let stall_logs: Vec<(PathBuf, u64)> = session_log
             .map(Path::to_path_buf)
             .into_iter()
@@ -2132,11 +2289,7 @@ impl PlannedClientOp {
                 (path, offset)
             })
             .collect();
-        let grace = if session_log.is_some() {
-            WINDOW_FALLBACK_GRACE
-        } else {
-            Duration::ZERO
-        };
+        let grace = session_log.map_or(Duration::ZERO, |_| WINDOW_FALLBACK_GRACE);
         let started_at = std::time::SystemTime::now();
         let started = Instant::now();
         let deadline = started + self.core.tuning.first_run_timeout;
@@ -2192,7 +2345,13 @@ impl PlannedClientOp {
             // session log say why, and a stall assertion names the prompt.
             gone = if self.client_running() { 0 } else { gone + 1 };
             if gone >= SETTLED_LOOKS {
-                return Err(self.client_gone(stalled, helper_missing));
+                let bootstrap = (bootstrap_log.as_path(), bootstrap_before);
+                return self.client_gone_or_shut_down(
+                    session_log.is_some(),
+                    stalled,
+                    helper_missing,
+                    bootstrap,
+                );
             }
             if Instant::now() >= deadline {
                 return Err(self.window_timed_out(helper_missing, report));
@@ -2204,7 +2363,7 @@ impl PlannedClientOp {
                     .max(CLIENT_POLL.min(self.core.tuning.tick * 4)),
             );
         }
-        Ok(())
+        Ok(WindowWait::Window)
     }
 
     /// Snapshots the prefix, then starts the client so it updates itself.
@@ -2514,6 +2673,7 @@ mod tests {
             BrokenReason::NoShim(PathBuf::from("/e/probes/steamwebhelper-shim.exe")),
             BrokenReason::ShimWithoutReal(PathBuf::from("/x/Steam/bin/cef/cef.win64")),
             BrokenReason::NoWebHelper(PathBuf::from("/x/Steam/bin/cef/cef.win64")),
+            BrokenReason::HelperUnshimmed(PathBuf::from("/x/Steam/bin/cef/cef.win64")),
             BrokenReason::HelperNotLaidDown {
                 dir: PathBuf::from("/x/Steam/bin/cef/cef.win64"),
                 waited: Some(600),
@@ -2539,6 +2699,7 @@ mod tests {
                     | BrokenReason::NoSteamExe(_)
                     | BrokenReason::ShimWithoutReal(_)
                     | BrokenReason::NoWebHelper(_)
+                    | BrokenReason::HelperUnshimmed(_)
                     | BrokenReason::HelperNotLaidDown { .. }
                     | BrokenReason::HelperUnreadable(_)
                     | BrokenReason::NoSnapshot

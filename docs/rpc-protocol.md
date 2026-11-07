@@ -290,7 +290,7 @@ Refused with an error response, before anything starts or any row is written:
 | `TitleNotInstalled` | No `apps` row, no complete `appmanifest_<appid>.acf` for this appid, an empty install directory, an `installdir` that is not one plain directory name, or a relative library |
 | `DownloadInProgress` | `<library>/applejack/<appid>.download.json` exists |
 | `ClientRuntimeUnavailable` | The title takes the client path and the runtime is `absent` or `needs_login`; the message names `applejack runtime steam install` and the sign-in |
-| `ClientRuntimeBroken` | The title takes the client path and the runtime is `installing`, `updating`, or `broken` (which includes a web helper shim with no real helper beside it, and a `cef.win*` directory with no web helper at all) |
+| `ClientRuntimeBroken` | The title takes the client path and the runtime is `installing`, `updating`, or `broken` (which includes a web helper shim with no real helper beside it, a `cef.win*` directory with no web helper at all, and a populated `cef.win*` directory whose `steamwebhelper.exe` is the client's own with nothing stashed beside it) |
 | `NoLaunchExe` | `launch_exe_override` is empty, is not a PE image, or leaves the install directory |
 | `EngineNotInstalled` | No active engine, and none pinned by the game configuration |
 | `AlreadyRunning` | The title has an open session, in this core or another process |

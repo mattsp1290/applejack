@@ -44,7 +44,15 @@ const BUNDLE_FILES: &[&str] = &[
 /// `$WINEPREFIX/no-file-check` is absent (under it the check lays nothing down, the live shape the
 /// recovery has not been seen to rule out), and `$WINEPREFIX/self-update`
 /// makes it write `REAL-HELPER-2` over the helper once, as a client update
-/// does. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`
+/// does; `$WINEPREFIX/late-cef-win64` lays a new `bin/cef/cef.win64/
+/// steamwebhelper.exe` (`REAL-HELPER-64`) at the second start since
+/// `client-args` was cleared (once; `cef.win7x64` stays as it is), the
+/// shape the live client showed; `$WINEPREFIX/
+/// new-cef-dir-every-start` lays `bin/cef/cef.win-extra-<n>/steamwebhelper.exe`
+/// at every start `n`; `$WINEPREFIX/early-shutdown` (one-shot) and
+/// `early-shutdown-always` make a start write `Verification skipped` and
+/// `Shutdown` to `logs/bootstrap_log.txt` and exit with no window, as the
+/// live first start did twice. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`
 /// when a helper file exists to run; without one no window line is written)
 /// that stays until `$WINEPREFIX/client-quit`; its arguments append to
 /// `$WINEPREFIX/client-args`; with
@@ -168,6 +176,20 @@ if [ "$name" = steam.exe ]; then
     mkdir -p "$cef"
     printf 'REAL-HELPER-2' > "$cef/steamwebhelper.exe"
     rm -f "$WINEPREFIX/self-update"
+  fi
+  starts=$(wc -l < "$WINEPREFIX/client-args" | tr -d ' ')
+  if [ -e "$WINEPREFIX/late-cef-win64" ] && [ "$starts" -ge 2 ] && [ ! -e "$steam/bin/cef/cef.win64" ]; then
+    mkdir -p "$steam/bin/cef/cef.win64"
+    printf 'REAL-HELPER-64' > "$steam/bin/cef/cef.win64/steamwebhelper.exe"
+  fi
+  if [ -e "$WINEPREFIX/new-cef-dir-every-start" ]; then
+    mkdir -p "$steam/bin/cef/cef.win-extra-$starts"
+    printf 'REAL-HELPER-EXTRA' > "$steam/bin/cef/cef.win-extra-$starts/steamwebhelper.exe"
+  fi
+  if [ -e "$WINEPREFIX/early-shutdown" ] || [ -e "$WINEPREFIX/early-shutdown-always" ]; then
+    rm -f "$WINEPREFIX/early-shutdown"
+    printf '%s\n' '[2026-11-06 20:00:00] Verification skipped' '[2026-11-06 20:00:16] Shutdown' >> "$steam/logs/bootstrap_log.txt"
+    exit 0
   fi
   # A client a stop just ended polls every 10 ms for its quit file; a fresh
   # start must not clear it from under them. The window line follows the
