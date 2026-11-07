@@ -159,6 +159,8 @@ struct Script {
     pending_polls: usize,
     /// The next submit fails with this.
     submit_error: Option<AuthError>,
+    /// The next poll fails with this.
+    poll_error: Option<AuthError>,
     logon_error: Option<AuthError>,
     submitted: Vec<String>,
     polls: usize,
@@ -289,6 +291,9 @@ impl SteamConnection for FakeConnection {
     fn poll_tokens(&mut self) -> impl Future<Output = Result<AuthPoll, AuthError>> + Send {
         let mut script = self.script.lock().unwrap();
         script.polls += 1;
+        if let Some(error) = script.poll_error.take() {
+            return ready(Err(error));
+        }
         ready(Ok(if script.pending_polls > 0 {
             script.pending_polls -= 1;
             AuthPoll::Pending { challenge: None }
@@ -1834,4 +1839,68 @@ fn a_steam_error_keeps_its_code_through_a_job() {
     assert_eq!(error.code(), ErrorCode::AppNotOwned);
     let error = CoreError::Steam(SteamError::Cancelled { appid: 1 });
     assert_eq!(error.code(), ErrorCode::InstallCancelled);
+}
+
+/// What `applejack steam login --qr` saw live on 2026-11-06: four challenges
+/// about 30 s apart, then the CM closed the socket. The flow names the expiry
+/// and the command, not the socket.
+#[test]
+fn an_unscanned_qr_challenge_ends_as_expired_and_names_the_command() {
+    let fixture = Fixture::new();
+    let host = FakeHost::new(
+        Script {
+            poll_error: Some(AuthError::Disconnected),
+            ..Script::default()
+        },
+        session(ONE_ENTRY, false),
+    );
+    let mut core = fixture.core();
+    let host = Arc::new(host);
+    let mut flow = LoginFlow::start(&mut core, Arc::clone(&host), AuthMode::Qr, None).unwrap();
+    assert_eq!(
+        flow.step(),
+        &LoginStep::QrReady {
+            payload: QR.to_owned()
+        }
+    );
+    let error = flow.advance(&mut core, None).unwrap_err();
+    assert!(matches!(error, CoreError::SteamQrExpired { .. }), "{error}");
+    assert_eq!(error.code(), ErrorCode::SteamLoginFailed);
+    let text = error.to_string();
+    assert!(
+        text.starts_with("the QR challenge expired after "),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(" s without a scan; run `applejack steam login --qr` again"),
+        "{text}"
+    );
+    assert_eq!(stored_token(&host), None);
+    assert_eq!(fixture.db().meta_get(META_ACCOUNT).unwrap(), None);
+}
+
+/// Only the QR wait reads a hang-up as an expiry; a code prompt and any other
+/// connection failure keep their own words.
+#[test]
+fn a_closed_connection_elsewhere_keeps_its_own_text() {
+    let fixture = Fixture::new();
+    let host = guarded(0);
+    host.script.lock().unwrap().poll_error = Some(AuthError::Disconnected);
+    let (mut core, _host, mut flow) = start_login(&fixture, host);
+    let error = flow.advance(&mut core, None).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::SteamUnavailable);
+    assert_eq!(error.to_string(), "connection: Steam closed the connection");
+
+    let host = FakeHost::new(
+        Script {
+            poll_error: Some(AuthError::Connection("Steam did not answer".to_owned())),
+            ..Script::default()
+        },
+        session(ONE_ENTRY, false),
+    );
+    let mut core = fixture.core();
+    let mut flow = LoginFlow::start(&mut core, Arc::new(host), AuthMode::Qr, None).unwrap();
+    let error = flow.advance(&mut core, None).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::SteamUnavailable);
+    assert_eq!(error.to_string(), "connection: Steam did not answer");
 }

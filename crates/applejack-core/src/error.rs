@@ -33,6 +33,12 @@ pub enum CoreError {
     /// caller does not poll for good.
     #[error("Steam issued no token within {seconds} seconds of the sign-in; begin again")]
     SteamLoginStalled { seconds: u64 },
+    /// Nobody scanned the QR challenge before Steam closed the connection
+    /// that held it.
+    #[error(
+        "the QR challenge expired after {seconds} s without a scan; run `applejack steam login --qr` again"
+    )]
+    SteamQrExpired { seconds: u64 },
     /// `steam.login.complete` for a login that is not the pending one.
     #[error("no such Steam login in progress; begin again")]
     NoSuchLogin,
@@ -239,7 +245,9 @@ impl CoreError {
             }
             Self::Steam(error) | Self::SteamRefreshFailed(error) => steam_code(error),
             Self::SteamLoginRequired { .. } => ErrorCode::SteamLoginRequired,
-            Self::NoSuchLogin | Self::SteamLoginStalled { .. } => ErrorCode::SteamLoginFailed,
+            Self::NoSuchLogin | Self::SteamLoginStalled { .. } | Self::SteamQrExpired { .. } => {
+                ErrorCode::SteamLoginFailed
+            }
             Self::LaunchExeAmbiguous { .. } => ErrorCode::LaunchExeAmbiguous,
             Self::VerifyFailed { .. } => ErrorCode::VerifyFailed,
             Self::UnsignedRefused => ErrorCode::UnsignedEngineRefused,
@@ -286,9 +294,10 @@ fn auth_code(error: &AuthError) -> ErrorCode {
         AuthError::RateLimited { .. } => ErrorCode::SteamRateLimited,
         AuthError::InvalidGuardCode => ErrorCode::SteamGuardRejected,
         AuthError::NoStoredToken => ErrorCode::SteamLoginRequired,
-        AuthError::Connection(_) | AuthError::CmUnavailable(_) | AuthError::CallDenied { .. } => {
-            ErrorCode::SteamUnavailable
-        }
+        AuthError::Connection(_)
+        | AuthError::Disconnected
+        | AuthError::CmUnavailable(_)
+        | AuthError::CallDenied { .. } => ErrorCode::SteamUnavailable,
         _ => ErrorCode::SteamLoginFailed,
     }
 }
