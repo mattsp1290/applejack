@@ -44,7 +44,8 @@ const BUNDLE_FILES: &[&str] = &[
 /// `$WINEPREFIX/no-file-check` is absent (under it the check lays nothing down, the live shape the
 /// recovery has not been seen to rule out), and `$WINEPREFIX/self-update`
 /// makes it write `REAL-HELPER-2` over the helper once, as a client update
-/// does; `$WINEPREFIX/late-cef-win64` lays a new `bin/cef/cef.win64/
+/// does (`self-update-always` at every start, a client that writes its
+/// helper back each time); `$WINEPREFIX/late-cef-win64` lays a new `bin/cef/cef.win64/
 /// steamwebhelper.exe` (`REAL-HELPER-64`) at the second start since
 /// `client-args` was cleared (once; `cef.win7x64` stays as it is), the
 /// shape the live client showed; `$WINEPREFIX/
@@ -172,7 +173,7 @@ if [ "$name" = steam.exe ]; then
       *) mkdir -p "$cef"; printf 'REAL-HELPER-1' > "$cef/steamwebhelper.exe" ;;
     esac
   fi
-  if [ -e "$WINEPREFIX/self-update" ]; then
+  if [ -e "$WINEPREFIX/self-update" ] || [ -e "$WINEPREFIX/self-update-always" ]; then
     mkdir -p "$cef"
     printf 'REAL-HELPER-2' > "$cef/steamwebhelper.exe"
     rm -f "$WINEPREFIX/self-update"

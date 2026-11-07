@@ -134,10 +134,10 @@ pub const REDOWNLOAD_GROWTH: u64 = 64 << 20;
 /// op ends `broken` naming the directory instead of looping.
 pub const RESHIM_ROUNDS: u32 = 2;
 
-/// The bootstrap log's line for the client ending on its own. A first start
-/// that logs it with no download line since the start (seen twice live:
+/// The bootstrap log's line for the client ending on its own. A start that
+/// logs it with no download line since the start (seen twice live:
 /// `Verification skipped`, `Shutdown` 16 s later, nothing else) is started
-/// once more before the exit is an error.
+/// once more, once per `install` or `update`, before the exit is an error.
 const SHUTDOWN_MARK: &str = "Shutdown";
 
 const INSTALL_MARKER: &str = "applejack/client-install.json";
@@ -266,10 +266,11 @@ pub(crate) enum BrokenReason {
     /// directory at all): nothing there can draw the window.
     NoWebHelper(PathBuf),
     /// A populated `cef.win*` directory holds the client's own helper as
-    /// `steamwebhelper.exe` with no `steamwebhelper_real.exe` beside it: the
-    /// helper runs without the shim (the client made the directory after
-    /// the shim pass, or wrote its helper back) and draws no window.
-    HelperUnshimmed(PathBuf),
+    /// `steamwebhelper.exe`, so it runs without the shim and draws no
+    /// window. `stashed` says which shape: the client wrote its helper back
+    /// over the shim with `steamwebhelper_real.exe` still beside it, or it
+    /// made the directory after the shim pass and nothing is stashed.
+    HelperUnshimmed { dir: PathBuf, stashed: bool },
     /// The start without `-noverifyfiles`, with the client's manifest in
     /// place, ended with the directory still without a helper: the window
     /// never came within the seconds waited, or the client exited first
@@ -358,14 +359,7 @@ impl BrokenReason {
                  fetches its web helper again",
                 dir.display()
             ),
-            Self::HelperUnshimmed(dir) => format!(
-                "{}/{WEBHELPER_EXE} is the client's own web helper with no {WEBHELPER_REAL} \
-                 beside it, so it runs without the shim and its window does not draw on this \
-                 engine (the client made the directory after the shim pass, or wrote its helper \
-                 back); `applejack runtime steam stop` if the client is running, then `applejack \
-                 runtime steam install`, put the shim in front of it without downloading anything",
-                dir.display()
-            ),
+            Self::HelperUnshimmed { dir, stashed } => helper_unshimmed(dir, *stashed),
             Self::HelperNotLaidDown { dir, waited } => helper_not_laid_down(dir, *waited),
             Self::HelperUnreadable(error) => {
                 format!("a web helper file does not read: {error}; {REPAIR_RESTORES}")
@@ -384,6 +378,29 @@ impl BrokenReason {
             ),
         }
     }
+}
+
+/// [`BrokenReason::HelperUnshimmed`]'s detail: the shape by the stash, the
+/// fix (the shim pass, by `install` or `repair`) the same for both.
+fn helper_unshimmed(dir: &Path, stashed: bool) -> String {
+    let (beside, shape) = if stashed {
+        (
+            format!("with {WEBHELPER_REAL} stashed beside it"),
+            "the client wrote its web helper back over the shim; the stash is beside it",
+        )
+    } else {
+        (
+            format!("with no {WEBHELPER_REAL} beside it"),
+            "the client made the directory after the shim pass; no stash beside it",
+        )
+    };
+    format!(
+        "{}/{WEBHELPER_EXE} is the client's own web helper {beside}, so it runs without the shim \
+         and its window does not draw on this engine ({shape}); `applejack runtime steam stop` \
+         if the client is running, then `applejack runtime steam install`, or `applejack runtime \
+         steam repair` alone, put the shim in front of it without downloading anything",
+        dir.display()
+    )
 }
 
 /// [`BrokenReason::HelperNotLaidDown`]'s detail: after the timeout the file
@@ -423,7 +440,7 @@ impl BrokenReason {
             | Self::NoSteamExe(_)
             | Self::ShimWithoutReal(_)
             | Self::NoWebHelper(_)
-            | Self::HelperUnshimmed(_)
+            | Self::HelperUnshimmed { .. }
             | Self::HelperNotLaidDown { .. }
             | Self::HelperUnreadable(_)
             | Self::NoSnapshot
@@ -858,35 +875,51 @@ pub(crate) fn ensure_webhelper_shim(
     Ok(pass)
 }
 
-/// The first populated `cef.win*` directory whose `steamwebhelper.exe` is
-/// not a shim (the payload's by hash, any build's by marker): a client
-/// start wrote its helper over the shim, or made the directory, since the
-/// last shim pass. Read after every start, since the client lays
-/// directories down as it pleases (`cef.win64` appeared at a second start
-/// live, after the pass had covered `cef.win7` and `cef.win7x64`).
-fn unshimmed_helper(engine_root: &Path, paths: &ClientPaths) -> Result<Option<PathBuf>, CoreError> {
-    let (_, shim_hash) = read_shim(engine_root)?;
-    let (dirs, _) = populated_cef_dirs(paths)?;
-    for dir in dirs {
-        if shim_file(&dir.join(WEBHELPER_EXE), Some(&shim_hash))? == Some(false) {
-            return Ok(Some(dir));
-        }
-    }
-    Ok(None)
+/// A populated `cef.win*` directory with the client's own helper in front
+/// of nothing: it runs unshimmed and draws no window, running client or
+/// not. The two shapes read the same way and are told apart only in the
+/// words, since the fix (the shim pass) is the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExposedHelper {
+    pub(crate) dir: PathBuf,
+    /// `steamwebhelper_real.exe` is beside the helper: the client wrote its
+    /// helper back over the shim. Without it the client made the directory
+    /// after the shim pass.
+    pub(crate) stashed: bool,
 }
 
-/// The first populated `cef.win*` directory with the client's own helper in
-/// front (not a shim by its marker) and no `steamwebhelper_real.exe` beside
-/// it: the helper was never stashed, so it runs unshimmed and draws no
-/// window, running client or not. Needs no payload, so `status`, `install`
-/// and the post-start scan read the same thing.
-fn exposed_helper(paths: &ClientPaths) -> Result<Option<PathBuf>, CoreError> {
+impl ExposedHelper {
+    pub(crate) fn reason(self) -> BrokenReason {
+        BrokenReason::HelperUnshimmed {
+            dir: self.dir,
+            stashed: self.stashed,
+        }
+    }
+
+    /// The shape, as the `shim:` and `client:` lines name it.
+    fn shape(&self) -> &'static str {
+        if self.stashed {
+            "the client wrote its web helper back over the shim; the stash is beside it"
+        } else {
+            "the client made the directory after the shim pass; no stash beside it"
+        }
+    }
+}
+
+/// The first populated `cef.win*` directory whose `steamwebhelper.exe` is
+/// not a shim by its marker (every build of the shim carries it): a client
+/// start wrote its helper back over the shim, or made the directory, since
+/// the last shim pass. Needs no payload, so `status`, `install`, `repair`
+/// and the scan after every start read the same thing; the scan runs after
+/// every start since the client lays directories down as it pleases
+/// (`cef.win64` appeared at a second start live, after the pass had
+/// covered `cef.win7` and `cef.win7x64`).
+pub(crate) fn exposed_helper(paths: &ClientPaths) -> Result<Option<ExposedHelper>, CoreError> {
     let (dirs, _) = populated_cef_dirs(paths)?;
     for dir in dirs {
-        if shim_file(&dir.join(WEBHELPER_EXE), None)? == Some(false)
-            && !dir.join(WEBHELPER_REAL).is_file()
-        {
-            return Ok(Some(dir));
+        if shim_file(&dir.join(WEBHELPER_EXE), None)? == Some(false) {
+            let stashed = dir.join(WEBHELPER_REAL).is_file();
+            return Ok(Some(ExposedHelper { dir, stashed }));
         }
     }
     Ok(None)
@@ -1650,7 +1683,7 @@ impl Core {
             Err(error) => return broken(BrokenReason::HelperUnreadable(error.to_string())),
         }
         match exposed_helper(&paths) {
-            Ok(Some(dir)) => return broken(BrokenReason::HelperUnshimmed(dir)),
+            Ok(Some(exposed)) => return broken(exposed.reason()),
             Ok(None) => {}
             Err(error) => return broken(BrokenReason::HelperUnreadable(error.to_string())),
         }
@@ -1855,34 +1888,22 @@ impl PlannedClientOp {
             // The window the user signs in to is up; a second steam.exe
             // would only hand off to it. A payload fault is reported when
             // the client next starts, not here.
-            if let Some(dir) = exposed_helper(&self.paths).ok().flatten() {
-                // No window to wait for: the helper in front was never
-                // stashed, so it runs without the shim.
+            if let Some(exposed) = exposed_helper(&self.paths).ok().flatten() {
+                // No window to wait for: the helper in front runs without
+                // the shim, whichever way it got there.
                 report(
                     "shim",
                     format!(
-                        "{}: the web helper running is the client's own with no {WEBHELPER_REAL} \
-                         beside it (the client made the directory after the shim pass), so the \
-                         window cannot draw",
-                        dir.display()
+                        "{}: the web helper running is the client's own ({}), so the window \
+                         cannot draw; `applejack runtime steam stop`, then `install` or \
+                         `repair`, put the shim in front of it",
+                        exposed.dir.display(),
+                        exposed.shape()
                     ),
                 );
-                return Err(BrokenReason::HelperUnshimmed(dir).into_error());
+                return Err(exposed.reason().into_error());
             }
-            if unshimmed_helper(&self.installed.root, &self.paths)
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                report(
-                    "shim",
-                    "the web helper running is not the shim (a client started outside \
-                     applejack, or a self-update while it ran, wrote its own back); \
-                     `applejack runtime steam stop`, then `install`, put the shim in front \
-                     again"
-                        .to_owned(),
-                );
-            } else if let Some(dir) = orphan_shim(&self.paths).ok().flatten() {
+            if let Some(dir) = orphan_shim(&self.paths).ok().flatten() {
                 report(
                     "shim",
                     format!(
@@ -2006,15 +2027,16 @@ impl PlannedClientOp {
     }
 
     /// Starts `steam.exe` and waits for its self-update and the login
-    /// window. The client stays up for the user. After every start, window
-    /// or not, the `cef.win*` directories are scanned again: a helper the
-    /// client laid down without the shim in front (its first self-update,
-    /// the file check after an orphan shim was removed, a client update, or
-    /// a directory the client made at that start) stops the client, and the
-    /// next start's shim pass stashes it, at most [`RESHIM_ROUNDS`] times;
-    /// past that the op ends `broken` naming the directory. A first start
-    /// that shuts down on its own with nothing in its bootstrap log but the
-    /// shutdown is started once more before the exit is an error.
+    /// window. The client stays up for the user. After every start whose
+    /// wait returns the window (or its fallback signal), the `cef.win*`
+    /// directories are scanned again: a helper the client laid down without
+    /// the shim in front (its first self-update, the file check after an
+    /// orphan shim was removed, a client update, or a directory the client
+    /// made at that start) stops the client, and the next start's shim pass
+    /// stashes it, at most [`RESHIM_ROUNDS`] times; past that the op ends
+    /// `broken` naming the directory and its shape. A start that shuts down
+    /// on its own with nothing in its bootstrap log but the shutdown is
+    /// started once more, once per op, before the exit is an error.
     fn first_run(
         &mut self,
         prefix: &Prefix,
@@ -2057,19 +2079,21 @@ impl PlannedClientOp {
                     .into_error());
                 }
             }
-            let Some(dir) = unshimmed_helper(&self.installed.root, &self.paths)? else {
+            let Some(exposed) = exposed_helper(&self.paths)? else {
                 break;
             };
             if restarts == RESHIM_ROUNDS {
+                // The same read `status` makes, so the error and `status`
+                // name the same shape.
                 report(
                     "client",
                     format!(
                         "{}/{WEBHELPER_EXE} is still not the shim after {RESHIM_ROUNDS} restarts; \
                          giving up",
-                        dir.display()
+                        exposed.dir.display()
                     ),
                 );
-                return Err(BrokenReason::HelperUnshimmed(dir).into_error());
+                return Err(exposed.reason().into_error());
             }
             restarts += 1;
             report(
@@ -2078,7 +2102,7 @@ impl PlannedClientOp {
                     "the client laid its web helper down without the shim in front of it ({}); \
                      restarting the client with the shim in front of it (restart {restarts} of \
                      {RESHIM_ROUNDS})",
-                    dir.display()
+                    exposed.dir.display()
                 ),
             );
             self.stop(report)?;
@@ -2424,6 +2448,24 @@ impl PlannedClientOp {
                 ),
             );
         }
+        if let Some(exposed) = exposed_helper(&self.paths)? {
+            // The shim pass fixes this in place and downloads nothing; a
+            // snapshot restore would roll the client back for no reason.
+            report(
+                "repair",
+                format!(
+                    "{}: the client's own web helper is in front ({}); nothing to restore: \
+                     stopping the client if it runs, stashing the helper, putting the shim in \
+                     front of it and starting the client to its window",
+                    exposed.dir.display(),
+                    exposed.shape()
+                ),
+            );
+            self.stop(report)?;
+            Core::settle(&self.paths.prefix_dir)?;
+            let prefix = self.ensure_prefix(report)?;
+            return self.first_run(&prefix, report);
+        }
         let newest = self.usable_snapshot(report)?;
         self.stop(report)?;
         let had_prefix = self.paths.prefix_dir.is_dir();
@@ -2523,7 +2565,18 @@ impl PlannedClientOp {
             Err(error) => return Some(format!("its web helper does not read: {error}")),
         }
         match missing_web_helper(&paths) {
-            Ok(Some(cef)) => Some(format!("{} holds no web helper", cef.display())),
+            Ok(Some(cef)) => {
+                return Some(format!("{} holds no web helper", cef.display()));
+            }
+            Ok(None) => {}
+            Err(error) => return Some(format!("its web helper does not read: {error}")),
+        }
+        match exposed_helper(&paths) {
+            Ok(Some(exposed)) => Some(format!(
+                "{} holds the client's own web helper without the shim in front ({})",
+                exposed.dir.display(),
+                exposed.shape()
+            )),
             Ok(None) => None,
             Err(error) => Some(format!("its web helper does not read: {error}")),
         }
@@ -2653,6 +2706,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one entry per reason and shape")]
     fn every_broken_message_names_its_own_way_out_and_no_restore_without_a_snapshot() {
         let log = PathBuf::from("/x/log.txt");
         let reasons = [
@@ -2673,7 +2727,14 @@ mod tests {
             BrokenReason::NoShim(PathBuf::from("/e/probes/steamwebhelper-shim.exe")),
             BrokenReason::ShimWithoutReal(PathBuf::from("/x/Steam/bin/cef/cef.win64")),
             BrokenReason::NoWebHelper(PathBuf::from("/x/Steam/bin/cef/cef.win64")),
-            BrokenReason::HelperUnshimmed(PathBuf::from("/x/Steam/bin/cef/cef.win64")),
+            BrokenReason::HelperUnshimmed {
+                dir: PathBuf::from("/x/Steam/bin/cef/cef.win64"),
+                stashed: false,
+            },
+            BrokenReason::HelperUnshimmed {
+                dir: PathBuf::from("/x/Steam/bin/cef/cef.win7x64"),
+                stashed: true,
+            },
             BrokenReason::HelperNotLaidDown {
                 dir: PathBuf::from("/x/Steam/bin/cef/cef.win64"),
                 waited: Some(600),
@@ -2699,7 +2760,7 @@ mod tests {
                     | BrokenReason::NoSteamExe(_)
                     | BrokenReason::ShimWithoutReal(_)
                     | BrokenReason::NoWebHelper(_)
-                    | BrokenReason::HelperUnshimmed(_)
+                    | BrokenReason::HelperUnshimmed { .. }
                     | BrokenReason::HelperNotLaidDown { .. }
                     | BrokenReason::HelperUnreadable(_)
                     | BrokenReason::NoSnapshot
