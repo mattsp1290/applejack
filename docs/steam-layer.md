@@ -319,9 +319,11 @@ quiet zone, dark modules in the foreground colour, and the `https://s.team/q/...
 URL under it for a terminal that cannot draw blocks. The encoder is the `qrcode`
 crate without its `image` feature. When Steam rotates the challenge, about every
 30 s, the CLI prints `The challenge rotated; scan this one instead:` and the new
-code and URL. An unscanned challenge ends with exit 1 and ``the QR challenge
-expired after <n> s without a scan; run `applejack steam login --qr` again``,
-where `<n>` counts from the first challenge. A code prompt
+code and URL. An unscanned challenge ends with exit 1. The core's message is
+`the QR challenge expired after <n> s without a scan`, where `<n>` counts from
+the first challenge, and names no command, since the shell shows the same text
+beside its Retry button; the CLI appends ``; run `applejack steam login --qr`
+again`` when it prints it. A code prompt
 keeps polling, so typing the code and approving in the mobile app both finish
 it. Codes are read with echo on: the reader thread is left blocked when the
 login ends first, and a process that exits mid-read with echo off leaves the

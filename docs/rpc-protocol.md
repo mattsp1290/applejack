@@ -426,14 +426,18 @@ pending, so an approval in the Steam mobile app ends the login as a typed code
 does. A poll sooner than Steam's interval answers the current step without
 reaching Steam. A code that arrives once none is wanted is dropped. A wrong code
 answers `SteamGuardRejected` and the login stays open; any other error ends it,
-and a later `complete` answers `SteamLoginFailed`. So does two minutes at
-`waiting`, which ends the login too, and so does a `qr_ready` challenge nobody
-scanned: the CM closes the connection after about two minutes, and the error says
-the challenge expired and after how many seconds. A `session_id` that is not the pending one
-answers `SteamLoginFailed` and leaves that login alone. One login is pending at a
-time: `steam.login.start` drops the last. These requests block the loop for one Steam
-call, bounded at 30 s, or longer while `start` tries up to three CMs. Their params
-and results never reach a log.
+and a later `complete` answers `SteamLoginFailed`. Two minutes at `waiting` ends
+the login with `SteamLoginFailed`. So does a `qr_ready` challenge nobody
+scanned: the CM closes the connection after about two minutes, and that
+`complete` answers `SteamLoginFailed` with the message `the QR challenge expired
+after <n> s without a scan`. The message names no command: a client offers its
+own "sign in again" affordance (the shell's Retry button; the CLI appends ``;
+run `applejack steam login --qr` again`` when it prints the text). A
+`session_id` that is not the pending one answers `SteamLoginFailed` and leaves
+that login alone. One login is pending at a time: `steam.login.start` drops the
+last. These requests block the loop for one Steam call, bounded at 30 s, or
+longer while `start` tries up to three CMs. Their params and results never
+reach a log.
 
 `steam.library` answers from the cache and touches nothing else. With
 `refresh: true` it answers the cache as it stood plus `job_id`, and fetches on that
