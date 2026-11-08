@@ -2,31 +2,20 @@ import SwiftUI
 
 public struct LibraryView: View {
     let models: ShellModels
+    @Bindable var model: LibraryViewModel
     @State private var path: [UInt32] = []
-    var model: LibraryViewModel { models.library }
 
     public init(models: ShellModels) {
         self.models = models
+        _model = Bindable(models.library)
     }
 
     public var body: some View {
         NavigationStack(path: $path) {
-            FlowStateView(model.library, retry: { Task { await model.load() } }) { library in
-                List(library.apps) { entry in
-                    HStack {
-                        NavigationLink(value: entry.appid) {
-                            VStack(alignment: .leading) {
-                                Text(entry.title)
-                                Text("App \(entry.appid) · \(entry.drm.rawValue) DRM").font(.caption).foregroundStyle(.secondary)
-                            }
-                        }
-                        .accessibilityLabel(entry.title)
-                        .accessibilityIdentifier("library.app.\(entry.appid)")
-                        Spacer()
-                        installColumn(entry)
-                    }
-                }
+            FlowStateView(model.library, retry: { Task { await model.load() } }) { _ in
+                titles
             }
+            .searchable(text: $model.query, prompt: "Name or appid")
             .navigationDestination(for: UInt32.self) { appid in
                 GameDetailView(models: models, appid: appid)
             }
@@ -42,6 +31,46 @@ public struct LibraryView: View {
             await model.load()
         }
         .onChange(of: path) { _, next in models.libraryDetail = next.last }
+    }
+
+    @ViewBuilder
+    private var titles: some View {
+        let apps = model.filteredApps
+        let count = model.matchCount
+        VStack(spacing: 0) {
+            if apps.isEmpty, count != nil {
+                ContentUnavailableView.search(text: model.trimmedQuery)
+            } else {
+                List(apps, selection: $model.selection) { entry in
+                    row(entry)
+                }
+            }
+            if let count {
+                Divider()
+                Text(count)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .accessibilityIdentifier("library.matchCount")
+            }
+        }
+    }
+
+    private func row(_ entry: LibraryEntry) -> some View {
+        HStack {
+            NavigationLink(value: entry.appid) {
+                VStack(alignment: .leading) {
+                    Text(entry.title)
+                    Text("App \(entry.appid) · \(entry.drm.rawValue) DRM").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityLabel(entry.title)
+            .accessibilityIdentifier("library.app.\(entry.appid)")
+            Spacer()
+            installColumn(entry)
+        }
     }
 
     @ViewBuilder

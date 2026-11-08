@@ -34,8 +34,9 @@ pub struct SteamArgs {
 enum Action {
     /// Sign in once; the refresh token goes to the Keychain
     Login {
-        /// Print a challenge for the Steam mobile app to scan, instead of
-        /// asking for the account name and password
+        /// Draw a QR code in the terminal for the Steam mobile app to scan,
+        /// with the URL under it, instead of asking for the account name and
+        /// password
         #[arg(long)]
         qr: bool,
     },
@@ -146,13 +147,41 @@ fn read_codes() -> Receiver<String> {
     codes
 }
 
-fn show(step: &LoginStep) {
-    match step {
-        LoginStep::QrReady { payload } => {
-            say(&format!(
-                "Scan this as a QR code with the Steam mobile app:\n{payload}"
-            ));
+/// The line above the drawing. `first_challenge` is false once a QR challenge
+/// has been on screen: Steam rotates it about every 30 s, and the user should
+/// know the old one is dead.
+fn qr_intro(first_challenge: bool) -> &'static str {
+    if first_challenge {
+        "Scan this QR code with the Steam mobile app:"
+    } else {
+        "The challenge rotated; scan this one instead:"
+    }
+}
+
+/// What a `QrReady` step prints: the intro, the drawing when the payload fits
+/// a QR code, and the URL for a terminal that cannot show the blocks.
+fn qr_lines(payload: &str, first_challenge: bool) -> String {
+    let intro = qr_intro(first_challenge);
+    match crate::qr::half_blocks(payload) {
+        Some(drawing) => format!("{intro}\n{drawing}\n{payload}"),
+        None => format!("{intro}\n{payload}"),
+    }
+}
+
+/// The core's expiry message names no command, since the shell shows the same
+/// text beside its Retry button; the command is this one.
+fn name_the_command(error: CoreError) -> CoreError {
+    match error {
+        CoreError::SteamQrExpired { .. } => {
+            CoreError::Message(format!("{error}; run `applejack steam login --qr` again"))
         }
+        other => other,
+    }
+}
+
+fn show(step: &LoginStep, first_challenge: bool) {
+    match step {
+        LoginStep::QrReady { payload } => say(&qr_lines(payload, first_challenge)),
         LoginStep::GuardRequired {
             factor: GuardFactor::DeviceConfirmation,
         } => say("Approve the sign-in in the Steam mobile app."),
@@ -185,7 +214,10 @@ fn login(qr: bool) -> Result<String, CoreError> {
             return Ok(format!("signed in as {account_name}"));
         }
         if shown.as_ref() != Some(&step) {
-            show(&step);
+            let first_challenge = shown
+                .as_ref()
+                .is_none_or(|previous| !matches!(previous, LoginStep::QrReady { .. }));
+            show(&step, first_challenge);
             shown = Some(step);
         }
         let interval = flow.poll_interval();
@@ -203,7 +235,7 @@ fn login(qr: bool) -> Result<String, CoreError> {
             Err(error) if error.code() == ErrorCode::SteamGuardRejected => {
                 say(&format!("{error}; type it again."));
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(name_the_command(error)),
         }
     }
 }
@@ -284,5 +316,43 @@ mod tests {
             install_state: InstallState::UpdateAvailable,
         });
         assert_eq!(line, "     480      2.5 GB  unknown  update     Example");
+    }
+
+    const CHALLENGE: &str = "https://s.team/q/1/1234567890123456";
+
+    #[test]
+    fn a_rotation_says_the_old_code_is_dead_and_the_first_challenge_does_not() {
+        let first = qr_lines(CHALLENGE, true);
+        let rotated = qr_lines(CHALLENGE, false);
+        assert!(
+            first.starts_with("Scan this QR code with the Steam mobile app:\n"),
+            "{first}"
+        );
+        assert!(!first.contains("rotated"), "{first}");
+        assert!(
+            rotated.starts_with("The challenge rotated; scan this one instead:\n"),
+            "{rotated}"
+        );
+        assert!(!rotated.contains("Scan this QR code"), "{rotated}");
+        for lines in [&first, &rotated] {
+            assert!(lines.ends_with(&format!("\n{CHALLENGE}")), "{lines}");
+            assert!(lines.lines().count() > 2, "a drawing sits between: {lines}");
+        }
+        assert_eq!(
+            qr_lines(&"x".repeat(3000), true).lines().count(),
+            2,
+            "over capacity, the intro and the URL alone"
+        );
+    }
+
+    #[test]
+    fn the_expiry_gains_this_command_and_other_errors_pass_through() {
+        let error = name_the_command(CoreError::SteamQrExpired { seconds: 125 });
+        assert_eq!(
+            error.to_string(),
+            "the QR challenge expired after 125 s without a scan; run `applejack steam login --qr` again"
+        );
+        let other = name_the_command(CoreError::NoSuchLogin);
+        assert!(matches!(other, CoreError::NoSuchLogin), "{other}");
     }
 }

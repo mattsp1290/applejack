@@ -123,6 +123,152 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
+    /// `FAKE_CORE_LIBRARY=mixed` answers fifteen titles in the core's order.
+    /// The view shows the installed and updating ones first, each group in
+    /// Finder's order (`half-life` with `Half-Life 2`, `Éclair` among the
+    /// E's, `Trials 2` before `Trials 10`), two titles of one name by appid,
+    /// and a title with no name, or an empty one, under the "App <appid>" it
+    /// is shown as. The names avoid letters whose place depends on the locale
+    /// (Ö, Å, Aa in sv/da), so the pinned order holds on any host's locale.
+    func testTheLibraryListsInstalledTitlesFirstThenByName() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
+        let library = LibraryViewModel(app: app)
+        XCTAssertEqual(library.sortedApps, [], "nothing loaded is an empty list, not a crash")
+        await library.load()
+        let raw = try XCTUnwrap(library.library.value?.apps)
+        XCTAssertEqual(raw.map(\.appid), [440, 1000, 220, 2200, 999, 400, 123456, 620, 1296610, 70, 570, 3200, 3000, 7, 3100], "the fake's rows are the core's order")
+        XCTAssertEqual(library.sortedApps.map(\.appid), [570, 70, 220, 620, 7, 123456, 999, 1000, 3000, 1296610, 400, 2200, 440, 3100, 3200])
+        XCTAssertEqual(library.sortedApps.prefix(4).map(\.installState), [.updateAvailable, .installed, .installed, .installed])
+        XCTAssertEqual(library.sortedApps[4].title, "App 7", "an empty name is shown, and sorted, as the appid")
+        XCTAssertEqual(library.filteredApps, library.sortedApps, "no query shows every title, in order")
+        XCTAssertNil(library.matchCount, "no count line without a query")
+        await app.shutdown()
+    }
+
+    private func libraryEntry(_ appid: UInt32, _ name: String?) -> LibraryEntry {
+        LibraryEntry(appid: appid, name: name, installdir: "\(appid)", sizeBytes: 1, drm: .none, defaultBranch: "public", installState: .notInstalled)
+    }
+
+    /// Case and accents never decide between two names: the appid does.
+    func testNamesThatDifferOnlyInCaseOrAccentsGoByAppid() {
+        XCTAssertEqual(LibraryViewModel.ordered([libraryEntry(1000, "duplicate"), libraryEntry(999, "Duplicate")]).map(\.appid), [999, 1000], "a case-only pair, the lower appid first")
+        XCTAssertEqual(LibraryViewModel.ordered([libraryEntry(3001, "Eclair"), libraryEntry(3000, "Éclair")]).map(\.appid), [3000, 3001], "an accent-only pair, the lower appid first")
+    }
+
+    /// `Abzu` sorts before `App` and `Bastion` after it, so a title with an
+    /// empty or no name lands between them only under its shown name.
+    func testANamelessTitleSortsUnderItsShownName() {
+        let entries = [libraryEntry(7, ""), libraryEntry(10, "Bastion"), libraryEntry(8, nil), libraryEntry(9, "Abzu")]
+        XCTAssertEqual(LibraryViewModel.ordered(entries).map(\.appid), [9, 7, 8, 10])
+        XCTAssertEqual(libraryEntry(11, " ").title, "App 11", "a whitespace-only name is no name")
+    }
+
+    func testSearchMatchesNamesAndAppidPrefixes() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
+        let library = LibraryViewModel(app: app)
+        await library.load()
+
+        library.query = "portal"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [620, 400], "a name substring, case-insensitive, installed first")
+        XCTAssertEqual(library.matchCount, "Showing 2 of 15 titles")
+
+        library.query = "PEG"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [1296610])
+        XCTAssertEqual(library.matchCount, "Showing 1 of 15 titles")
+
+        library.query = "PEGLIN"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [1296610], "capitals fold without the locale's rules")
+
+        library.query = "Ｐｏｒｔａｌ"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [620, 400], "full-width letters match their ASCII forms")
+
+        library.query = "eclair"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [3000], "a name substring without regard to diacritics")
+
+        library.query = "22"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [220, 2200], "an appid prefix: 220 and 2200 start with 22")
+
+        library.query = "61"
+        XCTAssertEqual(library.filteredApps, [], "an appid prefix, not a substring: 1296610 contains 61 but does not start with it")
+
+        library.query = "123456"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [123456], "a title with no name is found by its appid")
+
+        library.query = "app 7"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [7], "the shown name is matched: an empty name shows as App 7")
+
+        library.query = "app"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [7, 123456], "the shown name: `App <appid>` for a title with no name or an empty one")
+
+        library.query = "life 2"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [220], "a substring with a space; `half-life` alone does not contain it")
+
+        library.query = "no such title"
+        XCTAssertEqual(library.filteredApps, [])
+        XCTAssertEqual(library.matchCount, "Showing 0 of 15 titles")
+
+        library.query = "   "
+        XCTAssertEqual(library.filteredApps, library.sortedApps, "whitespace alone is no query")
+        XCTAssertNil(library.matchCount)
+
+        library.query = ""
+        XCTAssertEqual(library.filteredApps.count, 15, "clearing the query restores the full list")
+        XCTAssertNil(library.matchCount)
+        await app.shutdown()
+    }
+
+    func testTheSelectionSurvivesAQueryTheTitleStillMatches() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
+        let library = LibraryViewModel(app: app)
+        await library.load()
+        library.selection = 620
+        library.query = "portal"
+        XCTAssertEqual(library.selection, 620, "Portal 2 matches `portal`")
+        library.query = "62"
+        XCTAssertEqual(library.selection, 620, "and its appid prefix")
+        library.query = "dota"
+        XCTAssertNil(library.selection, "a title the query hides is no longer selected")
+        library.query = ""
+        XCTAssertNil(library.selection, "clearing the query does not bring a selection back")
+        library.selection = 440
+        library.query = ""
+        XCTAssertEqual(library.selection, 440, "no query hides nothing")
+        await app.shutdown()
+    }
+
+    /// `FAKE_CORE_LIBRARY=mixed-then-pair` answers the mixed list once and
+    /// the two-title pair, in reverse order, to every later read.
+    func testAReloadReSortsAndDropsASelectionItNoLongerLists() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed-then-pair"])
+        let library = LibraryViewModel(app: app)
+        await library.load()
+        XCTAssertEqual(library.sortedApps.count, 15)
+        library.selection = 1296610
+        await library.load()
+        XCTAssertEqual(try XCTUnwrap(library.library.value?.apps).map(\.appid), [440, 220], "the fake's second answer is the pair, scrambled")
+        XCTAssertEqual(library.sortedApps.map(\.appid), [220, 440], "a reload replacing the list re-sorts it")
+        XCTAssertNil(library.selection, "a reload that drops the highlighted title clears the highlight")
+        library.selection = 220
+        await library.load()
+        XCTAssertEqual(library.selection, 220, "a reload that keeps the title keeps the highlight through `.loading`")
+        await app.shutdown()
+    }
+
+    /// `FAKE_CORE_JOB_OUTCOME=never` holds a refresh in `.loading`.
+    func testAQueryTypedWhileLoadingKeepsTheHighlight() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed", "FAKE_CORE_JOB_OUTCOME": "never"])
+        let library = LibraryViewModel(app: app)
+        await library.load()
+        library.selection = 620
+        let refresh = Task { await library.load(refresh: true) }
+        try await waitUntil { library.library == .loading }
+        XCTAssertEqual(library.sortedApps, [], "nothing is listed while loading, not the old list")
+        library.query = "dota"
+        XCTAssertEqual(library.selection, 620, "a query typed while loading leaves the highlight to the next list")
+        await app.shutdown()
+        await refresh.value
+    }
+
     func testConfigEditorLoadsAndSets() async throws {
         let app = makeApp()
         let detail = GameDetailViewModel(app: app, appid: 220)
@@ -689,6 +835,26 @@ final class ViewModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(try requests(for: "steam.login.complete", in: secondRequestLog).count, 1, "an error ends the loop")
         await failing.shutdown()
+    }
+
+    /// The core's expiry text names no command. `FailureView` shows it as
+    /// `describe` renders it, with the Retry button `SteamAccountView` wires
+    /// to `startQrLogin`, which is the remedy here.
+    func testAnExpiredQrChallengeShowsTheCoreTextAndRetryStartsAgain() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_EXPIRE": "1"])
+        let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(30))
+        await steam.startQrLogin()
+        await steam.waitForLogin()
+        let expiry = RpcError(code: RpcErrorCode.steamLoginFailed.rawValue, message: "the QR challenge expired after 125 s without a scan")
+        XCTAssertEqual(steam.login, .failed(.rpc(expiry)))
+        XCTAssertFalse(steam.isPolling)
+        XCTAssertEqual(describe(.rpc(expiry)), "the QR challenge expired after 125 s without a scan (code 1021)")
+        XCTAssertFalse(describe(.rpc(expiry)).contains("applejack"), "no terminal command in the shell")
+        XCTAssertEqual(try requests(for: "steam.login.start").count, 1)
+        await steam.startQrLogin()
+        await steam.waitForLogin()
+        XCTAssertEqual(try requests(for: "steam.login.start").count, 2, "Retry begins a fresh login")
+        await app.shutdown()
     }
 
     func testGuardCodeIsWantedUnlessTheFactorIsDeviceConfirmation() async throws {
