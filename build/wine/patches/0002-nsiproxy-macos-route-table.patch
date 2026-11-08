@@ -1,5 +1,5 @@
 Origin: applejack
-Date: 2026-11-06
+Date: 2026-11-08
 Reason: On macOS the route table nsiproxy.sys builds from the PF_ROUTE sysctl
  dump includes interface-scoped routes (RTF_IFSCOPE: a VPN tunnel's own
  default route, and the scoped copy of the real one), the ARP and ND cache
@@ -15,14 +15,16 @@ Reason: On macOS the route table nsiproxy.sys builds from the PF_ROUTE sysctl
  because the kernel's netmask sockaddr has no family; and every utun
  reported IF_TYPE_OTHER. The Steam client's CM connect loop seen at the
  same time is not this: it persisted with the patch and with every adapter
- but en0 and lo0 hidden, and 0003 fixes it (U22b, 2026-11-08). Measured with
- crates/applejack-engine/probes/netprobe on 2026-11-06, see
- .agents/orchestrate/macos-windows-steam-runner/reports/U22a.md.
- After the patch the table matches what the Linux code in the same file
- reports from /proc/net/route: one default route, host routes /32, next
- hops only on gateway routes, loopback marked, point-to-point tunnels as
- MIB_IF_TYPE_PPP (as Linux tun devices), and netmasks read by the address's
- family.
+ but en0 and lo0 hidden, and 0003 fixes it (U22b, 2026-11-08); see "The CM
+ connect loop" in docs/steam-runtime.md. Measured with
+ crates/applejack-engine/probes/netprobe on 2026-11-06.
+ After the patch the table has the shape the Linux code in the same file
+ builds from /proc/net/route: one default route on this host, host routes
+ /32, next hops only on gateway routes, and point-to-point tunnels as
+ MIB_IF_TYPE_PPP (as Linux tun devices); netmasks are read by the address's
+ family. Routes into 127/8 are marked loopback, as are the 127/8 and
+ 127.0.0.1/32 routes the Linux code adds; the Linux code also marks every
+ direct /32 route from /proc/net/route as loopback, and this patch does not.
 Drop-when: upstream wine's dlls/nsiproxy.sys/ip.c skips RTF_IFSCOPE and
  cloned routes in ipv4_forward_enumerate_all and resets prefix_len and
  next_hop per route; check each Wine bump.

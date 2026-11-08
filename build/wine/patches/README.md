@@ -53,7 +53,8 @@ adapter list that `nsiproxy.sys` builds on macOS match what the same file
 builds on Linux, which is what Windows programs expect: interface-scoped
 routes (`RTF_IFSCOPE`, a VPN tunnel's own default route) and the ARP cache
 (`RTF_WASCLONED`, `RTF_LLINFO`) are not routes, host routes are /32, only
-gateway routes carry a next hop, loopback routes are marked, point-to-point
+gateway routes carry a next hop, routes into 127/8 are marked loopback (the
+Linux code also marks its direct /32 routes, this patch does not), point-to-point
 tunnels are `MIB_IF_TYPE_PPP`, and a netmask is read by its address's family
 (the kernel leaves the netmask's own family unset). Without it, with Tailscale
 up, `GetIpForwardTable` held three default routes, `GetAdaptersAddresses` gave
@@ -71,7 +72,8 @@ byte; a stale byte above it restarted the enumeration on every call, so
 `GetLogicalDrives` never returned. The Steam client's machine-ID thread calls
 it through WMI's `Win32_DiskPartition`, and the client's CM connect waits for
 that thread: without the patch the client logs `EConnect called - scheduling
-connection for 50ms from now` ten times a second and never connects.
+connection for 50ms from now` ten times a second and never connects. Other
+syscalls share the cause; see "Sub-int arguments to unix syscalls" below.
 
 `0004-iphlpapi-best-route-port.patch` gives `GetBestRoute2`'s routing probe a
 port. It asks the kernel for the route by connecting a UDP socket to the
@@ -84,3 +86,56 @@ Wine is LGPL: this directory is the source of the changes the bundle's `wine/`
 carries. `THIRD_PARTY_NOTICES.md` in the bundle links it at the commit that last
 changed it, which `build/assemble.sh` reads from Git, so a bundle meant to leave
 this repository is assembled from a commit on `main`.
+
+## Sub-int arguments to unix syscalls
+
+0003 fixes one case of a class. Wine's x86_64 syscall dispatcher copies each
+PE argument slot into the SysV argument registers as a whole 64-bit value.
+Under the Windows ABI the bits above a BOOLEAN (or any argument narrower than
+32 bits) are undefined, and a PE caller often writes only the low byte; clang,
+compiling the unix side for the SysV ABI, assumes the caller zero-extended it
+and may test 32 bits. Whether a call then misbehaves depends on what the
+caller left in the upper bits, which is stack and register contents, so it
+comes and goes.
+
+In the stock Wine 11.0 `x86_64-unix/ntdll.so` (measured with `objdump`) these
+syscalls read a register-passed BOOLEAN as 32 bits and are not patched:
+
+| Syscall | Argument | Read |
+| --- | --- | --- |
+| `NtDelayExecution` | `alertable` | `testl %edi,%edi` |
+| `NtContinue` | `alertable` | `testl %esi,%esi` |
+| `NtDuplicateToken` | `effective_only` | `testl %ecx,%ecx` |
+| `NtQueryDefaultLocale`, `NtSetDefaultLocale` | `user` | `testl %edi,%edi` |
+| `NtWaitForMultipleObjects` | `alertable` | spilled and passed on as 32 bits (`movl %ecx,-0x2c(%rbp)`), possibly exposed through its callee |
+
+None has been seen to fail. kernelbase's `SleepEx`, the common route into
+`NtDelayExecution`, passes a whole 32-bit `BOOL`; a caller that set only the
+low byte with dirty bits above would turn a non-alertable sleep into an
+alertable wait. They stay unpatched until a failure is observed.
+
+Not exposed in the same build: BOOLEANs passed on the stack (the seventh
+argument onward, such as `NtQueryDirectoryFile`'s `single_entry` and
+`restart_scan`) are loaded with `movzbl`, and several register BOOLEANs are
+read only through their low byte (`NtWaitForSingleObject`,
+`NtSignalAndWaitForSingleObject`, `NtSetTimer`, `NtCreateEvent`,
+`NtCreateMutant`, `NtCommitTransaction`, `NtRollbackTransaction`,
+`NtSetTimerResolution`, the keyed events).
+
+To check a new Wine build, disassemble each unix syscall that takes a BOOLEAN
+and look at the first use of the argument's register (SysV order `rdi`,
+`rsi`, `rdx`, `rcx`, `r8`, `r9`; seventh and later on the stack):
+
+```
+objdump -d --no-show-raw-insn --disassemble-symbols=_NtDelayExecution \
+  build/work/wine/stage/lib/wine/x86_64-unix/ntdll.so
+```
+
+A `testl`, `cmpl` or 32-bit `cmov` on the register (`%edi`, `%r8d`) means
+the upper bits count: exposed. A `movzbl` from the 8-bit register (`%dil`,
+`%r8b`), a `testb` or a `cmpb` reads the byte alone. A 32-bit `movl` copy or
+spill decides nothing yet: follow the copy to its first test, or into the
+callee it is passed to.
+A fix per function reloads the argument through `volatile BOOLEAN`, as 0003
+does; the general fix is for the dispatcher to zero-extend sub-int arguments,
+and is upstream's to make.

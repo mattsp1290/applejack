@@ -12,7 +12,7 @@ Reason: GetBestRoute2 asks the kernel for the route to a destination by
  port does not change the route. Measured 2026-11-08 with
  crates/applejack-engine/probes/netprobe under WINEDEBUG=warn+iphlpapi:
  two warnings and the fallback before, none after, the same interface (en0)
- on this host. See .agents/orchestrate/macos-windows-steam-runner/reports/U22b.md.
+ on this host. See build/wine/patches/README.md.
 Drop-when: upstream wine's GetBestRoute2 sets a port before its connect()
  probe; check each Wine bump.
 
