@@ -591,10 +591,18 @@ impl ClientPaths {
     }
 
     /// Where `repair --reinstall` keeps the old `package/` until the new
-    /// client reaches its end check.
+    /// `steam.exe` starts.
     #[must_use]
     pub fn package_aside(&self) -> PathBuf {
         self.steam_dir().join("package.reinstall-old")
+    }
+
+    /// The old `package/` once the new `steam.exe` started: renamed here
+    /// before its removal, so a removal that stops partway leaves nothing
+    /// that is ever put back.
+    #[must_use]
+    pub fn package_retired(&self) -> PathBuf {
+        self.steam_dir().join("package.reinstall-done")
     }
 
     #[must_use]
@@ -1001,6 +1009,20 @@ fn cef_helpers_read(paths: &ClientPaths) -> Result<(), CoreError> {
         shim_file(&dir.join(WEBHELPER_REAL), None)?;
     }
     Ok(())
+}
+
+/// Removes a retired old package; a removal that fails is a `phase` line,
+/// since the new package is already the client's and the next op retries.
+fn remove_retired(retired: &Path, phase: &str, report: &mut dyn FnMut(&str, String)) {
+    if let Err(error) = fs::remove_dir_all(retired) {
+        report(
+            phase,
+            format!(
+                "could not remove {}: {error}; the next op removes it",
+                retired.display()
+            ),
+        );
+    }
 }
 
 /// Whether the lines `path` gained past `offset` are the client ending on
@@ -1663,6 +1685,9 @@ pub struct PlannedClientOp {
     installed: InstalledEngine,
     paths: ClientPaths,
     op: ClientOp,
+    /// `repair --reinstall` moved `package/` aside and no `steam.exe` has
+    /// started on the new one yet.
+    aside_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1859,6 +1884,7 @@ impl Core {
             installed,
             paths,
             op,
+            aside_pending: false,
         })
     }
 }
@@ -1910,10 +1936,22 @@ impl PlannedClientOp {
         fetch: Fetcher<'_>,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
-        // A reinstall that died left the old package aside; restoring it
-        // undoes whatever half of the new one is there. The one window in
-        // which the new package is whole is between its end check and the
-        // removal, and the restore costs that client one self-update.
+        // A retired package is one a reinstall was removing after its new
+        // client started; whatever part is left is never put back.
+        let retired = self.paths.package_retired();
+        if fs::symlink_metadata(&retired).is_ok() {
+            report(
+                "package",
+                format!(
+                    "removing {}, left by a reinstall whose new client had started",
+                    retired.display()
+                ),
+            );
+            remove_retired(&retired, "package", report);
+        }
+        // An aside copy exists only before the new client's first start, so
+        // it is the whole old package and `package/` holds none of the new
+        // client's self-update: restoring it loses nothing.
         if self.paths.package_aside().is_dir() {
             self.put_package_back(report, "left by a reinstall that did not finish")?;
         }
@@ -1924,6 +1962,29 @@ impl PlannedClientOp {
             ClientOp::Update => self.update(report),
             ClientOp::Stop => self.stop(report),
         }
+    }
+
+    /// The reinstall's commit point, at the new `steam.exe`'s start: from
+    /// here its self-update fills `package/`, so the aside copy is renamed
+    /// to [`ClientPaths::package_retired`] (whole or not there, never
+    /// restored) and then removed, a failed removal being a line. A rename
+    /// that fails leaves the copy aside for the failure path to restore.
+    fn retire_aside(&mut self, report: &mut dyn FnMut(&str, String)) -> Result<(), CoreError> {
+        if !std::mem::take(&mut self.aside_pending) {
+            return Ok(());
+        }
+        let aside = self.paths.package_aside();
+        let retired = self.paths.package_retired();
+        report("repair", format!("removing {}", aside.display()));
+        if fs::symlink_metadata(&retired).is_ok() {
+            let _ = fs::remove_dir_all(&retired);
+        }
+        if let Err(error) = fs::rename(&aside, &retired) {
+            self.aside_pending = true;
+            return Err(CoreError::io(&aside, error));
+        }
+        remove_retired(&retired, "repair", report);
+        Ok(())
     }
 
     /// Stops the client if it runs and puts the moved-aside package back in
@@ -2089,20 +2150,22 @@ impl PlannedClientOp {
             self.stop(report)?;
             let package = self.paths.package();
             let aside = self.paths.package_aside();
-            let moved = package.is_dir();
-            if moved {
+            if package.is_dir() {
                 report(
                     "repair",
                     format!(
-                        "moving {} aside to {} until the new client reaches its window",
+                        "moving {} aside to {} until the new client starts",
                         package.display(),
                         aside.display()
                     ),
                 );
                 fs::rename(&package, &aside).map_err(|error| CoreError::io(&package, error))?;
+                self.aside_pending = true;
             }
             if let Err(error) = self.lay_down(fetch, &prefix, true, report) {
-                if moved
+                // Past the new client's start the aside copy is gone and its
+                // self-update stays for `install` to resume.
+                if self.aside_pending
                     && let Err(restore) =
                         self.put_package_back(report, "since the reinstall failed")
                 {
@@ -2114,10 +2177,7 @@ impl PlannedClientOp {
                 }
                 return Err(error);
             }
-            if moved {
-                report("repair", format!("removing {}", aside.display()));
-                fs::remove_dir_all(&aside).map_err(|error| CoreError::io(&aside, error))?;
-            }
+            self.retire_aside(report)?;
             return self.end_check();
         }
         let bootstrap = !self.paths.steam_exe().is_file();
@@ -2273,6 +2333,8 @@ impl PlannedClientOp {
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
         if self.client_up_with_server() {
+            // A client someone else started fills `package/` as ours would.
+            self.retire_aside(report)?;
             self.wait_window(None, None, false, report)?;
             return self.finish(report);
         }
@@ -2389,6 +2451,7 @@ impl PlannedClientOp {
             cpuid_probe: None,
         };
         let session = self.core.engine.launch(&self.installed, prefix, &spec)?;
+        self.retire_aside(report)?;
         self.core.db()?.meta_set(META_CLIENT_SESSION, &key)?;
         let _ = log_line(
             &self.log_path().to_string_lossy(),
@@ -2455,7 +2518,9 @@ impl PlannedClientOp {
 
     /// The first-run timeout passed without the window: the client is
     /// stopped and its files kept, and the error carries what `status`
-    /// reads then, under the timeout's own lead, so the two cannot differ.
+    /// reads then, under the timeout's own lead. No restore follows (a
+    /// reinstall's aside copy went at the start this wait follows), so the
+    /// two cannot differ.
     fn window_timed_out(&mut self, report: &mut dyn FnMut(&str, String)) -> CoreError {
         let _ = self.stop(report);
         let secs = self.core.tuning.first_run_timeout.as_secs();
@@ -2719,7 +2784,7 @@ impl PlannedClientOp {
                 Err(error) => why = BrokenReason::HelperUnreadable(error.to_string()).cause(),
                 Ok(()) => {
                     if let Some(exposed) = exposed_helper(&self.paths).ok().flatten() {
-                        return self.reshim_in_place(&exposed, report);
+                        return self.reshim_in_place(&exposed, false, report);
                     }
                 }
             }
@@ -2771,32 +2836,47 @@ impl PlannedClientOp {
             }
         }
         let _ = fs::remove_file(self.paths.install_marker());
-        let (state, detail) = self.core.runtime_state(true)?;
-        if state == ClientRuntimeState::Broken {
-            return Err(BrokenReason::StillBroken {
-                timestamp: newest.timestamp,
-                detail,
+        match self.core.runtime_reading(true)? {
+            // A snapshot taken while a helper ran unshimmed: restored, it is
+            // the in-place pass's, as the live client would be.
+            RuntimeReading::Broken(BrokenReason::HelperUnshimmed { dir, stashed }) => {
+                self.reshim_in_place(&ExposedHelper { dir, stashed }, true, report)
             }
-            .into_error());
+            RuntimeReading::Broken(reason) => Err(BrokenReason::StillBroken {
+                timestamp: newest.timestamp,
+                detail: reason.detail(),
+            }
+            .into_error()),
+            RuntimeReading::Other(..) => Ok(()),
         }
-        Ok(())
     }
 
     /// `repair`'s fix for a client whose one break is `exposed`: the shim
     /// pass puts the shim in front and downloads nothing, where a snapshot
     /// restore would roll the client back for no reason. `Ok` only when the
     /// runtime no longer reads `broken`, as the restore path promises.
+    /// `restored`: the helper came with the snapshot just restored.
     fn reshim_in_place(
         &mut self,
         exposed: &ExposedHelper,
+        restored: bool,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
+        let whose = if restored {
+            "the restored client's own web helper is in front"
+        } else {
+            "the client's own web helper is in front"
+        };
+        let what = if restored {
+            "putting the shim in front of it"
+        } else {
+            "nothing to restore"
+        };
         report(
             "repair",
             format!(
-                "{}: the client's own web helper is in front ({}); nothing to restore: \
-                 stopping the client if it runs, stashing the helper, putting the shim in \
-                 front of it and starting the client to its window",
+                "{}: {whose} ({}); {what}: stopping the client if it runs, stashing the \
+                 helper, putting the shim in front of it and starting the client to its window",
                 exposed.dir.display(),
                 exposed.shape()
             ),
@@ -2847,7 +2927,9 @@ impl PlannedClientOp {
     }
 
     /// Why `repair` cannot restore the snapshot at `dir`, or `None` when it
-    /// can: its prefix record opens and it holds `steam.exe`.
+    /// can: its prefix record opens, it holds `steam.exe`, and each helper
+    /// reads and is there. A helper without the shim in front is fine: the
+    /// in-place pass follows the restore.
     fn unusable_snapshot_reason(&self, dir: &Path) -> Option<String> {
         if let Err(error) = self.core.engine.open_prefix(dir) {
             return Some(format!("its prefix record does not open: {error}"));
@@ -2873,15 +2955,9 @@ impl PlannedClientOp {
             Ok(None) => {}
             Err(error) => return Some(format!("its web helper does not read: {error}")),
         }
-        match exposed_helper(&paths) {
-            Ok(Some(exposed)) => Some(format!(
-                "{} holds the client's own web helper without the shim in front ({})",
-                exposed.dir.display(),
-                exposed.shape()
-            )),
-            Ok(None) => None,
-            Err(error) => Some(format!("its web helper does not read: {error}")),
-        }
+        cef_helpers_read(&paths)
+            .err()
+            .map(|error| format!("its web helper does not read: {error}"))
     }
 }
 

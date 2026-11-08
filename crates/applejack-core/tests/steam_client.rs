@@ -1082,8 +1082,9 @@ fn repair_restores_the_newest_snapshot_and_reinstall_reruns_the_bootstrapper() {
         "the bootstrapper ran again"
     );
     assert!(
-        !fixture.steam_dir().join("package.reinstall-old").exists(),
-        "the old package goes once the new client reached its window: {lines:?}"
+        !fixture.steam_dir().join("package.reinstall-old").exists()
+            && !fixture.steam_dir().join("package.reinstall-done").exists(),
+        "the old package goes once the new client starts: {lines:?}"
     );
     drop(server);
     fixture.stop_client();
@@ -1871,11 +1872,17 @@ fn a_file_check_that_lays_no_helper_times_out_naming_reinstall_and_reinstall_rec
 /// `repair --reinstall`, the way out `NoWebHelper` names, starts the
 /// client's self-update with no manifest; when that does not reach the
 /// window within the timeout (the stub's `no-self-update` knob: the
-/// self-update lays nothing), the client is stopped and the old package is
-/// put back, so the error and `status` read the `broken` of before, and a
-/// second `repair --reinstall` recovers through the self-update.
+/// self-update lays nothing), the error is the plain `updating` timeout,
+/// not the file-check one (nothing checked, and `repair --reinstall` again
+/// would restart the whole download). The new client had started, so the
+/// old package moved aside is gone and nothing is put back: `status` reads
+/// `updating`, and `install` resumes the self-update to the window.
 #[test]
-fn a_reinstall_whose_self_update_times_out_puts_the_old_package_back() {
+#[expect(
+    clippy::too_many_lines,
+    reason = "the reinstall and the install that resumes it, in the order the user sees them"
+)]
+fn a_reinstall_whose_self_update_times_out_stays_updating_and_install_resumes_it() {
     let mut fixture = Fixture::new();
     fixture.install();
     fixture.stop_through_product();
@@ -1883,23 +1890,50 @@ fn a_reinstall_whose_self_update_times_out_puts_the_old_package_back() {
     fs::remove_file(fixture.cef_dir().join(WEBHELPER_REAL)).unwrap();
     fs::write(fixture.prefix_dir().join("no-file-check"), "").unwrap();
     fs::write(fixture.prefix_dir().join("no-self-update"), "").unwrap();
-    let before = fixture.core().client_runtime_state().unwrap();
-    assert_eq!(before.0, ClientRuntimeState::Broken);
-    let package = fixture.steam_dir().join("package");
-    let files = tree(&package);
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::Broken
+    );
     fixture.tuning = SHORT_WINDOW;
     fixture.clear_client_starts();
     let cef = fixture.cef_dir().display().to_string();
+    let aside = fixture.steam_dir().join("package.reinstall-old");
     let (outcome, lines) = fixture.reinstall_hooked(
         &mut fixture.server_at("start: starting steam.exe for its self-update, without"),
     );
     let error = outcome.unwrap_err();
     assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Updating,
+                ..
+            }
+        ),
+        "the self-update's timeout is not the file check's: {error}"
+    );
     let message = error.to_string();
+    assert_eq!(
+        message,
+        "the Steam client runtime is updating: the client did not reach the login window \
+         within 3 seconds; it was stopped and its files kept; the client has not finished its \
+         first self-update; wait for the client's self-update to finish, or run `applejack \
+         runtime steam install` if the client was stopped"
+    );
     assert!(
         message.contains("the client did not reach the login window within 3 seconds"),
         "{message}"
     );
+    assert!(
+        message.contains("wait for the client's self-update"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("still has no steamwebhelper.exe") && !message.contains("removed"),
+        "{message}"
+    );
+    assert!(!message.contains("repair --reinstall"), "{message}");
     assert_in_order(
         &lines,
         &[
@@ -1908,32 +1942,67 @@ fn a_reinstall_whose_self_update_times_out_puts_the_old_package_back() {
             &format!("shim: {cef}: no steamwebhelper.exe; the client's self-update lays it down"),
             "start: starting steam.exe for its self-update, without -noverifyfiles: a web \
              helper is missing and the client's self-update lays it down",
+            &format!("repair: removing {}", aside.display()),
             "stop: stopping the Steam client",
-            &format!(
-                "package: restoring {} from {}, since the reinstall failed",
-                package.display(),
-                fixture.steam_dir().join("package.reinstall-old").display()
-            ),
         ],
     );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("package: ")),
+        "{lines:?}"
+    );
+    assert!(!aside.exists(), "{lines:?}");
+    assert!(
+        !fixture.steam_dir().join("package.reinstall-done").exists(),
+        "{lines:?}"
+    );
     assert_eq!(fixture.client_starts().len(), 1);
-    assert_eq!(tree(&package), files, "{lines:?}");
+    assert!(!fixture.steam_dir().join("package").exists());
     wait_gone("the client", || fixture.client_up());
-    assert_eq!(fixture.core().client_runtime_state().unwrap(), before);
-    assert_error_state_is_status(&fixture, &error);
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Updating, "{detail}");
+    assert_eq!(detail, "the client has not finished its first self-update");
 
     fs::remove_file(fixture.prefix_dir().join("no-self-update")).unwrap();
-    fixture.tuning = FAST;
     fixture.clear_client_starts();
-    let (state, lines) =
-        fixture.reinstall_hooked(&mut fixture.server_at("client: the client laid its web helper"));
+    let (state, lines) = fixture.install_hooked(
+        "VALVE-SIGNED",
+        &mut fixture.server_at("client: the client laid its web helper"),
+    );
     assert_eq!(state.unwrap(), ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert_in_order(
+        &lines,
+        &[
+            &format!("shim: {cef}: no steamwebhelper.exe; the client's self-update lays it down"),
+            "start: starting steam.exe for its self-update, without -noverifyfiles: a web \
+             helper is missing and the client's self-update lays it down",
+            "client: window: ",
+            &format!(
+                "client: the client laid its web helper down without the shim in front of it \
+                 ({cef}); restarting the client with the shim in front of it (restart 1 of 2)"
+            ),
+            "stop: stopping the Steam client",
+            &format!(
+                "shim: {cef}: stashed the web helper as steamwebhelper_real.exe and put the shim \
+                 in front of it"
+            ),
+            "start: starting steam.exe for its self-update",
+            "client: window: ",
+            "needs_login: ",
+        ],
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("bootstrap:")),
+        "{lines:?}"
+    );
     assert_eq!(fixture.helper(), fixture.shim());
     assert_eq!(
         fixture.real_helper().as_deref(),
         Some(&b"REAL-HELPER-1"[..])
     );
-    assert!(!fixture.steam_dir().join("package.reinstall-old").exists());
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::NeedsLogin
+    );
     assert!(fixture.client_up());
     fixture.stop_client();
 }
@@ -3844,8 +3913,9 @@ fn a_reinstall_with_an_osslsigncode_that_does_not_execute_keeps_the_old_package(
     );
 }
 
-/// A `package.reinstall-old` left by a reinstall that died is the package
-/// from before it: the next op restores it over whatever `package/` holds.
+/// A `package.reinstall-old` left by a reinstall that died before its new
+/// client started is the whole package from before it: the next op
+/// restores it over whatever `package/` holds.
 #[test]
 fn a_package_left_aside_by_a_dead_reinstall_is_restored_by_the_next_op() {
     let fixture = Fixture::new();
@@ -3902,4 +3972,186 @@ fn install_with_the_client_up_names_stop_first_for_an_orphan_shim_or_no_helper()
         assert!(message.contains("the client is still running"), "{message}");
         fixture.stop_client();
     }
+}
+
+/// A `package.reinstall-done` is an old package a finished reinstall was
+/// removing when it stopped: never restored, whatever part of it is left.
+/// The next op removes it and keeps `package/` byte for byte.
+#[test]
+fn a_partial_retired_package_beside_a_whole_one_is_removed_not_restored() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let package = fixture.steam_dir().join("package");
+    fs::write(package.join("new-package-marker"), "the package after").unwrap();
+    let files = tree(&package);
+    let retired = fixture.steam_dir().join("package.reinstall-done");
+    fs::create_dir_all(retired.join("tmp")).unwrap();
+    fs::write(retired.join("left-over"), "a fragment of the old package").unwrap();
+    let (outcome, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(
+        outcome.unwrap(),
+        ClientRuntimeState::NeedsLogin,
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("package: restoring")),
+        "{lines:?}"
+    );
+    assert_eq!(tree(&package), files, "{lines:?}");
+    assert!(!retired.exists(), "{lines:?}");
+    assert!(!fixture.steam_dir().join("package.reinstall-old").exists());
+    fixture.stop_client();
+}
+
+/// A reinstall whose old package cannot be removed in full once the new
+/// client started still succeeds on the new package: the removal is a
+/// line, not the error, and what is left is never put back.
+#[cfg(unix)]
+#[test]
+fn a_reinstall_whose_old_package_does_not_remove_keeps_the_new_one() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let package = fixture.steam_dir().join("package");
+    fs::write(package.join("old-package-marker"), "the package before").unwrap();
+    let stuck = package.join("stuck");
+    fs::create_dir_all(&stuck).unwrap();
+    fs::write(stuck.join("file"), "cannot go").unwrap();
+    set_mode(&stuck, 0o555);
+    let retired = fixture.steam_dir().join("package.reinstall-done");
+    let (outcome, lines) = fixture.reinstall_reporting();
+    assert_eq!(
+        outcome.unwrap(),
+        ClientRuntimeState::NeedsLogin,
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line
+                .starts_with(&format!("repair: could not remove {}: ", retired.display()))),
+        "{lines:?}"
+    );
+    assert!(!package.join("old-package-marker").exists(), "{lines:?}");
+    assert!(
+        package.join("steam_client_win32.manifest").is_file(),
+        "{lines:?}"
+    );
+    let files = tree(&package);
+    assert!(!fixture.steam_dir().join("package.reinstall-old").exists());
+    fixture.stop_client();
+    set_mode(&retired.join("stuck"), 0o755);
+    let (outcome, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(
+        outcome.unwrap(),
+        ClientRuntimeState::NeedsLogin,
+        "{lines:?}"
+    );
+    assert_eq!(tree(&package), files, "{lines:?}");
+    assert!(!retired.exists(), "{lines:?}");
+    fixture.stop_client();
+}
+
+/// A reinstall whose new client stalls on the prompt and dies keeps the
+/// new package, as a timeout does: the old one is gone from the start of
+/// the new client, `status` reads the new package's `updating`, and
+/// `install`, as the stall's way out says, finishes the self-update.
+#[test]
+fn a_reinstall_whose_new_client_stalls_keeps_the_new_package_and_install_resumes_it() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let package = fixture.steam_dir().join("package");
+    fs::write(package.join("old-package-marker"), "the package before").unwrap();
+    let knob = fixture.prefix_dir().join("stall");
+    fs::write(&knob, "").unwrap();
+    let (outcome, lines) = fixture.reinstall_reporting();
+    let error = outcome.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("BMainLoop appears to have stalled"),
+        "{error}\n{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("package: ")),
+        "{lines:?}"
+    );
+    assert!(!package.join("old-package-marker").exists(), "{lines:?}");
+    assert!(!fixture.steam_dir().join("package.reinstall-old").exists());
+    assert!(!fixture.steam_dir().join("package.reinstall-done").exists());
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Updating, "{detail}");
+    assert_error_state_is_status(&fixture, &error);
+    fs::remove_file(&knob).unwrap();
+
+    let (outcome, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(
+        outcome.unwrap(),
+        ClientRuntimeState::NeedsLogin,
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("bootstrap:")),
+        "{lines:?}"
+    );
+    assert!(package.join("steam_client_win32.manifest").is_file());
+    assert!(!package.join("old-package-marker").exists());
+    fixture.stop_client();
+}
+
+/// A snapshot whose one break is an exposed helper (the live `cef.win64`
+/// shape) is still the newest client to restore: `repair` restores it and
+/// then puts the shim in front of the helper in place.
+#[test]
+fn repair_restores_a_snapshot_holding_an_exposed_helper_and_shims_it() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let win64 = fixture.cef_dir_named("cef.win64");
+    fs::create_dir_all(&win64).unwrap();
+    fs::write(win64.join(WEBHELPER_EXE), b"REAL-HELPER-64").unwrap();
+    let only = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fs::write(
+        fixture.prefix_dir().join("applejack/prefix.toml"),
+        "nope = = =",
+    )
+    .unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    let (outcome, lines) = repair_with_lines(&fixture);
+    assert_eq!(
+        outcome.map(|status| status.state).unwrap(),
+        ClientRuntimeState::NeedsLogin,
+        "{lines:?}"
+    );
+    assert_in_order(
+        &lines,
+        &[
+            &format!(
+                "repair: restoring {STEAM_CLIENT_PREFIX} from {}",
+                only.timestamp
+            ),
+            &format!("repair: {}: ", win64.display()),
+            &format!(
+                "shim: {}: stashed the web helper as steamwebhelper_real.exe and put the shim \
+                 in front of it",
+                win64.display()
+            ),
+            "start: ",
+        ],
+    );
+    assert_eq!(fs::read(win64.join(WEBHELPER_EXE)).unwrap(), fixture.shim());
+    assert_eq!(
+        fs::read(win64.join(WEBHELPER_REAL)).unwrap(),
+        b"REAL-HELPER-64"
+    );
+    assert_eq!(
+        fixture.core().client_runtime_state().unwrap().0,
+        ClientRuntimeState::NeedsLogin
+    );
+    fixture.stop_client();
 }
