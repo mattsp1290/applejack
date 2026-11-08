@@ -420,18 +420,24 @@ the last line the start printed:
 One rule covers every `ClientRuntimeBroken` these jobs fail with: its state
 is what `runtime.steam.status` reads when the job ends (after any stop or
 restore the job made), and its detail is the failure's own. A `repair
---reinstall` that fails before its new client starts puts the old package
-directory back (a `package: restoring ...` line); files the bootstrapper
-wrote outside it stay, and `runtime.steam.status` reads them, which is
-usually, not always, what it read before the job. One that fails after
-that start keeps the new package directory, and `runtime.steam.install`
-resumes its self-update.
+--reinstall` that fails before its new client's start commits (the rename
+of the old package right after the launch) puts the old package directory
+back (a `package: restoring ...` line), after stopping a client it had just
+launched; files the bootstrapper wrote outside it stay, and
+`runtime.steam.status` reads them, which is usually, not always, what it
+read before the job. One that fails after the commit keeps the new package
+directory, and `runtime.steam.install` resumes its self-update. A `repair
+--reinstall` with a `package.reinstall-done` directory that does not remove
+fails `ClientRuntimeBroken` (state as `runtime.steam.status` reads it)
+before it stops, moves or starts anything, naming the path and saying to
+remove it by hand; the other jobs report it as a
+`package:` line and go on.
 
 Every start's `start:` lines are followed by at least one `client:` phase
 line (`client: starting`, or `client: updating` while the self-update
 runs), so all but the missing shim end on a `client:` or `stop:` line, never
-on `start:` (on a `repair --reinstall` whose new client never started, a
-`package:` line follows). `status`
+on `start:` (on a `repair --reinstall` whose new client's start did not
+commit, a `package:` line follows). `status`
 does not see the stall, the early exit or the missing shim themselves: the
 error's detail is where they are named. `install`'s wait on a client already up
 starts nothing; its failures are the window timeout's and the exit's
