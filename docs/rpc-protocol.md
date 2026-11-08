@@ -385,19 +385,42 @@ phase named for the state the op left (`needs_login`, `ready`, `broken`,
 its marker-only clear, and `stop`, emit no such phase. An op that succeeds
 ends with a `status` phase that carries the state. A
 `runtime.steam.install`, `runtime.steam.update` or `runtime.steam.repair`
-whose client start reaches the window (or its fallback signal) and leaves
-the runtime `broken` (a helper that does not read after it, for one) fails
-with `ClientRuntimeBroken` after its `broken` phase, with no `status`
-phase. Two other starts fail with `ClientRuntimeBroken { broken }` and no
-state phase: the restart limit, after `client: <dir>/steamwebhelper.exe is
-still not the shim after 2 restarts; giving up`, and a file-check start
-that lays no helper down, after `start: starting steam.exe for its
-self-update, without -noverifyfiles: a web helper is missing and the
-client's file check lays it down` (then `stop: stopping the Steam client`
-when the wait times out, nothing more when the client exits). The prefix
-is claimed
-before the answer, so `PrefixBusy` (a title runs through the client) is an
-error response. `runtime.steam.install` is the one
+fails after a state phase only when its client start reaches the window
+(or its fallback signal) and `finish` reads the state it left: a `broken`
+there (a helper that does not read after it, for one) fails with
+`ClientRuntimeBroken` after its `broken` phase, with no `status` phase.
+Every other start failure sends `job.failed` with no state phase, after
+the last line the start printed:
+
+- the restart limit, `ClientRuntimeBroken { broken }` after `client:
+  <dir>/steamwebhelper.exe is still not the shim after 2 restarts; giving
+  up`;
+- a window timeout, after `stop: stopping the Steam client`: `{ broken }`
+  for a file-check start that laid no helper down (its `start:` line reads
+  `start: starting steam.exe for its self-update, without -noverifyfiles: a
+  web helper is missing and the client's file check lays it down`) and for
+  the client's own helper in front, else `{ updating }`;
+- a client that exits during the wait, `{ broken }` after its last
+  `client:` line: the stall (`client: stalled: the client's main loop is
+  stalled (<log>); ...`, or a `client:` phase line after it), a file-check
+  start that laid no helper down, or the early exit (a second clean
+  shutdown in one op, or any other exit);
+- a payload with no shim, `{ broken }` from the shim pass before the
+  start's first `start:` line.
+
+Every start's `start:` lines are followed by at least one `client:` phase
+line (`client: starting`, or `client: updating` while the self-update
+runs), so all but the missing shim end on a `client:` or `stop:` line, never
+on `start:`. `status` then reads `broken` after the restart limit, a
+file-check start that laid no helper down, and the client's own helper in
+front, and not after the stall, the early exit or the missing shim, which
+it cannot see. `install`'s wait on a client already up starts nothing; its
+failures are the window timeout's and the exit's above, and with the
+client's own helper in front it fails after its `shim:` line without
+waiting.
+
+The prefix is claimed before the answer, so `PrefixBusy` (a title runs
+through the client) is an error response. `runtime.steam.install` is the one
 method that reaches the network outside Steam's own protocol: it fetches
 Valve's `SteamSetup.exe`, refuses it with `BootstrapperUnverified` unless its
 Authenticode chain verifies with Valve Corp as the signer, runs it, and
