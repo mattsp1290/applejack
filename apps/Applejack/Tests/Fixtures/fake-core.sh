@@ -92,6 +92,17 @@
 #                                 decides), `refuse` (host.doctor answers Internal 1003
 #                                 instead), or a JSON array in the Rust shape,
 #                                 used as given
+#   FAKE_CORE_LIBRARY=<unset|mixed|mixed-then-pair>  steam.library answers
+#                                 the two-title list (unset), or with `mixed`
+#                                 fifteen titles in the core's own order:
+#                                 installed, updating and not-installed mixed,
+#                                 a lowercase name, two titles of one name,
+#                                 one with no name and one with an empty name,
+#                                 an accented name, `Trials 10` before
+#                                 `Trials 2`, and appids 220 and 2200;
+#                                 `mixed-then-pair` answers the mixed list to
+#                                 the first request and the two-title list in
+#                                 reverse order to every later one
 #   FAKE_CORE_HIDRAW=<unset|true|false>  config.get's `hidraw_enabled` (default
 #                                 false); config.resolve answers the stored
 #                                 value from `config`, or with `unset` the
@@ -592,7 +603,23 @@ implemented() {
       esac
       ;;
     steam.library)
-      apps='[{"appid":220,"name":"Half-Life 2","installdir":"Half-Life 2","size_bytes":4096,"drm":"steam","default_branch":"public","install_state":"installed"},{"appid":440,"name":"Team Fortress 2","installdir":"Team Fortress 2","size_bytes":8192,"drm":"unknown","default_branch":"public","install_state":"not_installed"}]'
+      mixed_library='[{"appid":440,"name":"Team Fortress 2","installdir":"Team Fortress 2","size_bytes":8192,"drm":"unknown","default_branch":"public","install_state":"not_installed"},{"appid":1000,"name":"Duplicate","installdir":"Duplicate","size_bytes":1,"drm":"none","default_branch":"public","install_state":"not_installed"},{"appid":220,"name":"Half-Life 2","installdir":"Half-Life 2","size_bytes":4096,"drm":"steam","default_branch":"public","install_state":"installed"},{"appid":2200,"name":"Quake III Arena","installdir":"Quake 3 Arena","size_bytes":1,"drm":"none","default_branch":"public","install_state":"not_installed"},{"appid":999,"name":"Duplicate","installdir":"Duplicate","size_bytes":1,"drm":"none","default_branch":"public","install_state":"not_installed"},{"appid":400,"name":"Portal","installdir":"Portal","size_bytes":1,"drm":"steam","default_branch":"public","install_state":"not_installed"},{"appid":123456,"name":null,"installdir":"123456","size_bytes":1,"drm":"unknown","default_branch":"public","install_state":"not_installed"},{"appid":620,"name":"Portal 2","installdir":"Portal 2","size_bytes":1,"drm":"steam","default_branch":"public","install_state":"installed"},{"appid":1296610,"name":"Peglin","installdir":"Peglin","size_bytes":1,"drm":"none","default_branch":"public","install_state":"not_installed"},{"appid":70,"name":"half-life","installdir":"Half-Life","size_bytes":1,"drm":"steam","default_branch":"public","install_state":"installed"},{"appid":570,"name":"Dota 2","installdir":"dota 2","size_bytes":1,"drm":"steam","default_branch":"public","install_state":"update_available"},{"appid":3200,"name":"Trials 10","installdir":"Trials 10","size_bytes":1,"drm":"none","default_branch":"public","install_state":"not_installed"},{"appid":3000,"name":"Éclair","installdir":"Eclair","size_bytes":1,"drm":"none","default_branch":"public","install_state":"not_installed"},{"appid":7,"name":"","installdir":"7","size_bytes":1,"drm":"unknown","default_branch":"public","install_state":"not_installed"},{"appid":3100,"name":"Trials 2","installdir":"Trials 2","size_bytes":1,"drm":"none","default_branch":"public","install_state":"not_installed"}]'
+      case "${FAKE_CORE_LIBRARY:-}" in
+        mixed)
+          apps="$mixed_library"
+          ;;
+        mixed-then-pair)
+          if [ "${library_answers:-0}" -eq 0 ]; then
+            apps="$mixed_library"
+          else
+            apps='[{"appid":440,"name":"Team Fortress 2","installdir":"Team Fortress 2","size_bytes":8192,"drm":"unknown","default_branch":"public","install_state":"not_installed"},{"appid":220,"name":"Half-Life 2","installdir":"Half-Life 2","size_bytes":4096,"drm":"steam","default_branch":"public","install_state":"installed"}]'
+          fi
+          library_answers=$((${library_answers:-0} + 1))
+          ;;
+        *)
+          apps='[{"appid":220,"name":"Half-Life 2","installdir":"Half-Life 2","size_bytes":4096,"drm":"steam","default_branch":"public","install_state":"installed"},{"appid":440,"name":"Team Fortress 2","installdir":"Team Fortress 2","size_bytes":8192,"drm":"unknown","default_branch":"public","install_state":"not_installed"}]'
+          ;;
+      esac
       case "$3" in
         *'"refresh":true'*)
           emit '{"jsonrpc":"2.0","id":'"$1"',"result":{"apps":'"$apps"',"fetched_at":"2026-11-02T00:00:00Z","job_id":9}}'
