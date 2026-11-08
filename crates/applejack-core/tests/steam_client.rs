@@ -2829,6 +2829,180 @@ fn repair_restores_a_client_without_steam_exe_even_with_an_exposed_helper_beside
     );
 }
 
+/// A helper file that does not read is `broken` with the io error and its
+/// detail says `repair` restores: `repair` takes the restore path, never
+/// the in-place pass (whose gate would read the same file and fail with
+/// the bare io error, as `main` never did).
+#[test]
+fn repair_restores_a_client_whose_helper_does_not_read() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let good = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.stop_client();
+    let helper = fixture.cef_dir().join(WEBHELPER_EXE);
+    fs::remove_file(&helper).unwrap();
+    fs::create_dir(&helper).unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    assert!(detail.contains("does not read"), "{detail}");
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert!(
+        lines.contains(&format!(
+            "repair: restoring {STEAM_CLIENT_PREFIX} from {}",
+            good.timestamp
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("nothing to restore")),
+        "the restore path, not the in-place pass: {lines:?}"
+    );
+    assert!(helper.is_file(), "the directory is gone: {lines:?}");
+    assert_eq!(fixture.helper(), fixture.shim(), "back from the snapshot");
+}
+
+/// The gate's record term: an exposed helper beside a prefix record that
+/// does not open is the restore's, never the in-place pass (whose
+/// `ensure_prefix` would fail on the record with no restore).
+#[test]
+fn repair_restores_a_record_that_does_not_open_even_with_an_exposed_helper_beside_it() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let good = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.stop_client();
+    let win64 = fixture.cef_dir_named("cef.win64");
+    fs::create_dir_all(&win64).unwrap();
+    fs::write(win64.join(WEBHELPER_EXE), b"REAL-HELPER-64").unwrap();
+    fs::write(
+        fixture.prefix_dir().join("applejack/prefix.toml"),
+        "nope = = =",
+    )
+    .unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    let (outcome, lines) = repair_with_lines(&fixture);
+    assert_eq!(
+        outcome.unwrap().state,
+        ClientRuntimeState::NeedsLogin,
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&format!(
+            "repair: restoring {STEAM_CLIENT_PREFIX} from {}",
+            good.timestamp
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| {
+            line.contains("nothing to restore")
+                || line.starts_with("shim:")
+                || line.starts_with("start:")
+        }),
+        "the restore path, not the in-place pass: {lines:?}"
+    );
+    assert!(!win64.exists(), "the snapshot predates the directory");
+}
+
+/// The in-place pass ends as the restore path does: `Ok` only when the
+/// runtime no longer reads `broken`. An exposed helper beside a populated
+/// `cef.win*` directory with no helper (one the stub's file check never
+/// fills) takes the pass, which stashes the one and cannot fill the other;
+/// the end check reports the directory and the op is the error, not `Ok`
+/// on a runtime `status` reads `broken`.
+#[test]
+fn repair_in_place_ends_broken_when_another_cef_directory_holds_no_helper() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::write(fixture.cef_dir().join(WEBHELPER_EXE), b"REAL-HELPER-2").unwrap();
+    let junk = fixture.cef_dir_named("cef.win64");
+    fs::create_dir_all(&junk).unwrap();
+    fs::write(junk.join("libcef.dll"), b"junk").unwrap();
+    let (outcome, lines) = repair_with_lines(&fixture);
+    assert!(
+        lines.iter().any(|line| line.contains("nothing to restore")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("broken:")),
+        "{lines:?}"
+    );
+    let Err(error) = outcome else {
+        panic!("repair must not return Ok on a broken runtime: {lines:?}");
+    };
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Broken,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(&junk.display().to_string()),
+        "{error}"
+    );
+    fixture.stop_client();
+}
+
+/// A helper the client's start leaves unreadable (a directory at its path)
+/// ends `install` on the `broken` state line `status` reads, not the bare
+/// io error of the re-scan that cannot read it.
+#[test]
+fn install_reports_broken_when_a_start_leaves_a_helper_that_does_not_read() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::write(fixture.prefix_dir().join("unreadable-helper-at-start"), "").unwrap();
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(state.unwrap(), ClientRuntimeState::Broken, "{lines:?}");
+    let unreadable = fixture.cef_dir_named("cef.win64").join(WEBHELPER_EXE);
+    assert!(
+        lines.iter().any(|line| line.starts_with("broken:")
+            && line.contains(&unreadable.display().to_string())
+            && line.contains("does not read")),
+        "{lines:?}"
+    );
+    fixture.stop_client();
+}
+
+/// An orphan shim beside an exposed directory goes with the in-place pass,
+/// as `install` would handle it: the pass removes the orphan, the file-check
+/// start lays the helper down, the re-scan stashes it, and the op ends with
+/// every populated directory shimmed and the snapshot untouched.
+#[test]
+fn repair_in_place_converges_with_an_orphan_shim_beside_the_exposed_helper() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.stop_client();
+    fs::remove_file(fixture.cef_dir().join(WEBHELPER_REAL)).unwrap();
+    let win64 = fixture.cef_dir_named("cef.win64");
+    fs::create_dir_all(&win64).unwrap();
+    fs::write(win64.join(WEBHELPER_EXE), b"REAL-HELPER-64").unwrap();
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert!(
+        lines.iter().any(|line| line.contains("nothing to restore")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("repair: restoring")),
+        "{lines:?}"
+    );
+    assert!(fixture.every_populated_cef_dir_is_shimmed(), "{lines:?}");
+    assert_eq!(status.snapshots, 1, "the snapshot is untouched");
+    fixture.stop_client();
+}
+
 /// A client the record names whose `wineserver` is gone died (under the
 /// stub its processes linger with no server): `repair` and `install` do
 /// not wait on it for a window that cannot come and return `Ok` on a

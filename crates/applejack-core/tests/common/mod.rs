@@ -50,7 +50,9 @@ const BUNDLE_FILES: &[&str] = &[
 /// `client-args` was cleared (once; `cef.win7x64` stays as it is), the
 /// shape the live client showed; `$WINEPREFIX/
 /// new-cef-dir-every-start` lays `bin/cef/cef.win-extra-<n>/steamwebhelper.exe`
-/// at every start `n`; `$WINEPREFIX/early-shutdown` (one-shot) and
+/// at every start `n`; `$WINEPREFIX/unreadable-helper-at-start` lays a
+/// directory at `bin/cef/cef.win64/steamwebhelper.exe`, a helper that does
+/// not read; `$WINEPREFIX/early-shutdown` (one-shot) and
 /// `early-shutdown-always` make a start write `Verification skipped` and
 /// `Shutdown` to `logs/bootstrap_log.txt` and exit with no window, as the
 /// live first start did twice; `$WINEPREFIX/no-window` makes every start
@@ -188,6 +190,9 @@ if [ "$name" = steam.exe ]; then
   if [ -e "$WINEPREFIX/new-cef-dir-every-start" ]; then
     mkdir -p "$steam/bin/cef/cef.win-extra-$starts"
     printf 'REAL-HELPER-EXTRA' > "$steam/bin/cef/cef.win-extra-$starts/steamwebhelper.exe"
+  fi
+  if [ -e "$WINEPREFIX/unreadable-helper-at-start" ]; then
+    mkdir -p "$steam/bin/cef/cef.win64/steamwebhelper.exe"
   fi
   if [ -e "$WINEPREFIX/early-shutdown" ] || [ -e "$WINEPREFIX/early-shutdown-always" ]; then
     rm -f "$WINEPREFIX/early-shutdown"

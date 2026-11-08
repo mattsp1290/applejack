@@ -128,10 +128,11 @@ const SHIM_MAX_LEN: u64 = 1 << 20;
 pub const REDOWNLOAD_GROWTH: u64 = 64 << 20;
 
 /// How many times one `install`, `update` or `repair` stops and restarts
-/// the client because a start left a `cef.win*` helper in front without the shim (the
-/// first self-update, a client update, or a directory the client made at
-/// that start, as `cef.win64` beside the two `cef.win7*` live). Past it the
-/// op ends `broken` naming the directory instead of looping.
+/// the client because a start left a `cef.win*` helper in front without
+/// the shim (the first self-update, a client update, or a directory the
+/// client made at that start, as `cef.win64` beside the two `cef.win7*`
+/// live). Past it the op ends `broken` naming the directory instead of
+/// looping.
 pub const RESHIM_ROUNDS: u32 = 2;
 
 /// The bootstrap log's line for the client ending on its own. A start that
@@ -2089,7 +2090,10 @@ impl PlannedClientOp {
                     .into_error());
                 }
             }
-            let Some(exposed) = exposed_helper(&self.paths)? else {
+            // A helper that does not read is `HelperUnreadable`, which
+            // `finish` reports as `status` reads it; the io error alone
+            // would end the op with no state line.
+            let Some(exposed) = exposed_helper(&self.paths).ok().flatten() else {
                 break;
             };
             if restarts == RESHIM_ROUNDS {
@@ -2428,11 +2432,13 @@ impl PlannedClientOp {
     /// client worth keeping (its sign-in, its `userdata/`) must go through
     /// `prefix restore`, which keeps a safety copy. A dead install's marker
     /// is cleared first; with the client intact after that, nothing is
-    /// restored. A client whose only break is its own web helper in front
-    /// of the shim (its record opens, `steam.exe` is there, no marker) is
-    /// fixed in place: stopped, the helper stashed and the shim put in
-    /// front by the next start's pass, and started to its window; nothing
-    /// is restored. Otherwise the newest usable snapshot is restored: one whose
+    /// restored. A client whose record opens and which has `steam.exe`,
+    /// with its own web helper in front of the shim, is fixed in place:
+    /// stopped, the helper stashed and the shim put in front by the next
+    /// start's pass, and started to its window; nothing is restored, and
+    /// whatever else `bin/cef` holds the pass handles or its end check
+    /// reports. A helper that does not read is the restore's. Otherwise
+    /// the newest usable snapshot is restored: one whose
     /// prefix record opens and which holds `steam.exe`. Each newer snapshot
     /// is reported as skipped with its reason, and with no usable one the
     /// op refuses with `ClientRuntimeBroken`. The safety copy the restore
@@ -2469,13 +2475,15 @@ impl PlannedClientOp {
             );
         }
         // `runtime_state` reads the record, `steam.exe` and the marker before
-        // any `cef.win*`, so with those intact the exposed helper is the
-        // runtime's one break; a record that does not open or a missing
-        // `steam.exe` is the restore's, whatever `bin/cef` holds beside it.
-        let intact = had_steam_exe
-            && !marker.exists()
-            && self.core.engine.open_prefix(&self.paths.prefix_dir).is_ok();
-        if intact && let Some(exposed) = exposed_helper(&self.paths)? {
+        // any `cef.win*` (the marker is gone by here: cleared above, or never
+        // there with `steam.exe`), so with the first two intact an exposed
+        // helper is the pass's, whatever else `bin/cef` holds beside it (an
+        // orphan shim or a directory with no helper the pass handles or its
+        // end check reports); a record that does not open, a missing
+        // `steam.exe`, or a helper that does not read (`HelperUnreadable`,
+        // whose detail promises the restore) is the restore's.
+        let intact = had_steam_exe && self.core.engine.open_prefix(&self.paths.prefix_dir).is_ok();
+        if intact && let Some(exposed) = exposed_helper(&self.paths).ok().flatten() {
             return self.reshim_in_place(&exposed, report);
         }
         let newest = self.usable_snapshot(report)?;
