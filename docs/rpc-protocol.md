@@ -379,7 +379,12 @@ core leaves this recovery to the next start.
 at once; the other four are jobs whose `job.progress` phases are the steps
 (`prepare`, `prefix`, `install`, `download`, `verify`, `bootstrap`,
 `library`, `shim`, `start`, `client`, `build`, `snapshot`, `repair`, `stop`),
-ending with a `status` phase that carries the state. The prefix is claimed
+then a phase named for the state the op left (`needs_login`, `ready`,
+`broken`, `updating`, ...) whose message is the state's detail, ending with
+a `status` phase that carries the state. A `runtime.steam.install`,
+`runtime.steam.update` or `runtime.steam.repair` whose client start leaves
+the runtime `broken` fails with `ClientRuntimeBroken` after its `broken`
+phase, with no `status` phase. The prefix is claimed
 before the answer, so `PrefixBusy` (a title runs through the client) is an
 error response. `runtime.steam.install` is the one
 method that reaches the network outside Steam's own protocol: it fetches
