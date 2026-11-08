@@ -218,7 +218,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `app.cancel` | `JobStarted`; see [Sessions](#sessions) |
 | `runtime.steam.install` | `JobStarted`; see [Steam client runtime](#steam-client-runtime) |
 | `runtime.steam.update` | `JobStarted` |
-| `runtime.steam.repair` | `JobStarted`. `reinstall` removes the client's package directory and reruns the bootstrapper |
+| `runtime.steam.repair` | `JobStarted`. `reinstall` checks the payload (`probes/osslsigncode`, the shim), then removes the client's package directory before it fetches and reruns the bootstrapper |
 | `runtime.steam.stop` | `JobStarted` |
 | `runtime.steam.status` | `{state, prefix, build_id, running, snapshots, detail}`; `state` is one of `absent`, `installing`, `needs_login`, `ready`, `updating`, `broken` |
 | `session.list` | `{"sessions": [SessionRow]}`, newest first; `appid` narrows it to one title |
@@ -385,8 +385,9 @@ phase named for the state the op left (`needs_login`, `ready`, `broken`,
 its marker-only clear, and `stop`, emit no such phase. An op that succeeds
 ends with a `status` phase that carries the state. A
 `runtime.steam.install`, `runtime.steam.update` or `runtime.steam.repair`
-fails after a state phase only when its client start reaches the window
-(or its fallback signal) and `finish` reads the state it left: a `broken`
+fails after a state phase only when its client start (or `install`'s wait
+on a client already up) reaches the window (or its fallback signal) and
+`finish` reads the state it left: a `broken`
 there (a helper that does not read after it, for one) fails with
 `ClientRuntimeBroken` after its `broken` phase, with no `status` phase.
 Every other start failure sends `job.failed` with no state phase, after
@@ -399,7 +400,9 @@ the last line the start printed:
   `ClientRuntimeBroken` carrying what `runtime.steam.status` then reads,
   its state and its detail, under the lead `the client did not reach the
   login window within 600 seconds; it was stopped and its files kept`, so
-  the two never disagree;
+  the two never disagree; for a state whose detail names no way out
+  (`ready`, `absent`) the detail ends `` `applejack runtime steam install`
+  starts the client to its window again``;
 - a client that exits during the wait, `{ broken }` after its last
   `client:` line: the stall (`client: stalled: the client's main loop is
   stalled (<log>); ...`, or a `client:` phase line after it), a file-check
@@ -408,8 +411,9 @@ the last line the start printed:
 - a payload with no shim, `{ broken }` before the start's first `start:`
   line: on an `install` that runs the bootstrapper, its check catches it
   first, before the download (on a fresh `install` the last line is
-  `prefix: creating prefix steam-client`, and `status` reads `absent`);
-  otherwise the shim pass does.
+  `prefix: creating prefix steam-client`, and `status` reads `absent`; on
+  `repair --reinstall`, before the stop and the removal of `package/`, so
+  `status` is unchanged); otherwise the shim pass does.
 
 Every start's `start:` lines are followed by at least one `client:` phase
 line (`client: starting`, or `client: updating` while the self-update
@@ -421,8 +425,9 @@ early exit or the missing shim. `install`'s wait on a client already up
 starts nothing; its failures are the window timeout's and the exit's
 above, and with the client's own helper in front it fails after its
 `shim:` line without waiting. With an orphan shim or no helper there it
-warns under `shim:`, waits, and succeeds after a `broken` phase (a
-recorded follow-up).
+warns under `shim:`, waits, and fails with `ClientRuntimeBroken` after
+its `broken` phase; a helper that does not read gets no `shim:` line and
+fails the same way.
 
 The prefix is claimed before the answer, so `PrefixBusy` (a title runs
 through the client) is an error response. `runtime.steam.install` is the one
