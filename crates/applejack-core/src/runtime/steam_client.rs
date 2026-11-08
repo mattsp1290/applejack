@@ -31,7 +31,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use applejack_engine::rosetta_wine::launch::new_session_id;
-use applejack_engine::rosetta_wine::process::{find_in_prefix, find_session, wineserver_running};
+use applejack_engine::rosetta_wine::process::{
+    find_in_prefix, find_session, signal, wineserver_running,
+};
 use applejack_engine::rosetta_wine::snapshot::{self, PrefixLock};
 use applejack_engine::rosetta_wine::utc_now;
 use applejack_engine::{Engine, GraphicsBackend, InstalledEngine, LaunchSpec, Prefix};
@@ -180,6 +182,10 @@ const SIZE_SCAN_EVERY: Duration = Duration::from_secs(5);
 
 /// Between looks while waiting for the client to come up.
 const CLIENT_POLL: Duration = Duration::from_secs(1);
+
+/// How long [`PlannedClientOp::end_launch`] waits for a just-launched
+/// client to show before it stops the prefix anyway.
+const LAUNCH_SHOW_WAIT: Duration = Duration::from_secs(10);
 
 /// Looks in a row without `package/tmp` before the self-update counts as done.
 const SETTLED_LOOKS: u32 = 5;
@@ -1011,18 +1017,15 @@ fn cef_helpers_read(paths: &ClientPaths) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Removes a retired old package; a removal that fails is a `phase` line,
-/// since the new package is already the client's and the next op retries.
-fn remove_retired(retired: &Path, phase: &str, report: &mut dyn FnMut(&str, String)) {
-    if let Err(error) = fs::remove_dir_all(retired) {
-        report(
-            phase,
-            format!(
-                "could not remove {}: {error}; the next op removes it",
-                retired.display()
-            ),
-        );
-    }
+/// The line for a retired old package that did not remove. Every op tries
+/// again, but a lasting cause (permissions, a busy file) fails each time,
+/// and `--reinstall` needs the name free for its commit point.
+fn retired_left_line(retired: &Path, error: &std::io::Error) -> String {
+    format!(
+        "could not remove {}: {error}; every op tries again, and `applejack runtime steam \
+         repair --reinstall` refuses while it is there: remove it by hand",
+        retired.display()
+    )
 }
 
 /// Whether the lines `path` gained past `offset` are the client ending on
@@ -1947,11 +1950,26 @@ impl PlannedClientOp {
                     retired.display()
                 ),
             );
-            remove_retired(&retired, "package", report);
+            if let Err(error) = fs::remove_dir_all(&retired) {
+                if matches!(self.op, ClientOp::Repair { reinstall: true }) {
+                    // The state is `run_with`'s to set from the reading.
+                    return Err(CoreError::ClientRuntimeBroken {
+                        state: ClientRuntimeState::Absent,
+                        detail: format!(
+                            "refusing to reinstall: {} is left by an earlier reinstall and \
+                             does not remove ({error}), and the reinstall's commit point needs \
+                             its name; nothing was stopped or moved: remove it by hand, then \
+                             run `applejack runtime steam repair --reinstall` again",
+                            retired.display()
+                        ),
+                    });
+                }
+                report("package", retired_left_line(&retired, &error));
+            }
         }
-        // An aside copy exists only before the new client's first start, so
-        // it is the whole old package and `package/` holds none of the new
-        // client's self-update: restoring it loses nothing.
+        // An aside copy is left only by a reinstall that never committed, so
+        // it is the whole old package: restoring it loses at most a moment of
+        // the new client's self-update.
         if self.paths.package_aside().is_dir() {
             self.put_package_back(report, "left by a reinstall that did not finish")?;
         }
@@ -1983,7 +2001,9 @@ impl PlannedClientOp {
             self.aside_pending = true;
             return Err(CoreError::io(&aside, error));
         }
-        remove_retired(&retired, "repair", report);
+        if let Err(error) = fs::remove_dir_all(&retired) {
+            report("repair", retired_left_line(&retired, &error));
+        }
         Ok(())
     }
 
@@ -2451,8 +2471,14 @@ impl PlannedClientOp {
             cpuid_probe: None,
         };
         let session = self.core.engine.launch(&self.installed, prefix, &spec)?;
-        self.retire_aside(report)?;
-        self.core.db()?.meta_set(META_CLIENT_SESSION, &key)?;
+        let mut committed = self.record_client(&key);
+        if committed.is_ok() {
+            committed = self.retire_aside(report);
+        }
+        if let Err(error) = committed {
+            self.end_launch(&key, report);
+            return Err(error);
+        }
         let _ = log_line(
             &self.log_path().to_string_lossy(),
             &format!(
@@ -2465,6 +2491,45 @@ impl PlannedClientOp {
         let session_log = session.log_path.clone();
         drop(session);
         self.wait_window(Some(&key), Some(&session_log), pass.helper_missing, report)
+    }
+
+    fn record_client(&mut self, key: &str) -> Result<(), CoreError> {
+        self.core.db()?.meta_set(META_CLIENT_SESSION, key)?;
+        Ok(())
+    }
+
+    /// Ends a client this op launched and fails past before its wait. A
+    /// look right after the launch can miss it (the loader has not started
+    /// the client or its server yet), so this waits for the client to show
+    /// under its key, stops the server, and kills what the key still names.
+    fn end_launch(&mut self, key: &str, report: &mut dyn FnMut(&str, String)) {
+        let shows = || {
+            find_session(key)
+                .iter()
+                .any(|process| process.exe.eq_ignore_ascii_case(STEAM_EXE))
+        };
+        let tick = self.core.tuning.tick;
+        let deadline = Instant::now() + LAUNCH_SHOW_WAIT;
+        while !shows() && Instant::now() < deadline {
+            std::thread::sleep(tick);
+        }
+        report("stop", "stopping the Steam client".to_owned());
+        let _ =
+            self.core
+                .engine
+                .stop_server(&self.installed, &self.paths.prefix_dir, &self.log_path());
+        let term_wait = self.core.tuning.term_wait;
+        let started = Instant::now();
+        loop {
+            let left = find_session(key);
+            if left.is_empty() || started.elapsed() >= term_wait * 2 {
+                return;
+            }
+            for process in left {
+                let _ = signal(process.pid, started.elapsed() >= term_wait);
+            }
+            std::thread::sleep(tick);
+        }
     }
 
     /// The directory the start without `-noverifyfiles` was to fill and did

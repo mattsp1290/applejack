@@ -24,7 +24,7 @@ use applejack_core::runtime::steam_client::{
     acf_backup_path,
 };
 use applejack_core::{Core, CoreError};
-use applejack_engine::rosetta_wine::process::find_session;
+use applejack_engine::rosetta_wine::process::{find_in_prefix, find_session, signal};
 use applejack_engine::rosetta_wine::utc_now;
 use applejack_engine::{Error as EngineError, GraphicsBackend, HidrawMode};
 use common::{spawn_stub_server, write_stub_bundle, write_title};
@@ -65,12 +65,22 @@ struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // A stub client leaves when its prefix goes, and a tree a failed
+        // test left with a 0555 directory never goes: the client is ended
+        // here instead, and the tree made removable.
+        let survivors = self.end_clients();
         // Each server left with the stop it served; a test that failed
         // first may leave one up, and the kill keeps the wait bounded.
         for mut server in self.servers.take() {
             let _ = server.kill();
             let _ = server.wait();
         }
+        #[cfg(unix)]
+        make_removable(self.dir.path());
+        assert!(
+            survivors.is_empty() || thread::panicking(),
+            "stub clients outlived the fixture's stop and were killed: {survivors:?}"
+        );
     }
 }
 
@@ -340,6 +350,41 @@ impl Fixture {
         find_session(&self.client_key())
             .iter()
             .any(|process| process.exe == "steam.exe")
+    }
+
+    /// The client's processes in its prefix, whatever key they carry: a
+    /// client launched and never recorded shows here and not under
+    /// [`Fixture::client_up`].
+    fn prefix_clients(&self) -> Vec<String> {
+        find_in_prefix(&self.prefix_dir())
+            .into_iter()
+            .filter(|process| process.exe == "steam.exe" || process.exe == "steamwebhelper.exe")
+            .map(|process| format!("{} {}", process.pid, process.exe))
+            .collect()
+    }
+
+    /// [`Fixture::stop_client`] for the fixture's end: the quit file again
+    /// at each look, since a start still in its shell clears it, until no
+    /// client process shows for a few looks running. What is still there
+    /// after the bound is killed and returned.
+    fn end_clients(&self) -> Vec<String> {
+        let quit = self.prefix_dir().join("client-quit");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut empty_looks = 0;
+        while empty_looks < 4 {
+            let _ = fs::write(&quit, "");
+            let left = self.prefix_clients();
+            if Instant::now() >= deadline {
+                for line in &left {
+                    let pid = line.split(' ').next().and_then(|pid| pid.parse().ok());
+                    let _ = pid.map(|pid| signal(pid, true));
+                }
+                return left;
+            }
+            empty_looks = if left.is_empty() { empty_looks + 1 } else { 0 };
+            thread::sleep(Duration::from_millis(50));
+        }
+        Vec::new()
     }
 
     fn quit_game(&self, code: i32) {
@@ -3882,6 +3927,29 @@ fn a_reinstall_into_a_prefix_with_old_dxmt_dlls_keeps_the_old_package() {
     );
 }
 
+/// Gives every directory under `dir` its owner's write and search bits,
+/// without following links, so the temporary tree removes.
+#[cfg(unix)]
+fn make_removable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(meta) = fs::symlink_metadata(&next) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = fs::set_permissions(&next, fs::Permissions::from_mode(mode | 0o700));
+        }
+        if let Ok(entries) = fs::read_dir(&next) {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -4053,6 +4121,118 @@ fn a_reinstall_whose_old_package_does_not_remove_keeps_the_new_one() {
     assert_eq!(tree(&package), files, "{lines:?}");
     assert!(!retired.exists(), "{lines:?}");
     fixture.stop_client();
+}
+
+/// A retired leftover that does not remove is a precondition of
+/// `--reinstall`: the reinstall refuses before the stop, the move aside and
+/// any start, naming the path; other ops report it and go on.
+#[cfg(unix)]
+#[test]
+fn a_retired_leftover_that_does_not_remove_refuses_the_reinstall_before_it_starts() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let package = fixture.steam_dir().join("package");
+    let retired = fixture.steam_dir().join("package.reinstall-done");
+    let stuck = package.join("stuck");
+    fs::create_dir_all(&stuck).unwrap();
+    fs::write(stuck.join("file"), "cannot go").unwrap();
+    set_mode(&stuck, 0o555);
+    let (outcome, lines) = fixture.reinstall_reporting();
+    assert_eq!(
+        outcome.unwrap(),
+        ClientRuntimeState::NeedsLogin,
+        "{lines:?}"
+    );
+    assert!(retired.join("stuck").is_dir(), "{lines:?}");
+    fixture.stop_client();
+
+    let (outcome, lines) = fixture.install_reporting("VALVE-SIGNED");
+    assert_eq!(
+        outcome.unwrap(),
+        ClientRuntimeState::NeedsLogin,
+        "{lines:?}"
+    );
+    let line = lines
+        .iter()
+        .find(|line| {
+            line.starts_with(&format!(
+                "package: could not remove {}: ",
+                retired.display()
+            ))
+        })
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(line.contains("remove it by hand"), "{line}");
+    assert!(!line.contains("the next op removes it"), "{line}");
+    fixture.stop_client();
+
+    fs::write(package.join("old-package-marker"), "the package before").unwrap();
+    let files = tree(&package);
+    fixture.clear_client_starts();
+    let (outcome, lines) = fixture.reinstall_reporting();
+    let error = outcome.unwrap_err();
+    assert_error_state_is_status(&fixture, &error);
+    let message = error.to_string();
+    assert!(
+        message.contains(&retired.display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("Permission denied"), "{message}");
+    assert!(message.contains("remove it by hand"), "{message}");
+    assert!(
+        !lines.iter().any(|line| line.starts_with("start:")
+            || line.starts_with("stop:")
+            || line.starts_with("repair:")),
+        "{lines:?}"
+    );
+    assert!(fixture.client_starts().is_empty(), "{lines:?}");
+    assert_eq!(tree(&package), files, "{lines:?}");
+    assert!(!fixture.steam_dir().join("package.reinstall-old").exists());
+    assert!(fixture.prefix_clients().is_empty(), "{lines:?}");
+    set_mode(&retired.join("stuck"), 0o755);
+}
+
+/// The commit point failing after the new client's launch (a retired
+/// directory that does not remove appeared mid-op, so the rename fails)
+/// stops that client before the old package comes back, though nothing
+/// shows it running yet when the failure comes: no client is left up
+/// unrecorded over the restored package.
+#[cfg(unix)]
+#[test]
+fn a_reinstall_whose_commit_fails_after_the_launch_stops_the_new_client() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let package = fixture.steam_dir().join("package");
+    fs::write(package.join("old-package-marker"), "the package before").unwrap();
+    let files = tree(&package);
+    let retired = fixture.steam_dir().join("package.reinstall-done");
+    let (outcome, lines) = fixture.reinstall_hooked(&mut |line| {
+        if line.starts_with("start: starting steam.exe") {
+            fs::create_dir_all(retired.join("stuck")).unwrap();
+            fs::write(retired.join("stuck/file"), "cannot go").unwrap();
+            set_mode(&retired.join("stuck"), 0o555);
+        }
+    });
+    let error = outcome.unwrap_err();
+    assert!(
+        error.to_string().contains("package.reinstall-old"),
+        "{error}"
+    );
+    assert_in_order(
+        &lines,
+        &[
+            "start: starting steam.exe for its self-update",
+            "stop: stopping the Steam client",
+            "package: restoring ",
+        ],
+    );
+    assert_eq!(tree(&package), files, "{lines:?}");
+    // The stub's start runs a shell and a sleep before its client shows.
+    thread::sleep(Duration::from_millis(500));
+    assert!(!fixture.client_up(), "{lines:?}");
+    assert!(fixture.prefix_clients().is_empty(), "{lines:?}");
+    set_mode(&retired.join("stuck"), 0o755);
 }
 
 /// A reinstall whose new client stalls on the prompt and dies keeps the
