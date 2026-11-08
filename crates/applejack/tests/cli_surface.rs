@@ -856,6 +856,24 @@ fn update_and_verify_cannot_go_together() {
     assert_eq!(output.status.code(), Some(2));
 }
 
+/// The one `--qr` description a terminal user reads says what appears.
+#[test]
+fn steam_login_help_says_the_code_is_drawn() {
+    let data = tempfile::tempdir().unwrap();
+    let output = with_data(data.path(), &["steam", "login", "--help"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let help = stdout_of(&output)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        help.contains(
+            "Draw a QR code in the terminal for the Steam mobile app to scan, with the URL under it"
+        ),
+        "{help}"
+    );
+}
+
 #[test]
 fn no_secret_is_an_argument() {
     let data = tempfile::tempdir().unwrap();

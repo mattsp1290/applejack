@@ -89,6 +89,11 @@ pub enum AuthError {
     /// Transport, protocol, or decode failure.
     #[error("connection: {0}")]
     Connection(String),
+    /// Steam hung up. This is how a QR challenge nobody scanned ends: the CM
+    /// closes an auth connection that has not logged on after about two
+    /// minutes, and the challenge goes with it.
+    #[error("connection: Steam closed the connection")]
+    Disconnected,
     /// This CM could not take the logon: it would not connect, answered
     /// `TryAnotherCM`, hung up before answering, or never answered. Another
     /// may, so `logon` moves on.

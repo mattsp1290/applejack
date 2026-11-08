@@ -691,6 +691,26 @@ final class ViewModelTests: XCTestCase {
         await failing.shutdown()
     }
 
+    /// The core's expiry text names no command. `FailureView` shows it as
+    /// `describe` renders it, with the Retry button `SteamAccountView` wires
+    /// to `startQrLogin`, which is the remedy here.
+    func testAnExpiredQrChallengeShowsTheCoreTextAndRetryStartsAgain() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LOGIN_EXPIRE": "1"])
+        let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(30))
+        await steam.startQrLogin()
+        await steam.waitForLogin()
+        let expiry = RpcError(code: RpcErrorCode.steamLoginFailed.rawValue, message: "the QR challenge expired after 125 s without a scan")
+        XCTAssertEqual(steam.login, .failed(.rpc(expiry)))
+        XCTAssertFalse(steam.isPolling)
+        XCTAssertEqual(describe(.rpc(expiry)), "the QR challenge expired after 125 s without a scan (code 1021)")
+        XCTAssertFalse(describe(.rpc(expiry)).contains("applejack"), "no terminal command in the shell")
+        XCTAssertEqual(try requests(for: "steam.login.start").count, 1)
+        await steam.startQrLogin()
+        await steam.waitForLogin()
+        XCTAssertEqual(try requests(for: "steam.login.start").count, 2, "Retry begins a fresh login")
+        await app.shutdown()
+    }
+
     func testGuardCodeIsWantedUnlessTheFactorIsDeviceConfirmation() async throws {
         let app = makeApp(environment: ["FAKE_CORE_LOGIN_GUARD": "device_confirmation", "FAKE_CORE_LOGIN_POLLS": "100"])
         let steam = SteamAccountViewModel(app: app, pollDelay: .milliseconds(30))
