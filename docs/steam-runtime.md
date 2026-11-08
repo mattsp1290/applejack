@@ -276,8 +276,10 @@ Before engine 11.0-3 the client could sit at the login window with
 `logs/connection_log.txt` repeating `EConnect called - scheduling connection
 for 50ms from now` ten times a second, after `UI Request: connect` in
 `logs/steamui_login.txt`, and never logging `YieldingConnect`: the client
-never connected (whether the QR code appeared in those runs was not
-checked). The client's CM connect waits for its
+never connected. On 2026-11-03 a QR code was seen to resolve within 10 s,
+but the record does not say in which of that day's starts (the one that
+connected or a later one); in the 2026-11-02 and 2026-11-08 runs whether
+it appeared was not checked. The client's CM connect waits for its
 `MachineIDInfoThread`, which runs WMI queries; `SELECT * FROM
 Win32_DiskPartition` calls `GetLogicalDrives`, and Wine 11.0's unix
 `NtQueryDirectoryObject`, built by clang, read the BOOLEAN `restart`
@@ -287,8 +289,9 @@ and the thread never finished. Whether it hung depended on stack contents,
 not on the network: hiding every adapter but `en0` and `lo0`, moving
 `config/config.vdf` aside, and the shim made no difference, and with engine
 11.0-2 and client build 1792618285 throughout, one start on 2026-11-03
-connected while the next one, an hour later with a byte-identical web helper
-command line, looped, as did the starts on 2026-11-02 and 2026-11-08. `build/wine/patches/0003-ntdll-directory-object-boolean-args.patch`
+connected while the next one, 45 minutes later with a byte-identical web
+helper command line, looped, as did the starts on 2026-11-02 and
+2026-11-08. `build/wine/patches/0003-ntdll-directory-object-boolean-args.patch`
 reads both BOOLEAN arguments through memory; with it the client connects
 with Tailscale and NetBird up.
 

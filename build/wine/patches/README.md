@@ -78,9 +78,10 @@ syscalls share the cause; see "Sub-int arguments to unix syscalls" below.
 `0004-iphlpapi-best-route-port.patch` gives `GetBestRoute2`'s routing probe a
 port. It asks the kernel for the route by connecting a UDP socket to the
 destination, which usually carries port 0, and macOS refuses `connect()` to
-port 0, so the kernel's answer was never used and every `GetBestInterface`,
-`GetBestInterfaceEx` and `GetBestRoute2` call fell back to scanning the route
-table.
+port 0, so the kernel's answer was never used: a `GetBestInterface`,
+`GetBestInterfaceEx` or `GetBestRoute2` call that gave no source address and
+port 0 fell back to scanning the route table (`GetBestInterface` always
+passes port 0).
 
 Wine is LGPL: this directory is the source of the changes the bundle's `wine/`
 carries. `THIRD_PARTY_NOTICES.md` in the bundle links it at the commit that last
@@ -99,7 +100,8 @@ caller left in the upper bits, which is stack and register contents, so it
 comes and goes.
 
 In the stock Wine 11.0 `x86_64-unix/ntdll.so` (measured with `objdump`) these
-syscalls read a register-passed BOOLEAN as 32 bits and are not patched:
+syscalls use a register-passed BOOLEAN as 32 bits and are not patched. The
+first five test it locally:
 
 | Syscall | Argument | Read |
 | --- | --- | --- |
@@ -107,7 +109,14 @@ syscalls read a register-passed BOOLEAN as 32 bits and are not patched:
 | `NtContinue` | `alertable` | `testl %esi,%esi` |
 | `NtDuplicateToken` | `effective_only` | `testl %ecx,%ecx` |
 | `NtQueryDefaultLocale`, `NtSetDefaultLocale` | `user` | `testl %edi,%edi` |
-| `NtWaitForMultipleObjects` | `alertable` | spilled and passed on as 32 bits (`movl %ecx,-0x2c(%rbp)`), possibly exposed through its callee |
+
+`NtAdjustPrivilegesToken` is exposed through the server request instead. It
+copies `disable` whole (`movl %esi,%r13d` at 0x299d1) and stores it as 32
+bits into `req->disable_all` (`movl %r13d,-0xc0(%rbp)` at 0x29a53), an `int`
+in `server/protocol.def` that wineserver tests whole (`server/token.c` line
+1284 in 11.0: `if (req->disable_all)`). Its own `if (!disable)` is a byte
+test (`testb %r13b,%r13b` at 0x29a68), so a FALSE with dirty upper bits sends no
+privilege list and has wineserver disable every privilege of the token.
 
 None has been seen to fail. kernelbase's `SleepEx`, the common route into
 `NtDelayExecution`, passes a whole 32-bit `BOOL`; a caller that set only the
@@ -118,12 +127,16 @@ Not exposed in the same build: BOOLEANs passed on the stack (the seventh
 argument onward, such as `NtQueryDirectoryFile`'s `single_entry` and
 `restart_scan`) are loaded with `movzbl`, and several register BOOLEANs are
 read only through their low byte (`NtWaitForSingleObject`,
-`NtSignalAndWaitForSingleObject`, `NtSetTimer`, `NtCreateEvent`,
-`NtCreateMutant`, `NtCommitTransaction`, `NtRollbackTransaction`,
-`NtSetTimerResolution`, the keyed events).
+`NtWaitForMultipleObjects`, `NtSignalAndWaitForSingleObject`, `NtSetTimer`,
+`NtCreateEvent`, `NtCreateMutant`, `NtCommitTransaction`,
+`NtRollbackTransaction`, `NtSetTimerResolution`, the keyed events).
+`NtWaitForMultipleObjects` spills `alertable` as 32 bits (`movl
+%ecx,-0x2c(%rbp)`) but afterwards reads it only as a byte: `movzbl
+%r13b,%edx` at 0x47c2d into `inproc_wait`, `cmpb $0x1,%r13b` at 0x47c47,
+and `cmpb $0x0,-0x30(%rbp)` at 0x47dcf in `inproc_wait`.
 
 To check a new Wine build, disassemble each unix syscall that takes a BOOLEAN
-and look at the first use of the argument's register (SysV order `rdi`,
+and follow every use of the argument's register (SysV order `rdi`,
 `rsi`, `rdx`, `rcx`, `r8`, `r9`; seventh and later on the stack):
 
 ```
@@ -134,8 +147,17 @@ objdump -d --no-show-raw-insn --disassemble-symbols=_NtDelayExecution \
 A `testl`, `cmpl` or 32-bit `cmov` on the register (`%edi`, `%r8d`) means
 the upper bits count: exposed. A `movzbl` from the 8-bit register (`%dil`,
 `%r8b`), a `testb` or a `cmpb` reads the byte alone. A 32-bit `movl` copy or
-spill decides nothing yet: follow the copy to its first test, or into the
-callee it is passed to.
+spill decides nothing yet: follow every use of the copy, not only its first
+test, including into the callee it is passed to. A 32-bit copy into a server
+request field (a `movl` into the request on the stack; in the C source,
+`req->field = arg`) is exposed when wineserver reads the field wider than a
+byte, even if the local code later tests only the byte. To check, find the
+field's type in `server/protocol.def` (or the generated
+`include/wine/server_protocol.h`) and its uses in `server/*.c`; an `int`
+field tested as `if (req->field)` is exposed. `NtAdjustPrivilegesToken`
+above is that case: its first local test is a `testb`, but the earlier
+`movl %r13d,-0xc0(%rbp)` fills `disable_all`, an `int` that
+`server/token.c` tests whole.
 A fix per function reloads the argument through `volatile BOOLEAN`, as 0003
 does; the general fix is for the dispatcher to zero-extend sub-int arguments,
 and is upstream's to make.

@@ -20,9 +20,10 @@ Reason: NtQueryDirectoryObject's unix side, built by clang for macOS, tests
  the same afternoon. See "The CM connect loop" in docs/steam-runtime.md.
  The same 32-bit read of a register-passed BOOLEAN is left unpatched in
  NtDelayExecution and NtContinue (alertable), NtDuplicateToken
- (effective_only), NtQueryDefaultLocale and NtSetDefaultLocale (user), and
- possibly NtWaitForMultipleObjects (alertable passed on as 32 bits): none
- has been seen to fail. build/wine/patches/README.md lists them and how to
+ (effective_only), and NtQueryDefaultLocale and NtSetDefaultLocale (user);
+ NtAdjustPrivilegesToken stores its BOOLEAN `disable` as 32 bits into the
+ server request's int `disable_all`, which wineserver tests whole. None has
+ been seen to fail. build/wine/patches/README.md lists them and how to
  check a new build.
 Drop-when: upstream wine's dlls/ntdll/unix/sync.c NtQueryDirectoryObject
  no longer reads its BOOLEAN arguments as wider than a byte, the unix side
