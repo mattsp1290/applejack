@@ -128,7 +128,8 @@ final class ViewModelTests: XCTestCase {
     /// Finder's order (`half-life` with `Half-Life 2`, `Éclair` among the
     /// E's, `Trials 2` before `Trials 10`), two titles of one name by appid,
     /// and a title with no name, or an empty one, under the "App <appid>" it
-    /// is shown as.
+    /// is shown as. The names avoid letters whose place depends on the locale
+    /// (Ö, Å, Aa in sv/da), so the pinned order holds on any host's locale.
     func testTheLibraryListsInstalledTitlesFirstThenByName() async throws {
         let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
         let library = LibraryViewModel(app: app)
@@ -144,6 +145,24 @@ final class ViewModelTests: XCTestCase {
         await app.shutdown()
     }
 
+    private func libraryEntry(_ appid: UInt32, _ name: String?) -> LibraryEntry {
+        LibraryEntry(appid: appid, name: name, installdir: "\(appid)", sizeBytes: 1, drm: .none, defaultBranch: "public", installState: .notInstalled)
+    }
+
+    /// Case and accents never decide between two names: the appid does.
+    func testNamesThatDifferOnlyInCaseOrAccentsGoByAppid() {
+        XCTAssertEqual(LibraryViewModel.ordered([libraryEntry(1000, "duplicate"), libraryEntry(999, "Duplicate")]).map(\.appid), [999, 1000], "a case-only pair, the lower appid first")
+        XCTAssertEqual(LibraryViewModel.ordered([libraryEntry(3001, "Eclair"), libraryEntry(3000, "Éclair")]).map(\.appid), [3000, 3001], "an accent-only pair, the lower appid first")
+    }
+
+    /// `Abzu` sorts before `App` and `Bastion` after it, so a title with an
+    /// empty or no name lands between them only under its shown name.
+    func testANamelessTitleSortsUnderItsShownName() {
+        let entries = [libraryEntry(7, ""), libraryEntry(10, "Bastion"), libraryEntry(8, nil), libraryEntry(9, "Abzu")]
+        XCTAssertEqual(LibraryViewModel.ordered(entries).map(\.appid), [9, 7, 8, 10])
+        XCTAssertEqual(libraryEntry(11, " ").title, "App 11", "a whitespace-only name is no name")
+    }
+
     func testSearchMatchesNamesAndAppidPrefixes() async throws {
         let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed"])
         let library = LibraryViewModel(app: app)
@@ -157,6 +176,12 @@ final class ViewModelTests: XCTestCase {
         XCTAssertEqual(library.filteredApps.map(\.appid), [1296610])
         XCTAssertEqual(library.matchCount, "Showing 1 of 15 titles")
 
+        library.query = "PEGLIN"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [1296610], "capitals fold without the locale's rules")
+
+        library.query = "Ｐｏｒｔａｌ"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [620, 400], "full-width letters match their ASCII forms")
+
         library.query = "eclair"
         XCTAssertEqual(library.filteredApps.map(\.appid), [3000], "a name substring without regard to diacritics")
 
@@ -168,6 +193,12 @@ final class ViewModelTests: XCTestCase {
 
         library.query = "123456"
         XCTAssertEqual(library.filteredApps.map(\.appid), [123456], "a title with no name is found by its appid")
+
+        library.query = "app 7"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [7], "the shown name is matched: an empty name shows as App 7")
+
+        library.query = "app"
+        XCTAssertEqual(library.filteredApps.map(\.appid), [7, 123456], "the shown name: `App <appid>` for a title with no name or an empty one")
 
         library.query = "life 2"
         XCTAssertEqual(library.filteredApps.map(\.appid), [220], "a substring with a space; `half-life` alone does not contain it")
@@ -221,6 +252,21 @@ final class ViewModelTests: XCTestCase {
         await library.load()
         XCTAssertEqual(library.selection, 220, "a reload that keeps the title keeps the highlight through `.loading`")
         await app.shutdown()
+    }
+
+    /// `FAKE_CORE_JOB_OUTCOME=never` holds a refresh in `.loading`.
+    func testAQueryTypedWhileLoadingKeepsTheHighlight() async throws {
+        let app = makeApp(environment: ["FAKE_CORE_LIBRARY": "mixed", "FAKE_CORE_JOB_OUTCOME": "never"])
+        let library = LibraryViewModel(app: app)
+        await library.load()
+        library.selection = 620
+        let refresh = Task { await library.load(refresh: true) }
+        try await waitUntil { library.library == .loading }
+        XCTAssertEqual(library.sortedApps, [], "nothing is listed while loading, not the old list")
+        library.query = "dota"
+        XCTAssertEqual(library.selection, 620, "a query typed while loading leaves the highlight to the next list")
+        await app.shutdown()
+        await refresh.value
     }
 
     func testConfigEditorLoadsAndSets() async throws {

@@ -19,15 +19,21 @@ public final class LibraryViewModel {
     public private(set) var installs: [UInt32: FlowState<JobSnapshot>] = [:]
     /// The search field's text. Whitespace alone is no query.
     public var query: String = "" {
-        didSet { dropHiddenSelection() }
+        didSet {
+            if library.value != nil {
+                dropHiddenSelection()
+            }
+        }
     }
     /// The highlighted row's appid; cleared when a query hides that title or
-    /// a reload no longer lists it.
+    /// a reload no longer lists it. While loading, or after a failed read, it
+    /// is kept until the next list arrives.
     public var selection: UInt32?
     /// Every title: `installed` and `update_available` first, then the rest,
-    /// each group in Finder's order (without regard to case or diacritics,
-    /// `Trials 2` before `Trials 10`) and by appid for two titles of one
-    /// name. Sorted once per library, not on every read.
+    /// each group in a Finder-like order (without regard to case, diacritics
+    /// or width, `Trials 2` before `Trials 10`) and by appid for two titles
+    /// whose names differ only in those. Sorted once per library, not on every read; `[]` unless a list
+    /// is loaded.
     public private(set) var sortedApps: [LibraryEntry] = []
     private let app: AppModel
 
@@ -51,7 +57,7 @@ public final class LibraryViewModel {
     }
 
     /// The query as matched: without surrounding whitespace.
-    public var trimmedQuery: String {
+    var trimmedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -66,7 +72,14 @@ public final class LibraryViewModel {
             if lhs.installState.isOnDisk != rhs.installState.isOnDisk {
                 return lhs.installState.isOnDisk
             }
-            switch lhs.title.localizedStandardCompare(rhs.title) {
+            // Not `localizedStandardCompare`: it orders names that differ only
+            // in case or accents, and the appid would never decide.
+            switch lhs.title.compare(
+                rhs.title,
+                options: [.caseInsensitive, .diacriticInsensitive, .numeric, .widthInsensitive],
+                range: nil,
+                locale: .current
+            ) {
             case .orderedAscending: return true
             case .orderedDescending: return false
             case .orderedSame: return lhs.appid < rhs.appid
@@ -75,7 +88,13 @@ public final class LibraryViewModel {
     }
 
     public static func matches(_ entry: LibraryEntry, query: String) -> Bool {
-        entry.title.localizedStandardRange(of: query) != nil
+        // Locale-free, so `PEGLIN` finds `Peglin` under a Turkish locale too.
+        entry.title.range(
+            of: query,
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            range: nil,
+            locale: nil
+        ) != nil
             || String(entry.appid).hasPrefix(query)
     }
 

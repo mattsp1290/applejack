@@ -134,24 +134,28 @@ and the params mirrors to the request goldens by `GoldenTests`.
 Library order and search: the core answers `steam.library` in its own order,
 and a library runs to a thousand titles, so `LibraryViewModel.sortedApps`
 puts the titles with files on disk first (`installed` and `update_available`
-count alike), then the rest, each group in Finder's order
-(`localizedStandardCompare`: without regard to case or diacritics, `Trials 2`
-before `Trials 10`, `Éclair` among the E's) and by appid for two titles of
-one name; a title with no name, or an empty one, is shown and sorted as `App
-<appid>`. The list is sorted once where `library` is assigned, not on every
-read; the sort is the view model's, tested against `FAKE_CORE_LIBRARY=mixed`
-(fifteen titles, scrambled), never the view's. The search field
+count alike), then the rest, each group in a Finder-like order
+(without regard to case, diacritics or width, `Trials 2` before `Trials 10`,
+`Éclair` among the E's) and by appid for two titles whose names differ only
+in those (`Duplicate` and `duplicate` go by appid); a title with no name,
+or an empty or blank one, is shown and sorted as `App <appid>`. The list
+is sorted once where `library` is assigned, not on every read; the sort is
+the view model's, tested against `FAKE_CORE_LIBRARY=mixed` (fifteen titles,
+scrambled), never the view's. The search field
 (`.searchable`, "Name or appid") writes `query`; `filteredApps` keeps a title
 whose shown name (the name, or `App <appid>` without one) contains the query
-without regard to case or diacritics (`eclair` finds `Éclair`) or whose appid
-starts with it (a prefix, not a substring), whitespace alone is no query, and
+without regard to case, diacritics or width and without the locale's case
+rules (`eclair` finds `Éclair`, `PEGLIN` finds `Peglin` under a Turkish
+locale, full-width `Ｐｏｒｔａｌ` finds `Portal`) or whose appid starts with
+it (a prefix, not a substring), whitespace alone is no query, and
 `matchCount` ("Showing 2 of 15 titles") is shown under the list only while a
 query is active, with `ContentUnavailableView.search` (showing the trimmed
 query) in place of an empty list. The highlighted row (`selection`) stays
 through a query its title still matches and through a reload that still lists
-it; it is cleared by a query that hides it or a reload that drops it
-(`FAKE_CORE_LIBRARY=mixed-then-pair` pins the reload); clearing the query
-restores the full list and brings no selection back.
+it; it is cleared by a query that hides it or a reload that drops it, and
+kept while a list is loading or after a failed read until the next list
+arrives (`FAKE_CORE_LIBRARY=mixed-then-pair` pins the reload); clearing the
+query restores the full list and brings no selection back.
 
 Flows that need an answer before the core sends a request:
 

@@ -326,9 +326,9 @@ public struct LibraryEntry: Codable, Equatable, Sendable, Identifiable {
     }
 
     public var id: UInt32 { appid }
-    /// The shown name; a `null` or empty name shows the appid.
+    /// The shown name; a `null`, empty or whitespace-only name shows the appid.
     public var title: String {
-        if let name, !name.isEmpty { return name }
+        if let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return name }
         return "App \(appid)"
     }
 }
