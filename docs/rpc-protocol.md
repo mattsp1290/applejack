@@ -218,7 +218,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `app.cancel` | `JobStarted`; see [Sessions](#sessions) |
 | `runtime.steam.install` | `JobStarted`; see [Steam client runtime](#steam-client-runtime) |
 | `runtime.steam.update` | `JobStarted` |
-| `runtime.steam.repair` | `JobStarted`. `reinstall` checks the payload (`probes/osslsigncode`, the shim), then removes the client's package directory before it fetches and reruns the bootstrapper |
+| `runtime.steam.repair` | `JobStarted`. `reinstall` checks the payload (`probes/osslsigncode`, the shim), then stops the client and moves its package directory aside before it fetches and reruns the bootstrapper; a failure before the new client's end check puts the old one back, success removes it |
 | `runtime.steam.stop` | `JobStarted` |
 | `runtime.steam.status` | `{state, prefix, build_id, running, snapshots, detail}`; `state` is one of `absent`, `installing`, `needs_login`, `ready`, `updating`, `broken` |
 | `session.list` | `{"sessions": [SessionRow]}`, newest first; `appid` narrows it to one title |
@@ -378,7 +378,8 @@ core leaves this recovery to the next start.
 `docs/steam-runtime.md` is the full account. `runtime.steam.status` answers
 at once; the other four are jobs whose `job.progress` phases are the steps
 (`prepare`, `prefix`, `install`, `download`, `verify`, `bootstrap`,
-`library`, `shim`, `start`, `client`, `build`, `snapshot`, `repair`, `stop`),
+`library`, `shim`, `start`, `client`, `build`, `snapshot`, `repair`,
+`package`, `stop`),
 then, after a client start (or `install`'s wait on a client already up), a
 phase named for the state the op left (`needs_login`, `ready`, `broken`,
 `updating`, ...) whose message is the state's detail; `repair`'s restore and
@@ -403,31 +404,38 @@ the last line the start printed:
   the two never disagree; for a state whose detail names no way out
   (`ready`, `absent`) the detail ends `` `applejack runtime steam install`
   starts the client to its window again``;
-- a client that exits during the wait, `{ broken }` after its last
+- a client that exits during the wait, after its last
   `client:` line: the stall (`client: stalled: the client's main loop is
   stalled (<log>); ...`, or a `client:` phase line after it), a file-check
   start that laid no helper down, or the early exit (a second clean
   shutdown in one op, or any other exit);
-- a payload with no shim, `{ broken }` before the start's first `start:`
-  line: on an `install` that runs the bootstrapper, its check catches it
-  first, before the download (on a fresh `install` the last line is
-  `prefix: creating prefix steam-client`, and `status` reads `absent`; on
-  `repair --reinstall`, before the stop and the removal of `package/`, so
-  `status` is unchanged); otherwise the shim pass does.
+- a payload with no shim, before the start's first `start:` line: on an
+  `install` that runs the bootstrapper and on `repair --reinstall`, the
+  payload check catches it first, before the download (on a fresh
+  `install` the last line is `prefix: creating prefix steam-client`; on
+  `repair --reinstall`, before the stop and the move aside of `package/`);
+  otherwise the shim pass does.
+
+One rule covers every `ClientRuntimeBroken` these jobs fail with: its state
+is what `runtime.steam.status` reads when the job ends (after any stop or
+restore the job made), and its detail is the failure's own. A failed
+`repair --reinstall` leaves the old package directory in place (a
+`package: restoring ...` line), so `status` then reads what it read before
+the job.
 
 Every start's `start:` lines are followed by at least one `client:` phase
 line (`client: starting`, or `client: updating` while the self-update
 runs), so all but the missing shim end on a `client:` or `stop:` line, never
-on `start:`. `status` then reads `broken` after the restart limit and a
-file-check start whose client exited with no helper laid down, reads the
-error's own state after a window timeout, and does not see the stall, the
-early exit or the missing shim. `install`'s wait on a client already up
+on `start:` (on `repair --reinstall`, a `package:` line follows). `status`
+does not see the stall, the early exit or the missing shim themselves: the
+error's detail is where they are named. `install`'s wait on a client already up
 starts nothing; its failures are the window timeout's and the exit's
 above, and with the client's own helper in front it fails after its
 `shim:` line without waiting. With an orphan shim or no helper there it
 warns under `shim:`, waits, and fails with `ClientRuntimeBroken` after
-its `broken` phase; a helper that does not read gets no `shim:` line and
-fails the same way.
+its `broken` phase, whose detail names `applejack runtime steam stop`
+first, then `install` (`install` on a running client only waits again); a
+helper that does not read gets no `shim:` line and fails the same way.
 
 The prefix is claimed before the answer, so `PrefixBusy` (a title runs
 through the client) is an error response. `runtime.steam.install` is the one
