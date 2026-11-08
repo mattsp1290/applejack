@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `absent` | no `drive_c/Program Files (x86)/Steam/steam.exe` in the prefix |
 //! | `installing` | `applejack/client-install.json` in the prefix while another process holds the prefix lock |
-//! | `broken` | the prefix record does not open, a `Steam/` directory without `steam.exe`, an install marker nobody holds the lock for, or a `cef.win*/steamwebhelper.exe` that is the web helper shim with no `steamwebhelper_real.exe` beside it |
+//! | `broken` | the prefix record does not open, a `Steam/` directory without `steam.exe`, an install marker nobody holds the lock for, a `cef.win*/steamwebhelper.exe` that is the web helper shim with no `steamwebhelper_real.exe` beside it, a `cef.win*` directory with neither helper file, a populated one with the client's own helper in front, or a helper file that does not read |
 //! | `updating` | `Steam/package/steam_client_win64.manifest` (or the older `win32` one) is missing, or `Steam/package/tmp/` exists while the client runs |
 //! | `needs_login` | `Steam/config/loginusers.vdf` names no remembered account |
 //! | `ready` | it names one |
@@ -582,6 +582,19 @@ impl ClientPaths {
     #[must_use]
     pub fn package_tmp(&self) -> PathBuf {
         self.steam_dir().join("package/tmp")
+    }
+
+    /// `Steam/package/`, the client's own package directory.
+    #[must_use]
+    pub fn package(&self) -> PathBuf {
+        self.steam_dir().join("package")
+    }
+
+    /// Where `repair --reinstall` keeps the old `package/` until the new
+    /// client reaches its end check.
+    #[must_use]
+    pub fn package_aside(&self) -> PathBuf {
+        self.steam_dir().join("package.reinstall-old")
     }
 
     #[must_use]
@@ -1897,6 +1910,13 @@ impl PlannedClientOp {
         fetch: Fetcher<'_>,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<(), CoreError> {
+        // A reinstall that died left the old package aside; restoring it
+        // undoes whatever half of the new one is there. The one window in
+        // which the new package is whole is between its end check and the
+        // removal, and the restore costs that client one self-update.
+        if self.paths.package_aside().is_dir() {
+            self.put_package_back(report, "left by a reinstall that did not finish")?;
+        }
         match self.op {
             ClientOp::Install => self.install(fetch, false, report),
             ClientOp::Repair { reinstall: true } => self.install(fetch, true, report),
@@ -1904,6 +1924,33 @@ impl PlannedClientOp {
             ClientOp::Update => self.update(report),
             ClientOp::Stop => self.stop(report),
         }
+    }
+
+    /// Stops the client if it runs and puts the moved-aside package back in
+    /// place of whatever `package/` holds.
+    fn put_package_back(
+        &mut self,
+        report: &mut dyn FnMut(&str, String),
+        why: &str,
+    ) -> Result<(), CoreError> {
+        if self.client_running() {
+            self.stop(report)?;
+        }
+        Core::settle(&self.paths.prefix_dir)?;
+        let package = self.paths.package();
+        let aside = self.paths.package_aside();
+        report(
+            "package",
+            format!(
+                "restoring {} from {}, {why}",
+                package.display(),
+                aside.display()
+            ),
+        );
+        if fs::symlink_metadata(&package).is_ok() {
+            fs::remove_dir_all(&package).map_err(|error| CoreError::io(&package, error))?;
+        }
+        fs::rename(&aside, &package).map_err(|error| CoreError::io(&aside, error))
     }
 
     fn log_path(&self) -> PathBuf {
@@ -2031,29 +2078,97 @@ impl PlannedClientOp {
             }
             self.wait_window(None, None, false, report)?;
             self.finish(report)?;
-            return self.end_check();
+            return self
+                .end_check()
+                .map_err(|error| self.stop_comes_first(error));
         }
         if reinstall {
-            // Refused here, not at the bootstrapper: past this point the
-            // client's package is gone.
+            // Cheap and clear, ahead of the stop; the move aside below
+            // covers whatever else fails.
             self.payload_preflight()?;
             self.stop(report)?;
-            let package = self.paths.steam_dir().join("package");
-            if package.is_dir() {
-                report("repair", format!("removing {}", package.display()));
-                fs::remove_dir_all(&package).map_err(|error| CoreError::io(&package, error))?;
+            let package = self.paths.package();
+            let aside = self.paths.package_aside();
+            let moved = package.is_dir();
+            if moved {
+                report(
+                    "repair",
+                    format!(
+                        "moving {} aside to {} until the new client reaches its window",
+                        package.display(),
+                        aside.display()
+                    ),
+                );
+                fs::rename(&package, &aside).map_err(|error| CoreError::io(&package, error))?;
             }
+            if let Err(error) = self.lay_down(fetch, &prefix, true, report) {
+                if moved
+                    && let Err(restore) =
+                        self.put_package_back(report, "since the reinstall failed")
+                {
+                    // Left aside, the next op restores it.
+                    report(
+                        "package",
+                        format!("could not restore {}: {restore}", package.display()),
+                    );
+                }
+                return Err(error);
+            }
+            if moved {
+                report("repair", format!("removing {}", aside.display()));
+                fs::remove_dir_all(&aside).map_err(|error| CoreError::io(&aside, error))?;
+            }
+            return self.end_check();
         }
-        if !self.paths.steam_exe().is_file() || reinstall {
+        let bootstrap = !self.paths.steam_exe().is_file();
+        self.lay_down(fetch, &prefix, bootstrap, report)?;
+        self.end_check()
+    }
+
+    /// The bootstrapper when `bootstrap`, then the first run to the window.
+    fn lay_down(
+        &mut self,
+        fetch: Fetcher<'_>,
+        prefix: &Prefix,
+        bootstrap: bool,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<(), CoreError> {
+        if bootstrap {
             self.write_marker()?;
             // A refusal is not a half-done install: only a death between
             // here and the removal leaves the marker, and that reads as broken.
-            let bootstrapped = self.bootstrap(fetch, &prefix, report);
+            let bootstrapped = self.bootstrap(fetch, prefix, report);
             let _ = fs::remove_file(self.paths.install_marker());
             bootstrapped?;
         }
-        self.first_run(&prefix, report)?;
-        self.end_check()
+        self.first_run(prefix, report)
+    }
+
+    /// `install`'s end check on a client that was already up: an orphan
+    /// shim's or a missing helper's way out assumes a stopped client, and
+    /// `install` on a running one only waits again, so `stop` leads.
+    fn stop_comes_first(&self, error: CoreError) -> CoreError {
+        if !self.client_up_with_server() {
+            return error;
+        }
+        match self.core.runtime_reading(true) {
+            Ok(RuntimeReading::Broken(
+                reason @ (BrokenReason::ShimWithoutReal(_) | BrokenReason::NoWebHelper(_)),
+            )) => {
+                let (cause, way_out) = reason.parts();
+                CoreError::ClientRuntimeBroken {
+                    state: ClientRuntimeState::Broken,
+                    detail: shown_detail(
+                        format!(
+                            "{cause}; the client is still running, so `applejack runtime steam \
+                             stop` comes first; then {way_out}"
+                        ),
+                        true,
+                    ),
+                }
+            }
+            _ => error,
+        }
     }
 
     /// The payload files the bootstrap path needs, checked before anything
