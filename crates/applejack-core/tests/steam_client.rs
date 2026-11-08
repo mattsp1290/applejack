@@ -1282,12 +1282,16 @@ fn repair_over_a_marker_and_a_record_that_does_not_open_restores_after_the_marke
         status.detail
     );
     assert!(!marker.exists());
-    assert!(
-        lines.iter().any(|line| line.starts_with(
-            "repair: cleared the marker of an install that died; the runtime is still broken: "
-        )),
-        "{lines:?}"
-    );
+    let cleared = lines
+        .iter()
+        .find(|line| {
+            line.starts_with(
+                "repair: cleared the marker of an install that died; the runtime is still broken: ",
+            )
+        })
+        .unwrap_or_else(|| panic!("no marker line: {lines:?}"));
+    assert_names_no_remedy(cleared);
+    assert_reason_names_no_remedy(&lines);
     assert!(
         lines.contains(&format!(
             "repair: restoring steam-client from {}",
@@ -2919,8 +2923,14 @@ fn assert_reason_names_no_remedy(lines: &[String]) {
             line.starts_with("repair: ") && line.ends_with("; restoring the newest usable snapshot")
         })
         .unwrap_or_else(|| panic!("no reason line before the restore: {lines:?}"));
+    assert_names_no_remedy(reason);
+}
+
+/// A `repair:` line the restore follows names the break, not a command
+/// that would contradict the restore.
+fn assert_names_no_remedy(line: &str) {
     for remedy in ["applejack runtime steam", "--reinstall", "`install`"] {
-        assert!(!reason.contains(remedy), "{remedy} in {reason:?}");
+        assert!(!line.contains(remedy), "{remedy} in {line:?}");
     }
 }
 
@@ -3089,7 +3099,7 @@ fn repair_in_place_ends_broken_when_another_cef_directory_holds_no_helper() {
 /// io error of the re-scan that cannot read it, and the op fails with that
 /// reason rather than succeeding on a `broken` runtime.
 #[test]
-fn install_reports_broken_when_a_start_leaves_a_helper_that_does_not_read() {
+fn install_fails_when_its_start_leaves_a_helper_that_does_not_read() {
     let fixture = Fixture::new();
     fixture.install();
     fixture.stop_client();

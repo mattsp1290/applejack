@@ -2543,17 +2543,16 @@ impl PlannedClientOp {
                 );
                 return Ok(());
             };
+            why = reason.cause();
             report(
                 "repair",
                 format!(
                     "cleared the marker of an install that died; the runtime is still broken: \
-                     {}",
-                    reason.detail()
+                     {why}"
                 ),
             );
-            why = reason.cause();
         }
-        // `runtime_state` reads the record, `steam.exe` and the marker before
+        // `runtime_reading` reads the record, `steam.exe` and the marker before
         // any `cef.win*` (the marker is gone by here: cleared above, or never
         // there with `steam.exe`), so with the first two intact and every
         // helper and stash path reading, an exposed helper is the pass's,
