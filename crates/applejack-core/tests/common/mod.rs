@@ -41,18 +41,21 @@ const BUNDLE_FILES: &[&str] = &[
 /// `REAL-HELPER-1`) unless `$WINEPREFIX/no-self-update` is there (a
 /// self-update that never gets that far); a later start lays a missing
 /// helper down only when its file check runs (no `-noverifyfiles`) and
-/// `$WINEPREFIX/no-file-check` is absent (under it the check lays nothing down, the live shape the
-/// recovery has not been seen to rule out), and `$WINEPREFIX/self-update`
-/// makes it write `REAL-HELPER-2` over the helper once, as a client update
-/// does (`self-update-always` at every start, a client that writes its
-/// helper back each time); `$WINEPREFIX/late-cef-win64` lays a new `bin/cef/cef.win64/
-/// steamwebhelper.exe` (`REAL-HELPER-64`) at the second start since
-/// `client-args` was cleared (once; `cef.win7x64` stays as it is), the
-/// shape the live client showed; `$WINEPREFIX/
-/// new-cef-dir-every-start` lays `bin/cef/cef.win-extra-<n>/steamwebhelper.exe`
-/// at every start `n`; `$WINEPREFIX/unreadable-helper-at-start` lays a
-/// directory at `bin/cef/cef.win64/steamwebhelper.exe`, a helper that does
-/// not read; `$WINEPREFIX/early-shutdown` (one-shot) and
+/// `$WINEPREFIX/no-file-check` is absent (under it the check lays nothing
+/// down, the live shape the recovery has not been seen to rule out), and
+/// `$WINEPREFIX/self-update` makes it write `REAL-HELPER-2` over the helper
+/// once, as a client update does (`self-update-always` at every start, a
+/// client that writes its helper back each time);
+/// `$WINEPREFIX/late-cef-win64` lays a new
+/// `bin/cef/cef.win64/steamwebhelper.exe` (`REAL-HELPER-64`) at the second
+/// start since `client-args` was cleared (once; `cef.win7x64` stays as it
+/// is), the shape the live client showed;
+/// `$WINEPREFIX/new-cef-dir-every-start` lays
+/// `bin/cef/cef.win-extra-<n>/steamwebhelper.exe` at every start `n`;
+/// `$WINEPREFIX/unreadable-helper-at-start` lays a directory at
+/// `bin/cef/cef.win64/steamwebhelper.exe`, a helper that does not read, at
+/// every start while it is there (it persists for the fixture, which owns
+/// its prefix); `$WINEPREFIX/early-shutdown` (one-shot) and
 /// `early-shutdown-always` make a start write `Verification skipped` and
 /// `Shutdown` to `logs/bootstrap_log.txt` and exit with no window, as the
 /// live first start did twice; `$WINEPREFIX/no-window` makes every start

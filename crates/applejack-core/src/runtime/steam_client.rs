@@ -915,7 +915,10 @@ impl ExposedHelper {
 /// and the scan after every start read the same thing; the scan runs after
 /// every start since the client lays directories down as it pleases
 /// (`cef.win64` appeared at a second start live, after the pass had
-/// covered `cef.win7` and `cef.win7x64`).
+/// covered `cef.win7` and `cef.win7x64`). It stops at the first exposed
+/// directory and reads none after it, so callers treat its error as `None`
+/// or read it after [`orphan_shim`] and [`missing_web_helper`], which read
+/// every helper first; `repair` reads them all ([`cef_helpers_read`]).
 pub(crate) fn exposed_helper(paths: &ClientPaths) -> Result<Option<ExposedHelper>, CoreError> {
     let (dirs, _) = populated_cef_dirs(paths)?;
     for dir in dirs {
@@ -925,6 +928,18 @@ pub(crate) fn exposed_helper(paths: &ClientPaths) -> Result<Option<ExposedHelper
         }
     }
     Ok(None)
+}
+
+/// The first read failure of a `steamwebhelper.exe` or
+/// `steamwebhelper_real.exe` under any `cef.win*` directory, read as the
+/// shim pass reads them (a regular file or nothing): the pass writes
+/// through each, so with one that does not read it would fail midway.
+fn cef_helpers_read(paths: &ClientPaths) -> Result<(), CoreError> {
+    for dir in cef_dirs(paths)? {
+        shim_file(&dir.join(WEBHELPER_EXE), None)?;
+        shim_file(&dir.join(WEBHELPER_REAL), None)?;
+    }
+    Ok(())
 }
 
 /// Whether the lines `path` gained past `offset` are the client ending on
@@ -1960,7 +1975,8 @@ impl PlannedClientOp {
             let _ = fs::remove_file(self.paths.install_marker());
             bootstrapped?;
         }
-        self.first_run(&prefix, report)
+        self.first_run(&prefix, report)?;
+        self.end_check()
     }
 
     fn bootstrap(
@@ -2425,7 +2441,8 @@ impl PlannedClientOp {
         )?;
         report("snapshot", SnapshotResult::from(taken).timestamp);
         let (_, prefix) = self.core.open_prefix(STEAM_CLIENT_PREFIX)?;
-        self.first_run(&prefix, report)
+        self.first_run(&prefix, report)?;
+        self.end_check()
     }
 
     /// Repairs a `broken` runtime and refuses any other state, since a
@@ -2437,19 +2454,21 @@ impl PlannedClientOp {
     /// stopped, the helper stashed and the shim put in front by the next
     /// start's pass, and started to its window; nothing is restored, and
     /// whatever else `bin/cef` holds the pass handles or its end check
-    /// reports. A helper that does not read is the restore's. Otherwise
-    /// the newest usable snapshot is restored: one whose
-    /// prefix record opens and which holds `steam.exe`. Each newer snapshot
-    /// is reported as skipped with its reason, and with no usable one the
-    /// op refuses with `ClientRuntimeBroken`. The safety copy the restore
-    /// takes of the state repaired away is discarded when that state had no
-    /// `steam.exe` (nothing of a client to keep), and kept as a regular
-    /// snapshot when it had one (a prefix record that does not open may sit
-    /// over a sign-in): the report names it for `prefix restore`, and
-    /// `repair` never picks it, since its record does not open. The op
-    /// succeeds only when the runtime no longer reads `broken`.
+    /// reports. A helper or stash path that does not read, in any
+    /// `cef.win*` directory, is the restore's. Otherwise a `repair:` line
+    /// names the break and the newest usable snapshot is restored: one
+    /// whose prefix record opens and which holds `steam.exe`. Each newer
+    /// snapshot is reported as skipped with its reason, and with no usable
+    /// one the op refuses with `ClientRuntimeBroken`. The safety copy the
+    /// restore takes of the state repaired away is discarded when that
+    /// state had no `steam.exe` (nothing of a client to keep), and kept as
+    /// a regular snapshot when it had one (a prefix record that does not
+    /// open may sit over a sign-in): the report names it for `prefix
+    /// restore`, and `repair` never picks it, since its record does not
+    /// open. The op succeeds only when the runtime no longer reads
+    /// `broken`.
     fn repair(&mut self, report: &mut dyn FnMut(&str, String)) -> Result<(), CoreError> {
-        let (state, detail) = self.core.runtime_state(true)?;
+        let (state, mut detail) = self.core.runtime_state(true)?;
         if state != ClientRuntimeState::Broken {
             return Err(nothing_to_repair(state, &detail));
         }
@@ -2457,7 +2476,7 @@ impl PlannedClientOp {
         let marker = self.paths.install_marker();
         if had_steam_exe && marker.exists() {
             fs::remove_file(&marker).map_err(|error| CoreError::io(&marker, error))?;
-            let (state, detail) = self.core.runtime_state(true)?;
+            let (state, now) = self.core.runtime_state(true)?;
             if state != ClientRuntimeState::Broken {
                 report(
                     "repair",
@@ -2470,23 +2489,37 @@ impl PlannedClientOp {
                 "repair",
                 format!(
                     "cleared the marker of an install that died; the runtime is still broken: \
-                     {detail}"
+                     {now}"
                 ),
             );
+            detail = now;
         }
         // `runtime_state` reads the record, `steam.exe` and the marker before
         // any `cef.win*` (the marker is gone by here: cleared above, or never
-        // there with `steam.exe`), so with the first two intact an exposed
-        // helper is the pass's, whatever else `bin/cef` holds beside it (an
-        // orphan shim or a directory with no helper the pass handles or its
-        // end check reports); a record that does not open, a missing
-        // `steam.exe`, or a helper that does not read (`HelperUnreadable`,
-        // whose detail promises the restore) is the restore's.
+        // there with `steam.exe`), so with the first two intact and every
+        // helper and stash path reading, an exposed helper is the pass's,
+        // whatever else `bin/cef` holds beside it (an orphan shim or a
+        // directory with no helper the pass handles or its end check
+        // reports); a record that does not open, a missing `steam.exe`, or
+        // any helper or stash path that does not read, in any directory
+        // (`HelperUnreadable`, whose detail promises the restore), is the
+        // restore's.
         let intact = had_steam_exe && self.core.engine.open_prefix(&self.paths.prefix_dir).is_ok();
-        if intact && let Some(exposed) = exposed_helper(&self.paths).ok().flatten() {
-            return self.reshim_in_place(&exposed, report);
+        if intact {
+            match cef_helpers_read(&self.paths) {
+                Err(error) => detail = format!("a web helper file does not read: {error}"),
+                Ok(()) => {
+                    if let Some(exposed) = exposed_helper(&self.paths).ok().flatten() {
+                        return self.reshim_in_place(&exposed, report);
+                    }
+                }
+            }
         }
         let newest = self.usable_snapshot(report)?;
+        report(
+            "repair",
+            format!("{detail}; restoring the newest usable snapshot"),
+        );
         self.stop(report)?;
         let had_prefix = self.paths.prefix_dir.is_dir();
         if had_prefix {
@@ -2563,6 +2596,13 @@ impl PlannedClientOp {
         Core::settle(&self.paths.prefix_dir)?;
         let prefix = self.ensure_prefix(report)?;
         self.first_run(&prefix, report)?;
+        self.end_check()
+    }
+
+    /// `Ok` only when the runtime no longer reads `broken`: an op whose
+    /// start left it `broken` fails with the reason `finish` reported,
+    /// rather than succeeding on a runtime `status` reads `broken`.
+    fn end_check(&self) -> Result<(), CoreError> {
         let (state, detail) = self.core.runtime_state(true)?;
         if state == ClientRuntimeState::Broken {
             return Err(CoreError::ClientRuntimeBroken {

@@ -2863,6 +2863,88 @@ fn repair_restores_a_client_whose_helper_does_not_read() {
     assert_eq!(fixture.helper(), fixture.shim(), "back from the snapshot");
 }
 
+/// Every helper and stash path under `bin/cef` must read for the in-place
+/// pass: an unreadable helper in a directory that sorts after an exposed
+/// one (`cef.win7x64` after `cef.win64`) is `HelperUnreadable`, the
+/// restore's, as `status` promises; the pass would fail on it with a bare
+/// io error. The line before the restore names why.
+#[test]
+fn repair_restores_an_unreadable_helper_even_with_an_exposed_directory_sorted_before_it() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let good = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.stop_client();
+    let win64 = fixture.cef_dir_named("cef.win64");
+    fs::create_dir_all(&win64).unwrap();
+    fs::write(win64.join(WEBHELPER_EXE), b"REAL-HELPER-64").unwrap();
+    let helper = fixture.cef_dir().join(WEBHELPER_EXE);
+    fs::remove_file(&helper).unwrap();
+    fs::create_dir(&helper).unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    assert!(detail.contains("does not read"), "{detail}");
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert_in_order(
+        &lines,
+        &[
+            &format!(
+                "repair: a web helper file does not read: {}: is not a regular file; restoring \
+                 the newest usable snapshot",
+                helper.display()
+            ),
+            &format!(
+                "repair: restoring {STEAM_CLIENT_PREFIX} from {}",
+                good.timestamp
+            ),
+        ],
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("nothing to restore")),
+        "the restore path, not the in-place pass: {lines:?}"
+    );
+    assert!(!win64.exists(), "the snapshot predates the directory");
+    assert!(helper.is_file(), "the directory is gone: {lines:?}");
+}
+
+/// An exposed helper whose stash path is not a regular file reads as the
+/// exposed shape in `status` (the stash is read as absent), but the pass
+/// would fail writing through it: the restore runs instead.
+#[test]
+fn repair_restores_an_exposed_helper_whose_stash_path_does_not_read() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let good = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.stop_client();
+    let real = fixture.cef_dir().join(WEBHELPER_REAL);
+    fs::remove_file(&real).unwrap();
+    fs::create_dir(&real).unwrap();
+    fs::write(fixture.cef_dir().join(WEBHELPER_EXE), b"REAL-HELPER-2").unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    assert!(
+        detail.contains("is the client's own web helper with no"),
+        "{detail}"
+    );
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert!(
+        lines.contains(&format!(
+            "repair: restoring {STEAM_CLIENT_PREFIX} from {}",
+            good.timestamp
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("nothing to restore")),
+        "the restore path, not the in-place pass: {lines:?}"
+    );
+    assert!(real.is_file(), "the directory is gone: {lines:?}");
+    assert_eq!(fixture.helper(), fixture.shim(), "back from the snapshot");
+}
+
 /// The gate's record term: an exposed helper beside a prefix record that
 /// does not open is the restore's, never the in-place pass (whose
 /// `ensure_prefix` would fail on the record with no restore).
@@ -2952,20 +3034,68 @@ fn repair_in_place_ends_broken_when_another_cef_directory_holds_no_helper() {
 
 /// A helper the client's start leaves unreadable (a directory at its path)
 /// ends `install` on the `broken` state line `status` reads, not the bare
-/// io error of the re-scan that cannot read it.
+/// io error of the re-scan that cannot read it, and the op fails with that
+/// reason rather than succeeding on a `broken` runtime.
 #[test]
 fn install_reports_broken_when_a_start_leaves_a_helper_that_does_not_read() {
     let fixture = Fixture::new();
     fixture.install();
     fixture.stop_client();
     fs::write(fixture.prefix_dir().join("unreadable-helper-at-start"), "").unwrap();
-    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
-    assert_eq!(state.unwrap(), ClientRuntimeState::Broken, "{lines:?}");
+    let (outcome, lines) = fixture.install_reporting("VALVE-SIGNED");
+    let Err(error) = outcome else {
+        panic!("install must not return Ok on a broken runtime: {lines:?}");
+    };
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Broken,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("does not read"), "{error}");
     let unreadable = fixture.cef_dir_named("cef.win64").join(WEBHELPER_EXE);
     assert!(
         lines.iter().any(|line| line.starts_with("broken:")
             && line.contains(&unreadable.display().to_string())
             && line.contains("does not read")),
+        "{lines:?}"
+    );
+    fixture.stop_client();
+}
+
+/// `update` ends as `install` does: a start that leaves the runtime
+/// `broken` fails the op with the reason, never `Ok` on a `broken` runtime.
+#[test]
+fn update_fails_when_its_start_leaves_a_helper_that_does_not_read() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::write(fixture.prefix_dir().join("unreadable-helper-at-start"), "").unwrap();
+    let mut lines = Vec::new();
+    let outcome = fixture
+        .core()
+        .plan_client_op(ClientOp::Update)
+        .and_then(|op| op.run(&mut |phase, message| lines.push(format!("{phase}: {message}"))));
+    let Err(error) = outcome else {
+        panic!("update must not return Ok on a broken runtime: {lines:?}");
+    };
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Broken,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("does not read"), "{error}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("broken:")),
         "{lines:?}"
     );
     fixture.stop_client();
