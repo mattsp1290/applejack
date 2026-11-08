@@ -2818,6 +2818,7 @@ fn repair_restores_a_client_without_steam_exe_even_with_an_exposed_helper_beside
         }),
         "the restore path, not the in-place pass: {lines:?}"
     );
+    assert_reason_names_no_remedy(&lines);
     assert!(
         fixture.steam_dir().join("steam.exe").is_file(),
         "back from the snapshot"
@@ -2904,8 +2905,59 @@ fn repair_restores_an_unreadable_helper_even_with_an_exposed_directory_sorted_be
         !lines.iter().any(|line| line.contains("nothing to restore")),
         "the restore path, not the in-place pass: {lines:?}"
     );
+    assert_reason_names_no_remedy(&lines);
     assert!(!win64.exists(), "the snapshot predates the directory");
     assert!(helper.is_file(), "the directory is gone: {lines:?}");
+}
+
+/// The restore's reason line, which names the break without the way out
+/// that the `status` detail gives: the way out is the restore it announces.
+fn assert_reason_names_no_remedy(lines: &[String]) {
+    let reason = lines
+        .iter()
+        .find(|line| {
+            line.starts_with("repair: ") && line.ends_with("; restoring the newest usable snapshot")
+        })
+        .unwrap_or_else(|| panic!("no reason line before the restore: {lines:?}"));
+    for remedy in ["applejack runtime steam", "--reinstall", "`install`"] {
+        assert!(!reason.contains(remedy), "{remedy} in {reason:?}");
+    }
+}
+
+/// An installed client with nothing under `bin/cef` (`NoWebHelper`, whose
+/// `status` detail points at `install` and `--reinstall`): `repair`
+/// restores, and its reason line names the empty directory, not those.
+#[test]
+fn repair_restores_an_empty_bin_cef_and_its_reason_names_no_other_command() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let good = fixture.core().prefix_snapshot(STEAM_CLIENT_PREFIX).unwrap();
+    fixture.stop_client();
+    let cef = fixture.steam_dir().join("bin/cef");
+    fs::remove_dir_all(&cef).unwrap();
+    fs::create_dir(&cef).unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    assert!(detail.contains("has neither"), "{detail}");
+    assert!(
+        detail.contains("--reinstall"),
+        "status keeps its way out: {detail}"
+    );
+    let (outcome, lines) = repair_with_lines(&fixture);
+    let status = outcome.unwrap();
+    assert_eq!(status.state, ClientRuntimeState::NeedsLogin, "{lines:?}");
+    assert_in_order(
+        &lines,
+        &[
+            &format!("repair: {} has neither ", cef.display()),
+            &format!(
+                "repair: restoring {STEAM_CLIENT_PREFIX} from {}",
+                good.timestamp
+            ),
+        ],
+    );
+    assert_reason_names_no_remedy(&lines);
+    assert_eq!(fixture.helper(), fixture.shim(), "back from the snapshot");
 }
 
 /// An exposed helper whose stash path is not a regular file reads as the
