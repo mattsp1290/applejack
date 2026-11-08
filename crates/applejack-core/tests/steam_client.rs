@@ -231,8 +231,14 @@ impl Fixture {
 
     /// The stub bundle's shim file, where the payload's would be.
     fn shim_file(&self) -> PathBuf {
+        self.engine_file("probes/steamwebhelper-shim.exe")
+    }
+
+    /// A file of the stub bundle, by its path inside the payload.
+    fn engine_file(&self, relative: &str) -> PathBuf {
         self.data()
-            .join("engines/rosetta-wine/10.0.0/probes/steamwebhelper-shim.exe")
+            .join("engines/rosetta-wine/10.0.0")
+            .join(relative)
     }
 
     /// The stub bundle's shim, as the payload's would be.
@@ -1861,10 +1867,10 @@ fn a_file_check_that_lays_no_helper_times_out_naming_reinstall_and_reinstall_rec
 /// `repair --reinstall`, the way out `NoWebHelper` names, starts the
 /// client's self-update with no manifest; when that does not reach the
 /// window within the timeout (the stub's `no-self-update` knob: the
-/// self-update lays nothing), the error is the plain `updating` timeout,
-/// not the file-check one (nothing was removed, nothing checked, and
-/// `repair --reinstall` again would restart the whole download), `status`
-/// reads `updating`, and `install` resumes the self-update to the window.
+/// self-update lays nothing), the timeout carries what `status` reads,
+/// `updating`, not the directory's `broken` (nothing was removed, nothing
+/// checked, and `repair --reinstall` again would restart the whole
+/// download), and `install` resumes the self-update to the window.
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -2279,6 +2285,53 @@ fn install_with_the_client_up_refuses_when_the_helper_was_written_back_over_the_
         fixture.helper(),
         b"REAL-HELPER-2",
         "nothing is written under a running client"
+    );
+    fixture.stop_client();
+}
+
+/// `install` with the client up and a helper that does not read: no
+/// `shim:` line can name it, and the wait ends `broken`, so the op fails
+/// with what `status` reads instead of succeeding.
+#[test]
+fn install_with_the_client_up_fails_when_a_helper_does_not_read() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let server = spawn_stub_server("server", &fixture.prefix_dir());
+    fixture.servers.borrow_mut().push(server);
+    let helper = fixture.cef_dir().join(WEBHELPER_EXE);
+    fs::remove_file(&helper).unwrap();
+    fs::create_dir(&helper).unwrap();
+    let (state, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
+    let (outcome, lines) = fixture.install_reporting("VALVE-SIGNED");
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    assert!(error.to_string().contains("does not read"), "{error}");
+    assert!(
+        lines
+            .last()
+            .is_some_and(|line| line.starts_with("broken: ")),
+        "{lines:?}"
+    );
+    fixture.stop_client();
+}
+
+/// `install` with the client up and an orphan shim warns under `shim:` and
+/// then fails `broken`, as every start's end check does.
+#[test]
+fn install_with_the_client_up_fails_on_an_orphan_shim() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let server = spawn_stub_server("server", &fixture.prefix_dir());
+    fixture.servers.borrow_mut().push(server);
+    fs::remove_file(fixture.cef_dir().join(WEBHELPER_REAL)).unwrap();
+    let (outcome, lines) = fixture.install_reporting("VALVE-SIGNED");
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ClientRuntimeBroken, "{error}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("shim: ")
+            && line.contains("the web helper is the shim with no steamwebhelper_real.exe")),
+        "{lines:?}"
     );
     fixture.stop_client();
 }
@@ -3443,21 +3496,94 @@ fn a_plain_window_timeout_on_an_installed_client_reads_as_status_does() {
     );
 }
 
+/// A timeout on a signed-in client reads `ready`, whose detail names no
+/// command, so the error names the timeout's own way out, and following it
+/// reaches the window with no refusal.
+#[test]
+fn a_signed_in_window_timeout_names_install_and_install_reaches_the_window() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.sign_in();
+    fixture.stop_client();
+    let no_window = fixture.prefix_dir().join("no-window");
+    fs::write(&no_window, "").unwrap();
+    let tuning = fixture.tuning;
+    fixture.tuning = SHORT_WINDOW;
+    let (outcome, lines) = fixture.install_hooked(
+        "VALVE-SIGNED",
+        &mut fixture.server_at("start: starting steam.exe"),
+    );
+    let error = outcome.unwrap_err();
+    wait_gone("the client", || fixture.client_up());
+    assert_timeout_is_status(&fixture, &error);
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Ready,
+                ..
+            }
+        ),
+        "{error}\n{lines:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("`applejack runtime steam install` starts the client to its window again"),
+        "{error}"
+    );
+    fs::remove_file(&no_window).unwrap();
+    fixture.tuning = tuning;
+    let (state, lines) = fixture.install_reporting("VALVE-SIGNED");
+    let state = state.unwrap();
+    assert!(
+        matches!(
+            state,
+            ClientRuntimeState::Ready | ClientRuntimeState::NeedsLogin
+        ),
+        "{state:?}\n{lines:?}"
+    );
+    fixture.stop_client();
+}
+
 /// `repair --reinstall` with a payload that ships no shim refuses before
 /// it touches the client: `package/` stays and `status` reads as before.
 #[test]
 fn a_reinstall_without_the_shim_refuses_before_it_removes_the_package() {
     let fixture = Fixture::new();
+    let shim = fixture.shim_file();
+    assert_reinstall_refuses_untouched(&fixture, &shim, "ships no web helper shim");
+}
+
+/// The same for a payload that ships no `probes/osslsigncode`: the
+/// bootstrapper could not be verified, so nothing is removed.
+#[test]
+fn a_reinstall_without_osslsigncode_refuses_before_it_removes_the_package() {
+    let fixture = Fixture::new();
+    let tool = fixture.engine_file("probes/osslsigncode");
+    assert_reinstall_refuses_untouched(&fixture, &tool, "ships no `probes/osslsigncode`");
+}
+
+/// The same for a payload whose loader is gone: the engine does not load,
+/// so the op refuses before it is planned.
+#[test]
+fn a_reinstall_without_the_loader_refuses_before_it_removes_the_package() {
+    let fixture = Fixture::new();
+    let loader = fixture.engine_file("wine/bin/wine64");
+    assert_reinstall_refuses_untouched(&fixture, &loader, "names loader `wine/bin/wine64`");
+}
+
+/// `repair --reinstall` on an installed, stopped client with the payload's
+/// `missing` file removed: refused with `says`, before the stop and the
+/// removal, so `package/` stays and `status` reads as it did.
+fn assert_reinstall_refuses_untouched(fixture: &Fixture, missing: &Path, says: &str) {
     fixture.install();
     fixture.stop_client();
     let before = fixture.core().client_runtime_state().unwrap();
-    fs::remove_file(fixture.shim_file()).unwrap();
+    fs::remove_file(missing).unwrap();
     let (outcome, lines) = fixture.reinstall_reporting();
     let error = outcome.unwrap_err();
-    assert!(
-        error.to_string().contains("ships no web helper shim"),
-        "{error}"
-    );
+    assert!(error.to_string().contains(says), "{error}");
     assert!(fixture.steam_dir().join("package").is_dir(), "{lines:?}");
     assert!(
         !lines

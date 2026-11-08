@@ -2006,12 +2006,13 @@ impl PlannedClientOp {
                 );
             }
             self.wait_window(None, None, false, report)?;
-            return self.finish(report);
+            self.finish(report)?;
+            return self.end_check();
         }
         if reinstall {
             // Refused here, not at the bootstrapper: past this point the
             // client's package is gone.
-            shim_path(&self.installed.root)?;
+            self.payload_preflight()?;
             self.stop(report)?;
             let package = self.paths.steam_dir().join("package");
             if package.is_dir() {
@@ -2031,12 +2032,12 @@ impl PlannedClientOp {
         self.end_check()
     }
 
-    fn bootstrap(
-        &mut self,
-        fetch: Fetcher<'_>,
-        prefix: &Prefix,
-        report: &mut dyn FnMut(&str, String),
-    ) -> Result<(), CoreError> {
+    /// The payload files the bootstrap path needs, checked before anything
+    /// is fetched or removed: `osslsigncode` to verify the bootstrapper and
+    /// the shim without which the window would not draw. The loader is
+    /// checked when the engine loads, before any op is planned. Returns the
+    /// verifier.
+    fn payload_preflight(&self) -> Result<PathBuf, CoreError> {
         let tool = self.installed.root.join(OSSLSIGNCODE);
         if !tool.is_file() {
             return Err(CoreError::ClientRuntimeBroken {
@@ -2046,8 +2047,17 @@ impl PlannedClientOp {
                 ),
             });
         }
-        // Before the download: without the shim the window would not draw.
         shim_path(&self.installed.root)?;
+        Ok(tool)
+    }
+
+    fn bootstrap(
+        &mut self,
+        fetch: Fetcher<'_>,
+        prefix: &Prefix,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<(), CoreError> {
+        let tool = self.payload_preflight()?;
         let file = self.paths.bootstrapper();
         if let Some(parent) = file.parent() {
             fs::create_dir_all(parent).map_err(|error| CoreError::io(parent, error))?;
@@ -2320,10 +2330,24 @@ impl PlannedClientOp {
                     shown_detail(reason.detail(), reason.shown_by_status())
                 ),
             },
-            Ok(RuntimeReading::Other(state, detail)) => CoreError::ClientRuntimeBroken {
-                state,
-                detail: format!("{lead}; {detail}"),
-            },
+            Ok(RuntimeReading::Other(state, detail)) => {
+                // `needs_login`'s detail and `updating`'s and `installing`'s
+                // advice name a way out; these states name none, and a
+                // failed op must.
+                let again = match state {
+                    ClientRuntimeState::Absent | ClientRuntimeState::Ready => {
+                        "; `applejack runtime steam install` starts the client to its window again"
+                    }
+                    ClientRuntimeState::Installing
+                    | ClientRuntimeState::Updating
+                    | ClientRuntimeState::NeedsLogin
+                    | ClientRuntimeState::Broken => "",
+                };
+                CoreError::ClientRuntimeBroken {
+                    state,
+                    detail: format!("{lead}; {detail}{again}"),
+                }
+            }
             Err(error) => error,
         }
     }
@@ -2361,8 +2385,8 @@ impl PlannedClientOp {
     /// dump written since the start) is reported, and the process then no
     /// longer counts: the client dies about 3 minutes in unless the prompt
     /// is answered, and that death is reported as the prompt.
-    /// `helper_missing` is the shim pass's: a wait that ends without the
-    /// window names the helper the start did not lay down. A client this
+    /// `helper_missing` is the shim pass's: a client that exits during the
+    /// wait names the helper the start did not lay down. A client this
     /// call started that is gone with a clean shutdown in its bootstrap log
     /// and nothing else to name is [`WindowWait::ShutDown`], the caller's to
     /// retry once; any other exit is the error.
