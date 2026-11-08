@@ -379,12 +379,23 @@ core leaves this recovery to the next start.
 at once; the other four are jobs whose `job.progress` phases are the steps
 (`prepare`, `prefix`, `install`, `download`, `verify`, `bootstrap`,
 `library`, `shim`, `start`, `client`, `build`, `snapshot`, `repair`, `stop`),
-then a phase named for the state the op left (`needs_login`, `ready`,
-`broken`, `updating`, ...) whose message is the state's detail, ending with
-a `status` phase that carries the state. A `runtime.steam.install`,
-`runtime.steam.update` or `runtime.steam.repair` whose client start leaves
-the runtime `broken` fails with `ClientRuntimeBroken` after its `broken`
-phase, with no `status` phase. The prefix is claimed
+then, after a client start (or `install`'s wait on a client already up), a
+phase named for the state the op left (`needs_login`, `ready`, `broken`,
+`updating`, ...) whose message is the state's detail; `repair`'s restore and
+its marker-only clear, and `stop`, emit no such phase. An op that succeeds
+ends with a `status` phase that carries the state. A
+`runtime.steam.install`, `runtime.steam.update` or `runtime.steam.repair`
+whose client start reaches the window (or its fallback signal) and leaves
+the runtime `broken` (a helper that does not read after it, for one) fails
+with `ClientRuntimeBroken` after its `broken` phase, with no `status`
+phase. Two other starts fail with `ClientRuntimeBroken { broken }` and no
+state phase: the restart limit, after `client: <dir>/steamwebhelper.exe is
+still not the shim after 2 restarts; giving up`, and a file-check start
+that lays no helper down, after `start: starting steam.exe for its
+self-update, without -noverifyfiles: a web helper is missing and the
+client's file check lays it down` (then `stop: stopping the Steam client`
+when the wait times out, nothing more when the client exits). The prefix
+is claimed
 before the answer, so `PrefixBusy` (a title runs through the client) is an
 error response. `runtime.steam.install` is the one
 method that reaches the network outside Steam's own protocol: it fetches
