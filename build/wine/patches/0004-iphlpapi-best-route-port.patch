@@ -1,0 +1,34 @@
+Origin: applejack
+Date: 2026-11-08
+Reason: GetBestRoute2 asks the kernel for the route to a destination by
+ connecting a UDP socket to it and reading the source address back. The
+ caller's address usually has port 0, and macOS refuses connect() to port 0
+ with EADDRNOTAVAIL. The probe runs only when the caller gave no source
+ address and the destination is not IPv6 link-local, so on macOS such a call
+ with port 0 never used the kernel's answer: it logged `GetBestRoute2
+ Resolving destination address failed` and fell back to a longest-prefix scan
+ of the route table, which keeps the first of equal routes and ignores the
+ routing policy a VPN installs. GetBestInterface (which always passes port 0),
+ and GetBestInterfaceEx and GetBestRoute2 calls with port 0 and no source
+ address (the Steam client's GetBestInterfaceEx calls among them), took that
+ path. The probe now uses port 9 when the caller gave none; the
+ port does not change the route. Measured 2026-11-08 with
+ crates/applejack-engine/probes/netprobe under WINEDEBUG=warn+iphlpapi:
+ two warnings and the fallback before, none after, the same interface (en0)
+ on this host. See build/wine/patches/README.md.
+Drop-when: upstream wine's GetBestRoute2 sets a port before its connect()
+ probe; check each Wine bump.
+
+--- a/dlls/iphlpapi/iphlpapi_main.c
++++ b/dlls/iphlpapi/iphlpapi_main.c
+@@ -4855,6 +4855,10 @@
+             if (v6) dst_addr.Ipv6.sin6_addr    = ipv6_default_addr;
+             else dst_addr.Ipv4.sin_addr.s_addr = 0x01010101;
+         }
++        /* macOS refuses connect() to port 0 with EADDRNOTAVAIL; the port does
++         * not change the route the kernel picks, and sin6_port shares the
++         * offset of sin_port. */
++        if (!dst_addr.Ipv4.sin_port) dst_addr.Ipv4.sin_port = htons( 9 );
+         if (connect( s, (struct sockaddr *)&dst_addr, sizeof(dst_addr) ) == -1)
+         {
+             WARN( "Resolving destination address failed.\n" );
