@@ -23,16 +23,15 @@ use common::{fake_installed, layout, rosetta, version};
 
 /// The stub loader. `$1` is the Wine command (`wineboot`, `reg`, or the
 /// executable). It appends to `<bundle>/calls.log`, dumps its environment
-/// to `<bundle>/env-<name>.txt`, writes its pid to `<bundle>/pid-<name>`,
-/// obeys `<bundle>/mode-<name>` (`fail`, `hang`, or `complain`: exit 0 with
-/// the line `reg import` prints for a key it cannot import), and for
-/// `wineboot` creates the directories a real boot would.
+/// to `<bundle>/env-<name>.txt`, obeys `<bundle>/mode-<name>` (`fail`,
+/// `hang`, or `complain`: exit 0 with the line `reg import` prints for a key
+/// it cannot import), and for `wineboot` creates the directories a real boot
+/// would.
 const WINE: &str = r#"#!/bin/sh
 D=$(cd "$(dirname "$0")/../.." && pwd)
 name=$(basename "$1")
 echo "wine $*" >> "$D/calls.log"
 env | sort > "$D/env-$name.txt"
-echo $$ > "$D/pid-$name"
 mode=$(cat "$D/mode-$name" 2>/dev/null)
 case "$mode" in
   fail) echo "stub: $name failed" >&2; exit 3 ;;
@@ -190,7 +189,14 @@ fn wineboot_past_its_bound_is_killed_and_the_prefix_removed() {
     let Error::WineCommandFailed { status, log, .. } = &err else {
         panic!("{err:?}")
     };
-    assert!(status.starts_with("timed out after 1s (pid "), "{status}");
+    // The pid comes from the engine's own record of what it killed: on a
+    // loaded host the bound can expire before the stub's shell runs a line,
+    // so nothing the stub writes is guaranteed to exist.
+    let pid = status
+        .strip_prefix("timed out after 1s (pid ")
+        .and_then(|rest| rest.strip_suffix(" killed)"))
+        .unwrap_or_else(|| panic!("{status}"));
+    assert!(pid.parse::<u32>().is_ok(), "{status}");
     assert!(log.is_file() && log.starts_with(dir.path().join("logs")));
     assert!(!prefix_dir.exists(), "prefix removed");
     assert_eq!(
@@ -199,9 +205,8 @@ fn wineboot_past_its_bound_is_killed_and_the_prefix_removed() {
         "the server is killed once, by the failed create:\n{}",
         calls(&engine)
     );
-    let pid = fs::read_to_string(engine.root.join("pid-wineboot")).unwrap();
     assert!(
-        !process_exists(&pid),
+        !process_exists(pid),
         "the hung loader (pid {pid}) was killed and reaped"
     );
 }
