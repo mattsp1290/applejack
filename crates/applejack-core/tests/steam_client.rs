@@ -19,8 +19,9 @@ use applejack_core::rpc::wire::ErrorCode;
 use applejack_core::run::{AppRegistration, PlannedRun};
 use applejack_core::runtime::session::{NOTE_CLIENT, NOTE_LOST, RunTuning};
 use applejack_core::runtime::steam_client::{
-    ClientOp, ClientRuntimeState, ClientRuntimeStatus, META_CLIENT_BUILD, META_CLIENT_SESSION,
-    META_REDOWNLOAD, STEAM_CLIENT_PREFIX, WEBHELPER_EXE, WEBHELPER_REAL, acf_backup_path,
+    CLIENT_MANIFESTS, ClientOp, ClientRuntimeState, ClientRuntimeStatus, META_CLIENT_BUILD,
+    META_CLIENT_SESSION, META_REDOWNLOAD, STEAM_CLIENT_PREFIX, WEBHELPER_EXE, WEBHELPER_REAL,
+    acf_backup_path,
 };
 use applejack_core::{Core, CoreError};
 use applejack_engine::rosetta_wine::process::find_session;
@@ -228,13 +229,15 @@ impl Fixture {
         fs::read(self.cef_dir().join(WEBHELPER_REAL)).ok()
     }
 
+    /// The stub bundle's shim file, where the payload's would be.
+    fn shim_file(&self) -> PathBuf {
+        self.data()
+            .join("engines/rosetta-wine/10.0.0/probes/steamwebhelper-shim.exe")
+    }
+
     /// The stub bundle's shim, as the payload's would be.
     fn shim(&self) -> Vec<u8> {
-        fs::read(
-            self.data()
-                .join("engines/rosetta-wine/10.0.0/probes/steamwebhelper-shim.exe"),
-        )
-        .unwrap()
+        fs::read(self.shim_file()).unwrap()
     }
 
     fn install(&self) {
@@ -435,6 +438,17 @@ fn wait_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
 
 fn wait_gone(what: &str, mut present: impl FnMut() -> bool) {
     wait_until(what, || (!present()).then_some(()));
+}
+
+/// A window timeout's error against the `status` read after it: the same
+/// state, with the reading's detail inside the error's.
+fn assert_timeout_is_status(fixture: &Fixture, error: &CoreError) {
+    let CoreError::ClientRuntimeBroken { state, detail } = error else {
+        panic!("not a runtime error: {error}");
+    };
+    let (status, reading) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(*state, status, "{error}\n{reading}");
+    assert!(detail.contains(&reading), "{detail}\n{reading}");
 }
 
 /// Asserts `lines` carries each of `wanted`, in that order, each matched by
@@ -1745,9 +1759,8 @@ fn a_file_check_that_lays_no_helper_times_out_naming_reinstall_and_reinstall_rec
     let message = error.to_string();
     assert!(
         message.contains(&format!(
-            "{cef} still has no steamwebhelper.exe: the directory held no web helper (an \
-             orphan shim was removed, or none was there) and the client's file check did not \
-             lay one down within 3 seconds"
+            "the client did not reach the login window within 3 seconds; it was stopped and its \
+             files kept; {cef} has neither steamwebhelper.exe nor steamwebhelper_real.exe"
         )),
         "{message}"
     );
@@ -1784,6 +1797,7 @@ fn a_file_check_that_lays_no_helper_times_out_naming_reinstall_and_reinstall_rec
     assert!(!fixture.cef_dir().join(WEBHELPER_EXE).exists());
     assert!(fixture.real_helper().is_none());
     wait_gone("the client", || fixture.client_up());
+    assert_timeout_is_status(&fixture, &error);
 
     let (state, detail) = fixture.core().client_runtime_state().unwrap();
     assert_eq!(state, ClientRuntimeState::Broken, "{detail}");
@@ -1852,6 +1866,10 @@ fn a_file_check_that_lays_no_helper_times_out_naming_reinstall_and_reinstall_rec
 /// `repair --reinstall` again would restart the whole download), `status`
 /// reads `updating`, and `install` resumes the self-update to the window.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one recovery from start to end, in the order the user sees it"
+)]
 fn a_reinstall_whose_self_update_times_out_stays_updating_and_install_resumes_it() {
     let mut fixture = Fixture::new();
     fixture.install();
@@ -1910,6 +1928,7 @@ fn a_reinstall_whose_self_update_times_out_stays_updating_and_install_resumes_it
     assert_eq!(fixture.client_starts().len(), 1);
     assert!(!fixture.steam_dir().join("package").exists());
     wait_gone("the client", || fixture.client_up());
+    assert_timeout_is_status(&fixture, &error);
     let (state, detail) = fixture.core().client_runtime_state().unwrap();
     assert_eq!(state, ClientRuntimeState::Updating, "{detail}");
     assert_eq!(detail, "the client has not finished its first self-update");
@@ -3274,9 +3293,9 @@ fn repair_and_install_on_a_client_whose_server_is_gone_run_the_pass_instead_of_w
 }
 
 /// A start at which the client writes its helper over the shim and the
-/// helper dies at once (no window line, no helper process) times out; the
-/// error names the exposed helper, as `status` does, not an update to wait
-/// for.
+/// helper dies at once (no window line, no helper process) times out; under
+/// the timeout's lead the error names the exposed helper, as `status` does,
+/// not an update to wait for.
 #[test]
 fn a_window_timeout_with_an_exposed_helper_names_the_helper_not_an_update() {
     let mut fixture = Fixture::new();
@@ -3317,7 +3336,11 @@ fn a_window_timeout_with_an_exposed_helper_names_the_helper_not_an_update() {
         "{message}"
     );
     assert!(
-        !message.contains("did not reach the login window"),
+        message.contains("the client did not reach the login window within 3 seconds"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("wait for the client's self-update"),
         "{message}"
     );
     assert!(
@@ -3329,6 +3352,120 @@ fn a_window_timeout_with_an_exposed_helper_names_the_helper_not_an_update() {
     assert!(message.contains(&detail), "{message}\n{detail}");
     assert_eq!(fixture.helper(), b"REAL-HELPER-2");
     wait_gone("the client", || fixture.client_up());
+    assert_timeout_is_status(&fixture, &error);
+}
+
+/// With no manifest the start is the client's self-update, which `status`
+/// reads as `updating` whatever its helpers read. A timeout there with the
+/// client's own helper in front is that same `updating`, not a `broken`
+/// naming a `repair` that refuses with "nothing to repair".
+#[test]
+fn a_window_timeout_before_the_manifest_reads_as_status_does_with_the_helper_exposed() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    for name in CLIENT_MANIFESTS {
+        let _ = fs::remove_file(fixture.steam_dir().join(name));
+    }
+    for knob in ["no-self-update", "self-update-always", "no-window"] {
+        fs::write(fixture.prefix_dir().join(knob), "").unwrap();
+    }
+    fixture.tuning = SHORT_WINDOW;
+    let (outcome, lines) = fixture.install_hooked(
+        "VALVE-SIGNED",
+        &mut fixture.server_at("start: starting steam.exe"),
+    );
+    let error = outcome.unwrap_err();
+    assert!(
+        lines.contains(&"stop: stopping the Steam client".to_owned()),
+        "{lines:?}"
+    );
+    assert_eq!(fixture.helper(), b"REAL-HELPER-2");
+    wait_gone("the client", || fixture.client_up());
+    assert_timeout_is_status(&fixture, &error);
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::Updating,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("the client did not reach the login window within 3 seconds"),
+        "{message}"
+    );
+    let names_repair = message.contains("`applejack runtime steam repair`");
+    let (repaired, _) = repair_with_lines(&fixture);
+    let refused =
+        matches!(&repaired, Err(error) if error.to_string().contains("nothing to repair"));
+    assert!(!(names_repair && refused), "{message}\n{repaired:?}");
+}
+
+/// A plain timeout on an installed client that is not signed in carries
+/// what `status` reads then, `needs_login`, under the timeout's lead.
+#[test]
+fn a_plain_window_timeout_on_an_installed_client_reads_as_status_does() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::write(fixture.prefix_dir().join("no-window"), "").unwrap();
+    fixture.tuning = SHORT_WINDOW;
+    let (outcome, lines) = fixture.install_hooked(
+        "VALVE-SIGNED",
+        &mut fixture.server_at("start: starting steam.exe"),
+    );
+    let error = outcome.unwrap_err();
+    assert!(
+        lines.contains(&"stop: stopping the Steam client".to_owned()),
+        "{lines:?}"
+    );
+    wait_gone("the client", || fixture.client_up());
+    assert_timeout_is_status(&fixture, &error);
+    assert!(
+        matches!(
+            &error,
+            CoreError::ClientRuntimeBroken {
+                state: ClientRuntimeState::NeedsLogin,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("the client did not reach the login window within 3 seconds"),
+        "{error}"
+    );
+}
+
+/// `repair --reinstall` with a payload that ships no shim refuses before
+/// it touches the client: `package/` stays and `status` reads as before.
+#[test]
+fn a_reinstall_without_the_shim_refuses_before_it_removes_the_package() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let before = fixture.core().client_runtime_state().unwrap();
+    fs::remove_file(fixture.shim_file()).unwrap();
+    let (outcome, lines) = fixture.reinstall_reporting();
+    let error = outcome.unwrap_err();
+    assert!(
+        error.to_string().contains("ships no web helper shim"),
+        "{error}"
+    );
+    assert!(fixture.steam_dir().join("package").is_dir(), "{lines:?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("repair: removing")),
+        "{lines:?}"
+    );
+    assert_eq!(fixture.core().client_runtime_state().unwrap(), before);
 }
 
 /// A run's client start is never restarted (that would end the game); a
