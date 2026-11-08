@@ -395,11 +395,11 @@ the last line the start printed:
 - the restart limit, `ClientRuntimeBroken { broken }` after `client:
   <dir>/steamwebhelper.exe is still not the shim after 2 restarts; giving
   up`;
-- a window timeout, after `stop: stopping the Steam client`: `{ broken }`
-  for a file-check start that laid no helper down (its `start:` line reads
-  `start: starting steam.exe for its self-update, without -noverifyfiles: a
-  web helper is missing and the client's file check lays it down`) and for
-  the client's own helper in front, else `{ updating }`;
+- a window timeout, after `stop: stopping the Steam client`:
+  `ClientRuntimeBroken` carrying what `runtime.steam.status` then reads,
+  its state and its detail, under the lead `the client did not reach the
+  login window within 600 seconds; it was stopped and its files kept`, so
+  the two never disagree;
 - a client that exits during the wait, `{ broken }` after its last
   `client:` line: the stall (`client: stalled: the client's main loop is
   stalled (<log>); ...`, or a `client:` phase line after it), a file-check
@@ -414,13 +414,15 @@ the last line the start printed:
 Every start's `start:` lines are followed by at least one `client:` phase
 line (`client: starting`, or `client: updating` while the self-update
 runs), so all but the missing shim end on a `client:` or `stop:` line, never
-on `start:`. `status` then reads `broken` after the restart limit, a
-file-check start that laid no helper down, and the client's own helper in
-front, and not after the stall, the early exit or the missing shim, which
-it cannot see. `install`'s wait on a client already up starts nothing; its
-failures are the window timeout's and the exit's above, and with the
-client's own helper in front it fails after its `shim:` line without
-waiting.
+on `start:`. `status` then reads `broken` after the restart limit and a
+file-check start whose client exited with no helper laid down, reads the
+error's own state after a window timeout, and does not see the stall, the
+early exit or the missing shim. `install`'s wait on a client already up
+starts nothing; its failures are the window timeout's and the exit's
+above, and with the client's own helper in front it fails after its
+`shim:` line without waiting. With an orphan shim or no helper there it
+warns under `shim:`, waits, and succeeds after a `broken` phase (a
+recorded follow-up).
 
 The prefix is claimed before the answer, so `PrefixBusy` (a title runs
 through the client) is an error response. `runtime.steam.install` is the one
