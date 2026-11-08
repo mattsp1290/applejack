@@ -38,8 +38,8 @@ use crate::runtime::session::{
 use crate::runtime::steam_client::RedownloadWatch;
 use crate::runtime::steam_client::{
     BrokenReason, ClientPaths, ClientRuntimeState, LibraryEdit, META_CLIENT_SESSION,
-    STEAM_CLIENT_PREFIX, ensure_webhelper_shim, missing_web_helper, prepare_client_launch,
-    record_client_build, runtime_refused,
+    STEAM_CLIENT_PREFIX, ensure_webhelper_shim, exposed_helper, missing_web_helper,
+    prepare_client_launch, record_client_build, runtime_refused,
 };
 use crate::state::Core;
 
@@ -262,7 +262,10 @@ impl PlannedRun {
             .engine
             .launch(&self.installed, &prefix, &self.spec)?;
         let watched = match redownload {
-            Some(watch) => self.watch_client(&mut session, watch, report),
+            Some(watch) => {
+                let scan = starts_client.then(|| ClientPaths::new(prefix.dir.clone()));
+                self.watch_client(&mut session, watch, scan.as_ref(), report)
+            }
             None => self.watch_spawned(&mut session, report),
         };
         if let Err(error) = &watched {
@@ -343,10 +346,16 @@ impl PlannedRun {
     /// The client path: the marker is the client's, a cancel before the
     /// marker shows ends the title by name, and the loader is reaped when it
     /// hands off.
+    /// `scan` is the client prefix when this run started the client: once
+    /// the title is up, the `cef.win*` directories are read once more for a
+    /// helper the client laid down without the shim at this start. A run
+    /// never restarts the client (that would end the game), so the line
+    /// says what the next `status` or `run` will say and what to do.
     fn watch_client(
         &mut self,
         session: &mut Session,
         redownload: RedownloadWatch,
+        scan: Option<&ClientPaths>,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<WatchEnd, CoreError> {
         let row = self.session.clone();
@@ -367,6 +376,22 @@ impl PlannedRun {
                 {
                     Ok(()) => {
                         report("running", format!("session {id}"));
+                        if let Some(exposed) =
+                            scan.and_then(|paths| exposed_helper(paths).ok().flatten())
+                        {
+                            report(
+                                "client",
+                                format!(
+                                    "the client laid its web helper down without the shim in \
+                                     front of it at this start ({}); the game runs on, but the \
+                                     client's window cannot draw and `status` reads broken: \
+                                     after the game, `applejack runtime steam stop`, then \
+                                     `applejack runtime steam install` or `applejack runtime \
+                                     steam repair`, put the shim in front of it",
+                                    exposed.dir.display()
+                                ),
+                            );
+                        }
                         return true;
                     }
                     Err(error) => {

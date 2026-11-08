@@ -127,7 +127,7 @@ Swift case; do not edit the table by hand.
 | 1031 | `SteamClientOwnsTitle` | A Windows Steam client is running against the library, or owns this title's update. |
 | 1032 | `VerifyFailed` | `app.install` with `verify` found files that differ from the manifest. |
 | 1033 | `BootstrapperUnverified` | `runtime.steam.install`: `SteamSetup.exe` failed its Authenticode check or its signer is not Valve Corp. The file is kept and the message names the signer found. |
-| 1034 | `ClientRuntimeBroken` | The Steam client runtime is updating, broken, or never reached the login window, or `runtime.steam.repair` found nothing broken or no usable snapshot. `runtime.steam.status` says which; `runtime.steam.repair` clears a dead install's marker and, unless the client is intact after that, restores the newest usable snapshot of a broken one (a prefix record that opens and a `steam.exe`); an updating one is waited for. |
+| 1034 | `ClientRuntimeBroken` | The Steam client runtime is updating, broken, or never reached the login window, or `runtime.steam.repair` found nothing broken or no usable snapshot. `runtime.steam.status` says which; `runtime.steam.repair` clears a dead install's marker and, unless the client is intact after that, puts the shim back in front of a client helper that lost it (the client's own `steamwebhelper.exe` in a populated `cef.win*` directory, the stash beside it or not; no restore, nothing downloaded) or restores the newest usable snapshot of a broken one (a prefix record that opens and a `steam.exe`); an updating one is waited for. |
 | 1035 | `ClientRedownloadRefused` | Assumption A2 failed: the client began re-downloading the title. The client was stopped and the `.acf` restored from its backup; the finding is in `meta`. |
 | 1036 | `ClientLaunchTimedOut` | The Steam client reported no running title within the wait after `-applaunch`; the client was stopped. |
 | 1037 | `TitleUpdatePending` | The Steam client began a routine update of the title (a build newer than the one installed), which is not a refuted A2. The client was stopped and the `.acf` restored; `app.install` with `update` brings the title current. |
@@ -218,7 +218,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `app.cancel` | `JobStarted`; see [Sessions](#sessions) |
 | `runtime.steam.install` | `JobStarted`; see [Steam client runtime](#steam-client-runtime) |
 | `runtime.steam.update` | `JobStarted` |
-| `runtime.steam.repair` | `JobStarted`. `reinstall` removes the client's package directory and reruns the bootstrapper |
+| `runtime.steam.repair` | `JobStarted`. `reinstall` checks the payload (`probes/osslsigncode`, the shim), then stops the client and moves its package directory aside before it fetches and reruns the bootstrapper; a failure before the new client's start puts the old one back; at that start the old one is removed, and a later failure keeps the new one for `runtime.steam.install` to resume |
 | `runtime.steam.stop` | `JobStarted` |
 | `runtime.steam.status` | `{state, prefix, build_id, running, snapshots, detail}`; `state` is one of `absent`, `installing`, `needs_login`, `ready`, `updating`, `broken` |
 | `session.list` | `{"sessions": [SessionRow]}`, newest first; `appid` narrows it to one title |
@@ -290,7 +290,7 @@ Refused with an error response, before anything starts or any row is written:
 | `TitleNotInstalled` | No `apps` row, no complete `appmanifest_<appid>.acf` for this appid, an empty install directory, an `installdir` that is not one plain directory name, or a relative library |
 | `DownloadInProgress` | `<library>/applejack/<appid>.download.json` exists |
 | `ClientRuntimeUnavailable` | The title takes the client path and the runtime is `absent` or `needs_login`; the message names `applejack runtime steam install` and the sign-in |
-| `ClientRuntimeBroken` | The title takes the client path and the runtime is `installing`, `updating`, or `broken` (which includes a web helper shim with no real helper beside it, and a `cef.win*` directory with no web helper at all) |
+| `ClientRuntimeBroken` | The title takes the client path and the runtime is `installing`, `updating`, or `broken` (which includes a web helper shim with no real helper beside it, a `cef.win*` directory with no web helper at all, and a populated `cef.win*` directory whose `steamwebhelper.exe` is the client's own, with `steamwebhelper_real.exe` stashed beside it or with nothing stashed beside it) |
 | `NoLaunchExe` | `launch_exe_override` is empty, is not a PE image, or leaves the install directory |
 | `EngineNotInstalled` | No active engine, and none pinned by the game configuration |
 | `AlreadyRunning` | The title has an open session, in this core or another process |
@@ -377,9 +377,78 @@ core leaves this recovery to the next start.
 
 `docs/steam-runtime.md` is the full account. `runtime.steam.status` answers
 at once; the other four are jobs whose `job.progress` phases are the steps
-(`prefix`, `install`, `download`, `verify`, `bootstrap`, `library`, `shim`,
-`start`, `client`, `build`, `snapshot`, `repair`, `stop`), ending with a `status` phase that carries the
-state. The prefix is claimed before the answer, so `PrefixBusy` (a title runs
+(`prepare`, `prefix`, `install`, `download`, `verify`, `bootstrap`,
+`library`, `shim`, `start`, `client`, `build`, `snapshot`, `repair`,
+`package`, `stop`),
+then, after a client start (or `install`'s wait on a client already up), a
+phase named for the state the op left (`needs_login`, `ready`, `broken`,
+`updating`, ...) whose message is the state's detail; `repair`'s restore and
+its marker-only clear, and `stop`, emit no such phase. An op that succeeds
+ends with a `status` phase that carries the state. A
+`runtime.steam.install`, `runtime.steam.update` or `runtime.steam.repair`
+fails after a state phase only when its client start (or `install`'s wait
+on a client already up) reaches the window (or its fallback signal) and
+`finish` reads the state it left: a `broken`
+there (a helper that does not read after it, for one) fails with
+`ClientRuntimeBroken` after its `broken` phase, with no `status` phase.
+Every other start failure sends `job.failed` with no state phase, after
+the last line the start printed:
+
+- the restart limit, `ClientRuntimeBroken { broken }` after `client:
+  <dir>/steamwebhelper.exe is still not the shim after 2 restarts; giving
+  up`;
+- a window timeout, after `stop: stopping the Steam client`:
+  `ClientRuntimeBroken` carrying what `runtime.steam.status` then reads,
+  its state and its detail, under the lead `the client did not reach the
+  login window within 600 seconds; it was stopped and its files kept`, so
+  the two never disagree (no restore follows a timeout: a reinstall's old
+  package is removed at its new client's start, before the wait); for a
+  state whose detail names no way out (`ready`, `absent`) the detail ends `` `applejack runtime steam install`
+  starts the client to its window again``;
+- a client that exits during the wait, after its last
+  `client:` line: the stall (`client: stalled: the client's main loop is
+  stalled (<log>); ...`, or a `client:` phase line after it), a file-check
+  start that laid no helper down, or the early exit (a second clean
+  shutdown in one op, or any other exit);
+- a payload with no shim, before the start's first `start:` line: on an
+  `install` that runs the bootstrapper and on `repair --reinstall`, the
+  payload check catches it first, before the download (on a fresh
+  `install` the last line is `prefix: creating prefix steam-client`; on
+  `repair --reinstall`, before the stop and the move aside of `package/`);
+  otherwise the shim pass does.
+
+One rule covers every `ClientRuntimeBroken` these jobs fail with: its state
+is what `runtime.steam.status` reads when the job ends (after any stop or
+restore the job made), and its detail is the failure's own. A `repair
+--reinstall` that fails before its new client's start commits (the rename
+of the old package right after the launch) puts the old package directory
+back (a `package: restoring ...` line), after stopping a client it had just
+launched; files the bootstrapper wrote outside it stay, and
+`runtime.steam.status` reads them, which is usually, not always, what it
+read before the job. One that fails after the commit keeps the new package
+directory, and `runtime.steam.install` resumes its self-update. A `repair
+--reinstall` with a `package.reinstall-done` directory that does not remove
+fails `ClientRuntimeBroken` (state as `runtime.steam.status` reads it)
+before it stops, moves or starts anything, naming the path and saying to
+remove it by hand; the other jobs report it as a
+`package:` line and go on.
+
+Every start's `start:` lines are followed by at least one `client:` phase
+line (`client: starting`, or `client: updating` while the self-update
+runs), so all but the missing shim end on a `client:` or `stop:` line, never
+on `start:` (on a `repair --reinstall` whose new client's start did not
+commit, a `package:` line follows). `status`
+does not see the stall, the early exit or the missing shim themselves: the
+error's detail is where they are named. `install`'s wait on a client already up
+starts nothing; its failures are the window timeout's and the exit's
+above, and with the client's own helper in front it fails after its
+`shim:` line without waiting. With an orphan shim or no helper there it
+warns under `shim:`, waits, and fails with `ClientRuntimeBroken` after
+its `broken` phase, whose detail names `applejack runtime steam stop`
+first, then `install` (`install` on a running client only waits again); a
+helper that does not read gets no `shim:` line and fails the same way.
+
+The prefix is claimed before the answer, so `PrefixBusy` (a title runs
 through the client) is an error response. `runtime.steam.install` is the one
 method that reaches the network outside Steam's own protocol: it fetches
 Valve's `SteamSetup.exe`, refuses it with `BootstrapperUnverified` unless its

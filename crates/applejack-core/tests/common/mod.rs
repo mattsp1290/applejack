@@ -41,10 +41,26 @@ const BUNDLE_FILES: &[&str] = &[
 /// `REAL-HELPER-1`) unless `$WINEPREFIX/no-self-update` is there (a
 /// self-update that never gets that far); a later start lays a missing
 /// helper down only when its file check runs (no `-noverifyfiles`) and
-/// `$WINEPREFIX/no-file-check` is absent (under it the check lays nothing down, the live shape the
-/// recovery has not been seen to rule out), and `$WINEPREFIX/self-update`
-/// makes it write `REAL-HELPER-2` over the helper once, as a client update
-/// does. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`
+/// `$WINEPREFIX/no-file-check` is absent (under it the check lays nothing
+/// down, the live shape the recovery has not been seen to rule out), and
+/// `$WINEPREFIX/self-update` makes it write `REAL-HELPER-2` over the helper
+/// once, as a client update does (`self-update-always` at every start, a
+/// client that writes its helper back each time);
+/// `$WINEPREFIX/late-cef-win64` lays a new
+/// `bin/cef/cef.win64/steamwebhelper.exe` (`REAL-HELPER-64`) at the second
+/// start since `client-args` was cleared (once; `cef.win7x64` stays as it
+/// is), the shape the live client showed;
+/// `$WINEPREFIX/new-cef-dir-every-start` lays
+/// `bin/cef/cef.win-extra-<n>/steamwebhelper.exe` at every start `n`;
+/// `$WINEPREFIX/unreadable-helper-at-start` lays a directory at
+/// `bin/cef/cef.win64/steamwebhelper.exe`, a helper that does not read, at
+/// every start while it is there (it persists for the fixture, which owns
+/// its prefix); `$WINEPREFIX/early-shutdown` (one-shot) and
+/// `early-shutdown-always` make a start write `Verification skipped` and
+/// `Shutdown` to `logs/bootstrap_log.txt` and exit with no window, as the
+/// live first start did twice; `$WINEPREFIX/no-window` makes every start
+/// write no window line and run no `steamwebhelper.exe`, a helper that dies
+/// at once. `steam.exe` is a client (`steam.exe` plus a `steamwebhelper.exe`
 /// when a helper file exists to run; without one no window line is written)
 /// that stays until `$WINEPREFIX/client-quit`; its arguments append to
 /// `$WINEPREFIX/client-args`; with
@@ -164,10 +180,27 @@ if [ "$name" = steam.exe ]; then
       *) mkdir -p "$cef"; printf 'REAL-HELPER-1' > "$cef/steamwebhelper.exe" ;;
     esac
   fi
-  if [ -e "$WINEPREFIX/self-update" ]; then
+  if [ -e "$WINEPREFIX/self-update" ] || [ -e "$WINEPREFIX/self-update-always" ]; then
     mkdir -p "$cef"
     printf 'REAL-HELPER-2' > "$cef/steamwebhelper.exe"
     rm -f "$WINEPREFIX/self-update"
+  fi
+  starts=$(wc -l < "$WINEPREFIX/client-args" | tr -d ' ')
+  if [ -e "$WINEPREFIX/late-cef-win64" ] && [ "$starts" -ge 2 ] && [ ! -e "$steam/bin/cef/cef.win64" ]; then
+    mkdir -p "$steam/bin/cef/cef.win64"
+    printf 'REAL-HELPER-64' > "$steam/bin/cef/cef.win64/steamwebhelper.exe"
+  fi
+  if [ -e "$WINEPREFIX/new-cef-dir-every-start" ]; then
+    mkdir -p "$steam/bin/cef/cef.win-extra-$starts"
+    printf 'REAL-HELPER-EXTRA' > "$steam/bin/cef/cef.win-extra-$starts/steamwebhelper.exe"
+  fi
+  if [ -e "$WINEPREFIX/unreadable-helper-at-start" ]; then
+    mkdir -p "$steam/bin/cef/cef.win64/steamwebhelper.exe"
+  fi
+  if [ -e "$WINEPREFIX/early-shutdown" ] || [ -e "$WINEPREFIX/early-shutdown-always" ]; then
+    rm -f "$WINEPREFIX/early-shutdown"
+    printf '%s\n' '[2026-11-06 20:00:00] Verification skipped' '[2026-11-06 20:00:16] Shutdown' >> "$steam/logs/bootstrap_log.txt"
+    exit 0
   fi
   # A client a stop just ended polls every 10 ms for its quit file; a fresh
   # start must not clear it from under them. The window line follows the
@@ -175,7 +208,7 @@ if [ "$name" = steam.exe ]; then
   sleep 0.1
   rm -f "$WINEPREFIX/client-quit"
   : > "$WINEPREFIX/client-up"
-  if [ -f "$cef/steamwebhelper.exe" ]; then
+  if [ -f "$cef/steamwebhelper.exe" ] && [ ! -e "$WINEPREFIX/no-window" ]; then
     echo 'SP DesktopLoginWindow_uid0: Created window: size: 700,440 pos: 0,0 mode: System window: 0000000000030106' >> "$steam/logs/webhelper.txt"
     "@HELPER@" common::stub_title --exact --ignored --nocapture steamwebhelper.exe &
   fi
