@@ -13,6 +13,9 @@
 //! | `needs_login` | `Steam/config/loginusers.vdf` names no remembered account |
 //! | `ready` | it names one |
 //!
+//! An op's `ClientRuntimeBroken` carries the state read when the op
+//! returns, so it is the state `status` then shows.
+//!
 //! `loginusers.vdf` holds the account name and id. They are read for the
 //! state alone and go nowhere: not into a row, a log, or an error.
 //!
@@ -1872,14 +1875,35 @@ impl PlannedClientOp {
         fetch: Fetcher<'_>,
         report: &mut dyn FnMut(&str, String),
     ) -> Result<ClientRuntimeStatus, CoreError> {
-        match self.op {
-            ClientOp::Install => self.install(fetch, false, report)?,
-            ClientOp::Repair { reinstall: true } => self.install(fetch, true, report)?,
-            ClientOp::Repair { reinstall: false } => self.repair(report)?,
-            ClientOp::Update => self.update(report)?,
-            ClientOp::Stop => self.stop(report)?,
+        match self.dispatch(fetch, report) {
+            Ok(()) => self.core.runtime_status(true),
+            // Every op's runtime error goes out through here, after any stop
+            // or restore the op made: the state is what `status` reads now,
+            // the detail the op's own. A reading that fails keeps the op's
+            // state, which is then the best there is.
+            Err(CoreError::ClientRuntimeBroken { state, detail }) => {
+                let state = self
+                    .core
+                    .runtime_state(true)
+                    .map_or(state, |(reading, _)| reading);
+                Err(CoreError::ClientRuntimeBroken { state, detail })
+            }
+            Err(error) => Err(error),
         }
-        self.core.runtime_status(true)
+    }
+
+    fn dispatch(
+        &mut self,
+        fetch: Fetcher<'_>,
+        report: &mut dyn FnMut(&str, String),
+    ) -> Result<(), CoreError> {
+        match self.op {
+            ClientOp::Install => self.install(fetch, false, report),
+            ClientOp::Repair { reinstall: true } => self.install(fetch, true, report),
+            ClientOp::Repair { reinstall: false } => self.repair(report),
+            ClientOp::Update => self.update(report),
+            ClientOp::Stop => self.stop(report),
+        }
     }
 
     fn log_path(&self) -> PathBuf {
@@ -2040,10 +2064,12 @@ impl PlannedClientOp {
     fn payload_preflight(&self) -> Result<PathBuf, CoreError> {
         let tool = self.installed.root.join(OSSLSIGNCODE);
         if !tool.is_file() {
+            // The state is `run_with`'s to set from the reading.
             return Err(CoreError::ClientRuntimeBroken {
                 state: ClientRuntimeState::Absent,
                 detail: format!(
-                    "the engine payload ships no `{OSSLSIGNCODE}`, so the bootstrapper cannot be verified"
+                    "the engine payload ships no `{OSSLSIGNCODE}`, so the bootstrapper cannot be \
+                     verified; install a payload that ships it"
                 ),
             });
         }

@@ -3592,6 +3592,9 @@ fn assert_reinstall_refuses_untouched(fixture: &Fixture, missing: &Path, says: &
         "{lines:?}"
     );
     assert_eq!(fixture.core().client_runtime_state().unwrap(), before);
+    if let CoreError::ClientRuntimeBroken { state, .. } = &error {
+        assert_eq!(*state, before.0, "{error}");
+    }
 }
 
 /// A run's client start is never restarted (that would end the game); a
@@ -3699,4 +3702,84 @@ fn a_client_that_shuts_down_cleanly_at_its_start_is_started_once_more() {
     assert_eq!(fixture.client_starts().len(), 2, "{lines:?}");
     fs::remove_file(&knob).unwrap();
     fixture.assert_lock_free();
+}
+
+/// An op's runtime error against the `status` read after it: the same
+/// state, whatever the op's own detail says.
+fn assert_error_state_is_status(fixture: &Fixture, error: &CoreError) {
+    let CoreError::ClientRuntimeBroken { state, .. } = error else {
+        panic!("not a runtime error: {error}");
+    };
+    let (status, detail) = fixture.core().client_runtime_state().unwrap();
+    assert_eq!(*state, status, "{error}\n{detail}");
+}
+
+/// A client that exits before its window, twice, fails with the exit, under
+/// the state `status` reads then.
+#[test]
+fn an_early_exit_carries_the_state_status_reads() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let knob = fixture.prefix_dir().join("early-shutdown-always");
+    fs::write(&knob, "").unwrap();
+    let error = fixture.install_with("VALVE-SIGNED").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the client exited before its window came up"),
+        "{error}"
+    );
+    assert_error_state_is_status(&fixture, &error);
+    fs::remove_file(&knob).unwrap();
+    fixture.assert_lock_free();
+}
+
+/// A client that stalls on the prompt and dies fails with the stall, under
+/// the state `status` reads then.
+#[test]
+fn a_stall_carries_the_state_status_reads() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    let knob = fixture.prefix_dir().join("stall");
+    fs::write(&knob, "").unwrap();
+    let error = fixture.install_with("VALVE-SIGNED").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("BMainLoop appears to have stalled"),
+        "{error}"
+    );
+    assert_error_state_is_status(&fixture, &error);
+    fs::remove_file(&knob).unwrap();
+    fixture.assert_lock_free();
+}
+
+/// A payload with no shim refuses a first install under `status`'s state.
+#[test]
+fn a_fresh_install_without_the_shim_carries_the_state_status_reads() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.shim_file()).unwrap();
+    let error = fixture.install_with("VALVE-SIGNED").unwrap_err();
+    assert!(
+        error.to_string().contains("ships no web helper shim"),
+        "{error}"
+    );
+    assert_error_state_is_status(&fixture, &error);
+}
+
+/// The same refusal on an installed client, from the shim pass.
+#[test]
+fn an_installed_client_without_the_shim_carries_the_state_status_reads() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fixture.stop_client();
+    fs::remove_file(fixture.shim_file()).unwrap();
+    let error = fixture.install_with("VALVE-SIGNED").unwrap_err();
+    assert!(
+        error.to_string().contains("ships no web helper shim"),
+        "{error}"
+    );
+    assert_error_state_is_status(&fixture, &error);
 }
