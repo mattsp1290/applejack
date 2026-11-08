@@ -218,7 +218,7 @@ example of each, read by both `tests/rpc_golden.rs` and the Swift `GoldenTests`.
 | `app.cancel` | `JobStarted`; see [Sessions](#sessions) |
 | `runtime.steam.install` | `JobStarted`; see [Steam client runtime](#steam-client-runtime) |
 | `runtime.steam.update` | `JobStarted` |
-| `runtime.steam.repair` | `JobStarted`. `reinstall` checks the payload (`probes/osslsigncode`, the shim), then stops the client and moves its package directory aside before it fetches and reruns the bootstrapper; a failure before the new client's end check puts the old one back, success removes it |
+| `runtime.steam.repair` | `JobStarted`. `reinstall` checks the payload (`probes/osslsigncode`, the shim), then stops the client and moves its package directory aside before it fetches and reruns the bootstrapper; a failure before the new client's start puts the old one back; at that start the old one is removed, and a later failure keeps the new one for `runtime.steam.install` to resume |
 | `runtime.steam.stop` | `JobStarted` |
 | `runtime.steam.status` | `{state, prefix, build_id, running, snapshots, detail}`; `state` is one of `absent`, `installing`, `needs_login`, `ready`, `updating`, `broken` |
 | `session.list` | `{"sessions": [SessionRow]}`, newest first; `appid` narrows it to one title |
@@ -401,8 +401,9 @@ the last line the start printed:
   `ClientRuntimeBroken` carrying what `runtime.steam.status` then reads,
   its state and its detail, under the lead `the client did not reach the
   login window within 600 seconds; it was stopped and its files kept`, so
-  the two never disagree; for a state whose detail names no way out
-  (`ready`, `absent`) the detail ends `` `applejack runtime steam install`
+  the two never disagree (no restore follows a timeout: a reinstall's old
+  package is removed at its new client's start, before the wait); for a
+  state whose detail names no way out (`ready`, `absent`) the detail ends `` `applejack runtime steam install`
   starts the client to its window again``;
 - a client that exits during the wait, after its last
   `client:` line: the stall (`client: stalled: the client's main loop is
@@ -418,15 +419,19 @@ the last line the start printed:
 
 One rule covers every `ClientRuntimeBroken` these jobs fail with: its state
 is what `runtime.steam.status` reads when the job ends (after any stop or
-restore the job made), and its detail is the failure's own. A failed
-`repair --reinstall` leaves the old package directory in place (a
-`package: restoring ...` line), so `status` then reads what it read before
-the job.
+restore the job made), and its detail is the failure's own. A `repair
+--reinstall` that fails before its new client starts puts the old package
+directory back (a `package: restoring ...` line); files the bootstrapper
+wrote outside it stay, and `runtime.steam.status` reads them, which is
+usually, not always, what it read before the job. One that fails after
+that start keeps the new package directory, and `runtime.steam.install`
+resumes its self-update.
 
 Every start's `start:` lines are followed by at least one `client:` phase
 line (`client: starting`, or `client: updating` while the self-update
 runs), so all but the missing shim end on a `client:` or `stop:` line, never
-on `start:` (on `repair --reinstall`, a `package:` line follows). `status`
+on `start:` (on a `repair --reinstall` whose new client never started, a
+`package:` line follows). `status`
 does not see the stall, the early exit or the missing shim themselves: the
 error's detail is where they are named. `install`'s wait on a client already up
 starts nothing; its failures are the window timeout's and the exit's
