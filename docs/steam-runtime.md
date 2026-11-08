@@ -270,6 +270,31 @@ started outside applejack (the host's own habit of double-clicking
 `steam.exe`) keeps the shim, since without `-noverifyfiles` the client
 writes its helper back and the next applejack start stashes it again.
 
+### The CM connect loop
+
+Before engine 11.0-3 the client could sit at the login window with
+`logs/connection_log.txt` repeating `EConnect called - scheduling connection
+for 50ms from now` ten times a second, after `UI Request: connect` in
+`logs/steamui_login.txt`, and never logging `YieldingConnect`, so the QR code
+never became usable. The client's CM connect waits for its
+`MachineIDInfoThread`, which runs WMI queries; `SELECT * FROM
+Win32_DiskPartition` calls `GetLogicalDrives`, and Wine 11.0's unix
+`NtQueryDirectoryObject`, built by clang, read the BOOLEAN `restart`
+argument as 32 bits while the PE caller had set only its low byte, so a
+stale stack byte restarted the enumeration of `\DosDevices` on every call
+and the thread never finished. Whether it hung depended on stack contents,
+not on the network: hiding every adapter but `en0` and `lo0`, moving
+`config/config.vdf` aside, and the shim made no difference, and one start on
+2026-11-03 connected with the same build. `build/wine/patches/0003-ntdll-directory-object-boolean-args.patch`
+reads both BOOLEAN arguments through memory; with it the client connects
+with Tailscale and NetBird up.
+
+A thread that never finishes shows by name: with the client up, run the
+payload's `wine winedbg --command "info thread"` with `WINEPREFIX` set to the
+client prefix and the prefix's sync variable (`WINEESYNC=1`), then
+`--command "bt 0x<tid>" 0x<pid>` for the thread. Nothing in that run talks
+to Steam; it attaches to the running wineserver.
+
 ### Snapshots and repair
 
 `update` snapshots the prefix before the client touches itself (decision
@@ -438,6 +463,7 @@ criterion 5 may be rewritten so the in-prefix client keeps its own copy.
 | The client began downloading the title | `ClientRedownloadRefused` | A2 refuted; see above |
 | The client began a routine patch of the title | `TitleUpdatePending` | Not a refuted A2. `runtime steam stop`, `install <appid> --update`, run again |
 | Another title runs through the client | `PrefixBusy` on `steam-client` | Wait for it, or `app cancel` it |
+| The login window stays, and `connection_log.txt` repeats `EConnect called - scheduling connection for 50ms from now` with no `YieldingConnect` | none | Engine before 11.0-3: the client's machine-ID thread is stuck in `GetLogicalDrives` (see "The CM connect loop"); install engine 11.0-3 or later |
 
 ## Recovery
 

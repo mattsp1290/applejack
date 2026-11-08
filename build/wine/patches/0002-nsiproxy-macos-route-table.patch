@@ -13,10 +13,9 @@ Reason: On macOS the route table nsiproxy.sys builds from the PF_ROUTE sysctl
  on utun6 and utun100; the loopback adapter carried gateway 127.0.0.1. The
  unicast table reported the NetBird tunnel's address with prefix length 0
  because the kernel's netmask sockaddr has no family; and every utun
- reported IF_TYPE_OTHER. The Steam client, which reads the adapter list,
- the gateways and GetBestInterfaceEx before it connects, scheduled its CM
- connection every 50 ms and never connected (connection_log.txt: ~1,900
- `EConnect called` lines, no `Connecting to`). Measured with
+ reported IF_TYPE_OTHER. The Steam client's CM connect loop seen at the
+ same time is not this: it persisted with the patch and with every adapter
+ but en0 and lo0 hidden, and 0003 fixes it (U22b, 2026-11-08). Measured with
  crates/applejack-engine/probes/netprobe on 2026-11-06, see
  .agents/orchestrate/macos-windows-steam-runner/reports/U22a.md.
  After the patch the table matches what the Linux code in the same file

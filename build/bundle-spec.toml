@@ -10,7 +10,7 @@ id = "rosetta-wine"
 # engines/rosetta-wine/, so lowercase [0-9a-z._+-] starting with a digit. Any
 # change to what the bundle ships bumps the revision: `engine install` refuses a
 # version that is already installed.
-version = "11.0-2"
+version = "11.0-3"
 arch = "x86_64"
 # MACOSX_DEPLOYMENT_TARGET in build/wine/build.sh.
 min_macos = "14.0"

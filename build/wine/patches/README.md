@@ -33,6 +33,8 @@ whether one applied.
 | --- | --- | --- |
 | `0001-dxmt-macdrv-abi.patch` | `dlls/winemac.drv/{cocoa_window.m,macdrv.h,macdrv_cocoa.h,window.c}` | Adapted to Wine 11.0 from <https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3> by cyy, the Wine 11.9 reference in <https://github.com/3Shain/dxmt/issues/170>. LGPL-2.1-or-later, as Wine. |
 | `0002-nsiproxy-macos-route-table.patch` | `dlls/nsiproxy.sys/{ip.c,ndis.c}` | applejack (U22a, 2026-11-06). LGPL-2.1-or-later, as Wine. |
+| `0003-ntdll-directory-object-boolean-args.patch` | `dlls/ntdll/unix/sync.c` | applejack (U22b, 2026-11-08). LGPL-2.1-or-later, as Wine. |
+| `0004-iphlpapi-best-route-port.patch` | `dlls/iphlpapi/iphlpapi_main.c` | applejack (U22b, 2026-11-08). LGPL-2.1-or-later, as Wine. |
 
 `0001-dxmt-macdrv-abi.patch` gives DXMT 0.80 what it needs from Wine 11.0: an
 exported `macdrv_functions` table and a `get_win_data` that returns DXMT's layout
@@ -56,10 +58,27 @@ tunnels are `MIB_IF_TYPE_PPP`, and a netmask is read by its address's family
 (the kernel leaves the netmask's own family unset). Without it, with Tailscale
 up, `GetIpForwardTable` held three default routes, `GetAdaptersAddresses` gave
 the tunnels and the loopback adapter gateways equal to their own addresses and
-`en0` a hundred of them, one tunnel address had prefix length 0, and the Steam
-client scheduled its CM connection every 50 ms without ever connecting. The
+`en0` a hundred of them, and one tunnel address had prefix length 0. The
 evidence is in the patch header; `crates/applejack-engine/probes/netprobe/`
-prints what a Windows program sees and is how to re-measure it.
+prints what a Windows program sees and is how to re-measure it. The Steam
+client's CM connect loop seen alongside it is 0003's, not this one's.
+
+`0003-ntdll-directory-object-boolean-args.patch` makes the unix side of
+`NtQueryDirectoryObject` read its BOOLEAN arguments as one byte. clang
+assumes a BOOLEAN argument arrives zero-extended, so the code tested 32 bits
+of `restart`, while a PE caller such as `GetLogicalDrives` sets only the low
+byte; a stale byte above it restarted the enumeration on every call, so
+`GetLogicalDrives` never returned. The Steam client's machine-ID thread calls
+it through WMI's `Win32_DiskPartition`, and the client's CM connect waits for
+that thread: without the patch the client logs `EConnect called - scheduling
+connection for 50ms from now` ten times a second and never connects.
+
+`0004-iphlpapi-best-route-port.patch` gives `GetBestRoute2`'s routing probe a
+port. It asks the kernel for the route by connecting a UDP socket to the
+destination, which usually carries port 0, and macOS refuses `connect()` to
+port 0, so the kernel's answer was never used and every `GetBestInterface`,
+`GetBestInterfaceEx` and `GetBestRoute2` call fell back to scanning the route
+table.
 
 Wine is LGPL: this directory is the source of the changes the bundle's `wine/`
 carries. `THIRD_PARTY_NOTICES.md` in the bundle links it at the commit that last

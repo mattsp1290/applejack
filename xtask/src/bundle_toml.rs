@@ -178,8 +178,8 @@ const WINE_LICENSE: &str = "LGPL-2.1-or-later";
 /// section 2(b) asks for. A new patch updates the date and the credit, which
 /// repeat the `Origin:` and `Date:` headers of the patches.
 const WINE_PATCHES_REPOSITORY: &str = "https://github.com/mattsp1290/applejack";
-const WINE_PATCHES_CHANGED: &str = "2026-10-31";
-const WINE_PATCHES_CREDIT: &str = "adapted from https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3 by cyy";
+const WINE_PATCHES_CHANGED: &str = "2026-11-08";
+const WINE_PATCHES_CREDIT: &str = "0001 adapted from https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3 by cyy, 0002 to 0004 written for applejack";
 /// The revision in the notices when the renderer is given none, which is what
 /// the checked-in fixtures carry; `build/assemble.sh` passes the commit.
 pub(crate) const DEFAULT_PATCHES_REV: &str = "main";
@@ -989,8 +989,9 @@ mod tests {
         let notices = spec().to_notices("0123abcd").expect("renders");
         for needle in [
             "https://github.com/mattsp1290/applejack/tree/0123abcd/build/wine/patches",
-            "changed on 2026-10-31",
-            "https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3 by cyy",
+            "changed on 2026-11-08",
+            "0001 adapted from https://github.com/cyyever/wine/commit/c5375ee66cb355bb949d60e952da3bf9323d7bc3 by cyy",
+            "0002 to 0004 written for applejack",
         ] {
             assert!(notices.contains(needle), "{needle}");
         }
