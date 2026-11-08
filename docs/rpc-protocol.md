@@ -377,10 +377,11 @@ core leaves this recovery to the next start.
 
 `docs/steam-runtime.md` is the full account. `runtime.steam.status` answers
 at once; the other four are jobs whose `job.progress` phases are the steps
-(`prefix`, `install`, `download`, `verify`, `bootstrap`, `library`, `shim`,
-`start`, `client`, `build`, `snapshot`, `repair`, `stop`), ending with a `status` phase that carries the
-state. The prefix is claimed before the answer, so `PrefixBusy` (a title runs
-through the client) is an error response. `runtime.steam.install` is the one
+(`prepare`, `prefix`, `install`, `download`, `verify`, `bootstrap`,
+`library`, `shim`, `start`, `client`, `build`, `snapshot`, `repair`, `stop`),
+ending with a `status` phase that carries the state. The prefix is claimed
+before the answer, so `PrefixBusy` (a title runs through the client) is an
+error response. `runtime.steam.install` is the one
 method that reaches the network outside Steam's own protocol: it fetches
 Valve's `SteamSetup.exe`, refuses it with `BootstrapperUnverified` unless its
 Authenticode chain verifies with Valve Corp as the signer, runs it, and
