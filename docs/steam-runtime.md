@@ -288,9 +288,10 @@ stale stack byte restarted the enumeration of `\DosDevices` on every call
 and the thread never finished. Whether it hung depended on stack contents,
 not on the network: hiding every adapter but `en0` and `lo0`, moving
 `config/config.vdf` aside, and the shim made no difference, and with engine
-11.0-2 and client build 1792618285 throughout, one start on 2026-11-03
-connected while the next one, 45 minutes later with a byte-identical web
-helper command line, looped, as did the starts on 2026-11-02 and
+11.0-2 and client build 1792618285 throughout, the 10:30 start on
+2026-11-03 connected while the 11:15 start, 45 minutes later with a
+byte-identical web helper command line, looped (the two starts between them,
+at 10:57 and 11:02, never reached the login window), as did the starts on 2026-11-02 and
 2026-11-08. `build/wine/patches/0003-ntdll-directory-object-boolean-args.patch`
 reads both BOOLEAN arguments through memory; with it the client connects
 with Tailscale and NetBird up.

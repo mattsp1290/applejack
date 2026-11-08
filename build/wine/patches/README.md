@@ -115,8 +115,10 @@ copies `disable` whole (`movl %esi,%r13d` at 0x299d1) and stores it as 32
 bits into `req->disable_all` (`movl %r13d,-0xc0(%rbp)` at 0x29a53), an `int`
 in `server/protocol.def` that wineserver tests whole (`server/token.c` line
 1284 in 11.0: `if (req->disable_all)`). Its own `if (!disable)` is a byte
-test (`testb %r13b,%r13b` at 0x29a68), so a FALSE with dirty upper bits sends no
-privilege list and has wineserver disable every privilege of the token.
+test (`testb %r13b,%r13b` at 0x29a68), so a FALSE with dirty upper bits
+still sends the privilege list (the test sees zero and falls through to add it
+at 0x29a6d), but wineserver sees `disable_all` nonzero, ignores the list and
+disables every privilege of the token (and returns no previous state).
 
 None has been seen to fail. kernelbase's `SleepEx`, the common route into
 `NtDelayExecution`, passes a whole 32-bit `BOOL`; a caller that set only the

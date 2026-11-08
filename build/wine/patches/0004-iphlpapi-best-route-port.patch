@@ -3,12 +3,15 @@ Date: 2026-11-08
 Reason: GetBestRoute2 asks the kernel for the route to a destination by
  connecting a UDP socket to it and reading the source address back. The
  caller's address usually has port 0, and macOS refuses connect() to port 0
- with EADDRNOTAVAIL, so on macOS the kernel's answer was never used: every
- call logged `GetBestRoute2 Resolving destination address failed` and fell
- back to a longest-prefix scan of the route table, which keeps the first of
- equal routes and ignores the routing policy a VPN installs. GetBestInterface,
- GetBestInterfaceEx and GetBestRoute2 callers (the Steam client among them)
- took that path. The probe now uses port 9 when the caller gave none; the
+ with EADDRNOTAVAIL. The probe runs only when the caller gave no source
+ address and the destination is not IPv6 link-local, so on macOS such a call
+ with port 0 never used the kernel's answer: it logged `GetBestRoute2
+ Resolving destination address failed` and fell back to a longest-prefix scan
+ of the route table, which keeps the first of equal routes and ignores the
+ routing policy a VPN installs. GetBestInterface (which always passes port 0),
+ and GetBestInterfaceEx and GetBestRoute2 calls with port 0 and no source
+ address (the Steam client's GetBestInterfaceEx calls among them), took that
+ path. The probe now uses port 9 when the caller gave none; the
  port does not change the route. Measured 2026-11-08 with
  crates/applejack-engine/probes/netprobe under WINEDEBUG=warn+iphlpapi:
  two warnings and the fallback before, none after, the same interface (en0)

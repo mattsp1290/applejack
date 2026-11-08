@@ -467,8 +467,9 @@ static void print_per_address_probes(void)
 }
 
 /* The local-address discovery idiom: connect a UDP socket to a public
- * address and read the local address back with getsockname. The Steam
- * client does this with port 0. */
+ * address and read the local address back with getsockname. Wine's
+ * GetBestRoute2 does this with the caller's port, which is 0 when the Steam
+ * client calls GetBestInterfaceEx (U22a); 0004 sets port 9 there. */
 static void print_udp_connect_trick(void)
 {
     static const unsigned short ports[] = { 0, 53 };
