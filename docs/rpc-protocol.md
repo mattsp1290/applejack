@@ -405,8 +405,11 @@ the last line the start printed:
   stalled (<log>); ...`, or a `client:` phase line after it), a file-check
   start that laid no helper down, or the early exit (a second clean
   shutdown in one op, or any other exit);
-- a payload with no shim, `{ broken }` from the shim pass before the
-  start's first `start:` line.
+- a payload with no shim, `{ broken }` before the start's first `start:`
+  line: on an `install` that runs the bootstrapper, its check catches it
+  first, before the download (on a fresh `install` the last line is
+  `prefix: creating prefix steam-client`, and `status` reads `absent`);
+  otherwise the shim pass does.
 
 Every start's `start:` lines are followed by at least one `client:` phase
 line (`client: starting`, or `client: updating` while the self-update
